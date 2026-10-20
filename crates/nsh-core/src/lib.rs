@@ -65,8 +65,8 @@ pub use crate::{
         DialogButtonStyle, EventKind, EventMask, EventPayload, HeaderSlot, HoverEvent, ImageProp,
         ImageSource, KeyboardAppearance, KeyboardDismissMode, KeyboardTaps, KeyboardType,
         ListContentStyle, ModalAnimation, ModalPresentation, ModalProp, NativeProp, NodeId, Op,
-        PayloadValue, Prop, ROOT_ID, ResizeMode, ReturnKeyType, ScreenAnimation, ScreenProp,
-        ScrollProp, SnapAlignment, StatusBarConfig, StatusBarSetting, StatusBarStyle,
+        PayloadValue, PressEvent, Prop, ROOT_ID, ResizeMode, ReturnKeyType, ScreenAnimation,
+        ScreenProp, ScrollProp, SnapAlignment, StatusBarConfig, StatusBarSetting, StatusBarStyle,
         SubmitBehavior, Tag, TouchEvent, TouchPhase, TouchPoint, Viewability, WebSource,
     },
     props::{

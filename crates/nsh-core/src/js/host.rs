@@ -366,6 +366,17 @@ export interface HoverEvent {
   shiftKey: boolean;
 }
 
+/** The modifier keys held when a press began and its click count: the payload of `onPress`, `onLongPress`, `onPressDown` and `onPressUp` on backends that know them (none otherwise). */
+export interface PressEvent {
+  altKey: boolean;
+  ctrlKey: boolean;
+  /** Command on Apple platforms, the Windows / Super key elsewhere. */
+  metaKey: boolean;
+  shiftKey: boolean;
+  /** Consecutive clicks at the same place: 1 for a click, 2 for a double click. */
+  clickCount: number;
+}
+
 /** Where a context menu was asked for: the payload of `onContextMenu`. */
 export interface ContextMenuEvent {
   /** Position in the view (points, its transforms undone). */
@@ -422,10 +433,20 @@ export interface WebViewNavigation {
 /// its documentation. An event whose payload differs between elements has
 /// a row per payload.
 pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
-    (EventKind::Press, on::ALL, "() => void", ""),
-    (EventKind::LongPress, on::ALL, "() => void", ""),
-    (EventKind::PressDown, on::ALL, "() => void", ""),
-    (EventKind::PressUp, on::ALL, "() => void", ""),
+    (EventKind::Press, on::ALL, "(e?: PressEvent) => void", ""),
+    (
+        EventKind::LongPress,
+        on::ALL,
+        "(e?: PressEvent) => void",
+        "",
+    ),
+    (
+        EventKind::PressDown,
+        on::ALL,
+        "(e?: PressEvent) => void",
+        "",
+    ),
+    (EventKind::PressUp, on::ALL, "(e?: PressEvent) => void", ""),
     (
         EventKind::HoverIn,
         on::ALL,

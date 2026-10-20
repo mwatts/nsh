@@ -120,7 +120,7 @@ mod tests {
         let elements = super::host::declarations();
         for (interface, prop) in [
             ("HostProps", "  pointerEvents?: PointerEvents;"),
-            ("HostProps", "  onPress?: () => void;"),
+            ("HostProps", "  onPress?: (e?: PressEvent) => void;"),
             ("HostProps", "  onLayout?: (e: LayoutEvent) => void;"),
             ("AndroidHostProps", "  elevation?: number;"),
             ("InputHostProps", "  keyboardType?: KeyboardType;"),

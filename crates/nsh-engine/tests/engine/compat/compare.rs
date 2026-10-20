@@ -185,7 +185,40 @@ fn widened(old: &str, new: &str) -> bool {
                 .iter()
                 .all(|p| p.starts_with("...") || optional(p));
     }
-    union_widened(old, new)
+    union_widened(old, new) || callback_extended(old, new)
+}
+
+/// `name?: (a: X) => R` → `name?: (a: X, b?: Y) => R`: a callback type that
+/// gains trailing optional parameters, its own parameters and result kept.
+/// An app's handler written for the old type still type-checks (TypeScript
+/// lets a function take fewer parameters) and ignores what it is given
+/// beyond them, so this is the one change a callback's parameters may take.
+fn callback_extended(old: &str, new: &str) -> bool {
+    let (Some(o), Some(n)) = (top_level(old, ':'), top_level(new, ':')) else {
+        return false;
+    };
+    let (old_ty, new_ty) = (old[o + 1..].trim_start(), new[n + 1..].trim_start());
+    if old[..o] != new[..n] || !old_ty.starts_with('(') || !new_ty.starts_with('(') {
+        return false;
+    }
+    let (Some(oc), Some(nc)) = (matching(old_ty, 0), matching(new_ty, 0)) else {
+        return false;
+    };
+    let result = old_ty[oc + 1..].trim_start();
+    if !result.starts_with("=>") || result != new_ty[nc + 1..].trim_start() {
+        return false;
+    }
+    let params = |list: &'_ str| -> Vec<String> {
+        split_top(list, ',')
+            .into_iter()
+            .filter(|p| !p.trim().is_empty())
+            .map(str::to_owned)
+            .collect()
+    };
+    let (old_params, new_params) = (params(&old_ty[1..oc]), params(&new_ty[1..nc]));
+    new_params.len() > old_params.len()
+        && new_params.starts_with(&old_params)
+        && new_params[old_params.len()..].iter().all(|p| optional(p))
 }
 
 /// `text` with the names of the parameters of every function type and
@@ -777,6 +810,27 @@ mod tests {
         assert!(!compatible(
             "onPress?: (e: X) => void",
             "onPress?: (e: X | Y) => void"
+        ));
+        // ... but a callback may be handed more, in optional parameters.
+        assert!(compatible(
+            "onPress?: () => void",
+            "onPress?: (e?: PressEvent) => void"
+        ));
+        assert!(compatible(
+            "onPick?: (a: X) => void",
+            "onPick?: (a: X, b?: Y) => void"
+        ));
+        assert!(!compatible(
+            "onPress?: () => void",
+            "onPress?: (e: PressEvent) => void"
+        ));
+        assert!(!compatible(
+            "onPick?: (a: X) => void",
+            "onPick?: (a: X | Z, b?: Y) => void"
+        ));
+        assert!(!compatible(
+            "onPress?: () => void",
+            "onPress?: (e?: PressEvent) => boolean"
         ));
         assert!(compatible(
             "onPress?: ((e: X) => void) | null",

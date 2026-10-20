@@ -900,6 +900,28 @@ impl Headless {
         self.done()
     }
 
+    /// The step `press(<selector>)` with `modifiers` held, as a single
+    /// click with those keys down: each event carries them and a click
+    /// count of 1 ([`EventPayload::Press`]).
+    pub fn press_with(
+        &mut self,
+        selector: &str,
+        modifiers: nsh_core::keymap::Modifiers,
+    ) -> Result<(), String> {
+        let parsed = Selector::parse(selector)?;
+        self.step(format!("press({selector}, {modifiers:?})"));
+        let pick = self.screen.pressable(&parsed);
+        let id = self.picked(pick, selector, "pressable view")?;
+        let event = nsh_core::PressEvent {
+            modifiers,
+            clicks: 1,
+        };
+        for kind in [EventKind::PressDown, EventKind::PressUp, EventKind::Press] {
+            self.send(id, kind, EventPayload::Press(event));
+        }
+        self.done()
+    }
+
     /// The step `longPress(<selector>)`: holds a finger on what `selector`
     /// names (or the nearest view around it that hears long presses or
     /// presses) for its `delayLongPress` (500 ms), as a long press does:
@@ -1255,6 +1277,39 @@ mod tests {
         assert_eq!(steps.first().map(String::as_str), Some("open"));
         assert!(steps.iter().any(|s| s == "press(Add)"), "{steps:?}");
         assert!(steps.iter().any(|s| s == "press(text:Add)"), "{steps:?}");
+    }
+
+    /// A button that shows whether Control was held for its last press.
+    #[component]
+    fn CtrlProbe() -> impl IntoElement {
+        let ctrl = signal(None::<bool>);
+        view()
+            .child(text(move || format!("ctrl: {:?}", ctrl.get())))
+            .child(
+                view()
+                    .on(EventKind::Press, move |p: &EventPayload| {
+                        let held = match p {
+                            EventPayload::Press(e) => Some(e.modifiers.ctrl),
+                            _ => None,
+                        };
+                        ctrl.set(held);
+                    })
+                    .child(text("Probe")),
+            )
+    }
+
+    #[test]
+    fn a_press_with_modifiers_carries_them() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<CtrlProbe>())).unwrap();
+        app.first_render().unwrap();
+        let ctrl = nsh_core::keymap::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        app.press_with("Probe", ctrl).unwrap();
+        app.wait_for("ctrl: Some(true)").unwrap();
+        app.press("Probe").unwrap();
+        app.wait_for("ctrl: None").unwrap();
     }
 
     /// A name field that says hello and keeps what was sent.

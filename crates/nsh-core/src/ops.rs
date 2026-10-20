@@ -150,8 +150,8 @@ macro_rules! events {
 // The order is part of the platform protocols (`encode.rs`, `Native.java`):
 // append new kinds at the end.
 events! {
-    Press = "onPress": "A tap / click.",
-    LongPress = "onLongPress": "A press held for about half a second.",
+    Press = "onPress": "A tap / click (payload: [`EventPayload::Press`] where the backend knows the modifier keys, else none).",
+    LongPress = "onLongPress": "A press held for about half a second (payload as `Press`).",
     PanStart = "onPanStart": "A drag started (payload: [`EventPayload::Pan`]).",
     PanEnd = "onPanEnd": "A drag ended (payload: [`EventPayload::Pan`] with velocity).",
     Refresh = "onRefresh": "Pull-to-refresh was triggered on a scroll or list.",
@@ -163,8 +163,8 @@ events! {
     SubmitEditing = "onSubmitEditing" as "onSubmit": "The return key was pressed in an input (payload: [`EventPayload::Text`]).",
     Focus = "onFocus": "An input became focused.",
     Blur = "onBlur": "An input lost focus.",
-    PressDown = "onPressIn" as "onPressDown": "A press went down on a pressable view (a finger, a pen or a mouse button).",
-    PressUp = "onPressOut" as "onPressUp": "The press ended: released, moved away or cancelled.",
+    PressDown = "onPressIn" as "onPressDown": "A press went down on a pressable view (a finger, a pen or a mouse button; payload as `Press`).",
+    PressUp = "onPressOut" as "onPressUp": "The press ended: released, moved away or cancelled (payload as `Press`).",
     Layout = "onLayout": "The frame changed (payload: [`EventPayload::Layout`], relative to the parent).",
     PinchStart = "onPinchStart": "A pinch started (payload: `scale`, `velocity`).",
     PinchEnd = "onPinchEnd": "A pinch ended (payload: `scale`, `velocity`).",
@@ -358,6 +358,18 @@ pub struct HoverEvent {
     pub modifiers: crate::keymap::Modifiers,
 }
 
+/// The modifier keys and click count of a press ([`EventKind::Press`],
+/// [`EventKind::LongPress`], [`EventKind::PressDown`],
+/// [`EventKind::PressUp`]), on backends that know them.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PressEvent {
+    /// The modifier keys held when the press began.
+    pub modifiers: crate::keymap::Modifiers,
+    /// Consecutive clicks at the same place: 1 for a click, 2 for a
+    /// double click, ...
+    pub clicks: u32,
+}
+
 /// Where a context menu was asked for ([`EventKind::ContextMenu`]), in
 /// points.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -489,6 +501,9 @@ pub enum EventPayload {
     Hover(HoverEvent),
     /// A context menu asked for over a view (`onContextMenu`).
     ContextMenu(ContextMenuEvent),
+    /// The modifier keys and click count of a press (`onPress`, `onLongPress`,
+    /// `onPressDown`, `onPressUp`).
+    Press(PressEvent),
     /// Local file URLs dropped by the user, in the platform's order.
     FileDrop(Vec<String>),
     /// The lines of a text block.

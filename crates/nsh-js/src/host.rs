@@ -1098,6 +1098,13 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             obj.set("metaKey", e.modifiers.cmd)?;
             obj.set("shiftKey", e.modifiers.shift)?;
         }
+        EventPayload::Press(e) => {
+            obj.set("altKey", e.modifiers.alt)?;
+            obj.set("ctrlKey", e.modifiers.ctrl)?;
+            obj.set("metaKey", e.modifiers.cmd)?;
+            obj.set("shiftKey", e.modifiers.shift)?;
+            obj.set("clickCount", e.clicks)?;
+        }
         EventPayload::FileDrop(uris) => {
             let list = rquickjs::Array::new(cx.clone())?;
             for (index, uri) in uris.iter().enumerate() {
@@ -1888,6 +1895,33 @@ const report = (v) => text(String(v));
             );
             assert!(flag("shiftKey") && flag("metaKey"));
             assert!(!flag("altKey") && !flag("ctrlKey"));
+        });
+    }
+
+    #[test]
+    fn press_payload_has_the_modifiers() {
+        let host = Host::new().unwrap();
+        let event = nsh_core::PressEvent {
+            modifiers: nsh_core::keymap::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            clicks: 2,
+        };
+        host.cx.with(|cx| {
+            let value = payload_object(&cx, &EventPayload::Press(event)).unwrap();
+            let obj = value.as_object().unwrap();
+            let flag = |k: &str| obj.get::<_, bool>(k).unwrap();
+            assert_eq!(
+                (
+                    flag("ctrlKey"),
+                    flag("shiftKey"),
+                    flag("altKey"),
+                    flag("metaKey")
+                ),
+                (true, false, false, false)
+            );
+            assert_eq!(obj.get::<_, u32>("clickCount").unwrap(), 2);
         });
     }
 
