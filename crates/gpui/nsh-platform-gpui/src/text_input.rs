@@ -45,7 +45,10 @@
 //!
 //! `onKeyPress` reports what typing inserts and deletes, as UIKit does
 //! (nothing for pasted text, no Backspace for a selection typed over), and
-//! Escape, as on the other desktops.
+//! Escape, as on the other desktops; and, before the input acts on them,
+//! the arrows, Delete and Tab. The keys from the keyboard carry the
+//! modifiers held. A handler cannot stop the input: the app's key bindings
+//! (`crate::keymap`) see a key first and take it.
 //!
 //! Shortcuts use the platform's command key: Ctrl, or Command on macOS
 //! (where Option moves by words and Command to the line's edges).
@@ -78,7 +81,7 @@ use crate::{
     input::{KeyEvent, Modifiers, PointerKind},
     keys::{
         VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT,
-        VK_PRIOR, VK_RETURN, VK_RIGHT, VK_UP,
+        VK_PRIOR, VK_RETURN, VK_RIGHT, VK_TAB, VK_UP,
     },
     render::DrawCx,
     surface::Surface,
@@ -1084,6 +1087,33 @@ fn key_press(surface: &Surface, view: &NshView, key: &str) {
     });
 }
 
+/// Reports `key`, pressed on the keyboard with `m` held.
+fn key_press_with(surface: &Surface, view: &NshView, key: &str, m: Modifiers) {
+    send(surface, view, EventKind::KeyPress, || {
+        EventPayload::Map(vec![
+            ("key", PayloadValue::Str(key.to_owned())),
+            ("altKey", PayloadValue::Bool(m.alt)),
+            ("ctrlKey", PayloadValue::Bool(m.ctrl)),
+            ("metaKey", PayloadValue::Bool(m.meta)),
+            ("shiftKey", PayloadValue::Bool(m.shift)),
+        ])
+    });
+}
+
+/// The `onKeyPress` name of a key reported before the input acts on it
+/// (the input moves the caret, deletes forward, or Tab moves the focus).
+fn navigation_key(vk: u16) -> Option<&'static str> {
+    Some(match vk {
+        VK_LEFT => "ArrowLeft",
+        VK_RIGHT => "ArrowRight",
+        VK_UP => "ArrowUp",
+        VK_DOWN => "ArrowDown",
+        VK_DELETE => "Delete",
+        VK_TAB => "Tab",
+        _ => return None,
+    })
+}
+
 /// Reports the selection if it moved and JS listens.
 fn report_selection(surface: &Surface, view: &NshView, input: &InputState) {
     if !view.state().events.contains(EventKind::SelectionChange) {
@@ -1099,11 +1129,51 @@ fn report_selection(surface: &Surface, view: &NshView, input: &InputState) {
         return;
     }
     send(surface, view, EventKind::SelectionChange, || {
-        EventPayload::Map(vec![
-            ("start", PayloadValue::Number(range.0 as f64)),
-            ("end", PayloadValue::Number(range.1 as f64)),
-        ])
+        let mut event = nsh_core::SelectionEvent::new(range.0, range.1);
+        (event.caret, event.first_rect) = selection_rects(view, input);
+        EventPayload::Selection(event)
     });
+}
+
+/// The caret's rectangle and the selection's first line (none for a
+/// caret), in the view's coordinates: the editor's offset by the content
+/// box.
+fn selection_rects(
+    view: &NshView,
+    input: &InputState,
+) -> (
+    Option<nsh_core::Bounds<Points>>,
+    Option<nsh_core::Bounds<Points>>,
+) {
+    let Some(layout) = input.layout() else {
+        return (None, None);
+    };
+    let content = content_rect(view, input).origin;
+    let (ox, oy) = input.origin(&layout);
+    let rect = |x: f32, y: f32, w: f32, h: f32| nsh_core::Bounds {
+        origin: nsh_core::Point {
+            x: content.x + Points(ox + x),
+            y: content.y + Points(oy + y),
+        },
+        size: nsh_core::Size {
+            width: Points(w),
+            height: Points(h),
+        },
+    };
+    let model = input.model.borrow();
+    let secure = input.secure();
+    let (cx, cy, ch) = layout.caret(model.display_caret(secure));
+    let caret = rect(cx, cy, CARET_WIDTH, ch);
+    let first = model.has_selection().then(|| {
+        let (s, e) = model.selection();
+        let (s, e) = (model.to_display(s, secure), model.to_display(e, secure));
+        layout
+            .rects(s, e)
+            .into_iter()
+            .next()
+            .map(|(x, y, w, h)| rect(x, y, w, h))
+    });
+    (Some(caret), first.flatten())
 }
 
 /// Reports the composition if it started, changed or ended since last
@@ -1683,6 +1753,14 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
     };
     // Command+Left / Right on macOS: the line's edges (Home / End's).
     let edge = mac && m.meta && (vk == VK_LEFT || vk == VK_RIGHT);
+    // Reported before the input acts, so that a component knows where the
+    // caret was (a block editor moves to the next block from the last
+    // line); a binding that takes the key (`crate::keymap`) ran before.
+    if let Some(name) = navigation_key(vk)
+        && !input.composing()
+    {
+        key_press_with(surface, &view, name, m);
+    }
     match vk {
         // The input method takes the keys it composes with.
         _ if input.composing() => false,
@@ -1748,7 +1826,7 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
             // Backspace in an empty field deletes nothing but is still a
             // key press.
             if deleted || empty {
-                key_press(surface, &view, "Backspace");
+                key_press_with(surface, &view, "Backspace", m);
             }
             input.goal_x.set(None);
             after_edit(surface, &view, &input, deleted);
@@ -1766,7 +1844,7 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
         // focus from the field (`navigation::key_pressed`).
         _ if vk == VK_ESCAPE => {
             if !m.ctrl && !m.alt && !event.repeat {
-                key_press(surface, &view, "Escape");
+                key_press_with(surface, &view, "Escape", m);
             }
             false
         }

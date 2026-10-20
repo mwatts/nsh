@@ -481,6 +481,9 @@ pub(super) struct Components {
     /// Elements to measure once this commit is laid out
     /// ([`crate::ui::ElementRef::measure`]).
     pub(super) measures: Vec<(NodeId, AnswerSlot<Option<crate::Measurement>>)>,
+    /// Points of text blocks to find the caret offsets of once this commit
+    /// is laid out ([`crate::ui::ElementRef::text_index_at`]).
+    pub(super) text_indexes: Vec<(NodeId, crate::Point<Points>, AnswerSlot<Option<u32>>)>,
     /// The components' own lists, by node.
     virtual_lists: FxHashMap<NodeId, VirtualListState>,
     /// Views JS made, waiting to be in the tree to make their view.
@@ -550,6 +553,7 @@ impl Default for Components {
             next_fetch: 1,
             animations: FxHashMap::default(),
             measures: Vec::new(),
+            text_indexes: Vec::new(),
             virtual_lists: FxHashMap::default(),
             list_counts: FxHashMap::default(),
             waiting: Vec::new(),
@@ -4213,6 +4217,9 @@ impl<M: TextEngine> Core<M> {
             Action::Direction(change) => self.change_direction(change),
             Action::Appearance(appearance) => self.set_appearance(appearance),
             Action::Measure(id, answer) => self.components.measures.push((id, answer)),
+            Action::TextIndex(id, at, answer) => {
+                self.components.text_indexes.push((id, at, answer))
+            }
             Action::ImageInfo(uri, answer) => {
                 let id = self.components.next_image_info;
                 self.components.next_image_info += 1;

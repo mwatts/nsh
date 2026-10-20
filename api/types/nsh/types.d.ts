@@ -427,6 +427,14 @@ export interface ScrollEvent {
   zoomScale: number;
 }
 
+/** A rectangle of an input's text, in the input's coordinates (points; its top left corner, padding and border included). */
+export interface TextRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** A line of a laid-out text (in the text's content box). */
 export interface TextLayoutLine {
   text: string;
@@ -786,9 +794,10 @@ export interface InputHostProps {
   onSubmit?: (e: { text: string }) => void;
   onFocus?: () => void;
   onBlur?: () => void;
-  onSelectionChange?: (e: { start: number; end: number }) => void;
-  /** Before the text changes: `key` is the typed text, `Backspace` or `Enter`. */
-  onKeyPress?: (e: { key: string }) => void;
+  /** `start` and `end` in UTF-16 units (equal for a caret). Where the backend knows them (the desktops' GPUI backend), `caret` is the caret's rectangle and `firstRect` the selection's first line (none for a caret): where a menu at the caret or a popover on the selection goes. */
+  onSelectionChange?: (e: { start: number; end: number; caret?: TextRect; firstRect?: TextRect }) => void;
+  /** Before the text changes: `key` is the typed text, `Backspace` (text was deleted) or `Enter`. The GPUI backend also reports `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Delete`, `Escape` and `Tab` before the input acts on them, and the modifier keys held with the keys it reports from the keyboard. A handler cannot stop the input acting on a key: a keystroke bound with `keymap.bind(..., { when: "always" })` takes the key before the input sees it. */
+  onKeyPress?: (e: { key: string; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => void;
   /** An input method's composition started, changed or ended: `text` is what is being composed (pinyin before a character is chosen), empty once it ends. The committed text reaches `onChange` before the composition's end; while composing, the platform holds the `value` the app sets and shows it once the composition ends. */
   onCompositionChange?: (e: { composing: boolean; text: string }) => void;
   /** The size of the text (at the input's width when `multiline`; one empty line's while it is empty, whatever its placeholder): grow a multiline input with it. */

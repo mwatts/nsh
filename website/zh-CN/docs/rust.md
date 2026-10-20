@@ -297,7 +297,8 @@ test("a tap counts", async () => {
 测试也可以在 `cargo test` 中用同一个驱动无界面地运行应用：运行在真实的引擎上，没有窗口，以 60 Hz 提供显示帧，所以定时器、
 任务和动画都像在屏幕上一样运行。`nsh_testing::Headless`（nsh-testing 的默认特性，不含 QuickJS）启动应用，维护一份它所显示
 视图的模型（`app.screen()`：它们的文本、应用发送的命令），并执行 `nsh test` 的那些步骤（`press`、`type_text`、`submit`、
-`scroll`、`wait_for`），视图用同样的选择器指定（文本、无障碍标签或 test id；`text:`、`label:`、`id:`）；步骤无法执行时
+`scroll`、`wait_for`）以及键盘步骤（`select` 设置输入框的选区，输入的文字替换选区；`press_key("mod+z")` 先交给应用的快捷键绑定，
+再交给获得焦点的输入框），视图用同样的选择器指定（文本、无障碍标签或 test id；`text:`、`label:`、`id:`）；步骤无法执行时
 返回带有屏幕文字的错误。Rust 应用运行它的根组件；`EngineConfig::new` 是一个手机尺寸、其余都未设置的引擎：
 
 ```toml

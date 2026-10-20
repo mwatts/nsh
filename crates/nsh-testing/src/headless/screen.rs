@@ -79,6 +79,8 @@ pub struct Screen {
     unsupported: Vec<&'static str>,
     /// The app asked for a back (`Command::Back`, what no listener took).
     back_asked: bool,
+    /// The app's keyboard shortcuts (`MountItem::Keymap`).
+    keymap: Option<Arc<nsh_core::keymap::Keymap>>,
 }
 
 #[derive(Debug, Default)]
@@ -123,9 +125,61 @@ pub(crate) enum Pick {
 #[derive(Debug, Default)]
 pub(crate) struct Input {
     pub(crate) text: String,
+    /// Where a selection started and where the caret is (UTF-16 units):
+    /// the selection runs between them. At the end of a value the app
+    /// sets, as on the platforms.
+    pub(crate) anchor: u32,
+    pub(crate) caret: u32,
     /// The edits reported so far ([`nsh_core::EventPayload::Text`]).
     pub(crate) count: u32,
     pub(crate) config: Box<InputConfig>,
+}
+
+impl Input {
+    /// Its length in UTF-16 units.
+    pub(crate) fn len(&self) -> u32 {
+        self.text.encode_utf16().count() as u32
+    }
+
+    /// The selection, start to end (equal for a caret).
+    pub(crate) fn selection(&self) -> (u32, u32) {
+        (self.anchor.min(self.caret), self.anchor.max(self.caret))
+    }
+
+    /// The byte offset of UTF-16 offset `at` (past the end: the end).
+    pub(crate) fn byte(&self, at: u32) -> usize {
+        let mut units = 0;
+        for (i, c) in self.text.char_indices() {
+            if units >= at {
+                return i;
+            }
+            units += c.len_utf16() as u32;
+        }
+        self.text.len()
+    }
+
+    /// The UTF-16 offset one character before (`forward`: after) `at`.
+    pub(crate) fn step(&self, at: u32, forward: bool) -> u32 {
+        let b = self.byte(at);
+        let c = if forward {
+            self.text[b..].chars().next()
+        } else {
+            self.text[..b].chars().next_back()
+        };
+        match c {
+            Some(c) if forward => at + c.len_utf16() as u32,
+            Some(c) => at - c.len_utf16() as u32,
+            None => at,
+        }
+    }
+
+    /// Replaces UTF-16 range `from..to` with `text`, the caret after it.
+    pub(crate) fn replace(&mut self, from: u32, to: u32, text: &str) {
+        let (a, b) = (self.byte(from), self.byte(to));
+        self.text.replace_range(a..b, text);
+        let caret = from + text.encode_utf16().count() as u32;
+        (self.anchor, self.caret) = (caret, caret);
+    }
 }
 
 /// Where a scroll view is, as its platform view keeps it.
@@ -221,8 +275,11 @@ impl Screen {
                 // A value based on fewer edits than the user made is stale.
                 if let Some(input) = self.input_mut(*id)
                     && *count >= input.count
+                    && input.text != *text
                 {
                     input.text = text.clone();
+                    let end = input.len();
+                    (input.anchor, input.caret) = (end, end);
                 }
             }
             MountItem::ScrollConfig { id, horizontal, .. } => {
@@ -245,6 +302,9 @@ impl Screen {
                         scroll.y += *dy;
                     }
                 }
+            }
+            MountItem::Keymap(keymap) => {
+                self.keymap = (!keymap.is_empty()).then(|| keymap.clone());
             }
             MountItem::Command { id, command } => {
                 self.command(*id, command);
@@ -274,6 +334,12 @@ impl Screen {
                     .push("an image's size (`Image.getSize`, `Image.prefetch`)");
             }
             Command::Back => self.back_asked = true,
+            Command::SetSelection { start, end } => {
+                if let Some(input) = self.input_mut(id) {
+                    let len = input.len();
+                    (input.anchor, input.caret) = ((*start).min(len), (*end).min(len));
+                }
+            }
             Command::Focus if self.input(id).is_some() => self.focused = Some(id),
             Command::Blur if id == ROOT || self.focused == Some(id) => self.focused = None,
             Command::ScrollTo { x, y, .. } => {
@@ -800,6 +866,11 @@ impl Screen {
 
     pub(crate) fn input_mut(&mut self, id: NodeId) -> Option<&mut Input> {
         self.nodes.get_mut(&id)?.input.as_mut()
+    }
+
+    /// The app's keyboard shortcuts, if it binds any.
+    pub(crate) fn keymap(&self) -> Option<&nsh_core::keymap::Keymap> {
+        self.keymap.as_deref()
     }
 
     /// The input that has the focus.

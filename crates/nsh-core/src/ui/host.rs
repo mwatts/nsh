@@ -10,7 +10,10 @@ use std::sync::Arc;
 use super::{
     Accessible, AnyElement, Interactive, IntoReactive,
     element::{ElNode, Element, IntoElement, IntoListener, Listener, ParentElement},
-    events::{self, Composition, NativeEvent, Selection, VideoInfo, VideoProgress, WebNavigation},
+    events::{
+        self, Composition, KeyPress, NativeEvent, Selection, VideoInfo, VideoProgress,
+        WebNavigation,
+    },
 };
 use crate::{
     AutoCapitalize, AutoFill, Color, EventKind, HeaderSlot, Hsla, JsonValue, KeyboardAppearance,
@@ -474,9 +477,38 @@ impl Input {
         )
     }
 
-    /// A key was pressed: the character, `Backspace` or `Enter`.
+    /// The selection or caret moved, with where it shows where the
+    /// backend knows it ([`crate::SelectionEvent`]: the caret's rectangle
+    /// and the selection's first line, in the input's coordinates; the GPUI
+    /// backend sends them): where a menu at the caret goes.
+    pub fn on_selection_change_with_rects<M>(
+        self,
+        listener: impl IntoListener<crate::SelectionEvent, M>,
+    ) -> Self {
+        self.listen(
+            EventKind::SelectionChange,
+            listener.into_listener(),
+            events::selection_event,
+        )
+    }
+
+    /// A key was pressed: the character, `Backspace` or `Enter`; on the
+    /// GPUI backend also the arrows, `Delete`, `Escape` and `Tab`
+    /// ([`Self::on_key_press_with_modifiers`]).
     pub fn on_key_press<M>(self, listener: impl IntoListener<str, M>) -> Self {
         self.listen(EventKind::KeyPress, listener.into_listener(), events::key)
+    }
+
+    /// A key was pressed, with the modifier keys held ([`KeyPress`]). It
+    /// is reported before the input acts on the key and cannot stop it: a
+    /// key binding with [`crate::keymap::When::Always`] (`on_key_with`)
+    /// takes a key before the focused input sees it.
+    pub fn on_key_press_with_modifiers<M>(self, listener: impl IntoListener<KeyPress, M>) -> Self {
+        self.listen(
+            EventKind::KeyPress,
+            listener.into_listener(),
+            events::key_press,
+        )
     }
 
     /// An input method's composition started, changed or ended (the text

@@ -36,7 +36,7 @@ NSH-owned declarations and behavior rather than copying the upstream API into it
    export between modules: the old module keeps exporting it.
 3. **Types only widen.** A union gains alternatives, a function gains overloads or trailing optional parameters, a
    parameter becomes optional, a prop accepts more values, a function or method that returned `void` returns a value
-   (a callback an app passes in keeps returning `void`, and its parameters change only by gaining trailing optional ones). Nothing else narrows or changes a return type, and what apps
+   (a callback an app passes in keeps returning `void`, and its parameters change only by gaining trailing optional ones, or an object literal it is handed gaining optional members). Nothing else narrows or changes a return type, and what apps
    pass in (props, styles, options, configs) gains optional members only. Parameter names are not part of a type:
    TypeScript compares function types by structure, so `(data: number) => void` and `(value: number) => void` are one
    type, and a function, method or callback may rename its parameters; their count, optionality and types may not

@@ -1105,6 +1105,25 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             obj.set("shiftKey", e.modifiers.shift)?;
             obj.set("clickCount", e.clicks)?;
         }
+        EventPayload::Selection(e) => {
+            obj.set("start", e.start)?;
+            obj.set("end", e.end)?;
+            let rect =
+                |r: nsh_core::Bounds<nsh_core::Points>| -> rquickjs::Result<rquickjs::Object<'js>> {
+                    let o = rquickjs::Object::new(cx.clone())?;
+                    o.set("x", r.origin.x.0)?;
+                    o.set("y", r.origin.y.0)?;
+                    o.set("width", r.size.width.0)?;
+                    o.set("height", r.size.height.0)?;
+                    Ok(o)
+                };
+            if let Some(r) = e.caret {
+                obj.set("caret", rect(r)?)?;
+            }
+            if let Some(r) = e.first_rect {
+                obj.set("firstRect", rect(r)?)?;
+            }
+        }
         EventPayload::FileDrop(uris) => {
             let list = rquickjs::Array::new(cx.clone())?;
             for (index, uri) in uris.iter().enumerate() {
@@ -1922,6 +1941,33 @@ const report = (v) => text(String(v));
                 (true, false, false, false)
             );
             assert_eq!(obj.get::<_, u32>("clickCount").unwrap(), 2);
+        });
+    }
+
+    #[test]
+    fn selection_payload_has_the_caret_when_known() {
+        use nsh_core::geometry::{bounds, point, px, size};
+        let host = Host::new().unwrap();
+        let mut event = nsh_core::SelectionEvent::new(1, 3);
+        event.first_rect = Some(bounds(point(px(8.0), px(4.0)), size(px(20.0), px(16.0))));
+        event.caret = Some(bounds(point(px(28.0), px(4.0)), size(px(1.0), px(16.0))));
+        host.cx.with(|cx| {
+            let value = payload_object(&cx, &EventPayload::Selection(event)).unwrap();
+            let obj = value.as_object().unwrap();
+            assert_eq!(obj.get::<_, u32>("start").unwrap(), 1);
+            assert_eq!(obj.get::<_, u32>("end").unwrap(), 3);
+            let rect = |key: &str| {
+                let r: rquickjs::Object = obj.get(key).unwrap();
+                ["x", "y", "width", "height"].map(|k| r.get::<_, f64>(k).unwrap())
+            };
+            assert_eq!(rect("caret"), [28.0, 4.0, 1.0, 16.0]);
+            assert_eq!(rect("firstRect"), [8.0, 4.0, 20.0, 16.0]);
+            // A caret has no first rectangle.
+            let caret = nsh_core::SelectionEvent::new(2, 2);
+            let value = payload_object(&cx, &EventPayload::Selection(caret)).unwrap();
+            let obj = value.as_object().unwrap();
+            assert!(!obj.contains_key("caret").unwrap());
+            assert!(!obj.contains_key("firstRect").unwrap());
         });
     }
 

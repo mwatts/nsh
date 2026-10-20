@@ -1218,6 +1218,9 @@ impl<M: TextEngine> Core<M> {
         for (id, answer) in std::mem::take(&mut self.components.measures) {
             answer.borrow_mut().deliver(self.measure(id));
         }
+        for (id, at, answer) in std::mem::take(&mut self.components.text_indexes) {
+            answer.borrow_mut().deliver(self.text_index_at(id, at));
+        }
         // On laid out views; dropped for views that were never shown.
         for (id, mut command) in std::mem::take(&mut self.commands) {
             // Answered here, with this commit's layout (null for views that

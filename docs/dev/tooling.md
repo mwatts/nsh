@@ -221,8 +221,17 @@ and more than one fails the step; a press whose match, or a view between it and 
   `delayLongPress` (500 ms) `LongPress` and `PressOut`;
 - `clear`: the input takes the focus, gets a `KeyPress` of `Backspace` and an edit to nothing;
 - `type_text`: the input (the match or the first input in it) takes the focus (`Blur` to the one that had it,
-  `Focus`), then each character is a `KeyPress` and a `ChangeText` with the edit count, within `maxLength`; a line
-  break in a single line is the return key;
+  `Focus`), then each character is a `KeyPress`, a `ChangeText` with the edit count and a `SelectionChange` of the
+  caret after it, within `maxLength`, typed over the selection (at the end of the text unless the app or `select`
+  moved it); a line break in a single line is the return key;
+- `select`: the input takes the focus and its selection becomes `start..end` (UTF-16, clamped), reported by
+  `SelectionChange`;
+- `press_key`: a keystroke in `nsh/keymap`'s syntax goes as the desktop platforms take a key: the app's bindings
+  first (the root's `MountItem::Keymap`, matched with `Keymap::find` as the platforms do; a match fires the root's
+  `KeyCommand` and takes the key), else the focused input, which reports the arrows, `Delete`, `Escape` and `Tab`
+  (`KeyPress` with the modifiers) and acts on the key: arrows Left and Right and Home and End move the caret (Shift
+  extends), Backspace and Delete delete (reported as `Backspace`), Enter is the return key, `mod+a` selects all, a
+  character types;
 - `submit`: the return key as the input's `submitBehavior` resolves (`InputConfig::submit`): `KeyPress` `Enter` and
   `SubmitEditing` (then `Blur` for blur-and-submit), or a line break;
 - `scroll`: the scroll view (the match, the nearest one around it, else the first in it) moves along its axis 10

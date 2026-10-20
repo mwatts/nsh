@@ -121,8 +121,8 @@ let composing = false;
 | `onChange` | `text: string` | 文本改变。 |
 | `onSubmit` | `{ text }` | 在会提交的输入框中按下回车键（单行，或 `submitBehavior` 为 `"submit"` / `"blurAndSubmit"`）。 |
 | `onFocus` / `onBlur` | | 获得 / 失去焦点。 |
-| `onSelectionChange` | `{ start, end }` | 光标或选区移动（UTF-16 码元）。 |
-| `onKeyPress` | `{ key }` | 文本改变之前：`key` 是输入的文本、`"Backspace"` 或 `"Enter"`。 |
+| `onSelectionChange` | `{ start, end, caret?, firstRect? }` | 光标或选区移动（UTF-16 码元）。在 GPUI 后端上，`caret` 和 `firstRect` 给出光标和选区第一行在输入框中的位置。 |
+| `onKeyPress` | `{ key, altKey?, ctrlKey?, metaKey?, shiftKey? }` | 文本改变之前：`key` 是输入的文本、`"Backspace"` 或 `"Enter"`。在 GPUI 后端上还有方向键、`"Delete"`、`"Escape"` 和 `"Tab"`，并带有按下的修饰键。 |
 | `onContentSizeChange` | `{ width, height }` | 文本尺寸改变（多行时按输入框的宽度计算），随输入报告；输入框为空时报告一行空行的尺寸，与占位文字无关。 |
 | `onCompositionChange` | `{ composing, text }` | 输入法的组字开始、变化或结束（见[输入法](#输入法)）。 |
 

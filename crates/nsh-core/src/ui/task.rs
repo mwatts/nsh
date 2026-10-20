@@ -104,6 +104,13 @@ pub(crate) enum Action {
     /// Measures the node with the layout of the commit the action goes out
     /// with; the measurement resolves the slot.
     Measure(NodeId, AnswerSlot<Option<crate::Measurement>>),
+    /// The caret offset nearest a point of a text block, with the layout
+    /// of the commit the action goes out with; it resolves the slot.
+    TextIndex(
+        NodeId,
+        crate::geometry::Point<crate::geometry::Points>,
+        AnswerSlot<Option<u32>>,
+    ),
 }
 
 /// A clipboard read waiting for the platform's answer.

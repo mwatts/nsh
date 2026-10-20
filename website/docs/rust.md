@@ -322,7 +322,9 @@ test("a tap counts", async () => {
 Tests can also run the app headless in `cargo test`, with the same driver: on the real engine, without a window,
 with display frames at 60 Hz, so timers, tasks and animations run as on screen. `nsh_testing::Headless` (nsh-testing's
 default features, without QuickJS) starts the app, keeps a model of the views it shows (`app.screen()`: their texts,
-the commands it sent) and takes the steps of `nsh test` (`press`, `type_text`, `submit`, `scroll`, `wait_for`), on
+the commands it sent) and takes the steps of `nsh test` (`press`, `type_text`, `submit`, `scroll`, `wait_for`) and
+keyboard steps (`select` sets an input's selection, which typing replaces; `press_key("mod+z")` goes to the app's key
+bindings first, then to the focused input), on
 views named by the same selectors (a text, an accessibility label or a test id; `text:`, `label:`, `id:`); a step
 returns an error with the texts on screen when it cannot be taken. A Rust app runs its root; `EngineConfig::new` is a
 phone-sized engine with nothing else set:

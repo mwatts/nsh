@@ -70,13 +70,29 @@ pub struct GestureEvent<T = f32> {
     pub velocity: f32,
 }
 
-/// An input's selection (UTF-16 units; equal for a caret).
+/// An input's selection (UTF-16 units; equal for a caret). Where it
+/// shows: [`crate::SelectionEvent`]
+/// (`Input::on_selection_change_with_rects`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Selection {
     /// Start.
     pub start: u32,
     /// End.
     pub end: u32,
+}
+
+/// A key an input reports (`on_key_press_with_modifiers`): the typed
+/// text, `Backspace` (text was deleted), `Enter`, or, from the GPUI
+/// backend, `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Delete`,
+/// `Escape` and `Tab`, before the input acts on them; with the modifier
+/// keys held where the backend knows them (none otherwise).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KeyPress {
+    /// The key.
+    pub key: String,
+    /// The modifier keys held.
+    pub modifiers: crate::keymap::Modifiers,
 }
 
 /// An input method's composition in an input (`on_composition_change`):
@@ -209,6 +225,18 @@ pub(crate) fn key(p: &EventPayload) -> Option<Cow<'_, str>> {
     string(p, "key").map(Cow::Borrowed)
 }
 
+pub(crate) fn key_press(p: &EventPayload) -> Option<Cow<'_, KeyPress>> {
+    Some(Cow::Owned(KeyPress {
+        key: string(p, "key")?.to_owned(),
+        modifiers: crate::keymap::Modifiers {
+            ctrl: flag(p, "ctrlKey"),
+            alt: flag(p, "altKey"),
+            shift: flag(p, "shiftKey"),
+            cmd: flag(p, "metaKey"),
+        },
+    }))
+}
+
 pub(crate) fn action(p: &EventPayload) -> Option<Cow<'_, str>> {
     string(p, "actionName").map(Cow::Borrowed)
 }
@@ -225,10 +253,28 @@ pub(crate) fn data(p: &EventPayload) -> Option<Cow<'_, str>> {
 }
 
 pub(crate) fn selection(p: &EventPayload) -> Option<Cow<'_, Selection>> {
+    let e = selection_event(p)?;
     Some(Cow::Owned(Selection {
-        start: number(p, "start") as u32,
-        end: number(p, "end") as u32,
+        start: e.start,
+        end: e.end,
     }))
+}
+
+pub(crate) fn selection_event(p: &EventPayload) -> Option<Cow<'_, crate::SelectionEvent>> {
+    Some(match p {
+        EventPayload::Selection(e) => Cow::Borrowed(e),
+        _ => Cow::Owned(crate::SelectionEvent::new(
+            number(p, "start") as u32,
+            number(p, "end") as u32,
+        )),
+    })
+}
+
+pub(crate) fn text_layout(p: &EventPayload) -> Option<Cow<'_, [crate::TextLine]>> {
+    match p {
+        EventPayload::TextLayout(lines) => Some(Cow::Borrowed(lines)),
+        _ => None,
+    }
 }
 
 pub(crate) fn composition(p: &EventPayload) -> Option<Cow<'_, Composition>> {
@@ -404,6 +450,28 @@ mod tests {
                 .uris,
             uris
         );
+    }
+
+    #[test]
+    fn selection_reads_the_caret_where_the_backend_sends_it() {
+        use crate::{
+            EventPayload, PayloadValue, SelectionEvent,
+            geometry::{bounds, point, px, size},
+        };
+        let plain = EventPayload::Map(vec![
+            ("start", PayloadValue::Number(2.0)),
+            ("end", PayloadValue::Number(5.0)),
+        ]);
+        let s = super::selection_event(&plain).unwrap();
+        assert_eq!((s.start, s.end, s.caret, s.first_rect), (2, 5, None, None));
+        let mut event = SelectionEvent::new(1, 4);
+        event.caret = Some(bounds(point(px(30.0), px(8.0)), size(px(1.0), px(17.0))));
+        event.first_rect = Some(bounds(point(px(8.0), px(8.0)), size(px(22.0), px(17.0))));
+        let sent = EventPayload::Selection(event);
+        let s = super::selection_event(&sent).unwrap();
+        assert_eq!(*s, event);
+        let plain = super::selection(&sent).unwrap();
+        assert_eq!((plain.start, plain.end), (1, 4));
     }
 
     #[test]

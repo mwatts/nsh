@@ -130,7 +130,7 @@ pub use self::{
     element_ref::{ComponentRef, ElementRef},
     env::Environment,
     events::{
-        Composition, FileDropEvent, GestureEvent, ImageProgress, NativeEvent, PanEvent,
+        Composition, FileDropEvent, GestureEvent, ImageProgress, KeyPress, NativeEvent, PanEvent,
         ScrollEvent, Selection, VideoInfo, VideoProgress, WebNavigation,
     },
     flow::{Each, If, IntoElements, Reset, catch_error, dynamic},
@@ -177,9 +177,9 @@ pub use crate::{
     EventKind, EventPayload, HoverEvent, KeyboardAppearance, KeyboardDismissMode, KeyboardTaps,
     KeyboardType, KeyframeAnimation, Keyframes, LayoutAnimation, LayoutCurve, LayoutProperty,
     LayoutTransition, Measurement, ModalAnimation, ModalPresentation, PanActivation, PointerEvents,
-    PressEvent, ResizeMode, ReturnKeyType, ScreenAnimation, SnapAlignment, StatusBarConfig,
-    StatusBarSetting, StatusBarStyle, SubmitBehavior, TouchEvent, TransformKind, TransformOrigin,
-    Viewability,
+    PressEvent, ResizeMode, ReturnKeyType, ScreenAnimation, SelectionEvent, SnapAlignment,
+    StatusBarConfig, StatusBarSetting, StatusBarStyle, SubmitBehavior, TouchEvent, TransformKind,
+    TransformOrigin, Viewability,
     animation::{Curve, EaseMode, Easing, Extrapolate, Output as AnimationOutput, sample_easing},
     color::{
         ColorParseError, Hsla, Rgba, black, blue, green, hsl, hsla, opaque_grey, red, rgb, rgba,
@@ -187,6 +187,7 @@ pub use crate::{
     },
     platform::{Appearance, HttpBody, HttpHead, HttpRequest, Idiom, Locale, Os},
     style::Color,
+    text::TextLine,
 };
 
 /// Everything a component's module needs: `use nsh_core::ui::prelude::*;`.
@@ -268,6 +269,7 @@ pub mod prelude {
         JsObject,
         JsValue,
         // Scrolling and lists.
+        KeyPress,
         KeyboardAppearance,
         KeyboardDismissMode,
         KeyboardTaps,
@@ -314,6 +316,7 @@ pub mod prelude {
         ScrollEvent,
         Scrollable,
         Selection,
+        SelectionEvent,
         SharedString,
         Size,
         Slot,
@@ -327,6 +330,7 @@ pub mod prelude {
         System,
         Task,
         Text,
+        TextLine,
         Timing,
         ToastDuration,
         Tokens,

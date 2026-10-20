@@ -109,8 +109,8 @@ The placeholder's color and the color of the caret and the selection are style k
 | `onChange` | `(text: string)` | The user changed the text. |
 | `onSubmit` | `{ text }` | The return key was pressed in an input that submits (single line, or `submitBehavior` `"submit"` / `"blurAndSubmit"`). |
 | `onFocus` / `onBlur` | none | The input gained / lost focus. |
-| `onSelectionChange` | `{ start, end }` | The caret or selection moved (UTF-16 units). |
-| `onKeyPress` | `{ key }` | Before the text changes: `key` is the typed text, `"Backspace"` or `"Enter"`. |
+| `onSelectionChange` | `{ start, end, caret?, firstRect? }` | The caret or selection moved (UTF-16 units). On the GPUI backend, `caret` is the caret's rectangle and `firstRect` the first line of the selection, in the input's coordinates: where a menu at the caret or a popover on the selection goes. |
+| `onKeyPress` | `{ key, altKey?, ctrlKey?, metaKey?, shiftKey? }` | Before the text changes: `key` is the typed text, `"Backspace"` or `"Enter"`. On the GPUI backend also `"ArrowUp"`, `"ArrowDown"`, `"ArrowLeft"`, `"ArrowRight"`, `"Delete"`, `"Escape"` and `"Tab"`, before the input acts on them, with the modifier keys held. To take a key from the input, bind it with `keymap.bind(key, handler, { when: "always" })`. |
 | `onContentSizeChange` | `{ width, height }` | The size of the text changed (at the input's width when multiline), as it is typed; an empty input reports one empty line, whatever its placeholder. |
 | `onCompositionChange` | `{ composing, text }` | An input method's composition started, changed or ended: `text` is what is being composed (pinyin before a character is chosen, kana before conversion), `""` once it ends. The committed text reaches `onChange` before the end. |
 

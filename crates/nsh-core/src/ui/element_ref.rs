@@ -247,6 +247,27 @@ impl ElementRef {
         }
         answer
     }
+
+    /// The caret position nearest `at` in a text block (`text()`), as a
+    /// UTF-16 offset of its text: on the line at that height (the first
+    /// above the text, the last below it), at the character edge nearest
+    /// `at.x`. `at` is in the element's coordinates (its top left corner,
+    /// padding included, as `on_hover_move`'s `location`); its lines
+    /// ([`super::Text::on_text_layout`]) are in its content box. From the
+    /// layout of the commit this call goes out with. `None` when no
+    /// rendered text block carries the ref, it is not laid out, or the
+    /// platform's text engine cannot tell. Await it in a task.
+    pub fn text_index_at(&self, at: Point<Points>) -> Answer<Option<u32>> {
+        let (answer, slot) = Answer::new();
+        let pending = slot.clone();
+        if self
+            .reach(|node, executor| executor.act(Action::TextIndex(node, at, pending)))
+            .is_none()
+        {
+            slot.borrow_mut().deliver(None);
+        }
+        answer
+    }
 }
 
 impl PartialEq for ElementRef {

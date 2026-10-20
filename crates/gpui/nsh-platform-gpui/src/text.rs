@@ -1467,6 +1467,11 @@ impl TextEngine for GpuiTextEngine {
         })
     }
 
+    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
+        let l = layout.downcast::<GpuiLayout>()?;
+        Some(l.caret_at(at.x.0, at.y.0))
+    }
+
     fn register_font(&self, data: &[u8]) -> Result<(), String> {
         let families = font_families(data)?;
         let key = (Arc::as_ptr(&self.system) as usize, hash(data));
@@ -3394,6 +3399,31 @@ mod tests {
         let (cap, x) = (first.cap_height.0, first.x_height.0);
         assert!(cap > 11.0 && cap < 16.0 && x > 8.0 && x < cap, "{cap} {x}");
         assert!(second.width.0 > first.width.0);
+    }
+
+    /// A point maps to the caret position nearest it: on the line at its
+    /// height (the first above the text, the last below it), at the
+    /// nearer edge of the character under it.
+    #[test]
+    fn index_at_finds_the_nearest_caret_position() {
+        let Some(engine) = engine() else {
+            return;
+        };
+        let t = text(&[("Hx\nsecond line", plain(20.0))]);
+        let (_, layout) = layout_of(&engine, &t, None);
+        let lines = engine.lines(&layout);
+        let (first, second) = (&lines[0], &lines[1]);
+        let at = |x: f32, y: f32| engine.index_at(&layout, point(Points(x), Points(y)));
+        let middle = |l: &TextLine| (l.y + l.height / 2.0).0;
+        assert_eq!(at(0.0, middle(first)), Some(0));
+        assert_eq!(at(first.width.0 + 50.0, middle(first)), Some(2));
+        assert_eq!(at(0.0, middle(second)), Some(3));
+        assert_eq!(at(second.width.0 + 50.0, middle(second)), Some(14));
+        assert_eq!(at(-10.0, -10.0), Some(0));
+        assert_eq!(at(1.0e4, 1.0e4), Some(14));
+        // Inside "H" near its left edge, inside "x" near its right one.
+        assert_eq!(at(1.0, middle(first)), Some(0));
+        assert_eq!(at(first.width.0 - 1.0, middle(first)), Some(2));
     }
 
     #[test]

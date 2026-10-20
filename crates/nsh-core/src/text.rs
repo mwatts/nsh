@@ -491,6 +491,17 @@ pub trait TextEngine {
         Vec::new()
     }
 
+    /// The caret position (UTF-16 offset) nearest `at` (content box, y
+    /// down) in a final layout: on the line at that height (the first
+    /// above the text, the last below it), at the character edge nearest
+    /// `at.x`, as `CTLineGetStringIndexForPosition` and Android's
+    /// `Layout.getOffsetForHorizontal` answer. `None` when the engine
+    /// cannot tell.
+    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
+        let _ = (layout, at);
+        None
+    }
+
     /// Makes the font in `data` (TrueType / OpenType) available by its
     /// family name. Fonts are registered before the text using them is
     /// measured.
@@ -523,6 +534,10 @@ impl<T: TextEngine> TextEngine for std::rc::Rc<T> {
 
     fn attachments(&self, layout: &TextLayout) -> Vec<Option<Point<Points>>> {
         (**self).attachments(layout)
+    }
+
+    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
+        (**self).index_at(layout, at)
     }
 
     fn register_font(&self, data: &[u8]) -> Result<(), String> {
@@ -560,46 +575,60 @@ pub struct TextLine {
 
 /// A deterministic, platform-free [`TextEngine`] for headless runs and
 /// tests: every character is `0.55 × font size` wide and lines are
-/// `1.2 × font size` tall.
+/// `1.2 × font size` tall. Text wider than its box breaks into as many
+/// lines as [`TextEngine::measure`] counts, each holding an equal share of
+/// the characters (the last the rest), wherever that falls.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ApproxTextEngine;
 
+/// [`ApproxTextEngine`]'s final layout.
+struct ApproxLayout {
+    attachments: Vec<Option<Point<Points>>>,
+    lines: Vec<TextLine>,
+    /// A character's width.
+    advance: Points,
+    /// The UTF-16 offset of each character, and of the end.
+    offsets: Arc<[u32]>,
+}
+
 impl TextEngine for ApproxTextEngine {
-    /// `(character count, font size, max lines, attachments)`.
-    type Prepared = (usize, Points, u32, Vec<TextAttachment>);
+    /// `(character count, font size, max lines, attachments, the UTF-16
+    /// offset of each character and of the end)`.
+    type Prepared = (usize, Points, u32, Vec<TextAttachment>, Arc<[u32]>);
 
     fn prepare(&self, text: &AttributedText) -> Self::Prepared {
         let size = text.spans.first().map_or(px(14.0), |s| s.style.font_size);
+        let mut offsets = Vec::with_capacity(text.text.len() + 1);
+        let mut at = 0;
+        for c in text.text.chars() {
+            offsets.push(at);
+            at += c.len_utf16() as u32;
+        }
+        offsets.push(at);
         (
             text.text.chars().count(),
             size,
             text.max_lines,
             text.attachments.clone(),
+            offsets.into(),
         )
     }
 
     fn measure(
         &self,
-        &(chars, font, max_lines, _): &Self::Prepared,
+        &(chars, font, max_lines, _, _): &Self::Prepared,
         max_width: Option<Points>,
     ) -> Size<Points> {
-        // The order of the products is kept: it decides the last bit.
-        let width = Points(chars as f32 * font.0 * 0.55);
-        let line = font * 1.2;
-        let (width, mut lines) = match max_width {
-            Some(max) if width > max && max > Points::ZERO => (max, (width / max).ceil()),
-            _ => (width, 1.0),
-        };
-        if max_lines > 0 {
-            lines = lines.min(max_lines as f32);
-        }
-        size(width, line * lines)
+        let (width, lines) = approx_lines(chars, font, max_lines, max_width);
+        size(width, font * 1.2 * lines)
     }
 
     fn layout(&self, prepared: &Self::Prepared, size: Size<Points>) -> TextLayout {
-        // On one line, each character as wide as the others.
-        let (_, font, _, attachments) = prepared;
-        let line = *font * 1.2;
+        let (chars, font, max_lines, attachments, offsets) = prepared;
+        let (chars, font) = (*chars, *font);
+        let line = font * 1.2;
+        let advance = Points(font.0 * 0.55);
+        // Attachments as on one line, each character as wide as the others.
         let points: Vec<Option<Point<Points>>> = attachments
             .iter()
             .map(|a| {
@@ -609,18 +638,84 @@ impl TextEngine for ApproxTextEngine {
                 ))
             })
             .collect();
-        TextLayout(Arc::new((size, points)))
+        let (_, count) = approx_lines(chars, font, *max_lines, Some(size.width));
+        let count = count as usize;
+        let per = chars.div_ceil(count.max(1)).max(1);
+        let lines = (0..count)
+            .map(|k| {
+                let (from, to) = ((k * per).min(chars), ((k + 1) * per).min(chars));
+                TextLine {
+                    text: String::new(),
+                    start: offsets[from],
+                    end: offsets[to],
+                    x: Points::ZERO,
+                    y: line * k as f32,
+                    width: advance * (to - from) as f32,
+                    height: line,
+                    ascender: font,
+                    descender: font * 0.2,
+                    cap_height: font * 0.7,
+                    x_height: font * 0.5,
+                }
+            })
+            .collect();
+        TextLayout(Arc::new(ApproxLayout {
+            attachments: points,
+            lines,
+            advance,
+            offsets: offsets.clone(),
+        }))
+    }
+
+    fn lines(&self, layout: &TextLayout) -> Vec<TextLine> {
+        layout
+            .downcast::<ApproxLayout>()
+            .map_or_else(Vec::new, |l| l.lines.clone())
     }
 
     fn attachments(&self, layout: &TextLayout) -> Vec<Option<Point<Points>>> {
         layout
-            .downcast::<(Size<Points>, Vec<Option<Point<Points>>>)>()
-            .map_or_else(Vec::new, |(_, p)| p.clone())
+            .downcast::<ApproxLayout>()
+            .map_or_else(Vec::new, |l| l.attachments.clone())
+    }
+
+    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
+        let l = layout.downcast::<ApproxLayout>()?;
+        let line = l
+            .lines
+            .iter()
+            .find(|line| at.y < line.y + line.height)
+            .or(l.lines.last())?;
+        let first = l.offsets.partition_point(|&o| o < line.start);
+        let last = l.offsets.partition_point(|&o| o < line.end);
+        let column = ((at.x - line.x) / l.advance).round().max(0.0) as usize;
+        Some(l.offsets[(first + column).min(last)])
     }
 
     fn register_font(&self, _: &[u8]) -> Result<(), String> {
         Ok(())
     }
+}
+
+/// The width and the line count of `chars` characters at `font` within
+/// `max_width`: one line while they fit, else as many full-width lines as
+/// they fill (at most `max_lines`, 0: no limit).
+fn approx_lines(
+    chars: usize,
+    font: Points,
+    max_lines: u32,
+    max_width: Option<Points>,
+) -> (Points, f32) {
+    // The order of the products is kept: it decides the last bit.
+    let width = Points(chars as f32 * font.0 * 0.55);
+    let (width, mut lines) = match max_width {
+        Some(max) if width > max && max > Points::ZERO => (max, (width / max).ceil()),
+        _ => (width, 1.0),
+    };
+    if max_lines > 0 {
+        lines = lines.min(max_lines as f32);
+    }
+    (width, lines)
 }
 
 /// Content-addressed text measurements shared by all nodes of a surface,

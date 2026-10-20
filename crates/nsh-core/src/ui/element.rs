@@ -1505,6 +1505,18 @@ impl Text {
         self
     }
 
+    /// Its lines after each layout (TS: `onTextLayout`): each line's box
+    /// in the text's content box (y down) and its range of the text
+    /// (`start..end`, UTF-16 units), with its characters. With
+    /// [`super::ElementRef::text_index_at`], what a component needs to map
+    /// between points and offsets of a paragraph.
+    pub fn on_text_layout<M>(self, listener: impl IntoListener<[crate::TextLine], M>) -> Self {
+        self.on(
+            EventKind::TextLayout,
+            super::events::typed(listener.into_listener(), super::events::text_layout),
+        )
+    }
+
     /// Whether its fonts follow the system's text size (true by default;
     /// TS: `allowFontScaling`).
     pub fn allow_font_scaling(mut self, allow: bool) -> Self {

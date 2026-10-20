@@ -8,7 +8,8 @@
 //!   aside), or widens it: a union gains alternatives, a function gains
 //!   overloads or trailing optional parameters, a parameter becomes
 //!   optional, a function's or method's `void` result becomes a value (a
-//!   callback an app passes in keeps its `void`);
+//!   callback an app passes in keeps its `void`, and its parameters only
+//!   gain trailing optional ones or optional members of object literals);
 //! - what apps pass in (an interface named `…Props`, `…Style`, `…Options`
 //!   or `…Config`) gains optional members only.
 //!
@@ -189,10 +190,13 @@ fn widened(old: &str, new: &str) -> bool {
 }
 
 /// `name?: (a: X) => R` → `name?: (a: X, b?: Y) => R`: a callback type that
-/// gains trailing optional parameters, its own parameters and result kept.
-/// An app's handler written for the old type still type-checks (TypeScript
-/// lets a function take fewer parameters) and ignores what it is given
-/// beyond them, so this is the one change a callback's parameters may take.
+/// gains trailing optional parameters, or whose object-literal parameters
+/// gain optional members (`(e: { a: X }) => R` → `(e: { a: X; b?: Y }) =>
+/// R`), its other parameters and result kept. An app's handler written for
+/// the old type still type-checks (TypeScript lets a function take fewer
+/// parameters, and an object with more members is one with the members it
+/// reads) and ignores what it is given beyond them, so these are the
+/// changes a callback's parameters may take.
 fn callback_extended(old: &str, new: &str) -> bool {
     let (Some(o), Some(n)) = (top_level(old, ':'), top_level(new, ':')) else {
         return false;
@@ -216,9 +220,40 @@ fn callback_extended(old: &str, new: &str) -> bool {
             .collect()
     };
     let (old_params, new_params) = (params(&old_ty[1..oc]), params(&new_ty[1..nc]));
-    new_params.len() > old_params.len()
-        && new_params.starts_with(&old_params)
+    new_params.len() >= old_params.len()
+        && old_params
+            .iter()
+            .zip(&new_params)
+            .all(|(o, n)| o == n || members_added(o, n))
         && new_params[old_params.len()..].iter().all(|p| optional(p))
+}
+
+/// `_: { a: X }` → `_: { a: X; b?: Y }`: a parameter typed by an object
+/// literal that keeps its members and gains optional ones.
+fn members_added(old: &str, new: &str) -> bool {
+    let (Some(o), Some(n)) = (top_level(old, ':'), top_level(new, ':')) else {
+        return false;
+    };
+    let literal = |ty: &str| -> Option<Vec<String>> {
+        let body = ty.trim().strip_prefix('{')?.strip_suffix('}')?;
+        Some(
+            split_top(body, ';')
+                .into_iter()
+                .map(|m| m.trim().to_owned())
+                .filter(|m| !m.is_empty())
+                .collect(),
+        )
+    };
+    let (Some(old_members), Some(new_members)) = (literal(&old[o + 1..]), literal(&new[n + 1..]))
+    else {
+        return false;
+    };
+    old[..o] == new[..n]
+        && old_members.iter().all(|m| new_members.contains(m))
+        && new_members
+            .iter()
+            .filter(|m| !old_members.contains(m))
+            .all(|m| optional(m))
 }
 
 /// `text` with the names of the parameters of every function type and
@@ -831,6 +866,27 @@ mod tests {
         assert!(!compatible(
             "onPress?: () => void",
             "onPress?: (e?: PressEvent) => boolean"
+        ));
+        // ... and an object it is handed may gain optional members.
+        assert!(compatible(
+            "onSelectionChange?: (e: { start: number; end: number }) => void",
+            "onSelectionChange?: (e: { start: number; end: number; caret?: TextRect }) => void"
+        ));
+        assert!(compatible(
+            "onPick?: (e: { a: X }) => void",
+            "onPick?: (e: { a: X; b?: Y }, more?: Z) => void"
+        ));
+        assert!(!compatible(
+            "onPick?: (e: { a: X }) => void",
+            "onPick?: (e: { a: X; b: Y }) => void"
+        ));
+        assert!(!compatible(
+            "onPick?: (e: { a: X; b: Y }) => void",
+            "onPick?: (e: { a: X; c?: Y }) => void"
+        ));
+        assert!(!compatible(
+            "onPick?: (e: { a: X }) => void",
+            "onPick?: (e: { a: X | Z; b?: Y }) => void"
         ));
         assert!(compatible(
             "onPress?: ((e: X) => void) | null",

@@ -106,8 +106,8 @@ function NameField() {
 | `onChange` | `(text: string)` | 用户修改了文本。 |
 | `onSubmit` | `{ text }` | 在会提交的输入框中按下了回车键（单行，或 `submitBehavior` 为 `"submit"` / `"blurAndSubmit"`）。 |
 | `onFocus` / `onBlur` | 无 | 输入框获得 / 失去焦点。 |
-| `onSelectionChange` | `{ start, end }` | 光标或选区移动（UTF-16 单位）。 |
-| `onKeyPress` | `{ key }` | 文本变化之前：`key` 是输入的文本、`"Backspace"` 或 `"Enter"`。 |
+| `onSelectionChange` | `{ start, end, caret?, firstRect? }` | 光标或选区移动（UTF-16 单位）。在 GPUI 后端上，`caret` 是光标的矩形，`firstRect` 是选区第一行的矩形，均以输入框的坐标表示：光标处的菜单或选区上的浮层放在这里。 |
+| `onKeyPress` | `{ key, altKey?, ctrlKey?, metaKey?, shiftKey? }` | 文本变化之前：`key` 是输入的文本、`"Backspace"` 或 `"Enter"`。在 GPUI 后端上还有 `"ArrowUp"`、`"ArrowDown"`、`"ArrowLeft"`、`"ArrowRight"`、`"Delete"`、`"Escape"` 和 `"Tab"`，在输入框处理按键之前报告，并带有按下的修饰键。要让输入框收不到某个按键，用 `keymap.bind(key, handler, { when: "always" })` 绑定它。 |
 | `onContentSizeChange` | `{ width, height }` | 文本尺寸变化（多行时按输入框宽度计算），随输入报告；输入框为空时报告一行空行的尺寸，与占位文字无关。 |
 | `onCompositionChange` | `{ composing, text }` | 输入法的组字开始、变化或结束：`text` 是正在组的字（选字前的拼音、变换前的假名），结束时为 `""`。上屏的文本先经 `onChange` 报告，然后才报告结束。 |
 

@@ -121,8 +121,8 @@ Events:
 | `onChange` | `text: string` | The text changed. |
 | `onSubmit` | `{ text }` | The return key was pressed in an input that submits (single line, or `submitBehavior` `"submit"` / `"blurAndSubmit"`). |
 | `onFocus` / `onBlur` | | The input gained / lost focus. |
-| `onSelectionChange` | `{ start, end }` | The caret or selection moved (UTF-16 units). |
-| `onKeyPress` | `{ key }` | Before the text changes: `key` is the typed text, `"Backspace"` or `"Enter"`. |
+| `onSelectionChange` | `{ start, end, caret?, firstRect? }` | The caret or selection moved (UTF-16 units). On the GPUI backend, `caret` and `firstRect` place the caret and the selection's first line in the input. |
+| `onKeyPress` | `{ key, altKey?, ctrlKey?, metaKey?, shiftKey? }` | Before the text changes: `key` is the typed text, `"Backspace"` or `"Enter"`. On the GPUI backend also the arrows, `"Delete"`, `"Escape"` and `"Tab"`, with the modifier keys held. |
 | `onContentSizeChange` | `{ width, height }` | The text's size changed (at the input's width when multiline), as it is typed; an empty input reports one empty line, whatever its placeholder. |
 | `onCompositionChange` | `{ composing, text }` | An input method's composition started, changed or ended (see [Input methods](#input-methods)). |
 

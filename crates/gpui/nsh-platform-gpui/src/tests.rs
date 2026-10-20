@@ -112,6 +112,67 @@ function App() {
 mount(App);
 "#;
 
+/// A field 40 points tall with 8 of padding under a 40-point strip; a
+/// press on the strip writes what the field's last selection event said
+/// into it: the range, then the caret's and the first line's left edge,
+/// vertical middle and width, rounded (`-` for none).
+const SELECTION_RECTS: &str = r#"
+import { Input, mount, signal, View } from "nsh";
+
+type Rect = { x: number; y: number; width: number; height: number };
+const shown = (r?: Rect) =>
+  r ? `${Math.round(r.x)} ${Math.round(r.y + r.height / 2)} ${Math.round(r.width)}` : "-";
+
+function App() {
+  const text = signal("abcd");
+  let last = "none";
+  return (
+    <View style={{ flex: 1 }}>
+      <View focusable={false} onPress={() => text.set(last)} style={{ height: 40 }} />
+      <Input
+        autoFocus
+        value={text()}
+        onChange={(t) => text.set(t)}
+        onSelectionChange={(e) => {
+          last = `${e.start} ${e.end} caret ${shown(e.caret)} first ${shown(e.firstRect)}`;
+        }}
+        style={{ height: 40, padding: 8 }}
+      />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+/// A field that logs its key presses (with Shift and Control) and caret
+/// moves, under keymap bindings that take Control+Up and Tab wherever the
+/// focus is; a press on the strip above writes the log into the field.
+const KEYS_AND_BINDINGS: &str = r#"
+import { Input, mount, signal, View } from "nsh";
+import { keymap } from "nsh/keymap";
+
+function App() {
+  const text = signal("abcd");
+  const log: string[] = [];
+  keymap.bind("ctrl+up", () => log.push("bound"), { when: "always" });
+  keymap.bind("tab", () => log.push("bound tab"), { when: "always" });
+  return (
+    <View style={{ flex: 1 }}>
+      <View focusable={false} onPress={() => text.set(log.join("|"))} style={{ height: 40 }} />
+      <Input
+        autoFocus
+        value={text()}
+        onChange={(t) => text.set(t)}
+        onKeyPress={(e) => log.push(e.key + (e.shiftKey ? "+shift" : "") + (e.ctrlKey ? "+ctrl" : ""))}
+        onSelectionChange={(e) => log.push(`sel ${e.start}`)}
+        style={{ height: 40 }}
+      />
+    </View>
+  );
+}
+mount(App);
+"#;
+
 /// The focused field's text.
 fn field_text(view: &Entity<AppView>, cx: &mut VisualTestContext) -> Option<String> {
     view.read_with(cx, |view, _| {
@@ -184,6 +245,30 @@ fn windows(cx: &mut TestAppContext) {
     keys_reach_the_fields_of_a_surface_showing_a_native_component(cx);
     compositions_are_reported_and_hold_values_until_they_end(cx);
     presses_carry_the_modifier_keys_and_click_count(cx);
+    selections_carry_the_caret_and_first_line_rectangles(cx);
+    keys_are_reported_before_the_field_acts_and_bindings_take_them_first(cx);
+}
+
+/// Runs the window until the focused field's text satisfies `done`, and
+/// returns it.
+fn wait_until(
+    view: &Entity<AppView>,
+    cx: &mut VisualTestContext,
+    done: impl Fn(&str) -> bool,
+) -> String {
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        let now = field_text(view, cx).unwrap_or_default();
+        if done(&now) {
+            return now;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the field reads {now:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn keys_reach_the_fields_of_a_surface_showing_a_native_component(cx: &mut TestAppContext) {
@@ -273,4 +358,63 @@ fn click(cx: &mut VisualTestContext, position: gpui::Point<gpui::Pixels>, count:
         modifiers,
         click_count: count,
     });
+}
+
+fn selections_carry_the_caret_and_first_line_rectangles(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", SELECTION_RECTS, &[]).unwrap();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    wait_for(&view, cx, "abcd");
+    let strip = gpui::point(gpui::px(20.0), gpui::px(20.0));
+    // Whichever end the caret started at, it moves and ends at the start:
+    // at the padding, in the middle of the 40-point field, one point wide.
+    cx.simulate_keystrokes("end");
+    cx.simulate_keystrokes("home");
+    cx.run_until_parked();
+    cx.simulate_click(strip, gpui::Modifiers::default());
+    wait_for(&view, cx, "0 0 caret 8 20 1 first -");
+    // All of it selected: the first line starts at the padding, and the
+    // caret, at the end, where the line ends.
+    let all = if cfg!(target_os = "macos") {
+        "cmd-a"
+    } else {
+        "ctrl-a"
+    };
+    cx.simulate_keystrokes(all);
+    cx.run_until_parked();
+    cx.simulate_click(strip, gpui::Modifiers::default());
+    let report = wait_until(&view, cx, |t| t.starts_with("0 24 caret"));
+    let n: Vec<f32> = report.split(' ').filter_map(|w| w.parse().ok()).collect();
+    let [_, _, caret_x, caret_y, caret_w, first_x, first_y, first_w] = n[..] else {
+        panic!("{report:?}");
+    };
+    assert_eq!((caret_y, caret_w), (20.0, 1.0), "{report}");
+    assert_eq!((first_x, first_y), (8.0, 20.0), "{report}");
+    assert!(first_w > 60.0, "{report}");
+    assert!((first_x + first_w - caret_x).abs() <= 1.0, "{report}");
+}
+
+fn keys_are_reported_before_the_field_acts_and_bindings_take_them_first(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", KEYS_AND_BINDINGS, &[]).unwrap();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    wait_for(&view, cx, "abcd");
+    for keys in ["end", "left", "shift-left", "delete", "ctrl-up", "tab"] {
+        cx.simulate_keystrokes(keys);
+        cx.run_until_parked();
+    }
+    cx.simulate_click(
+        gpui::point(gpui::px(20.0), gpui::px(20.0)),
+        gpui::Modifiers::default(),
+    );
+    // Each key before what the field did with it: the caret moved, the
+    // selection deleted (Backspace reports the deletion); the bound keys
+    // never reached the field.
+    let expected = "ArrowLeft|sel 3|ArrowLeft+shift|sel 2|Delete|Backspace|sel 2|bound|bound tab";
+    let log = wait_until(&view, cx, |t| t.contains("bound tab"));
+    assert!(log.ends_with(expected), "{log}");
 }

@@ -405,6 +405,14 @@ export interface ScrollEvent {
   zoomScale: number;
 }
 
+/** A rectangle of an input's text, in the input's coordinates (points; its top left corner, padding and border included). */
+export interface TextRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
 /** A line of a laid-out text (in the text's content box). */
 export interface TextLayoutLine {
   text: string;
@@ -642,14 +650,14 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::SelectionChange,
         on::INPUT,
-        "(e: { start: number; end: number }) => void",
-        "",
+        "(e: { start: number; end: number; caret?: TextRect; firstRect?: TextRect }) => void",
+        "`start` and `end` in UTF-16 units (equal for a caret). Where the backend knows them (the desktops' GPUI backend), `caret` is the caret's rectangle and `firstRect` the selection's first line (none for a caret): where a menu at the caret or a popover on the selection goes.",
     ),
     (
         EventKind::KeyPress,
         on::INPUT,
-        "(e: { key: string }) => void",
-        "Before the text changes: `key` is the typed text, `Backspace` or `Enter`.",
+        "(e: { key: string; altKey?: boolean; ctrlKey?: boolean; metaKey?: boolean; shiftKey?: boolean }) => void",
+        "Before the text changes: `key` is the typed text, `Backspace` (text was deleted) or `Enter`. The GPUI backend also reports `ArrowUp`, `ArrowDown`, `ArrowLeft`, `ArrowRight`, `Delete`, `Escape` and `Tab` before the input acts on them, and the modifier keys held with the keys it reports from the keyboard. A handler cannot stop the input acting on a key: a keystroke bound with `keymap.bind(..., { when: \"always\" })` takes the key before the input sees it.",
     ),
     (
         EventKind::CompositionChange,

@@ -190,7 +190,7 @@ events! {
     MomentumScrollEnd = "onMomentumScrollEnd": "A scroll view stopped gliding (payload: [`EventPayload::Scroll`]).",
     Dialog = "onDialog": "An alert or action sheet closed (root only; payload: `id`, `index`, -1 when dismissed).",
     Touch = "onTouch": "Touches on the view or inside it, for the JS touch and responder handlers (payload: [`EventPayload::Touch`]).",
-    SelectionChange = "onSelectionChange": "The selection (or caret) of an input moved (payload: `start`, `end` in UTF-16 units).",
+    SelectionChange = "onSelectionChange": "The selection (or caret) of an input moved (payload: `start`, `end` in UTF-16 units, as [`EventPayload::Selection`] where the backend also knows where the caret is, else a map).",
     KeyPress = "onKeyPress": "A key was pressed in an input (payload: `key`: the character, `Backspace` or `Enter`).",
     LoadEnd = "onLoadEnd": "An image finished loading, or failed.",
     ImageInfo = "onImageInfo": "An `Image.getSize` / `Image.prefetch` request finished (root only; payload: `id`, `width` and `height` in pixels, or `error`).",
@@ -370,6 +370,36 @@ pub struct PressEvent {
     pub clicks: u32,
 }
 
+/// An input's selection ([`EventKind::SelectionChange`]): its range and,
+/// on backends that know them, where it shows.
+/// Rust components hear it with `Input::on_selection_change_with_rects`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
+pub struct SelectionEvent {
+    /// Start (UTF-16 units).
+    pub start: u32,
+    /// End (UTF-16 units; `start` for a caret).
+    pub end: u32,
+    /// The caret's rectangle, in the input's coordinates (its top left
+    /// corner, padding and border included; the text's scrolling applied):
+    /// where a menu at the caret goes.
+    pub caret: Option<Bounds<Points>>,
+    /// The rectangle of the selection's first line, in the same
+    /// coordinates; `None` for a caret.
+    pub first_rect: Option<Bounds<Points>>,
+}
+
+impl SelectionEvent {
+    /// The selection `start..end` (a caret when equal), with no geometry.
+    pub fn new(start: u32, end: u32) -> Self {
+        Self {
+            start,
+            end,
+            ..Self::default()
+        }
+    }
+}
+
 /// Where a context menu was asked for ([`EventKind::ContextMenu`]), in
 /// points.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -504,6 +534,8 @@ pub enum EventPayload {
     /// The modifier keys and click count of a press (`onPress`, `onLongPress`,
     /// `onPressDown`, `onPressUp`).
     Press(PressEvent),
+    /// An input's selection and where it shows (`onSelectionChange`).
+    Selection(SelectionEvent),
     /// Local file URLs dropped by the user, in the platform's order.
     FileDrop(Vec<String>),
     /// The lines of a text block.

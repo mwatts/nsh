@@ -949,6 +949,7 @@ impl Headless {
             && !input.text.is_empty()
         {
             input.text.clear();
+            (input.anchor, input.caret) = (0, 0);
             input.count += 1;
             let payload = EventPayload::Text {
                 text: String::new(),
@@ -961,13 +962,16 @@ impl Headless {
         self.done()
     }
 
-    /// The step `type(<selector>, <text>)`: types `text` at the end of the
-    /// input `selector` names (the matching view, or the first input in
-    /// it; `text:` also matches what an input holds or its placeholder),
-    /// as a keyboard does: the input takes the focus, then each character
-    /// is a key (`onKeyPress`) and an edit (`onChange`); a line break
-    /// in a single-line input is the return key ([`Headless::submit`]). A
-    /// character past `maxLength` is dropped.
+    /// The step `type(<selector>, <text>)`: types `text` at the caret of
+    /// the input `selector` names (the matching view, or the first input
+    /// in it; `text:` also matches what an input holds or its
+    /// placeholder), over its selection: the end of its text unless the
+    /// app ([`nsh_core::ui::Input::selected_range`], `setSelection`) or a
+    /// [`Headless::select`] step moved it. As a keyboard does: the input
+    /// takes the focus, then each character is a key (`onKeyPress`), an
+    /// edit (`onChange`) and the caret after it (`onSelectionChange`); a
+    /// line break in a single-line input is the return key
+    /// ([`Headless::submit`]). A character past `maxLength` is dropped.
     pub fn type_text(&mut self, selector: &str, text: &str) -> Result<(), String> {
         let id = self.input_step(selector, format!("type({selector}, {text:?})"))?;
         for c in text.chars() {
@@ -1025,29 +1029,175 @@ impl Headless {
         );
     }
 
-    /// The key `c` in input `id`: its text grows by it, within
-    /// `maxLength`.
-    fn key(&mut self, id: NodeId, c: char) {
-        self.key_press(
+    /// The step `select(<selector>, <start>, <end>)`: the user selects
+    /// `start..end` (UTF-16 units, a caret when equal; clamped to the
+    /// text) of the input `selector` names, which takes the focus:
+    /// `onSelectionChange` reports it, and typing replaces it.
+    pub fn select(&mut self, selector: &str, start: u32, end: u32) -> Result<(), String> {
+        let id = self.input_step(selector, format!("select({selector}, {start}, {end})"))?;
+        if let Some(input) = self.screen.input_mut(id) {
+            let len = input.len();
+            (input.anchor, input.caret) = (start.min(len), end.min(len));
+        }
+        self.report_selection(id);
+        self.done()
+    }
+
+    /// The step `key(<keystroke>)`: the user presses `keystroke` (`"mod+z"`,
+    /// `"ctrl+shift+up"`, `"left"`, `"delete"`, `"tab"`, `"a"`; the syntax
+    /// of `nsh/keymap`), as the desktop platforms take a key: the app's
+    /// key bindings first (`nsh/keymap`, [`nsh_core::ui::on_key`]), whose
+    /// match fires the root's `KeyCommand` and takes the key; else the
+    /// focused input, which reports the arrows, Delete, Escape and Tab
+    /// (`onKeyPress`, with the modifiers) and then acts: Left and Right
+    /// move the caret a character (Shift extends the selection), Home and
+    /// End to the text's edges, Backspace and Delete delete (reported as
+    /// `Backspace`), Enter is the return key, `mod+a` selects all, and a
+    /// character key types (Shift for a capital). Up and Down only report,
+    /// Escape and Tab do not move the focus. With neither, nothing.
+    pub fn press_key(&mut self, keystroke: &str) -> Result<(), String> {
+        let apple =
+            nsh_core::keymap::apple_keys(self.environment.os, self.environment.apple_keyboard);
+        let stroke = nsh_core::keymap::Keystroke::parse_with(keystroke, apple)
+            .map_err(|e| format!("key({keystroke}): {e}"))?;
+        self.step(format!("key({keystroke})"));
+        let focused = self
+            .screen
+            .focused()
+            .filter(|&id| self.screen.input(id).is_some());
+        let found = self
+            .screen
+            .keymap()
+            .map_or(nsh_core::keymap::KeyMatch::None, |k| {
+                k.find(stroke, focused.is_some(), false)
+            });
+        if let nsh_core::keymap::KeyMatch::Fire(binding) = found {
+            self.engine.control().dispatch_event(
+                nsh_core::ROOT_ID,
+                EventKind::KeyCommand,
+                EventPayload::Value(PayloadValue::Number(f64::from(binding))),
+            );
+        }
+        if let (false, Some(id)) = (found.consumed(), focused) {
+            self.input_key(id, stroke, apple);
+        }
+        self.done()
+    }
+
+    /// What the focused input `id` does with `stroke` ([`Self::press_key`]).
+    fn input_key(&mut self, id: NodeId, stroke: nsh_core::keymap::Keystroke, apple: bool) {
+        use nsh_core::keymap::Key;
+        let m = stroke.modifiers;
+        let command = if apple { m.cmd } else { m.ctrl };
+        let named = match stroke.key {
+            Key::Left => Some("ArrowLeft"),
+            Key::Right => Some("ArrowRight"),
+            Key::Up => Some("ArrowUp"),
+            Key::Down => Some("ArrowDown"),
+            Key::Delete => Some("Delete"),
+            Key::Escape => Some("Escape"),
+            Key::Tab => Some("Tab"),
+            _ => None,
+        };
+        if let Some(name) = named {
+            self.key_press_with(id, name, m);
+        }
+        let Some(input) = self.screen.input(id) else {
+            return;
+        };
+        let editable = input.config.editable;
+        let (start, end) = input.selection();
+        let len = input.len();
+        match stroke.key {
+            Key::Left | Key::Right | Key::Home | Key::End => {
+                let forward = matches!(stroke.key, Key::Right | Key::End);
+                let caret = match stroke.key {
+                    Key::Home => 0,
+                    Key::End => len,
+                    _ if start != end && !m.shift => {
+                        if forward {
+                            end
+                        } else {
+                            start
+                        }
+                    }
+                    _ => input.step(input.caret, forward),
+                };
+                let anchor = if m.shift { input.anchor } else { caret };
+                if let Some(input) = self.screen.input_mut(id) {
+                    (input.anchor, input.caret) = (anchor, caret);
+                }
+                self.report_selection(id);
+            }
+            Key::Backspace | Key::Delete if editable => {
+                let forward = stroke.key == Key::Delete;
+                let (from, to) = if start != end {
+                    (start, end)
+                } else if forward {
+                    (start, input.step(start, true))
+                } else {
+                    (input.step(start, false), start)
+                };
+                if from < to || len == 0 {
+                    self.key_press_with(id, "Backspace", m);
+                }
+                if from < to {
+                    self.edit(id, from, to, "");
+                }
+            }
+            Key::Enter => self.return_key(id),
+            Key::Char('a') if command => {
+                if let Some(input) = self.screen.input_mut(id) {
+                    (input.anchor, input.caret) = (0, len);
+                }
+                self.report_selection(id);
+            }
+            Key::Char(c) if !command && !m.alt && editable => {
+                let c = if m.shift { c.to_ascii_uppercase() } else { c };
+                self.key(id, c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Reports input `id`'s selection, if it listens.
+    fn report_selection(&self, id: NodeId) {
+        let Some((start, end)) = self.screen.input(id).map(screen::Input::selection) else {
+            return;
+        };
+        self.send(
             id,
-            &if c == '\n' {
-                "Enter".into()
-            } else {
-                c.to_string()
-            },
+            EventKind::SelectionChange,
+            EventPayload::Map(vec![
+                ("start", PayloadValue::Number(f64::from(start))),
+                ("end", PayloadValue::Number(f64::from(end))),
+            ]),
         );
+    }
+
+    /// `onKeyPress` of `key` with `m` held.
+    fn key_press_with(&self, id: NodeId, key: &str, m: nsh_core::keymap::Modifiers) {
+        self.send(
+            id,
+            EventKind::KeyPress,
+            EventPayload::Map(vec![
+                ("key", PayloadValue::Str(key.to_owned())),
+                ("altKey", PayloadValue::Bool(m.alt)),
+                ("ctrlKey", PayloadValue::Bool(m.ctrl)),
+                ("metaKey", PayloadValue::Bool(m.cmd)),
+                ("shiftKey", PayloadValue::Bool(m.shift)),
+            ]),
+        );
+    }
+
+    /// The user's edit of input `id`: `from..to` (UTF-16) becomes `text`,
+    /// the caret after it; reported as the text (`onChange`) and the
+    /// caret.
+    fn edit(&mut self, id: NodeId, from: u32, to: u32, text: &str) {
         let Some(input) = self.screen.input_mut(id) else {
             return;
         };
-        let length = input.text.encode_utf16().count() + c.len_utf16();
-        if input
-            .config
-            .max_length
-            .is_some_and(|max| length > max as usize)
-        {
-            return;
-        }
-        input.text.push(c);
+        input.replace(from, to, text);
         input.count += 1;
         let payload = EventPayload::Text {
             text: input.text.clone(),
@@ -1058,6 +1208,33 @@ impl Headless {
         self.engine
             .control()
             .dispatch_event(id, EventKind::ChangeText, payload);
+        self.report_selection(id);
+    }
+
+    /// The key `c` in input `id`: it replaces the selection (at the caret),
+    /// within `maxLength`.
+    fn key(&mut self, id: NodeId, c: char) {
+        self.key_press(
+            id,
+            &if c == '\n' {
+                "Enter".into()
+            } else {
+                c.to_string()
+            },
+        );
+        let Some(input) = self.screen.input(id) else {
+            return;
+        };
+        let (start, end) = input.selection();
+        let length = (input.len() - (end - start)) as usize + c.len_utf16();
+        if input
+            .config
+            .max_length
+            .is_some_and(|max| length > max as usize)
+        {
+            return;
+        }
+        self.edit(id, start, end, c.encode_utf8(&mut [0; 4]));
     }
 
     /// The return key in input `id`.
@@ -1310,6 +1487,115 @@ mod tests {
         app.wait_for("ctrl: Some(true)").unwrap();
         app.press("Probe").unwrap();
         app.wait_for("ctrl: None").unwrap();
+    }
+
+    /// A paragraph narrower than its text, which shows the lines it was
+    /// laid out in and, once "Find" is pressed, the caret offsets at four
+    /// points of it.
+    #[component]
+    fn Paragraph() -> impl IntoElement {
+        let lines = signal(String::from("none"));
+        let found = signal(String::from("none"));
+        let paragraph = element_ref();
+        let points = [(16.0, 5.0), (16.0, 20.0), (1000.0, 1000.0), (-5.0, -5.0)];
+        view()
+            .child(
+                text("abcdefghij")
+                    .w(px(40.0))
+                    .element_ref(&paragraph)
+                    .on_text_layout(move |l: &[TextLine]| {
+                        let shown: Vec<String> = l
+                            .iter()
+                            .map(|l| format!("{}..{} {} y {:.1}", l.start, l.end, l.text, l.y.0))
+                            .collect();
+                        lines.set(shown.join(", "));
+                    }),
+            )
+            .child(text(move || format!("lines: {}", lines.get())))
+            .child(text(move || format!("at: {}", found.get())))
+            .child(
+                view()
+                    .on_press(move || {
+                        spawn(async move {
+                            let mut at = Vec::new();
+                            for (x, y) in points {
+                                at.push(paragraph.text_index_at(point(px(x), px(y))).await);
+                            }
+                            found.set(format!("{at:?}"));
+                        });
+                    })
+                    .child(text("Find")),
+            )
+    }
+
+    /// The approximate engine sets 7.7 points a character and 16.8 a
+    /// line at the default 14-point font: ten characters in 40 points
+    /// are two lines of five.
+    #[test]
+    fn a_paragraph_reports_its_lines_and_the_offsets_at_points() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<Paragraph>())).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("lines: 0..5 abcde y 0.0, 5..10 fghij y 16.8")
+            .unwrap();
+        app.press("Find").unwrap();
+        app.wait_for("at: [Some(2), Some(7), Some(10), Some(0)]")
+            .unwrap();
+    }
+
+    /// A field that logs its keys and selections, with an undo binding
+    /// that fires in text fields too and a Left binding that does not.
+    #[component]
+    fn KeyLog() -> impl IntoElement {
+        let value = signal(String::from("abcd"));
+        let log = signal(Vec::<String>::new());
+        let note = move |entry: String| log.update(|l| l.push(entry));
+        let always = KeyOptions {
+            when: nsh_core::keymap::When::Always,
+            ..KeyOptions::default()
+        };
+        on_key_with("mod+z", always, move |_| note("undo".into()));
+        on_key("left", move |_| note("bound left".into()));
+        view()
+            .child(
+                input()
+                    .value(move || value.get())
+                    .on_change(move |t: &str| value.set(t.to_owned()))
+                    .on_key_press_with_modifiers(move |k: &KeyPress| {
+                        let shift = if k.modifiers.shift { "+shift" } else { "" };
+                        note(format!("{}{shift}", k.key));
+                    })
+                    .on_selection_change(move |s: &Selection| {
+                        note(format!("sel {}-{}", s.start, s.end))
+                    })
+                    .test_id("field"),
+            )
+            .child(text(move || format!("value: {}", value.get())))
+            .child(text(move || format!("log: {}", log.get().join("|"))))
+    }
+
+    #[test]
+    fn keys_go_to_bindings_first_then_the_field_at_its_caret() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<KeyLog>())).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("value: abcd").unwrap();
+        // Typing goes in at the selection, which replaces it.
+        app.select("id:field", 1, 3).unwrap();
+        app.type_text("id:field", "X").unwrap();
+        app.wait_for("value: aXd").unwrap();
+        // A Left binding that does not fire in text fields leaves the key
+        // to the field: reported, then the caret moves; Shift extends.
+        app.press_key("left").unwrap();
+        app.press_key("shift+left").unwrap();
+        app.press_key("delete").unwrap();
+        app.wait_for("value: Xd").unwrap();
+        // The undo binding fires in the field, which never sees the key.
+        app.press_key("mod+z").unwrap();
+        app.press_key("shift+y").unwrap();
+        app.wait_for("value: YXd").unwrap();
+        app.wait_for(
+            "log: sel 1-3|X|sel 2-2|ArrowLeft|sel 1-1|ArrowLeft+shift|sel 0-1|Delete|Backspace|sel 0-0|undo|Y|sel 1-1",
+        )
+        .unwrap();
     }
 
     /// A name field that says hello and keeps what was sent.

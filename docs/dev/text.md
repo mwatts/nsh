@@ -5,7 +5,11 @@
   `fontStyle`, `letterSpacing`, `textDecorationLine` + `textDecorationColor`, `textTransform`, `lineHeight`, `textAlign`,
   `textAlignVertical` (the core moves the content box down). `adjustsFontSizeToFit` shrinks the fonts (down to
   `minimumFontScale`, at least 0.1) until the text fits its box and lines (`Paragraph::fit`, a binary search in the core).
-  `onTextLayout` reports the final lines (`TextEngine::lines`: range, box, ascender, descender, cap / x height).
+  `onTextLayout` reports the final lines (`TextEngine::lines`: range, box, ascender, descender, cap / x height); Rust
+  components hear them with `Text::on_text_layout`, and `ElementRef::text_index_at(point)` asks the core for the caret
+  offset nearest a point of the block (`TextEngine::index_at` on the last final layout, answered on the engine thread
+  with the layout of the commit it goes out with, as `measure()` is; the GPUI and approximate engines answer, the
+  others `None` so far).
   `selectable` (or `select-text`): range selection, drawing only (`AttributedText::selectable` /
   `selection_color`, not part of layout). iOS (`text_selection.rs`): the CoreText `TextView` adopts `UITextInput`
   (non-editable: no keyboard, `inputView` is empty) and a `UITextInteraction` (`NonEditable`) attached only while the text

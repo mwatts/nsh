@@ -96,6 +96,20 @@ impl<M: TextEngine> Core<M> {
         })
     }
 
+    /// The caret offset (UTF-16) nearest `at` (in the view's coordinates)
+    /// in text block `id`'s last final layout; `None` when it is no laid
+    /// out text block or the text engine cannot tell.
+    pub fn text_index_at(&self, id: NodeId, at: Point<Points>) -> Option<u32> {
+        let key = self.key(id).ok()?;
+        let layout = self.nodes[key as usize].layout?;
+        let Some(super::LeafContext::Text(cx)) = self.layout.get_node_context(layout) else {
+            return None;
+        };
+        let (content, text_layout) = cx.laid_out.as_ref()?;
+        let at = point(at.x - content.origin.x, at.y - content.origin.y);
+        self.text_engine.index_at(text_layout, at)
+    }
+
     /// Whether `key` hangs from the main tree's root or a root view that
     /// does.
     pub(super) fn in_tree(&self, mut key: Key) -> bool {

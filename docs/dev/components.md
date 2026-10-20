@@ -311,7 +311,8 @@ reasons: `reactive-components.md`.
   it is mounted, so mounting and unmounting it never reach the ref's owner. Once that owner is gone, `node()` is `None`
   and commands do nothing, as with no element carrying it. A measurement (`measure()`) waits in the core for the layout
   of the commit it goes out with, as JS's `Command::Measure` does, and is answered there (`Core::measure`); none goes to
-  the platform.
+  the platform. `text_index_at(point)` on a text block's ref waits the same way and is answered from the block's last
+  final layout (`Core::text_index_at`, the text engine's `index_at`).
 - **Element attributes for system UI**: `.inset_padding(insets)` / `.inset_margin(insets)` add to the padding /
   margin the styles resolve to (what `SafeAreaView` and `KeyboardAvoidingView` use, so the app's own padding stays),
   `.inline_style(props.style)` applies a `ui::Style` prop (a value or a binding).
