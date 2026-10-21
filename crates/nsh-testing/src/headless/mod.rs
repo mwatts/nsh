@@ -964,7 +964,11 @@ impl Headless {
                 let view = self.picked(self.screen.view(&parsed), selector, "view")?;
                 self.screen.bounds_in_root(view).map(|b| b.origin + at)
             }
-            None => self.screen.bounds_in_root(id).map(|b| b.center()),
+            None => match self.screen.resolve(&parsed)[..] {
+                [node] => self.screen.canvas_node_center(node),
+                _ => None,
+            }
+            .or_else(|| self.screen.bounds_in_root(id).map(|b| b.center())),
         };
         let event = PressEvent {
             modifiers,
@@ -1737,6 +1741,84 @@ mod tests {
             "log: sel 1-3|X|sel 2-2|ArrowLeft|sel 1-1|ArrowLeft+shift|sel 0-1|Delete|Backspace|sel 0-0|undo|Y|sel 1-1",
         )
         .unwrap();
+    }
+
+    /// A pad that says where it was last pressed, under a canvas that
+    /// takes no touches and draws two cells it names as nodes.
+    #[component]
+    fn Cells() -> impl IntoElement {
+        let pressed = signal(String::from("none"));
+        let cell = |x: f32, label: &str, id: &str| {
+            nsh_core::canvas::CanvasNode::new(
+                Bounds::new(point(px(x), px(0.0)), size(px(100.0), px(40.0))),
+                nsh_core::AccessibilityRole::Text,
+                label,
+            )
+            .test_id(id)
+        };
+        let drawing = Painter::new()
+            .fill_text("12", 4.0, 20.0)
+            .fill_text("Total", 104.0, 20.0)
+            .node(cell(0.0, "12", "cell-a1"))
+            .node(cell(100.0, "Total", "cell-b1").selected(true));
+        view()
+            .child(text(move || format!("pressed: {}", pressed.get())))
+            .child(
+                view()
+                    .w(px(200.0))
+                    .h(px(40.0))
+                    .child(view().test_id("pad").absolute().size_full().on(
+                        EventKind::Press,
+                        move |p: &EventPayload| {
+                            if let EventPayload::Press(PressEvent {
+                                position: Some(at), ..
+                            }) = *p
+                            {
+                                pressed.set(format!("{} {}", at.location.x.0, at.location.y.0));
+                            }
+                        },
+                    ))
+                    .child(
+                        canvas(drawing)
+                            .absolute()
+                            .size_full()
+                            .pointer_events(PointerEvents::None),
+                    ),
+            )
+    }
+
+    #[test]
+    fn a_canvas_nodes_are_found_and_a_press_on_one_reaches_the_view_under_it() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<Cells>())).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("id:cell-b1").unwrap();
+        assert_eq!(app.screen().count("label:Total"), Ok(1));
+        assert!(app.shows("12"));
+        assert_eq!(app.screen().selected("id:cell-b1"), Ok(true));
+        assert_eq!(app.screen().selected("id:cell-a1"), Ok(false));
+        app.press("id:cell-b1").unwrap();
+        app.wait_for("pressed: 150 20").unwrap();
+        app.press("text:12").unwrap();
+        app.wait_for("pressed: 50 20").unwrap();
+    }
+
+    /// The metrics of a line of text in a canvas font.
+    #[component]
+    fn Metrics() -> impl IntoElement {
+        let m = text_metrics("20px system-ui", "abc");
+        text(format!(
+            "{} {} {} {}",
+            m.width.0, m.ascent.0, m.descent.0, m.height.0
+        ))
+    }
+
+    /// The approximate engine's lines: characters 0.55 em wide, the em
+    /// above the baseline and a fifth of it below, 1.2 em lines.
+    #[test]
+    fn text_metrics_are_the_engines_line() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<Metrics>())).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("33 20 4 24").unwrap();
     }
 
     /// A name field that says hello and keeps what was sent.
