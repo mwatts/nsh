@@ -8,11 +8,9 @@ use std::{cell::Cell, rc::Rc, time::Duration};
 
 use gpui::{App, AsyncApp, Window, WindowHandle};
 
-use crate::{
-    app::AppView,
-    input::{KeyEvent, Modifiers},
-    surface::Surface,
-};
+#[cfg(feature = "dev")]
+use crate::input::{KeyEvent, Modifiers};
+use crate::{app::AppView, surface::Surface};
 
 /// Runs `f` with the window's surface on the main thread, then redraws
 /// what changed. `None` when the window is gone.
@@ -64,6 +62,7 @@ pub(crate) async fn drawn(window: WindowHandle<AppView>, cx: &mut AsyncApp) -> b
     true
 }
 
+#[cfg(feature = "dev")]
 pub(crate) fn press(surface: &Rc<Surface>, vk: u16, modifiers: Modifiers) {
     for down in [true, false] {
         let handled = crate::input::key(
@@ -121,6 +120,40 @@ pub(crate) async fn frame(
             Ok((capture(window)?, window.viewport_size()))
         })
     }
+}
+
+/// PNG bytes of `handle`'s content, one pixel per point (what the removed
+/// `shot` step wrote). A denser display's device pixels are scaled to the
+/// window's point size.
+///
+/// On Linux the pixels are read from the X server, so the window has to be
+/// an X11 window (`DISPLAY` set and `WAYLAND_DISPLAY` empty). On macOS and
+/// Windows the frame is GPUI's offscreen image, which needs the `shot`
+/// feature. `Err` when the window has closed or the frame cannot be read.
+pub fn screenshot(
+    handle: WindowHandle<AppView>,
+    cx: &mut AsyncApp,
+) -> gpui::Task<Result<Vec<u8>, String>> {
+    cx.spawn(async move |cx| match frame(handle, cx).await {
+        None => Err("the window is gone".to_owned()),
+        Some(Err(err)) => Err(format!("{err:#}")),
+        Some(Ok((frame, content))) => {
+            let (w, h) = (
+                f32::from(content.width).round().max(1.0) as u32,
+                f32::from(content.height).round().max(1.0) as u32,
+            );
+            let frame = if (frame.width(), frame.height()) == (w, h) {
+                frame
+            } else {
+                ::image::imageops::resize(&frame, w, h, ::image::imageops::FilterType::Triangle)
+            };
+            let mut png = std::io::Cursor::new(Vec::new());
+            frame
+                .write_to(&mut png, ::image::ImageFormat::Png)
+                .map(|()| png.into_inner())
+                .map_err(|err| err.to_string())
+        }
+    })
 }
 
 /// The window's last frame, in device pixels.

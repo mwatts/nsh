@@ -50,7 +50,6 @@ mod scroll;
 mod selection_area;
 mod stats;
 mod surface;
-#[cfg(feature = "dev")]
 mod synth;
 mod system;
 mod text;
@@ -81,4 +80,5 @@ pub use crate::{
     chrome::titlebar_options,
     image::AssetBase,
     native::{ComponentContext, ComponentFactory, Components, NativeComponent},
+    synth::screenshot,
 };
