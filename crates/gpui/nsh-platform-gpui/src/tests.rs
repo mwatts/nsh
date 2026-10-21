@@ -267,6 +267,7 @@ fn windows(cx: &mut TestAppContext) {
     keys_are_reported_before_the_field_acts_and_bindings_take_them_first(cx);
     an_embedded_surface_takes_the_keyboard_when_its_app_focuses_a_field(cx);
     each_view_s_functions_read_the_context_its_options_gave_its_engine(cx);
+    a_view_given_its_own_ui_sets_serves_those_and_not_the_process_s(cx);
     an_embedded_view_that_owns_its_window_sets_its_title_and_menu(cx);
     quit_and_close_requests_go_to_the_handler_instead_of_acting(cx);
     an_auto_hidden_menu_bar_shows_on_alt_alone_and_while_a_menu_is_open(cx);
@@ -647,6 +648,64 @@ fn each_view_s_functions_read_the_context_its_options_gave_its_engine(cx: &mut T
     }
     wait_for(&a, cx, "A A");
     wait_for(&b, cx, "B B");
+}
+
+/// A field showing whether `test/context` exists for this engine.
+const REACHES: &str = r#"
+import { Input, mount, signal, View } from "nsh";
+import { nativeModule } from "nsh/native";
+
+function App() {
+  const text = signal("waiting");
+  setTimeout(() => {
+    try {
+      const { Whose } = nativeModule<{ Whose: { now(): string } }>("test/context");
+      text.set(`reaches ${Whose.now()}`);
+    } catch {
+      text.set("no set");
+    }
+  }, 0);
+  return (
+    <View style={{ flex: 1 }}>
+      <Input autoFocus value={text()} onChange={(t) => text.set(t)} style={{ height: 30 }} />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn a_view_given_its_own_ui_sets_serves_those_and_not_the_process_s(cx: &mut TestAppContext) {
+    let mut context = nsh_core::ui::Registry::ui_set("test/context");
+    context.module::<Whose>();
+    crate::set_ui_sets(vec![nsh_base::registry(), context.clone()]);
+    let code = nsh_bundler::compile_module("App.tsx", REACHES, &[]).unwrap();
+    use gpui::AppContext as _;
+    let (pair, cx) = cx.add_window_view(|window, cx| {
+        let view = |sets: Option<Vec<nsh_core::ui::Registry>>,
+                    window: &mut Window,
+                    cx: &mut gpui::Context<Pair>| {
+            let options = AppOptions {
+                context: nsh_engine::EngineContext::default().with(Desk("own")),
+                ui_sets: sets,
+                ..AppOptions::default()
+            };
+            cx.new(|cx| AppView::new(options, window, cx))
+        };
+        Pair {
+            // The process's sets, `test/context` among them.
+            a: view(None, window, cx),
+            // Its own: `nsh/base` alone.
+            b: view(Some(vec![nsh_base::registry()]), window, cx),
+        }
+    });
+    let (a, b) = pair.read_with(cx, |pair, _| (pair.a.clone(), pair.b.clone()));
+    for view in [&a, &b] {
+        view.update(cx, |view, _| {
+            view.load(App::Js(Bundle::source(code.clone())))
+        });
+    }
+    wait_for(&a, cx, "reaches own");
+    wait_for(&b, cx, "no set");
 }
 
 /// A view the window's root holds, as an embedding app's frame does.

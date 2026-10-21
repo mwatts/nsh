@@ -150,6 +150,12 @@ pub struct AppOptions {
     /// functions read it with `nsh_core::ui::engine_context`, so each view
     /// reaches its own part of the embedding app.
     pub context: nsh_engine::EngineContext,
+    /// The UI sets the engines of the views made with these options serve,
+    /// in place of the process's ([`set_ui_sets`]): an embedding app gives
+    /// a view it trusts less (a preview of a module someone else wrote,
+    /// say) only the sets that view may reach. A set that is not here does
+    /// not exist for the app the view runs. `None` serves the process's.
+    pub ui_sets: Option<Vec<nsh_core::ui::Registry>>,
 }
 
 impl Default for AppOptions {
@@ -167,6 +173,7 @@ impl Default for AppOptions {
             data_dir: None,
             storage: None,
             context: Default::default(),
+            ui_sets: None,
         }
     }
 }
@@ -314,7 +321,7 @@ impl AppView {
             // NSH draws no header: a page's `header` sits at its top.
             header_heights: nsh_core::NO_NATIVE_HEADER,
             limits: options.limits,
-            ui_sets: ui_sets(),
+            ui_sets: options.ui_sets.clone().unwrap_or_else(ui_sets),
             runtime: None,
             data_dir: options.data_dir.clone().or_else(nsh_engine::data_dir),
             storage: options.storage.clone(),
