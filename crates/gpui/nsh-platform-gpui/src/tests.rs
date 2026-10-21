@@ -183,7 +183,10 @@ struct Host {
 impl gpui::Render for Host {
     fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
         use gpui::{InteractiveElement as _, ParentElement as _};
-        div().size_full().track_focus(&self.focus).child(self.view.clone())
+        div()
+            .size_full()
+            .track_focus(&self.focus)
+            .child(self.view.clone())
     }
 }
 
