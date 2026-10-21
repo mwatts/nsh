@@ -115,8 +115,10 @@ before every `cargo run`): `✓` lines for its builds, cargo's and the tools' ou
   (`DevServer::set_limits`, the bundle message's `limits`, `HostLimits`' syntax; the hosts read it with
   `Limits::development` and start the app with it, and an invalid one is shown over the app). `sandbox.md`.
 - The web host is a page the dev server serves itself (`DevServer::serve_web`, the fallback route: `/`, `/nsh.js`,
-  `/nsh.wasm`) when a web runtime exists; browsers connect to `/ws` on the same port. `nsh run --target web` builds the
-  runtime in a checkout and prints the page's address (`docs/dev/web.md`, "The CLI's web target").
+  `/nsh.wasm`, `/nsh.version`, and for a runtime whose crates call JS through wasm-bindgen its glue, `/nsh-bindgen.js`,
+  with the snippets it imports, `/snippets/…`) when a web runtime exists; browsers connect to `/ws` on the same port.
+  `nsh run --target web` builds the runtime in a checkout and prints the page's address (`docs/dev/web.md`, "The CLI's
+  web target" and "Crates that call JS through wasm-bindgen").
 - Watching ignores `Access` events: inotify (Linux) reports reads, FSEvents does not, so the build's own reads of the
   sources would start the next build, forever.
 - `nsh dev` and `nsh run` default to the host that runs on this machine: `--target macos` on macOS, `--target linux` (the GTK
@@ -197,12 +199,19 @@ Writes a split bundle (`native-pipeline.md`, "Split bundles"): `bundle.js` / `.m
 `<id>`, `<id>.map` and `<stem>.nshc` (`build::compile_split`, `Built::chunks`). Without `--split` (and for `nsh
 package`, `publish`, the dev server) the bundle holds the whole app.
 
+Hosts serve a chunk the bundle does not hold through `MountSink::load_chunk` (`AppOptions::chunks` on macOS):
+`nsh-macos-host --bundle <path>` reads it from the bundle's directory, the packaged macOS runner from
+`NSH_CHUNK_DIR` (a writable directory an app fills with its own delivered modules — the bundle's resources are
+read-only). File reads run on a global dispatch queue and reply through the requesting engine's
+`EngineControl`, keeping AppKit responsive and replies tied to that engine across app reloads. Chunks always load
+as source: files can be replaced, so bytecode only comes from an app's signed resources (`Bundle::read`).
+
 ## Headless runs
 
 `nsh-testing`'s `headless` module runs apps without a platform, on its driver `Headless` (the crate's default
 features, without QuickJS):
 the app on an engine (`ApproxTextEngine`, a channel as the mount sink, 60 Hz frames from a timer thread), its batches
-applied to a model of the native views (`headless::Screen`, `headless/screen.rs`), and steps taken on what they show.
+applied to a model of the native views (`Screen`, `screen.rs`), and steps taken on what they show.
 An observer sees every batch with the step it came in; `print_batch` prints it as `nsh test --trace` does
 (`── press(id:save): 8 items`).
 
@@ -217,7 +226,7 @@ and more than one fails the step; a press whose match, or a view between it and 
 (the accessibility state) fails too. Each step sends what a platform would, to the views that report it:
 
 - `press`: the match or its nearest pressable ancestor gets `PressIn`, `PressOut`, `Press`;
-- `press_span` (`headless/screen/spans.rs`): characters of a text view, named by a selector whose last part matches
+- `press_span` (`screen/spans.rs`): characters of a text view, named by a selector whose last part matches
   them instead of views (`id:<testID>` a nested `<Text>`'s span, from `AttributedText::test_ids`; `text:<text>` or
   `/regex/` each place a text reads it; a bare string a test id, else a text; the parts before it name the views to
   look in): the press lands on the first character, where `AttributedText::link_at` finds the innermost pressable
@@ -245,13 +254,28 @@ and more than one fails the step; a press whose match, or a view between it and 
   points per frame within its content (`ScrollBeginDrag`, offsets with the applied count as platforms report them,
   `ScrollEndDrag`, `ScrollEnd`); the model applies `ScrollBy` and `ScrollTo` / `ScrollToEnd` and reports where a
   command moved the view;
-- `drag` (`headless/drag.rs`): a mouse drag from the middle of the match (the innermost view there) by an offset or
-  onto the middle of another match, 10 points per frame, as `nsh-platform-gpui`'s `input.rs` takes it: the views
-  around the pointer that listen to touches get `Touch` on the root (start, moves, end) for JS's responder system; a
-  `panActivation` around it decides on each move and sends the activation with the move; past 6 points the innermost
-  view with a native pan (`pan` values, `PanStart` / `PanEnd`) taking that direction pans (`PanStart`, its values
-  follow the pointer in the model's animator, `PanEnd` with translation, velocity and values) unless a JS responder
-  blocks native gestures (`SetJsResponder`); it drags no scroll view and presses nothing;
+- `drag` (`headless/pointer.rs`): a finger lands on the match's middle (`Screen::bounds_in_root`), rests 100 ms,
+  moves 10 points a frame by an offset or onto the middle of another match (`DragTo`) and lifts, and what takes it is decided as the desktop backends decide it, with
+  `nsh_core::input` over the views from the match out (`Screen::link`: events, tracked states, gesture values, the
+  scroll axis, `panActivation`): the views listening to touches hear `Touch` (start, moves, end; the JS responder's
+  `SetJsResponder` block keeps native drags from starting), past the slop a pan (`PanStart`, its `pan` values moved
+  through nsh-core's `animation::Animator`, which the headless animator wraps, `PanEnd` with the velocity) or a
+  scroll view (dragged within its content; past its top only when it listens to `Refresh`, rubber-banded, refreshing
+  when released past `scroll::refreshes`) takes it, and the press under it is cancelled once it moves away;
+- `hover` (`headless/pointer.rs`): on a desktop environment the mouse comes over the match's middle: the views from it
+  out that hovering matters to (`input::hoverable`: `hover:` styles or hover events) replace those hovered before
+  (`Screen::set_hovered`), `input::hover_changes` says which hear `HoverOut` and `HoverIn` (with their `HOVERED` state
+  reported, `EngineControl::set_states`), and the hovered views hear `HoverMove`;
+- `right_click`, `choose_menu_item`, `close_menu` (`headless/menus.rs`): on a desktop environment the match, or the
+  nearest view around it listening, hears `ContextMenu`; the menu the app then shows (`Menu.popup`,
+  `DesktopCommand::PopupMenu`) is the model's (`Screen::menu`, read through `menu.rs`: its actions by label, a
+  submenu's as `"Share > Mail"`) until it is chosen from (the root hears `Menu` with the action's id, then
+  `Menu { closed }`) or closed;
+- `press_key` (`headless/keyboard.rs`, `app.keyboard.press`): the keystroke as `nsh/keymap` parses it for the
+  environment's OS; on a desktop environment (`open`'s `platform`: `Environment::desktop`) the root's keymap
+  (`MountItem::Keymap`, `Screen::keymap`) finds the binding that fires where the focus is (`Keymap::find`) and the
+  root hears `KeyCommand`; else the focused input takes a character, Backspace or the return key, else Escape goes
+  back when there is something to go back from;
 - `wait`, `wait_for` / `wait_for_gone` / `wait_until` (until a selector matches, matches no more, a condition on the
   screen holds), `next_change` (one batch or animation frame: what `nsh/test`'s `waitUntil` waits for between calls
   of its JS condition), `idle` (until quiet for a while).
@@ -287,8 +311,8 @@ Headless runs play the platform's part NSH's protocol defines, and refuse what o
   them after each step itself (`answer_dialogs_myself`), so its JS handler runs on the test file's VM;
 - the clipboard holds text (`SetClipboard`, `ReadClipboard` answered with `onClipboard`), modals get `onShow` when
   inserted;
-- images are not loaded; an image's size (`ImageInfo`) and an image or files on the clipboard fail the step that asked
-  (`Screen::take_unsupported`).
+- images are not loaded: an image's size (`ImageInfo`) is answered with an error, as a failed load (a `TextView` asks
+  for the sizes of its images); an image or files on the clipboard fail the step that asked (`Screen::take_unsupported`).
 
 Rust tests use the driver directly: `nsh_testing::start` (the engine with its frames, the batches to the caller),
 `Screen` (texts in tree order, the commands sent, `press_target`, `matches`, `input_text`) and `Headless`.
@@ -348,11 +372,22 @@ each entry (`RunnerMessage::Build` on its stderr, one JSON line), `nsh` writes t
 `.nsh/test/build` and answers with a `Reply` on the runner's stdin, or `Reply::Root` for a Rust app's `nsh.json` (or its
 directory): the runner then makes the app's root (`app_root()`), so `open(".")` starts a Rust app. Results, file
 failures and log records come back as `RunnerMessage`s; batches of `--trace` go to the runner's stdout, which is
-`nsh`'s.
+`nsh`'s. On a real platform (`--target`) such an app's tests run in `nsh`'s process like any other's, and its apps in
+the development hosts built with its crates (`runtime::test_host`, `test_web`, `test_android`: a Rust app's too, whose
+runners have no dev server client). A Rust app's hosts know its root (the platforms' `set_root`, Android's `root!`, the
+web runtime's `rust_app!`); for its `nsh.json` the test session's server publishes no bundle but
+`DevServer::publish_root` (`ServerMessage::Root`, after the test's setup), and the host runs the root.
+
+`--trace` on a real platform is the host's: the test's setup says so (`DevServer::set_test_trace`,
+`ServerMessage::TestSetup`'s `trace`), the host's engine runs with `EngineConfig::trace` (`Model::set_up_engine`), so
+its commit and event timings come as its log lines, and the agent's `Model::apply` sends each batch's items, formatted
+as headless runs print them (`trace.rs`), as a `ClientMessage::Trace`, before the outcome of the step it came in. The
+test's side prints them under the step `Remote` took last (named as `Headless` names its steps).
 
 ### On a real platform (`--target`)
 
-`nsh test --target <platform>` runs the apps tests open on the platform's development host. `App` drives either kind
+`nsh test --target <platform>` runs the apps tests open on the platform's development host (`macos`, `linux`,
+`windows`, `gpui`, `web`, `ios`, `android`). `App` drives either kind
 of app through one trait (`driver.rs` `Driver`): `Headless`, or `Remote`, which turns each step and query into a
 `nsh_dev::protocol::TestStep` for the host (`TestRun::host`, a `StartHost` the CLI makes: `nsh-cli/src/test_host.rs`).
 For each `open`, the CLI builds the entry, starts a dev server of its own in a test session
@@ -365,22 +400,92 @@ The host's side is `nsh_testing::agent` (feature `agent`: no QuickJS, no network
 `Model` keeps the headless driver's `Screen`, fed every batch the surface applied and every error the app reported,
 so selectors resolve the same everywhere; the `Agent` takes each step on a thread of its own: it resolves the
 selector on the model, scrolls the view into view when it is not (the innermost scroll view around it that hides it,
-a gesture at a time), asks the platform where it is (`Native::bounds`) and acts there with synthesized input
-(`Native`: press, long press, scroll, typed keys, `back`, dialogs, screenshots, the window's size and appearance),
-then waits until no batch came for 100 ms and no native animation runs (2 s at most). `Native`'s calls do their work
+a gesture at a time; between gestures it waits only for the view to stop moving, `Agent::stopped`, and once it is in
+view for the app to settle, so a page that is never quiet, a ticking timer, costs one settling per step rather than
+one per gesture), asks the platform where it is (`Native::bounds`) and acts there with synthesized input
+(`Native`: press, long press, scroll, drag along `agent::drag_path` after resting `agent::LANDING`, typed keys,
+the mouse's secondary button (`right_click`), the open context menu's items chosen or the menu closed
+(`choose_menu_item`, `close_menu`: macOS's tracking `NSMenu`, run from the run loop rather than the main queue so the
+agent's calls and the app's batches go on while it tracks; Windows' `TrackPopupMenuEx` ended with `EndMenu` and the
+chosen item carried out after; GTK's popover with the item's action's work done and the popover popped down; GPUI's
+menus of its own; the web, whose `Menu.popup` is the app's own UI, has none), the mouse's hover (`hover`, when
+`Native::mouse`: macOS hands the move to the surface's input, as AppKit gives posted
+moves to the first responder only), keystrokes (`press_keys`: macOS's posted key events, Windows' and GPUI's key entry points with
+`keymap::Key::virtual_key`, the web's CDP key events, Linux's bindings fired as its shortcut controller would, as GTK
+takes no made-up keys; the phones, without app shortcuts, refuse them),
+`back`, dialogs, screenshots, the window's size and appearance),
+then waits until neither a batch came nor a native animation ran for 100 ms (2 s at most; the web's page counts its own
+finite animations too: a screen sliding in). `Native`'s calls do their work
 on the platform's main thread and return when the input is posted. Screenshots come back as PNG bytes (base64): the
 test's side saves them, as the host may run on another machine. A manual clock does not exist on a real platform:
-`runFor` waits, `fastForward` and `setSystemTime` fail, and `open` refuses what a host cannot be given yet (stubbed
-routes, storage, clipboard, locale, reduced motion, safe area).
+`runFor` waits, and `fastForward` and `setSystemTime` fail. `open`'s locale, reduced motion and safe area reach the
+host in the test's setup (`TestEnvironment`, `DevServer::set_test_environment`) and its engine pins them
+(`EngineConfig::pinned`, `EnvironmentPins`: applied to every environment the platform reports); its clipboard is the
+test's (`EngineConfig::clipboard`: the core serves the app's clipboard commands from a `ClipboardBackend`, here a
+`MemoryClipboard` the agent's model keeps, which `app.clipboard()` reads), so the machine's is never touched.
+
+Routes and storage reach the host through the dev server (`HostOptions`, `DevServer::set_test_storage` and
+`set_test_network`). Before the first bundle, the server sends the test host a `ServerMessage::TestSetup` with the
+seeded storage; the host's `Tester` hands it to `Model::set_up`, and `Model::set_up_engine` starts the engine on a
+`MemoryStorage` holding those entries and on `agent/forward.rs`'s `ForwardNetwork`. Each
+request the app makes goes back as a `ClientMessage::Fetch` with an id (`FetchCancel` when the app drops it); the
+test's side answers it from its routes (`protocol::TestNetwork`, `run.rs`'s `HostRoutes` over the same
+`StubNetwork` headless runs use, recording every request for `app.requests()`) with `ServerMessage::Fetch` replies:
+`Head`, `Data` (base64) and `End`, or `Failed`, or `Pass` for `network: "live"`, when the host's own network makes
+the request. `app.storage()` asks the host (`SceneQuery::Storage`). The web's page takes both through `dev.html`
+(`player.testSetup`, `testFetchReply`, and `onTestSend` for its requests).
 
 macOS (`nsh-platform-macos`, feature `dev`): `agent.rs` implements `Native` with `synth.rs`'s posted mouse, trackpad
-and key events (which `--script` steps use too), `NSView` frames converted to the content's top-left points, `NSAlert`
+and key events, `NSView` frames converted to the content's top-left points, `NSAlert`
 buttons pressed by title (`system::answer_dialog`), and the content view cached into a PNG; `dev.rs`'s `Tester`
 attaches the model to the surface on the server's test session (before the first bundle) and starts the agent's
 thread. GPUI (`nsh-platform-gpui`, feature `dev`): `agent.rs` on GPUI's main thread, input through the handlers real
 input goes through (`synth.rs`), back the mouse's back button, dialogs pressed at their buttons' laid-out middles
-(`docs/dev/gpui.md`). Both use `nsh_testing::agent::Tester`, which turns the dev client's test events into an agent's
-steps on a `Worker` thread.
+(`docs/dev/gpui.md`). Linux (`nsh-platform-linux`, feature `dev`): input through `input::simulate` and the focused
+GTK field's own signals (GTK 4 takes no made-up events), dialogs' `GtkButton`s clicked, screenshots rendered
+offscreen (`docs/dev/linux.md`). Windows (`nsh-platform-windows`, feature `dev`): input at the input module's entry
+points as on GPUI, screenshots captured with `PrintWindow` (`docs/dev/windows.md`). iOS (`nsh-platform-ios`,
+feature `dev`; `nsh-cli/src/test_ios.rs`): the CLI installs the host in a simulator (a booted one, else the newest
+iPhone) and launches it per `open` with `--dev-server` and a fresh `--data-dir` (the simulator shares the Mac's network
+and files). Touches are IOHID digitizer events handed to UIKit (`-[UIApplication _enqueueHIDEvent:]`, with IOKit's
+and BackBoardServices' functions looked up at run time, `synth.rs`), so UIKit makes the `UITouch`es and runs hit
+testing, gesture recognizers and scroll views as for a finger: a press is a finger down and up, a scroll a drag kept
+inside the scroll view that rests (still reporting where it is) before it lifts, so it ends without a fling; a tap
+that lands in a text input also gives it the focus (made touches leave the first responder where it was, as UI test
+tools know). Typing goes through the software keyboard's input manager (`UIKeyboardImpl.addInputString:`, a key at
+a quick typist's pace), which asks the input's delegate first (`maxLength`, a controlled value), as the keyboard does.
+Back taps the header's back button (the bar button carrying the back chevron's mask) or swipes a presented sheet
+down; dialogs are answered with a tap on the `UIAlertController`'s button; screenshots are
+`drawViewHierarchyInRect:` as a PNG; a step waits for finite Core Animation animations and gliding scroll views too.
+The system's appearance is the simulator's: the CLI switches it (`simctl ui appearance`) and restores it after the
+app; the screen keeps its device's size. Android (`nsh-platform-android`, feature `dev`; `TestAgent.java`;
+`nsh-cli/src/test_android.rs`): the CLI installs the host on the first device `adb devices` lists and starts it per
+`open` with the dev server's port forwarded (`adb reverse`) and a data directory of its own in the host's cache
+(`dataDir`, emptied as it starts). The agent's calls go to `TestAgent` (a class looked up in `JNI_OnLoad`), which does
+each on the UI thread: `MotionEvent`s dispatched to the window's views (or the dialog's) as a finger's, with drags
+that rest before they lift as on iOS; typing as a keyboard's `KeyEvent`s (`KeyCharacterMap`; what no key types is
+committed through the field's input connection), Ctrl+A first as a shortcut, as the window's input stage offers it;
+back is the activity's back press; dialogs are answered with a tap on the `AlertDialog`'s button (back to close it);
+screenshots draw the window and the dialog into a bitmap. A step waits for the native animation graph and for anything
+that moves: a signature of every shown view's place, offset, scroll position and opacity, compared between looks. The
+system's appearance is the device's night mode, which the CLI switches (`cmd uimode night`) and restores. All of them
+use `nsh_testing::agent::Tester`, which turns the dev client's
+test events into an agent's steps on a `Worker` thread.
+These hosts are also how a change to a platform is checked by hand: `nsh test <entry> --target <platform>` with steps
+on standard input (`app.screenshot("a.png")`, `app.press(…)`) opens the app in the platform's window, takes them and
+closes it.
+
+The web (`--target web`, `nsh-cli/src/test_web.rs`): the agent runs in the CLI, the app in a page of a headless
+Chromium browser (Chrome, Edge or Chromium; `--browser <PATH>`, else the one installed where `cdp.rs` looks; nsh never
+fetches one and fails saying so when there is none). One browser serves the run; each `open` gets a page in a browser
+context of its own (storage apart) on a dev server of its own that also serves the web host's page
+(`DevServer::serve_web`). The development runtime (`nsh-dev.wasm`, feature `dev` of `nsh-platform-web`) keeps the
+`Model` once the server's hello says `test`, and answers the steps' questions about it (`TestStep::Scene` with a
+`SceneQuery`: `nsh_testing::agent::answer`; where views are, the viewport, inputs' text and dialogs' buttons from the
+DOM, in `nsh.js`'s `testPage`). The CLI's agent sees the app through `RemoteScene`, which asks those questions
+through `DevServer::step`, and acts with the browser's trusted input over the DevTools protocol (`Input.dispatch*`:
+mouse presses, wheel events of 20 px a frame apart, key events with macOS's editing commands, as Playwright sends
+them), `history.back()` for back, `Emulation.*` for the viewport and the color scheme and `Page.captureScreenshot`.
 
 ## New apps (`nsh init --template`)
 
@@ -392,7 +497,7 @@ otherwise, so scripts and CI never wait for an answer.
   that exist are kept; only a directory that has them all is refused.
 - **`rust`**: an independent Cargo workspace: `Cargo.toml`, `src/main.rs` (a native desktop entry using
   `AppSource::Rust(Root::of::<App>())`; the platform dependencies are target-specific and disable default features,
-  so `cargo run` mounts the Rust root directly and accepts `NSH_SCRIPT` for window checks), `src/lib.rs` (the root
+  so `cargo run` mounts the Rust root directly), `src/lib.rs` (the root
   component and its `#[native_module("<slug>/native")]` registry, which exports `App` for a TSX entry added later),
   `nsh.json` with `"rust": "."` and `"root": "App"`, `.gitignore` and a README (`templates/rust/`) saying how to add
   that entry. No TSX, so no `tsconfig.json` and no `.nsh/types`. `examples/gallery-rs` is a Rust app with a native

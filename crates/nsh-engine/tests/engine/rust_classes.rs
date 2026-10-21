@@ -524,6 +524,8 @@ pub(crate) fn start_with(
         storage: None,
         clock: Default::default(),
         context: Default::default(),
+        pinned: Default::default(),
+        clipboard: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),

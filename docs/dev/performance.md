@@ -4,6 +4,15 @@ Performance is the project's first priority; the rules are in `AGENTS.md`. Chang
 after `nsh test --trace` timings and item counts (`nsh trace` before it, in the records below). Current baselines
 (Apple Silicon):
 
+`onMouseMove` (Desktop and web): Linux x86_64, debug CLI, five interleaved runs of
+`echo 'await app.press("+1")' | nsh test examples/counter/App.tsx --trace`, against main `fd772aef`.
+The first commit stays at 56 ops / 49 mount items / 21 nodes; the press stays at 10 ops / 7 items / 24 nodes.
+Minimum first-commit times were 277 → 280 µs, press times 180 → 189 µs (medians 189 → 202 µs for the press).
+Cold-start timings varied widely (277–633 µs), so these runs establish unchanged work counts rather than a speedup.
+Without mouse listeners, each backend skips the new mouse hit test. Mouse moves share the existing 8 ms hover
+coalescing interval, with the latest coordinates kept independently per view and event kind.
+
+
 - counter, headless (debug): first frame ~0.5–0.65ms (58 ops / 49 mount items), one tap ~0.15ms (12 ops / 8 items).
 - counter, Catalyst (release): first frame ~1.05–1.15ms (of which ~0.7ms is cold CoreText layout of 10 texts), one tap ~0.12ms.
 - Hot reload: ~120ms from saving a file to the device running the new version (file event latency and ~60ms of development
@@ -153,7 +162,7 @@ per frame). Other platforms need only call `record_work` / `vsync` / `record_lat
 draw a panel.
 
 - macOS (release, Apple silicon, 1200×800 window, 120 Hz ProMotion screen; `nsh-macos-host --fps --trace` with
-  `--script`, two alternating runs of each; main-thread ms per shown frame as p50 / p95). The display link delivers
+  scripted input (the then `--script` steps), two alternating runs of each; main-thread ms per shown frame as p50 / p95). The display link delivers
   120 Hz in every case (refresh gaps p50 8.33 ms). Before = the backend without the two drawing fixes below:
 
   | Scenario | Before: main p50 / p95, CPU | After: main p50 / p95, CPU |

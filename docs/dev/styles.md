@@ -16,14 +16,19 @@
   context). Variants: `dark:`, `sm:`…`2xl:` / `max-*:` / `min-[..]:`, `portrait:` /
   `landscape:`, `ios:` / `android:` / `web:`, `rtl:` / `ltr:`, `motion-safe:` / `motion-reduce:`, `active:` / `hover:` /
   `focus:` / `focus-within:` / `disabled:` / `enabled:` / `selected:` (`accessibilityState.selected`, a `Button`'s
-  `selected`) / `checked:` (`accessibilityState.checked`, not mixed), `group-*:` (named groups `group/name`), `first:` / `last:` /
+  `selected`) / `checked:` (`accessibilityState.checked`, not mixed) / `indeterminate:` (`accessibilityState.checked`
+  mixed, CSS's `:indeterminate`), `group-*:` (named groups `group/name`), `first:` / `last:` /
   `odd:` / `even:` / `only:`, `placeholder:` / `selection:` (a color only: the `placeholderColor` / `selectionColor`
   style keys), `!` (important). The state classes have style props of their own (`activeStyle`, `hoverStyle`,
-  `focusStyle`, `disabledStyle`, `checkedStyle`, a `Button`'s `selectedStyle`), resolved the same way: later states
-  win, `disabled` over all. `selected` and `checked` are value states the core sets from the accessibility state
-  (never reported by the platform), below the interaction states: `checked`, then `selected`, then `hover`, `focus`,
-  `active` (gpui-base's order of value states). `disabled` (any element) applies `disabled:` and drops
-  the node's press listeners from what is mounted, so it shows no press feedback either. `dark:` follows the appearance
+  `focusStyle`, `disabledStyle`, `checkedStyle`, `indeterminateStyle`, a `Button`'s `selectedStyle`), resolved the same
+  way: later states win, `disabled` over all. `selected`, `checked` and `indeterminate` are value states the core sets
+  from the accessibility state (never reported by the platform), below the interaction states: `checked` and
+  `indeterminate` (one rank: a view is never both), then `selected`, then `hover`, `focus`, `active` (gpui-base's order
+  of value states). `disabled` (any element) applies `disabled:` and drops
+  the node's press listeners from what is mounted, so it shows no press feedback either. A part of a Rust component
+  shows its control's `checked`, `indeterminate` and `disabled` to its own classes and state styles
+  (`Interactive::project_checked`, `project_indeterminate`, `project_disabled`; `Prop::ProjectedStates`): a switch's thumb styled `checked:translate-x-4`, with no accessibility
+  state or press change on the part, so screen readers hear the control alone. `dark:` follows the appearance
   shown: the app's own when it set one (`nsh.json` `"appearance"`, `setColorScheme`; `Core::set_appearance`), else the
   system's. The theme is Tailwind 4's
   extended by `nsh.json` `"tailwind"` (`colors`, `spacing`, `breakpoints`, `fontSize`, `radius`, `shadow`, ...; unknown
@@ -54,7 +59,7 @@
   gradients `encode.rs` sends as written, with their stop count negated; the web hands them to the browser as `px`), or
   at angles around conic ones (fractions of a turn), up to two per stop; transition hints are not parsed; a gradient
   that does not parse is logged (inline styles, `bg-[…]` classes, Rust components' `Style`); but press feedback must show, so a background color an interaction state sets (`active:` / `hover:` / `focus:` /
-  `focus-within:` / `group-*:` classes, Rust components' `.active(..)`, `activeStyle` / `hoverStyle` / `focusStyle` / `disabledStyle`) or a native
+  `focus-within:` / `group-*:` classes, Rust components' `.active(..)`, on a nested component's element too, `activeStyle` / `hoverStyle` / `focusStyle` / `disabledStyle`) or a native
   animation drives (`Animated` `backgroundColor`) replaces the gradients, unless that state sets a gradient of its own:
   done in the core, so every platform shows it alike), `filter` (`brightness`, `contrast`,
   `grayscale`, `hue-rotate`, `invert`, `saturate`, `sepia`, `opacity`, `blur`, `drop-shadow`; color filters are composed into one

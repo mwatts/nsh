@@ -2,7 +2,7 @@ use std::cell::Cell;
 
 use super::*;
 use crate::{
-    Color, EventKind, StyleValue,
+    Color, EventKind, IMAGE_SCALES, ImageScales, StyleValue,
     animation::{AnimationOp, AnimationProp},
     geometry::{point, px},
 };
@@ -84,6 +84,25 @@ fn js_events<M: TextEngine>(c: &mut Core<M>) -> Vec<(NodeId, EventKind, EventPay
             JsEvent::Children { host, wanted } => {
                 native(host, "$children", crate::JsonValue::Bool(wanted))
             }
+            JsEvent::Render {
+                host,
+                prop,
+                key,
+                value,
+            } => native(
+                host,
+                "$render",
+                serde_json::json!({
+                    "prop": prop,
+                    "key": key.as_str(),
+                    "value": json_host::render_value(&*value),
+                }),
+            ),
+            JsEvent::Unrender { host, prop, key } => native(
+                host,
+                "$unrender",
+                serde_json::json!({ "prop": prop, "key": key.as_str() }),
+            ),
             JsEvent::Reply { call, result } => native(
                 ROOT_ID,
                 "$return",
@@ -1035,6 +1054,7 @@ fn image_uses_natural_size_and_aspect_ratio() {
                 prop: Prop::Source(Some(ImageSource {
                     uri: "asset:/logo.png".into(),
                     size: Some(size_pt(200.0, 100.0)),
+                    scales: ImageScales::NONE,
                 })),
             },
             Op::Insert {
@@ -1058,6 +1078,7 @@ fn image_uses_natural_size_and_aspect_ratio() {
                 prop: Prop::Source(Some(ImageSource {
                     uri: "asset:/logo.png".into(),
                     size: Some(size_pt(200.0, 100.0)),
+                    scales: ImageScales::NONE,
                 })),
             },
             Op::Insert {
@@ -1238,6 +1259,85 @@ fn scroll_reports_content_size() {
             ..
         }
     )));
+}
+
+/// `overflow: "hidden"` clips in layout as well as in paint: what a box
+/// clips away must not grow an ancestor scroll view's content size. A
+/// preview laid out at its design width and scaled down by a transform
+/// (transforms do not affect layout) otherwise leaves a vertical scroll
+/// view scrollable sideways.
+#[test]
+fn clipped_overflow_does_not_grow_scroll_content() {
+    /// The content width of a 320pt-wide vertical scroll view holding a
+    /// 300pt box, itself holding a 400pt-wide absolute child.
+    fn content_width(clips: bool) -> f32 {
+        let mut c = core();
+        let mut boxed = vec![
+            ("width", StyleValue::Number(300.0)),
+            ("height", StyleValue::Number(100.0)),
+        ];
+        if clips {
+            boxed.push(("overflow", StyleValue::Str("hidden")));
+        }
+        apply(
+            &mut c,
+            vec![
+                Op::Create {
+                    id: 2,
+                    tag: Tag::Scroll,
+                },
+                style_op(2, &[("height", StyleValue::Number(200.0))]),
+                Op::Insert {
+                    parent: ROOT_ID,
+                    child: 2,
+                    before: None,
+                },
+                Op::Create {
+                    id: 3,
+                    tag: Tag::View,
+                },
+                style_op(3, &boxed),
+                Op::Insert {
+                    parent: 2,
+                    child: 3,
+                    before: None,
+                },
+                Op::Create {
+                    id: 4,
+                    tag: Tag::View,
+                },
+                style_op(
+                    4,
+                    &[
+                        ("position", StyleValue::Str("absolute")),
+                        ("left", StyleValue::Number(0.0)),
+                        ("top", StyleValue::Number(0.0)),
+                        ("width", StyleValue::Number(400.0)),
+                        ("height", StyleValue::Number(50.0)),
+                    ],
+                ),
+                Op::Insert {
+                    parent: 3,
+                    child: 4,
+                    before: None,
+                },
+            ],
+        );
+        let batch = c.commit().unwrap();
+        batch
+            .items
+            .iter()
+            .find_map(|i| match i {
+                MountItem::ScrollContent { id: 2, size } => Some(size.width.0),
+                _ => None,
+            })
+            .expect("scroll content size")
+    }
+    // Visible: the 400pt child reaches the scroll view, which scrolls to it.
+    assert_eq!(content_width(false), 400.0);
+    // Clipped: the scroll view keeps its own width, so it does not scroll
+    // sideways at all.
+    assert_eq!(content_width(true), 320.0);
 }
 
 /// A scroll view's content size set twice in one batch (a row relaid in
@@ -3357,6 +3457,45 @@ fn disabled_views_take_no_presses() {
     assert_eq!(view_style_of(&batch, 2).unwrap().opacity, 1.0);
 }
 
+/// A view that takes no presses unmounts its other listeners when it is
+/// disabled too: a secondary click goes on to the listener around it.
+#[test]
+fn disabled_views_hear_no_context_menus_or_file_drops() {
+    let mut c = core();
+    view_with_classes(&mut c, 2, "disabled:opacity-40");
+    let disabled = |d| Op::SetProp {
+        id: 2,
+        prop: Prop::Native(NativeProp::Disabled(d)),
+    };
+    let events_of = |batch: &MountBatch| {
+        batch.items.iter().rev().find_map(|i| match i {
+            MountItem::Events { id: 2, events } => Some(*events),
+            _ => None,
+        })
+    };
+    apply(
+        &mut c,
+        [EventKind::ContextMenu, EventKind::FileDrop]
+            .into_iter()
+            .map(|event| Op::Listen {
+                id: 2,
+                event,
+                enabled: true,
+            })
+            .collect(),
+    );
+    let batch = c.commit().unwrap();
+    let events = events_of(&batch).unwrap();
+    assert!(events.contains(EventKind::ContextMenu) && events.contains(EventKind::FileDrop));
+    apply(&mut c, vec![disabled(true)]);
+    let batch = c.commit().unwrap();
+    assert!(events_of(&batch).unwrap().is_empty());
+    apply(&mut c, vec![disabled(false)]);
+    let batch = c.commit().unwrap();
+    let events = events_of(&batch).unwrap();
+    assert!(events.contains(EventKind::ContextMenu) && events.contains(EventKind::FileDrop));
+}
+
 /// A style patch of `decls` (`activeStyle={{ … }}`).
 fn patch(decls: &[(&str, crate::StyleValue<'_>)]) -> Option<Arc<crate::StylePatch>> {
     let mut style = crate::Style::default();
@@ -3584,6 +3723,103 @@ fn checked_style_follows_the_accessibility_state() {
     assert_eq!(track.background_color, Color(0xe4e4_e7ff));
     assert_eq!(track.opacity, 0.5);
     assert!(view_style_of(&batch, 3).unwrap().transform.ops().is_empty());
+}
+
+#[test]
+fn indeterminate_style_follows_the_accessibility_state() {
+    use crate::{AccessibilityProp, AccessibilityState, Checked, StyleValue as V};
+    // A checkbox: the box by its mixed state, the mark by its group's.
+    let mut c = core();
+    view_with_classes(
+        &mut c,
+        2,
+        "group bg-zinc-200 checked:bg-emerald-500 indeterminate:bg-black",
+    );
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 3,
+                tag: Tag::View,
+            },
+            class_op(3, "h-4 w-4 group-indeterminate:opacity-50"),
+            Op::Insert {
+                parent: 2,
+                child: 3,
+                before: None,
+            },
+        ],
+    );
+    let state = |checked| Op::SetProp {
+        id: 2,
+        prop: Prop::Accessibility(AccessibilityProp::State(AccessibilityState {
+            checked,
+            ..AccessibilityState::default()
+        })),
+    };
+    apply(
+        &mut c,
+        vec![
+            Op::SetProp {
+                id: 2,
+                prop: Prop::IndeterminateStyle(patch(&[("opacity", V::Number(0.7))])),
+            },
+            state(Some(Checked::Mixed)),
+        ],
+    );
+    let batch = c.commit().unwrap();
+    let mixed = view_style_of(&batch, 2).unwrap();
+    assert_eq!(mixed.background_color, Color(0x0000_00ff));
+    assert_eq!(mixed.opacity, 0.7);
+    assert_eq!(view_style_of(&batch, 3).unwrap().opacity, 0.5);
+    // The platform never tracks it.
+    assert!(!batch.items.iter().any(|i| matches!(
+        i,
+        MountItem::TrackStates { id: 2, states }
+            if states & crate::tailwind::state::INDETERMINATE != 0
+    )));
+    // Checked is not indeterminate.
+    apply(&mut c, vec![state(Some(Checked::True))]);
+    let batch = c.commit().unwrap();
+    let checked = view_style_of(&batch, 2).unwrap();
+    assert_eq!(checked.background_color, Color(0x00bc_7dff));
+    assert_eq!(checked.opacity, 1.0);
+    assert_eq!(view_style_of(&batch, 3).unwrap().opacity, 1.0);
+}
+
+#[test]
+fn projected_states_style_a_part_without_its_accessibility() {
+    use crate::tailwind::state;
+    // A switch's thumb: styled by the switch's value and disabled state,
+    // with no accessibility state or listeners of its own.
+    let mut c = core();
+    view_with_classes(
+        &mut c,
+        2,
+        "h-4 w-4 checked:translate-x-4 disabled:opacity-50",
+    );
+    let projected = |states| Op::SetProp {
+        id: 2,
+        prop: Prop::ProjectedStates(states),
+    };
+    apply(&mut c, vec![projected(state::CHECKED | state::DISABLED)]);
+    let batch = c.commit().unwrap();
+    let thumb = view_style_of(&batch, 2).unwrap();
+    assert_eq!(thumb.transform.ops()[0].value, 16.0);
+    assert_eq!(thumb.opacity, 0.5);
+    assert!(
+        !batch.items.iter().any(|i| matches!(
+            i,
+            MountItem::ViewProps { id: 2, .. } | MountItem::Events { id: 2, .. }
+        )),
+        "{:?}",
+        batch.items
+    );
+    apply(&mut c, vec![projected(0)]);
+    let batch = c.commit().unwrap();
+    let thumb = view_style_of(&batch, 2).unwrap();
+    assert!(thumb.transform.ops().is_empty());
+    assert_eq!(thumb.opacity, 1.0);
 }
 
 #[test]
@@ -4057,6 +4293,7 @@ fn refused_urls_fail_and_send_nothing() {
                 prop: Prop::Source(Some(ImageSource {
                     uri: uri.into(),
                     size: None,
+                    scales: ImageScales::NONE,
                 })),
             },
             Op::Insert {
@@ -4972,7 +5209,7 @@ mod components {
                     .footer
                     .place(move |f| f.on_press(move |_: &()| shown.update(|s| *s = !*s))),
             )
-            .child(If::new(shown, || view().h(px(10.0))))
+            .child(when(shown, || view().h(px(10.0))))
     }
 
     /// What a view gives a slot's node (its handlers) stays while the node
@@ -5110,17 +5347,10 @@ mod components {
         let inner_taps = signal(0);
         view()
             .child(text(move || format!("outer {}", inner_taps.get())))
-            .child(
-                Tally::element(TallyProps {
-                    label: "In".into(),
-                    ..TallyProps::initial()
-                })
-                .on_event(move |event: &TallyEvent| {
-                    let TallyEvent::Tap { .. } = event;
-                    inner_taps.update(|t| *t += 1);
-                    cx.emit(OuterEvent::InnerTap(inner_taps.get_untracked()));
-                }),
-            )
+            .child(tally().label("In").on_tap(move |_: &TallyEvent| {
+                inner_taps.update(|t| *t += 1);
+                cx.emit(OuterEvent::InnerTap(inner_taps.get_untracked()));
+            }))
     }
 
     #[test]
@@ -5299,6 +5529,87 @@ mod components {
         c.set_states(2, crate::tailwind::state::PRESSED);
         let batch = c.commit().unwrap();
         assert_eq!(background(&batch), Some(Color(0xff0000ff)));
+    }
+
+    /// A selected state whose style is the app's (as `nsh_base::Button`'s).
+    #[derive(Clone, PartialEq, Props)]
+    struct PillProps {
+        #[prop(default)]
+        selected: crate::ui::Prop<bool>,
+        #[prop(default)]
+        selected_style: crate::ui::Prop<crate::ui::Style>,
+    }
+
+    #[component]
+    fn Pill(props: PillProps) -> impl IntoElement {
+        view()
+            .size_10()
+            .accessibility_state(move || crate::AccessibilityState {
+                selected: props.selected.get(),
+                ..crate::AccessibilityState::default()
+            })
+            .selected_style(props.selected_style)
+    }
+
+    /// A selected pill styled with a theme color and an opacity a press
+    /// changes, through its style prop's closure.
+    #[component]
+    fn Pills() -> impl IntoElement {
+        let dim = signal(false);
+        view()
+            .on_press(move || dim.set(true))
+            .child(pill().selected(true).selected_style(move |s| {
+                s.bg(move || tokens().color("primary.background").unwrap())
+                    .opacity(move || if dim.get() { 0.5_f32 } else { 1.0 })
+            }))
+    }
+
+    #[test]
+    fn a_style_prop_set_with_a_closure_follows_the_theme_and_its_signals() {
+        let mut c = core();
+        let mut registry = Registry::new();
+        registry.register::<Pills>().tokens_from(test_tokens);
+        c.set_components(registry);
+        apply(
+            &mut c,
+            vec![
+                Op::Create {
+                    id: 2,
+                    tag: Tag::View,
+                },
+                Op::SetProp {
+                    id: 2,
+                    prop: Prop::Component(std::any::type_name::<Pills>().into()),
+                },
+                Op::Insert {
+                    parent: ROOT_ID,
+                    child: 2,
+                    before: None,
+                },
+            ],
+        );
+        let styled = |batch: &MountBatch| {
+            batch.items.iter().find_map(|i| match i {
+                MountItem::ViewStyle { id, style } if *id != 2 => {
+                    Some((style.background_color, style.opacity))
+                }
+                _ => None,
+            })
+        };
+        let primary = token("primary.background");
+        let batch = c.commit().unwrap();
+        assert_eq!(styled(&batch), Some((Color::from(primary.light), 1.0)));
+        // Dark appearance: the theme color switches natively.
+        c.set_class_environment(crate::tailwind::ClassEnvironment {
+            dark: true,
+            ..Default::default()
+        });
+        let batch = c.commit().unwrap();
+        assert_eq!(styled(&batch), Some((Color::from(primary.dark), 1.0)));
+        // What the closure's bindings read changes it.
+        assert!(c.component_event(2, EventKind::Press, &EventPayload::None));
+        let batch = c.commit().unwrap();
+        assert_eq!(styled(&batch), Some((Color::from(primary.dark), 0.5)));
     }
 
     #[test]
@@ -5887,8 +6198,10 @@ mod components {
                 let len = name.with(String::len) as f32;
                 Painter::new().fill_rect(0.0, 0.0, len, 4.0)
             }))
-            .child(If::new(
+            .child(when(
                 move || name.with(String::len) > 2,
+                // `nsh_base::dialog` is this, and nsh-base depends on the core.
+                #[allow(deprecated)]
                 move || {
                     modal()
                         .close_on_swipe(false)
@@ -6564,7 +6877,7 @@ mod components {
     #[component]
     fn SelfClosing() -> impl IntoElement {
         let open = signal(true);
-        view().child(If::new(open, move || {
+        view().child(when(open, move || {
             view().on_press(move |_: &()| {
                 Owner::current().dispose();
                 let _ = (signal(5), animated_value(1.0), element_ref());
@@ -6779,9 +7092,7 @@ mod components {
 
     #[component]
     fn Drawer(props: DrawerProps) -> impl IntoElement {
-        view().child(If::new(props.open, move || {
-            view().p_2().child(props.children)
-        }))
+        view().child(when(props.open, move || view().p_2().child(props.children)))
     }
 
     /// Content with state of its own: the how-manieth it was made.
@@ -6804,13 +7115,7 @@ mod components {
                     .h(px(10.0))
                     .on_press(move |_: &()| open.update(|o| *o = !*o)),
             )
-            .child(
-                Drawer::element(DrawerProps {
-                    open: open.into(),
-                    children: Children::default(),
-                })
-                .child(Opened::element(())),
-            )
+            .child(drawer().open(open).child(opened()))
     }
 
     #[test]
@@ -6902,6 +7207,41 @@ mod components {
         }
         let shown = run_until(&mut c, |s| s.iter().any(|t| t.starts_with("pasted h")));
         assert_eq!(shown.last().unwrap(), "pasted hello");
+    }
+
+    #[test]
+    fn a_clipboard_of_the_embedders_own_answers_in_place_of_the_platform() {
+        use crate::clipboard::{ClipboardBackend, MemoryClipboard};
+        let clipboard = std::sync::Arc::new(MemoryClipboard::new(Some("hello".into())));
+        let mut c = core();
+        c.set_clipboard(Some(clipboard.clone()));
+        c.mount_root(&crate::ui::Root::new::<Paster>(|| ()));
+        let batch = c.commit().unwrap();
+        let button = batch
+            .items
+            .iter()
+            .find_map(|i| match i {
+                MountItem::Events { id, events } if events.contains(EventKind::Press) => Some(*id),
+                _ => None,
+            })
+            .expect("the button");
+        assert!(c.component_event(button, EventKind::Press, &EventPayload::None));
+        // Nothing goes to the platform: the reads are answered from it.
+        let items = c.commit().map(|b| b.items).unwrap_or_default();
+        assert!(
+            !items.iter().any(|i| matches!(
+                i,
+                MountItem::Command {
+                    command: Command::ReadClipboard { .. },
+                    ..
+                }
+            )),
+            "{items:?}"
+        );
+        let shown = run_until(&mut c, |s| s.iter().any(|t| t.starts_with("pasted h")));
+        assert_eq!(shown.last().unwrap(), "pasted hello");
+        clipboard.set_text(None);
+        assert_eq!(clipboard.text(), None);
     }
 
     /// Pastes the clipboard's image and files when pressed.
@@ -7132,7 +7472,7 @@ mod components {
                 }))
                 .child(", ")
                 .child(text("bold").font_weight(FontWeight::BOLD))
-                .child(If::new(long, || " and more"))
+                .child(when(long, || " and more"))
                 .child(view().size(px(10.0)).bg(rgb(0xff0000))),
         )
     }
@@ -7258,7 +7598,7 @@ mod touch {
 
     /// The pad mounted: the core, the outer node and the inner one (both
     /// listen to touches).
-    fn pad(keep: bool) -> (Core<FakeEngine>, NodeId, NodeId) {
+    fn mount_pad(keep: bool) -> (Core<FakeEngine>, NodeId, NodeId) {
         let mut c = core();
         c.mount_root(&crate::ui::Root::new::<Pad>(move || PadProps { keep }));
         let batch = c.commit().unwrap();
@@ -7278,7 +7618,7 @@ mod touch {
 
     #[test]
     fn an_element_claims_the_touches_on_start_and_blocks_scrolling() {
-        let (mut c, outer, inner) = pad(false);
+        let (mut c, outer, inner) = mount_pad(false);
         let path = [inner, outer];
         // The root's touches: the components hear theirs, JS still gets
         // the event for its own nodes.
@@ -7315,7 +7655,7 @@ mod touch {
 
     #[test]
     fn a_capturing_claim_takes_the_touches_over_unless_they_are_kept() {
-        let (mut c, outer, inner) = pad(false);
+        let (mut c, outer, inner) = mount_pad(false);
         let path = [inner, outer];
         let send = |c: &mut Core<FakeEngine>, phase, x, t| {
             c.component_event(ROOT_ID, EventKind::Touch, &touch(phase, &path, x, t));
@@ -7336,7 +7676,7 @@ mod touch {
         );
 
         // An inner responder that keeps the touches rejects the claim.
-        let (mut c, outer, inner) = pad(true);
+        let (mut c, outer, inner) = mount_pad(true);
         let path = [inner, outer];
         let send = |c: &mut Core<FakeEngine>, phase, x, t| {
             c.component_event(ROOT_ID, EventKind::Touch, &touch(phase, &path, x, t));
@@ -7354,7 +7694,7 @@ mod touch {
 
     #[test]
     fn js_and_component_responders_share_the_native_block() {
-        let (mut c, outer, inner) = pad(false);
+        let (mut c, outer, inner) = mount_pad(false);
         apply(
             &mut c,
             vec![
@@ -7924,7 +8264,7 @@ mod views {
     use super::*;
     use crate::{
         Prop,
-        ui::{Component, Each, If, Props, Registry, Root, Scope, prelude::*},
+        ui::{Component, Props, Registry, Root, Scope, prelude::*},
     };
 
     fn texts(batch: &MountBatch) -> Vec<String> {
@@ -8058,6 +8398,57 @@ mod views {
         assert!(texts(&c.commit().unwrap()).contains(&"log abcd".to_owned()));
     }
 
+    #[derive(Event)]
+    enum ChooserEvent {
+        Press,
+        Pick(u32),
+        Placed { at: u32 },
+    }
+
+    /// Emits each of its events on a press: a press, the pick 7, the
+    /// placement at 9.
+    #[component]
+    fn Chooser(cx: Scope<ChooserEvent>) -> impl IntoElement {
+        view().child(text("choose")).on_press(move || {
+            cx.emit(ChooserEvent::Press);
+            cx.emit(ChooserEvent::Pick(7));
+            cx.emit(ChooserEvent::Placed { at: 9 });
+        })
+    }
+
+    /// A [`Chooser`] heard through its events' listener methods.
+    #[component]
+    fn Chosen() -> impl IntoElement {
+        let log = signal(String::new());
+        let note = move |s: String| log.update(|l| l.push_str(&s));
+        view()
+            .child(
+                chooser()
+                    .on_press(move || note("press ".into()))
+                    .on_press(move |_: &()| note("again ".into()))
+                    .on_pick(move |index: &u32| note(format!("pick {index} ")))
+                    .on_placed(move |event: &ChooserEvent| {
+                        if let ChooserEvent::Placed { at } = event {
+                            note(format!("placed {at}"));
+                        }
+                    }),
+            )
+            .child(text(move || format!("log {}", log.get())))
+    }
+
+    #[test]
+    fn a_components_listener_methods_hear_their_event_and_its_data() {
+        let mut c = core();
+        c.mount_root(&Root::new::<Chosen>(|| ()));
+        let batch = c.commit().unwrap();
+        let chooser = native_parent(&c, text_node(&batch, "choose")).unwrap();
+        assert!(c.component_event(chooser, EventKind::Press, &EventPayload::None));
+        assert_eq!(
+            texts(&c.commit().unwrap()),
+            ["log press again pick 7 placed 9"]
+        );
+    }
+
     /// A region made again with what it read: its pressable text is kept
     /// (the same node), its listener the new run's.
     #[component]
@@ -8152,7 +8543,7 @@ mod views {
                 .on_press(move |_: &()| on.update(|v| *v = !*v))
                 .child(text("before"))
                 .child(
-                    If::new(on, || {
+                    when(on, || {
                         cleanup(|| CLEANED.with(|c| c.set(c.get() + 1)));
                         text("on")
                     })
@@ -8214,12 +8605,13 @@ mod views {
                     on.set(false);
                 })
                 .child(
-                    If::new(on, || Counter::element(CounterProps { label: "On".into() }))
-                        .otherwise(|| {
+                    when(on, || Counter::element(CounterProps { label: "On".into() })).otherwise(
+                        || {
                             Counter::element(CounterProps {
                                 label: "Off".into(),
                             })
-                        }),
+                        },
+                    ),
                 )
         }
     }
@@ -8257,7 +8649,7 @@ mod views {
         fn view(_: RowsProps, _: Scope<NoEvent>) -> impl IntoElement {
             let items = signal(vec![1, 2, 3]);
             ITEMS.with(|i| i.set(Some(items)));
-            view().child(Each::new(
+            view().child(each(
                 items,
                 |n| *n,
                 |item, index| {
@@ -8353,9 +8745,7 @@ mod views {
         view()
             .on_press(move |_: &()| first.update(|f| *f = !*f))
             .child(dynamic(move || {
-                Intro::element(IntroProps {
-                    label: if first.get() { "one" } else { "two" }.into(),
-                })
+                intro().label(if first.get() { "one" } else { "two" })
             }))
     }
 
@@ -8825,7 +9215,7 @@ mod views {
 
         fn view(props: PocketProps, _: Scope<NoEvent>) -> impl IntoElement {
             let children = props.children;
-            view().child(If::new(props.open, move || view().p_2().child(children)))
+            view().child(when(props.open, move || view().p_2().child(children)))
         }
     }
 
@@ -8862,9 +9252,9 @@ mod views {
             Holder::element(HolderProps {
                 children: Children::default(),
             })
-            .child(If::new(open, || {
+            .child(when(open, || {
                 vec![
-                    Label::element(()).into_element(),
+                    label().into_element(),
                     text("plain").into_element(),
                     Holder::element(HolderProps {
                         children: Children::default(),
@@ -8916,7 +9306,7 @@ mod views {
             let children = props.children;
             view()
                 .on_press(move || shown.update(|s| *s = !*s))
-                .child(If::new(shown, move || {
+                .child(when(shown, move || {
                     Holder::element(HolderProps {
                         children: Children::default(),
                     })
@@ -8945,7 +9335,7 @@ mod views {
                     children: Children::default(),
                 })
                 .child(text("a"))
-                .child(If::new(middle, || text("b")))
+                .child(when(middle, || text("b")))
                 .child(text("c")),
             )
         }
@@ -9197,9 +9587,7 @@ mod views {
             view()
                 .on_press(move || shown.update(|s| *s = !*s))
                 .child(text(move || format!("empty {}", children.get().is_empty())))
-                .child(If::new(shown, move || {
-                    view().child(children.get_untracked())
-                }))
+                .child(when(shown, move || view().child(children.get_untracked())))
         }
     }
 
@@ -9218,12 +9606,9 @@ mod views {
     #[component]
     fn Giver() -> impl IntoElement {
         let on = signal(true);
-        view().on_press(move || on.update(|o| *o = !*o)).child(
-            PassOn::element(HolderProps {
-                children: Children::default(),
-            })
-            .child(If::new(on, || text("given"))),
-        )
+        view()
+            .on_press(move || on.update(|o| *o = !*o))
+            .child(pass_on().child(when(on, || text("given"))))
     }
 
     #[test]
@@ -9334,6 +9719,159 @@ mod views {
                 "only nodes' own ids"
             );
         }
+    }
+
+    /// A press target with no look: presses, its selection for screen
+    /// readers, and the app's styles.
+    #[derive(Default)]
+    struct Key;
+
+    #[derive(Clone, PartialEq, Props)]
+    struct KeyProps {
+        #[prop(default)]
+        selected: crate::ui::Prop<bool>,
+    }
+
+    impl Component for Key {
+        type Props = KeyProps;
+        type Event = NoEvent;
+
+        fn view(props: KeyProps, _: Scope<NoEvent>) -> impl IntoElement {
+            let selected = props.selected;
+            view()
+                .size_10()
+                .accessibility_state(move || crate::AccessibilityState {
+                    selected: selected.get(),
+                    ..crate::AccessibilityState::default()
+                })
+                .on_press(|| {})
+        }
+    }
+
+    /// Two keys in a row, styled per state as an app styles a `Button`.
+    #[derive(Default)]
+    struct Keys;
+
+    #[derive(Clone, PartialEq, Props)]
+    struct KeysProps {}
+
+    impl Component for Keys {
+        type Props = KeysProps;
+        type Event = NoEvent;
+
+        fn view(_: KeysProps, _: Scope<NoEvent>) -> impl IntoElement {
+            let key = |selected: bool| {
+                Key::element(KeyProps {
+                    selected: selected.into(),
+                })
+                .bg(rgb(0x0000ff))
+                .selected(|s| s.bg(rgb(0x00ff00)))
+                .hover(|s| s.opacity(0.5))
+                .active(|s| s.bg(rgb(0xff0000)))
+            };
+            view().flex_row().child(key(false)).child(key(true))
+        }
+    }
+
+    #[test]
+    fn a_nested_components_state_styles_follow_its_roots_states() {
+        use crate::tailwind::state::{HOVERED, PRESSED};
+        let mut c = core();
+        c.mount_root(&Root::new::<Keys>(|| KeysProps {}));
+        let batch = c.commit().unwrap();
+        // The keys' roots report presses and hovers to the core.
+        let tracked = |id: NodeId| {
+            batch.items.iter().any(|i| {
+                matches!(i, MountItem::TrackStates { id: v, states }
+                    if *v == id && states & (PRESSED | HOVERED) == PRESSED | HOVERED)
+            })
+        };
+        let roots: Vec<NodeId> = batch
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                MountItem::TrackStates { id, .. } if tracked(*id) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(roots.len(), 2, "{:?}", batch.items);
+        let is_selected = |id: NodeId| {
+            batch.items.iter().any(|i| {
+                matches!(i, MountItem::ViewProps { id: v, props }
+                    if *v == id && props.accessibility.state.selected)
+            })
+        };
+        let (selected, plain) = match is_selected(roots[0]) {
+            true => (roots[0], roots[1]),
+            false => (roots[1], roots[0]),
+        };
+        let background =
+            |batch: &MountBatch, id| view_style_of(batch, id).map(|s| s.background_color);
+        assert_eq!(background(&batch, plain), Some(crate::Color(0x0000ffff)));
+        assert_eq!(
+            background(&batch, selected),
+            Some(crate::Color(0x00ff00ff)),
+            "selected:"
+        );
+        c.set_states(plain, PRESSED | HOVERED);
+        let batch = c.commit().unwrap();
+        let style = view_style_of(&batch, plain).expect("restyled");
+        assert_eq!(style.background_color, crate::Color(0xff0000ff), "active:");
+        assert_eq!(style.opacity, 0.5, "hover:");
+        c.set_states(plain, 0);
+        let batch = c.commit().unwrap();
+        assert_eq!(background(&batch, plain), Some(crate::Color(0x0000ffff)));
+    }
+
+    /// A page whose header's colors are typed styles, theme colors among
+    /// them.
+    #[derive(Default)]
+    struct Page;
+
+    #[derive(Clone, PartialEq, Props)]
+    struct PageProps {}
+
+    impl Component for Page {
+        type Props = PageProps;
+        type Event = NoEvent;
+
+        // The core's own stack and screen: `nsh_base`'s wrap them.
+        #[allow(deprecated)]
+        fn view(_: PageProps, _: Scope<NoEvent>) -> impl IntoElement {
+            stack().flex_1().child(
+                screen()
+                    .title("Page")
+                    .header_style_with(|s| {
+                        s.bg(AdaptiveColor::rgb(0xffffff, 0x000000))
+                            .text_color(rgb(0x00ff00))
+                            .tint_color(rgb(0x0000ff))
+                    })
+                    .child(view().flex_1()),
+            )
+        }
+    }
+
+    #[test]
+    fn typed_header_styles_reach_the_screens_config() {
+        let mut c = core();
+        c.mount_root(&Root::new::<Page>(|| PageProps {}));
+        let config = |batch: &MountBatch| {
+            batch.items.iter().find_map(|i| match i {
+                MountItem::ScreenConfig { config, .. } => Some((**config).clone()),
+                _ => None,
+            })
+        };
+        let first = config(&c.commit().unwrap()).expect("a screen");
+        assert_eq!(first.background_color, Some(crate::Color(0xffffffff)));
+        assert_eq!(first.title_color, Some(crate::Color(0x00ff00ff)));
+        assert_eq!(first.tint_color, Some(crate::Color(0x0000ffff)));
+        // Dark appearance: the theme color switches natively.
+        c.set_class_environment(crate::tailwind::ClassEnvironment {
+            dark: true,
+            ..Default::default()
+        });
+        let dark = config(&c.commit().unwrap()).expect("restyled");
+        assert_eq!(dark.background_color, Some(crate::Color(0x000000ff)));
     }
 
     /// A holder of its children as its view's root.
@@ -9621,15 +10159,12 @@ mod views {
         let n = signal(0);
         view()
             .on_press(move || n.update(|n| *n += 1))
-            .child(Mid::element(MidProps::default()).fill("corner", text("deep")))
-            .child(Mid::element(MidProps::default()).fill(
-                "corner",
-                dynamic(move || match n.get() % 3 {
-                    0 => Some(text("switched").into_element()),
-                    1 => None,
-                    _ => Some(view().child(text("boxed")).into_element()),
-                }),
-            ))
+            .child(mid().corner(text("deep")))
+            .child(mid().corner(dynamic(move || match n.get() % 3 {
+                0 => Some(text("switched").into_element()),
+                1 => None,
+                _ => Some(view().child(text("boxed")).into_element()),
+            })))
     }
 
     #[test]
@@ -9917,9 +10452,9 @@ mod views {
     /// A dial with a ref, as its view's root or inside a view.
     #[component]
     fn DialPanel(props: DialPanelProps) -> impl IntoElement {
-        let dial = component_ref::<Dial>();
-        DIAL.with(|d| d.set(Some(dial)));
-        let el = Dial::element(()).component_ref(&dial);
+        let handle = component_ref::<Dial>();
+        DIAL.with(|d| d.set(Some(handle)));
+        let el = Dial::element(()).component_ref(&handle);
         if props.rooted {
             el.into_element()
         } else {
@@ -9968,7 +10503,7 @@ mod views {
                         children: Children::default(),
                     })
                     .child(text("before"))
-                    .child(If::new(open, || text("open")))
+                    .child(when(open, || text("open")))
                     .child(text("after")),
                 )
         }
@@ -10302,7 +10837,7 @@ mod views {
                 } else {
                     crate::ui::Prop::bind(move || format!("n {}", n.get()).into())
                 };
-                Shown::element(ShownProps { value })
+                shown().value(value)
             }))
     }
 
@@ -10331,7 +10866,7 @@ mod views {
         view()
             .on_press(move |_: &()| shown.set(false))
             .child(text(move || format!("k {}", count.get())))
-            .child(If::new(shown, move || {
+            .child(when(shown, move || {
                 on_key("mod+k", move |_| count.update(|c| *c += 1));
                 view()
             }))
@@ -10418,7 +10953,7 @@ mod views {
         let shown = signal(true);
         view()
             .on_press(move |_: &()| shown.set(false))
-            .child(If::new(shown, || Leafy::element(())))
+            .child(when(shown, leafy))
     }
 
     #[test]
@@ -11087,5 +11622,1636 @@ mod builders {
         assert_eq!(run::<ChildrenTogether>(|| (), &[]), one_by_one);
         assert!(one_by_one[0].contains("\"row 1\""));
         assert!(one_by_one[0].contains("\"right\""));
+    }
+
+    /// The setters of host elements' own options, each given a closure
+    /// of `flipped`.
+    #[component]
+    fn BoundOptions() -> impl IntoElement {
+        let flipped = signal(false);
+        let pick =
+            move |a: &'static str, b: &'static str| move || if flipped.get() { b } else { a };
+        view()
+            .child(text("flip").on_press(move || flipped.set(true)))
+            .child(
+                text("lines")
+                    .number_of_lines(move || if flipped.get() { 2_u32 } else { 1 })
+                    .selectable(flipped)
+                    .max_font_size_multiplier(move || if flipped.get() { 3.0_f32 } else { 1.5 }),
+            )
+            .child(
+                image("a.png")
+                    .resize_mode(move || {
+                        if flipped.get() {
+                            crate::ResizeMode::Contain
+                        } else {
+                            crate::ResizeMode::Cover
+                        }
+                    })
+                    .placeholder(pick("before.png", "after.png"))
+                    .fade_duration(move || if flipped.get() { 300.0_f32 } else { 100.0 }),
+            )
+            .child(web_view(pick(
+                "https://before.test/",
+                "https://after.test/",
+            )))
+            .child(video(pick(
+                "https://before.test/v.mp4",
+                "https://after.test/v.mp4",
+            )))
+            .child(native("map").prop("zoom", move || {
+                serde_json::json!(if flipped.get() { 9 } else { 4 })
+            }))
+    }
+
+    #[test]
+    fn host_options_take_signals_and_closures() {
+        let frames = run::<BoundOptions>(|| (), &["flip"]);
+        for before in [
+            "before.png",
+            "https://before.test/",
+            "https://before.test/v.mp4",
+            "Number(4)",
+            "Cover",
+            "fade_ms: Some(100.0)",
+            "max_lines: 1",
+            "selectable: Some(false)",
+        ] {
+            assert!(frames[0].contains(before), "{before} in {}", frames[0]);
+        }
+        for after in [
+            "after.png",
+            "https://after.test/",
+            "https://after.test/v.mp4",
+            "Number(9)",
+            "resize_mode: Contain",
+            "fade_ms: Some(300.0)",
+            "max_lines: 2",
+            "selectable: Some(true)",
+        ] {
+            assert!(frames[1].contains(after), "{after} in {}", frames[1]);
+        }
+        for gone in ["before.png", "before.test"] {
+            assert!(!frames[1].contains(gone), "{gone} in {}", frames[1]);
+        }
+    }
+
+    #[test]
+    fn a_status_bar_style_is_a_setting() {
+        let setting = crate::StatusBarStyle::Light.into_reactive();
+        assert_eq!(
+            setting.get(),
+            StatusBarSetting::default().foreground(crate::StatusBarStyle::Light)
+        );
+    }
+}
+
+/// Render functions (`Option<Renderer<T>>` props) and the app's classes on
+/// a view's elements (`app_class`).
+mod renders {
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        Prop,
+        ui::{AnyValue, Props, Registry, Rendered, Renderer, Root, dynamic, prelude::*},
+    };
+
+    /// Renders each item (`key:label`) with the app's function, keyed by
+    /// its key; in one paragraph when `inline`.
+    #[derive(Clone, PartialEq, Props)]
+    struct ShelfProps {
+        #[prop(default)]
+        items: crate::ui::Prop<Vec<String>>,
+        #[prop(default)]
+        inline: bool,
+        render_item: crate::ui::Prop<Option<Renderer<String>>>,
+    }
+
+    fn split(item: &str) -> (String, String) {
+        let (key, label) = item.split_once(':').unwrap_or((item, item));
+        (key.to_owned(), label.to_owned())
+    }
+
+    #[component]
+    fn Shelf(props: ShelfProps) -> impl IntoElement {
+        let rows = each(
+            props.items,
+            |item: &String| split(item).0,
+            move |item, _| {
+                // (A row's root is a node: an `Each` keeps rows by it.)
+                view().child(dynamic(move || -> Option<Rendered> {
+                    let (key, label) = split(&item.get());
+                    props.render_item.get().map(|r| r.render(key, label))
+                }))
+            },
+        );
+        if props.inline {
+            text("on the shelf: ").child(rows).into_element()
+        } else {
+            view().child(rows).into_element()
+        }
+    }
+
+    fn core_with_shelf(inline: bool) -> Core<FakeEngine> {
+        let mut c = core();
+        let mut registry = Registry::new();
+        registry.register::<Shelf>();
+        c.set_components(registry);
+        let mut ops = vec![
+            Op::Create {
+                id: 2,
+                tag: Tag::View,
+            },
+            Op::SetProp {
+                id: 2,
+                prop: Prop::Component(std::any::type_name::<Shelf>().into()),
+            },
+            Op::SetProp {
+                id: 2,
+                prop: Prop::RustProp(
+                    "renderItem",
+                    Some(AnyValue::new(Some(Renderer::<String>::__js_of(
+                        "renderItem",
+                        2,
+                    )))),
+                ),
+            },
+            items(&["a:Apple", "b:Banana"]),
+        ];
+        if inline {
+            ops.push(Op::SetProp {
+                id: 2,
+                prop: rust_prop::<ShelfProps>("inline", Some(json!(true))),
+            });
+        }
+        ops.push(Op::Insert {
+            parent: ROOT_ID,
+            child: 2,
+            before: None,
+        });
+        apply(&mut c, ops);
+        c
+    }
+
+    fn items(items: &[&str]) -> Op {
+        Op::SetProp {
+            id: 2,
+            prop: rust_prop::<ShelfProps>("items", Some(json!(items))),
+        }
+    }
+
+    /// What the core asked JS: `$render key value` / `$unrender key`.
+    fn asked(c: &mut Core<FakeEngine>) -> Vec<String> {
+        js_events(c)
+            .into_iter()
+            .filter_map(|(host, _, payload)| match payload {
+                EventPayload::Native { name, data } if name.starts_with("$") => {
+                    assert_eq!(host, 2);
+                    assert_eq!(data["prop"], "renderItem");
+                    let key = data["key"].as_str().unwrap().to_owned();
+                    Some(match data.get("value") {
+                        Some(v) => format!("{name} {key} {}", v.as_str().unwrap()),
+                        None => format!("{name} {key}"),
+                    })
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// JS's answer to `$render key`: holder `holder` with a text of
+    /// `label`, inserted into the host.
+    fn holder(holder: NodeId, key: &str, label: &str) -> Vec<Op> {
+        vec![
+            Op::Create {
+                id: holder,
+                tag: Tag::View,
+            },
+            Op::SetProp {
+                id: holder,
+                prop: Prop::ComponentRender(format!("renderItem\u{1f}{key}").into()),
+            },
+            Op::Create {
+                id: holder + 2,
+                tag: Tag::Text,
+            },
+            Op::CreateText {
+                id: holder + 4,
+                text: label.into(),
+            },
+            Op::Insert {
+                parent: holder + 2,
+                child: holder + 4,
+                before: None,
+            },
+            Op::Insert {
+                parent: holder,
+                child: holder + 2,
+                before: None,
+            },
+            Op::Insert {
+                parent: 2,
+                child: holder,
+                before: None,
+            },
+        ]
+    }
+
+    fn parent_of(c: &Core<FakeEngine>, id: NodeId) -> Option<NodeId> {
+        let key = c.key(id).ok()?;
+        let parent = c.nodes[key as usize].parent;
+        (parent != NO_KEY).then(|| c.nodes[parent as usize].id)
+    }
+
+    #[test]
+    fn js_renders_each_key_once_per_value_and_releases_it() {
+        let mut c = core_with_shelf(false);
+        c.commit().unwrap();
+        assert_eq!(asked(&mut c), ["$render a Apple", "$render b Banana"]);
+        apply(&mut c, holder(10, "a", "Apple"));
+        apply(&mut c, holder(20, "b", "Banana"));
+        c.commit().unwrap();
+        // Each holder is the only child of its placeholder, a view of the
+        // core's in the component's view.
+        let (a, b) = (parent_of(&c, 10).unwrap(), parent_of(&c, 20).unwrap());
+        assert_eq!((a % 2, b % 2), (1, 1));
+        assert_ne!(a, b);
+        // In their rows.
+        let row = |p| parent_of(&c, p).and_then(|r| parent_of(&c, r));
+        assert_eq!(row(a), row(b));
+        assert!(asked(&mut c).is_empty());
+        // An equal value asks nothing; a new one asks again; the holder of
+        // the new render replaces the old one.
+        apply(&mut c, vec![items(&["a:Apple", "b:Banana"])]);
+        let _ = c.commit();
+        assert!(asked(&mut c).is_empty());
+        apply(&mut c, vec![items(&["a:Avocado", "b:Banana"])]);
+        let _ = c.commit();
+        assert_eq!(asked(&mut c), ["$render a Avocado"]);
+        apply(&mut c, holder(30, "a", "Avocado"));
+        apply(
+            &mut c,
+            vec![
+                Op::Remove {
+                    parent: 2,
+                    child: 10,
+                },
+                Op::Release { id: 10 },
+            ],
+        );
+        c.commit().unwrap();
+        assert_eq!(parent_of(&c, 30), Some(a));
+        // A key that leaves is released once.
+        apply(&mut c, vec![items(&["b:Banana"])]);
+        let _ = c.commit();
+        assert_eq!(asked(&mut c), ["$unrender a"]);
+        assert_eq!(parent_of(&c, 30), None, "out of the tree");
+        assert!(c.key(a).is_err(), "the placeholder went");
+        apply(
+            &mut c,
+            vec![
+                Op::Remove {
+                    parent: 2,
+                    child: 30,
+                },
+                Op::Release { id: 30 },
+            ],
+        );
+        let _ = c.commit();
+        assert!(asked(&mut c).is_empty());
+        // Back: rendered again.
+        apply(&mut c, vec![items(&["a:Apple", "b:Banana"])]);
+        let _ = c.commit();
+        assert_eq!(asked(&mut c), ["$render a Apple"]);
+        // The host goes: nothing is left of its renders.
+        apply(
+            &mut c,
+            vec![
+                Op::Remove {
+                    parent: ROOT_ID,
+                    child: 2,
+                },
+                Op::Release { id: 2 },
+            ],
+        );
+        let _ = c.commit();
+        assert!(c.components.renders.is_empty());
+    }
+
+    #[test]
+    fn a_holder_coming_after_its_key_left_stays_out_of_the_tree() {
+        let mut c = core_with_shelf(false);
+        c.commit().unwrap();
+        asked(&mut c);
+        apply(&mut c, vec![items(&["b:Banana"])]);
+        let _ = c.commit();
+        assert_eq!(asked(&mut c), ["$unrender a"]);
+        // JS answers the first ask after the core moved on.
+        apply(&mut c, holder(10, "a", "Apple"));
+        let _ = c.commit();
+        assert_eq!(parent_of(&c, 10), None);
+    }
+
+    #[test]
+    fn renders_in_a_paragraph_are_inline_views() {
+        let mut c = core_with_shelf(true);
+        c.commit().unwrap();
+        assert_eq!(asked(&mut c), ["$render a Apple", "$render b Banana"]);
+        apply(&mut c, holder(10, "a", "Apple"));
+        let batch = c.commit().unwrap();
+        let place = parent_of(&c, 10).unwrap();
+        // The row is an inline view of the paragraph.
+        let paragraph = parent_of(&c, parent_of(&c, place).unwrap()).unwrap();
+        let key = c.key(paragraph).unwrap();
+        assert_eq!(c.nodes[key as usize].kind, Kind::Text);
+        // Laid out as an attachment of the paragraph: it has a frame.
+        assert!(frame_of(&batch, place).is_some(), "{:?}", batch.items);
+    }
+
+    /// A Rust view passing a closure: rendered on the spot.
+    #[derive(Clone, PartialEq, Props)]
+    struct ShelvesProps {}
+
+    #[component]
+    fn Shelves(_props: ShelvesProps) -> impl IntoElement {
+        shelf()
+            .items(vec!["a:Apple".to_owned(), "b:Banana".to_owned()])
+            .render_item(|label| text(format!("[{label}]")))
+    }
+
+    #[test]
+    fn a_rust_renderer_renders_in_place() {
+        let mut c = core();
+        c.mount_root(&Root::new::<Shelves>(|| ShelvesProps {}));
+        let batch = c.commit().unwrap();
+        let texts: Vec<_> = batch
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                MountItem::Text { text, .. } => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(texts, ["[Apple]", "[Banana]"]);
+        assert!(js_events(&mut c).is_empty());
+    }
+
+    /// A view styling a part with the app's classes.
+    #[derive(Clone, PartialEq, Props)]
+    struct CardProps {
+        #[prop(default)]
+        heading_class: crate::ui::Prop<Option<SharedString>>,
+    }
+
+    #[component]
+    fn Card(props: CardProps) -> impl IntoElement {
+        view().child(
+            view()
+                .bg(crate::ui::palette::RED.shade(500))
+                .border_2()
+                .app_class(props.heading_class),
+        )
+    }
+
+    fn core_with_card(class: &str) -> Core<FakeEngine> {
+        let mut c = core();
+        let mut registry = Registry::new();
+        registry.register::<Card>();
+        c.set_components(registry);
+        apply(
+            &mut c,
+            vec![
+                Op::Create {
+                    id: 2,
+                    tag: Tag::View,
+                },
+                Op::SetProp {
+                    id: 2,
+                    prop: Prop::Component(std::any::type_name::<Card>().into()),
+                },
+                card_class(class),
+                Op::Insert {
+                    parent: ROOT_ID,
+                    child: 2,
+                    before: None,
+                },
+            ],
+        );
+        c
+    }
+
+    fn card_class(class: &str) -> Op {
+        Op::SetProp {
+            id: 2,
+            prop: rust_prop::<CardProps>("headingClass", Some(json!(class))),
+        }
+    }
+
+    /// The heading's view: the host's only child.
+    fn heading(c: &Core<FakeEngine>) -> NodeId {
+        let key = c.key(2).unwrap();
+        let child = c.nodes[key as usize].children[0];
+        c.nodes[child as usize].id
+    }
+
+    #[test]
+    fn the_apps_classes_go_after_an_elements_own_styles() {
+        let mut c = core_with_card("bg-white dark:bg-black");
+        let batch = c.commit().unwrap();
+        let id = heading(&c);
+        let style = view_style_of(&batch, id).unwrap();
+        // The app's background wins; the view's own border stays.
+        assert_eq!(style.background_color, Color(0xffff_ffff));
+        assert_eq!(style.borders.widths.to_array().map(|w| w.0), [2.0; 4]);
+        // Dark: the app's dark variant.
+        c.set_class_environment(crate::tailwind::ClassEnvironment {
+            dark: true,
+            ..Default::default()
+        });
+        let batch = c.commit().unwrap();
+        assert_eq!(
+            view_style_of(&batch, id).unwrap().background_color,
+            Color(0x0000_00ff)
+        );
+        // Another class from the app: applied again, on the same node.
+        apply(&mut c, vec![card_class("bg-red-500 dark:bg-white")]);
+        let batch = c.commit().unwrap();
+        assert_eq!(heading(&c), id);
+        assert_eq!(
+            view_style_of(&batch, id).unwrap().background_color,
+            Color(0xffff_ffff)
+        );
+        // None: the view's own.
+        apply(
+            &mut c,
+            vec![Op::SetProp {
+                id: 2,
+                prop: rust_prop::<CardProps>("headingClass", None),
+            }],
+        );
+        let batch = c.commit().unwrap();
+        assert_eq!(
+            view_style_of(&batch, id).unwrap().background_color,
+            Color::from(crate::ui::palette::RED.shade(500))
+        );
+    }
+}
+
+mod rust_selection_area {
+    use std::cell::Cell;
+
+    use super::*;
+    use crate::ui::{Root, prelude::*};
+
+    thread_local! {
+        static AREA: Cell<Option<Signal<bool>>> = const { Cell::new(None) };
+    }
+
+    #[component]
+    fn Area() -> impl IntoElement {
+        let area = signal(true);
+        AREA.set(Some(area));
+        view()
+            .child(
+                view()
+                    .selection_area(move || area.get())
+                    .child(text("inside")),
+            )
+            .child(view().child(text("outside")))
+    }
+
+    /// `Element::selection_area` reaches the platform in the view's props,
+    /// follows its signal, and views without it get no props for it.
+    #[test]
+    fn a_selection_area_is_a_view_prop() {
+        let mut c = core();
+        c.mount_root(&Root::of::<Area>());
+        let batch = c.commit().unwrap();
+        let areas: Vec<_> = batch
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                MountItem::ViewProps { id, props } if props.selection_area => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(areas.len(), 1, "{:?}", batch.items);
+        assert!(
+            !batch.items.iter().any(
+                |item| matches!(item, MountItem::ViewProps { props, .. } if !props.selection_area)
+            ),
+            "views without the flag get no props: {:?}",
+            batch.items
+        );
+        {
+            let _entered = c.components.runtime.enter();
+            AREA.get().unwrap().set(false);
+        }
+        let batch = c.commit().unwrap();
+        assert!(batch.items.iter().any(
+            |item| matches!(item, MountItem::ViewProps { id, props } if *id == areas[0] && !props.selection_area)
+        ));
+    }
+}
+
+/// Creates `id` of `tag` with `style`, in `parent`.
+fn add(
+    c: &mut Core<FakeEngine>,
+    id: NodeId,
+    tag: Tag,
+    parent: NodeId,
+    s: &[(&str, StyleValue<'_>)],
+) {
+    apply(
+        c,
+        vec![
+            Op::Create { id, tag },
+            style_op(id, s),
+            Op::Insert {
+                parent,
+                child: id,
+                before: None,
+            },
+        ],
+    );
+}
+
+fn inserts(batch: &MountBatch) -> Vec<(NodeId, NodeId, Option<NodeId>)> {
+    batch
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            MountItem::Insert {
+                parent,
+                child,
+                before,
+            } => Some((*parent, *child, *before)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn overlay_prop(id: NodeId, prop: crate::OverlayProp) -> Op {
+    Op::SetProp {
+        id,
+        prop: Prop::Overlay(prop),
+    }
+}
+
+#[test]
+fn overlays_show_in_their_root_view_above_its_children() {
+    use StyleValue::Number;
+    let mut c = core();
+    // A clipping box with an overlay deep inside.
+    add(
+        &mut c,
+        2,
+        Tag::View,
+        ROOT_ID,
+        &[
+            ("height", Number(100.0)),
+            ("overflow", StyleValue::Str("hidden")),
+        ],
+    );
+    add(&mut c, 4, Tag::View, 2, &[("padding", Number(5.0))]);
+    add(
+        &mut c,
+        6,
+        Tag::Overlay,
+        4,
+        &[("left", Number(10.0)), ("top", Number(300.0))],
+    );
+    add(
+        &mut c,
+        8,
+        Tag::View,
+        6,
+        &[("width", Number(50.0)), ("height", Number(20.0))],
+    );
+    let batch = c.commit().unwrap();
+    let creates = batch.items.iter().find_map(|i| match i {
+        MountItem::Create { id: 6, kind } => Some(*kind),
+        _ => None,
+    });
+    assert_eq!(creates, Some(ViewKind::View));
+    let ins = inserts(&batch);
+    assert!(ins.contains(&(ROOT_ID, 6, None)), "{ins:?}");
+    assert!(!ins.iter().any(|&(p, c, _)| p == 4 && c == 6));
+    assert!(ins.contains(&(6, 8, None)));
+    // `position: fixed` in the root view, out of its parent's layout.
+    assert_eq!(frame_of(&batch, 6), Some(rect(10.0, 300.0, 50.0, 20.0)));
+    assert_eq!(frame_of(&batch, 4), Some(rect(0.0, 0.0, 320.0, 10.0)));
+    // Measured in the root view.
+    let m = c.measure(8).unwrap();
+    assert_eq!(m.page, point(px(10.0), px(300.0)));
+
+    // The root view's children go below the overlays.
+    add(&mut c, 10, Tag::View, ROOT_ID, &[("height", Number(10.0))]);
+    let batch = c.commit().unwrap();
+    assert_eq!(inserts(&batch), vec![(ROOT_ID, 10, Some(6))]);
+
+    // Out of the tree: out of the root view; back in: on top.
+    add(&mut c, 12, Tag::Overlay, ROOT_ID, &[]);
+    c.commit().unwrap();
+    apply(
+        &mut c,
+        vec![Op::Remove {
+            parent: ROOT_ID,
+            child: 2,
+        }],
+    );
+    let batch = c.commit().unwrap();
+    assert!(
+        batch
+            .items
+            .iter()
+            .any(|i| matches!(i, MountItem::Remove { id: 6 }))
+    );
+    apply(
+        &mut c,
+        vec![Op::Insert {
+            parent: ROOT_ID,
+            child: 2,
+            before: Some(10),
+        }],
+    );
+    let batch = c.commit().unwrap();
+    let ins = inserts(&batch);
+    assert!(ins.contains(&(ROOT_ID, 2, Some(10))), "{ins:?}");
+    assert!(ins.contains(&(ROOT_ID, 6, None)), "{ins:?}");
+    assert_eq!(c.overlays.last().map(|&k| c.nodes[k as usize].id), Some(6));
+    // Released with its parent's subtree.
+    apply(
+        &mut c,
+        vec![
+            Op::Remove {
+                parent: ROOT_ID,
+                child: 2,
+            },
+            Op::Release { id: 6 },
+        ],
+    );
+    let batch = c.commit().unwrap();
+    assert!(
+        batch
+            .items
+            .iter()
+            .any(|i| matches!(i, MountItem::Delete { id: 6 }))
+    );
+    assert_eq!(c.overlays.len(), 1);
+    // `display: none` around it hides it.
+    add(&mut c, 14, Tag::View, ROOT_ID, &[]);
+    add(&mut c, 16, Tag::Overlay, 14, &[]);
+    c.commit().unwrap();
+    apply(
+        &mut c,
+        vec![style_op(14, &[("display", StyleValue::Str("none"))])],
+    );
+    let batch = c.commit().unwrap();
+    assert!(
+        batch
+            .items
+            .iter()
+            .any(|i| matches!(i, MountItem::Remove { id: 16 }))
+    );
+}
+
+#[test]
+fn anchored_overlays_go_beside_their_anchor_and_follow_it() {
+    use StyleValue::Number;
+    let mut c = core();
+    add(
+        &mut c,
+        2,
+        Tag::Scroll,
+        ROOT_ID,
+        &[("height", Number(480.0))],
+    );
+    add(&mut c, 4, Tag::View, 2, &[("height", Number(100.0))]);
+    add(
+        &mut c,
+        6,
+        Tag::View,
+        2,
+        &[
+            ("width", Number(80.0)),
+            ("height", Number(40.0)),
+            ("marginLeft", Number(20.0)),
+        ],
+    );
+    add(&mut c, 8, Tag::View, 2, &[("height", Number(1000.0))]);
+    add(&mut c, 10, Tag::Overlay, 6, &[]);
+    add(
+        &mut c,
+        12,
+        Tag::View,
+        10,
+        &[("width", Number(120.0)), ("height", Number(60.0))],
+    );
+    apply(
+        &mut c,
+        vec![
+            overlay_prop(
+                10,
+                crate::OverlayProp::Anchor(crate::overlay::OverlayAnchor::Node(6)),
+            ),
+            overlay_prop(10, crate::OverlayProp::Align(crate::overlay::Align::Start)),
+            overlay_prop(10, crate::OverlayProp::Offset(px(4.0))),
+            Op::Listen {
+                id: 10,
+                event: EventKind::Position,
+                enabled: true,
+            },
+        ],
+    );
+    let batch = c.commit().unwrap();
+    assert_eq!(frame_of(&batch, 10), Some(rect(20.0, 144.0, 120.0, 60.0)));
+    let events = js_events(&mut c);
+    assert!(events.iter().any(|(id, kind, payload)| *id == 10
+        && *kind == EventKind::Position
+        && matches!(payload, EventPayload::Map(m) if m.contains(&("placement", PayloadValue::Str("bottom".into()))))));
+
+    // The scroll view scrolled: it follows.
+    c.set_scroll_offset(2, point(px(0.0), px(30.0)), 0);
+    let batch = c.commit().unwrap();
+    assert_eq!(frame_of(&batch, 10), Some(rect(20.0, 114.0, 120.0, 60.0)));
+    // Near the bottom of the screen it goes above.
+    c.set_scroll_offset(2, point(px(0.0), px(-300.0)), 0);
+    let batch = c.commit().unwrap();
+    assert_eq!(frame_of(&batch, 10), Some(rect(20.0, 336.0, 120.0, 60.0)));
+    let events = js_events(&mut c);
+    assert!(events.iter().any(|(_, kind, payload)| *kind == EventKind::Position
+        && matches!(payload, EventPayload::Map(m) if m.contains(&("placement", PayloadValue::Str("top".into()))))));
+
+    // Kept inside the safe area less the margin.
+    c.set_scroll_offset(2, point(px(0.0), px(0.0)), 0);
+    c.set_safe_area(EdgeInsets {
+        left: px(30.0),
+        ..EdgeInsets::default()
+    });
+    apply(
+        &mut c,
+        vec![overlay_prop(10, crate::OverlayProp::Margin(px(8.0)))],
+    );
+    let batch = c.commit().unwrap();
+    assert_eq!(frame_of(&batch, 10).map(|f| f.origin.x), Some(px(38.0)));
+
+    // A point anchor.
+    apply(
+        &mut c,
+        vec![overlay_prop(
+            10,
+            crate::OverlayProp::Anchor(crate::overlay::OverlayAnchor::Point(point(
+                px(200.0),
+                px(50.0),
+            ))),
+        )],
+    );
+    let batch = c.commit().unwrap();
+    assert_eq!(frame_of(&batch, 10), Some(rect(192.0, 54.0, 120.0, 60.0)));
+}
+
+fn touch_down(path: Vec<NodeId>) -> EventPayload {
+    EventPayload::Touch(Box::new(crate::TouchEvent {
+        phase: crate::TouchPhase::Start,
+        timestamp: 0.0,
+        points: vec![crate::TouchPoint {
+            id: 1,
+            target: path[0],
+            path,
+            page: point(px(5.0), px(6.0)),
+            location: point(px(5.0), px(6.0)),
+            changed: true,
+        }],
+        activated: None,
+    }))
+}
+
+#[test]
+fn overlays_hear_presses_outside_and_cancel_from_the_top() {
+    use StyleValue::Number;
+    let mut c = core();
+    add(&mut c, 2, Tag::View, ROOT_ID, &[("height", Number(40.0))]);
+    add(&mut c, 4, Tag::Overlay, 2, &[]);
+    add(&mut c, 6, Tag::Overlay, 4, &[]);
+    apply(
+        &mut c,
+        vec![
+            overlay_prop(
+                4,
+                crate::OverlayProp::Anchor(crate::overlay::OverlayAnchor::Node(2)),
+            ),
+            Op::Listen {
+                id: 4,
+                event: EventKind::PressOutside,
+                enabled: true,
+            },
+            Op::Listen {
+                id: 4,
+                event: EventKind::Cancel,
+                enabled: true,
+            },
+            Op::Listen {
+                id: 6,
+                event: EventKind::Cancel,
+                enabled: true,
+            },
+        ],
+    );
+    let batch = c.commit().unwrap();
+    // The overlays, the anchor and the root listen to touches.
+    for id in [ROOT_ID, 2, 4, 6] {
+        let events = batch.items.iter().find_map(|i| match i {
+            MountItem::Events { id: i, events } if *i == id => Some(*events),
+            _ => None,
+        });
+        assert!(events.is_some_and(|e| e.contains(EventKind::Touch)), "{id}");
+    }
+    // Escape is bound, back listened to.
+    let keymap = batch.items.iter().find_map(|i| match i {
+        MountItem::Keymap(k) => Some(k.clone()),
+        _ => None,
+    });
+    assert!(keymap.is_some_and(|k| k.bindings().iter().any(|b| b.id == overlay::ESCAPE_BINDING)));
+    js_events(&mut c);
+
+    for (path, outside) in [
+        (vec![ROOT_ID], true),
+        (vec![2, ROOT_ID], false),
+        (vec![4, ROOT_ID], false),
+        (vec![6, ROOT_ID], false),
+    ] {
+        c.component_event(ROOT_ID, EventKind::Touch, &touch_down(path.clone()));
+        let events = js_events(&mut c);
+        let pressed = events
+            .iter()
+            .any(|(id, kind, _)| *id == 4 && *kind == EventKind::PressOutside);
+        assert_eq!(pressed, outside, "{path:?}");
+    }
+
+    // The top one listening hears Escape and back.
+    c.component_event(
+        ROOT_ID,
+        EventKind::KeyCommand,
+        &EventPayload::Value(PayloadValue::Number(overlay::ESCAPE_BINDING as f64)),
+    );
+    c.commit();
+    let events = js_events(&mut c);
+    assert!(
+        events.contains(&(6, EventKind::Cancel, EventPayload::None)),
+        "{events:?}"
+    );
+    assert!(!events.iter().any(|(id, ..)| *id == 4));
+    apply(
+        &mut c,
+        vec![Op::Listen {
+            id: 6,
+            event: EventKind::Cancel,
+            enabled: false,
+        }],
+    );
+    c.commit();
+    assert!(c.component_event(ROOT_ID, EventKind::BackPress, &EventPayload::None));
+    c.commit();
+    let events = js_events(&mut c);
+    assert!(
+        events.contains(&(4, EventKind::Cancel, EventPayload::None)),
+        "{events:?}"
+    );
+
+    // Closed: nothing is listened to any more.
+    apply(
+        &mut c,
+        vec![Op::Remove {
+            parent: 2,
+            child: 4,
+        }],
+    );
+    let batch = c.commit().unwrap();
+    let root_events = batch.items.iter().find_map(|i| match i {
+        MountItem::Events {
+            id: ROOT_ID,
+            events,
+        } => Some(*events),
+        _ => None,
+    });
+    assert!(root_events.is_some_and(|e| !e.contains(EventKind::Touch)));
+}
+
+#[test]
+fn overlays_in_a_modal_show_in_it() {
+    use StyleValue::Number;
+    let mut c = core();
+    add(&mut c, 2, Tag::Modal, ROOT_ID, &[]);
+    add(&mut c, 4, Tag::View, 2, &[("height", Number(40.0))]);
+    add(
+        &mut c,
+        6,
+        Tag::Overlay,
+        4,
+        &[("right", Number(0.0)), ("bottom", Number(0.0))],
+    );
+    add(
+        &mut c,
+        8,
+        Tag::View,
+        6,
+        &[("width", Number(10.0)), ("height", Number(10.0))],
+    );
+    c.set_root_size(2, size_pt(200.0, 300.0), EdgeInsets::default());
+    let batch = c.commit().unwrap();
+    assert!(inserts(&batch).contains(&(2, 6, None)));
+    assert_eq!(frame_of(&batch, 6), Some(rect(190.0, 290.0, 10.0, 10.0)));
+}
+
+#[test]
+fn overlays_anchored_to_content_go_by_what_the_wrapper_draws() {
+    use StyleValue::Number;
+    let mut c = core();
+    // A wrapper the root stretches, around an 80 × 30 trigger.
+    add(
+        &mut c,
+        2,
+        Tag::View,
+        ROOT_ID,
+        &[("paddingTop", Number(50.0))],
+    );
+    add(&mut c, 4, Tag::View, 2, &[]);
+    add(
+        &mut c,
+        6,
+        Tag::View,
+        4,
+        &[
+            ("width", Number(80.0)),
+            ("height", Number(30.0)),
+            ("alignSelf", StyleValue::Str("flex-start")),
+        ],
+    );
+    add(&mut c, 8, Tag::Overlay, 2, &[]);
+    add(
+        &mut c,
+        10,
+        Tag::View,
+        8,
+        &[("width", Number(40.0)), ("height", Number(20.0))],
+    );
+    apply(
+        &mut c,
+        vec![overlay_prop(
+            8,
+            crate::OverlayProp::Anchor(crate::overlay::OverlayAnchor::Content(4)),
+        )],
+    );
+    let batch = c.commit().unwrap();
+    // Centered below the trigger (0, 50, 80 × 30), not the 320-wide wrapper.
+    assert_eq!(frame_of(&batch, 8), Some(rect(20.0, 80.0, 40.0, 20.0)));
+    // Against the wrapper itself: centered on its width.
+    apply(
+        &mut c,
+        vec![overlay_prop(
+            8,
+            crate::OverlayProp::Anchor(crate::overlay::OverlayAnchor::Node(4)),
+        )],
+    );
+    let batch = c.commit().unwrap();
+    assert_eq!(frame_of(&batch, 8), Some(rect(140.0, 80.0, 40.0, 20.0)));
+}
+
+/// The texts a batch lays out.
+fn texts_of(batch: &MountBatch) -> Vec<String> {
+    batch
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            MountItem::Text { text, .. } => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether the batch mounts `id` listening to `kind`.
+fn mounts_listening(batch: &MountBatch, id: NodeId, kind: EventKind) -> Option<bool> {
+    batch.items.iter().rev().find_map(|i| match i {
+        MountItem::Events { id: i, events } if *i == id => Some(events.contains(kind)),
+        _ => None,
+    })
+}
+
+#[test]
+fn tooltips_show_after_the_pointer_rests_and_hide_when_it_leaves_or_presses() {
+    use StyleValue::Number;
+    let clock = crate::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+    let _clock = clock.enter();
+    let mut c = core();
+    c.set_environment(crate::ui::Environment {
+        os: crate::platform::Os::Linux,
+        idiom: crate::platform::Idiom::Desktop,
+        ..crate::ui::Environment::default()
+    });
+    add(
+        &mut c,
+        2,
+        Tag::View,
+        ROOT_ID,
+        &[
+            ("marginTop", Number(100.0)),
+            ("width", Number(80.0)),
+            ("height", Number(40.0)),
+        ],
+    );
+    apply(
+        &mut c,
+        vec![Op::SetProp {
+            id: 2,
+            prop: Prop::Tooltip(crate::overlay::TooltipContent::Text("Saves it".into())),
+        }],
+    );
+    let batch = c.commit().unwrap();
+    // The element follows the pointer; the tooltip waits out of the view.
+    assert_eq!(mounts_listening(&batch, 2, EventKind::HoverIn), Some(true));
+    assert!(texts_of(&batch).is_empty(), "{:?}", texts_of(&batch));
+
+    c.component_event(2, EventKind::HoverIn, &EventPayload::None);
+    c.run_component_tasks();
+    assert!(c.commit().is_none());
+    clock.advance_to(crate::time::now() + std::time::Duration::from_millis(499));
+    c.run_component_tasks();
+    assert!(c.commit().is_none());
+    clock.advance_to(crate::time::now() + std::time::Duration::from_millis(1));
+    c.run_component_tasks();
+    let batch = c.commit().unwrap();
+    assert_eq!(texts_of(&batch), ["Saves it"]);
+    // In the root view, above the element.
+    let overlay = inserts(&batch)
+        .into_iter()
+        .find(|&(p, ..)| p == ROOT_ID)
+        .map(|(_, child, _)| child)
+        .expect("the tooltip's overlay in the root view");
+    let frame = frame_of(&batch, overlay).unwrap();
+    assert_eq!(frame.bottom(), px(96.0));
+    // A bubble of the theme's `popover` tokens.
+    let style = batch.items.iter().find_map(|i| match i {
+        MountItem::ViewStyle { id, style } if *id == overlay => Some(style.clone()),
+        _ => None,
+    });
+    assert!(
+        style.is_some_and(|s| s.background_color != Color::default() && s.border_radius.0 > 0.0)
+    );
+
+    // Leaving hides it.
+    c.component_event(2, EventKind::HoverOut, &EventPayload::None);
+    let batch = c.commit().unwrap();
+    assert!(
+        batch
+            .items
+            .iter()
+            .any(|i| matches!(i, MountItem::Remove { id } if *id == overlay))
+    );
+
+    // A press hides it too, until the pointer comes again.
+    c.component_event(2, EventKind::HoverIn, &EventPayload::None);
+    clock.advance_to(crate::time::now() + std::time::Duration::from_millis(500));
+    c.run_component_tasks();
+    assert!(c.commit().is_some());
+    c.component_event(ROOT_ID, EventKind::Touch, &touch_down(vec![2, ROOT_ID]));
+    let batch = c.commit().unwrap();
+    assert!(
+        batch
+            .items
+            .iter()
+            .any(|i| matches!(i, MountItem::Remove { id } if *id == overlay))
+    );
+    clock.advance_to(crate::time::now() + std::time::Duration::from_millis(1000));
+    c.run_component_tasks();
+    assert!(c.commit().is_none());
+
+    // No tooltip: the element no longer follows the pointer.
+    apply(
+        &mut c,
+        vec![Op::SetProp {
+            id: 2,
+            prop: Prop::Tooltip(crate::overlay::TooltipContent::None),
+        }],
+    );
+    let batch = c.commit().unwrap();
+    assert_eq!(mounts_listening(&batch, 2, EventKind::HoverIn), Some(false));
+}
+
+#[test]
+fn tooltips_wait_for_nothing_on_touch_screens() {
+    use StyleValue::Number;
+    let mut c = core();
+    add(&mut c, 2, Tag::View, ROOT_ID, &[("height", Number(40.0))]);
+    apply(
+        &mut c,
+        vec![Op::SetProp {
+            id: 2,
+            prop: Prop::Tooltip(crate::overlay::TooltipContent::Text("Saves it".into())),
+        }],
+    );
+    let batch = c.commit().unwrap();
+    assert_eq!(mounts_listening(&batch, 2, EventKind::HoverIn), None);
+}
+
+#[test]
+fn a_tooltip_element_is_shown_as_it_is() {
+    use StyleValue::Number;
+    let mut c = core();
+    add(&mut c, 2, Tag::View, ROOT_ID, &[("height", Number(40.0))]);
+    add(&mut c, 4, Tag::Text, ROOT_ID, &[]);
+    apply(
+        &mut c,
+        vec![
+            Op::Remove {
+                parent: ROOT_ID,
+                child: 4,
+            },
+            Op::SetProp {
+                id: 2,
+                prop: Prop::Tooltip(crate::overlay::TooltipContent::Node(4)),
+            },
+            // Shown whatever the pointer does.
+            Op::SetProp {
+                id: 2,
+                prop: Prop::Tooltip(crate::overlay::TooltipContent::Node(4)),
+            },
+        ],
+    );
+    c.commit();
+    let key = c.key(4).unwrap();
+    let overlay = c.nodes[key as usize].parent;
+    assert_eq!(c.nodes[overlay as usize].kind, Kind::Overlay);
+    assert_eq!(c.nodes[c.nodes[overlay as usize].parent as usize].id, 2);
+    // A text in place of the element: it leaves (still JS's).
+    apply(
+        &mut c,
+        vec![Op::SetProp {
+            id: 2,
+            prop: Prop::Tooltip(crate::overlay::TooltipContent::Text("Hi".into())),
+        }],
+    );
+    c.commit();
+    assert_eq!(c.nodes[c.key(4).unwrap() as usize].parent, NO_KEY);
+    // Released with the element.
+    let made = c.overlay_state.tooltips[&2];
+    apply(
+        &mut c,
+        vec![
+            Op::Remove {
+                parent: ROOT_ID,
+                child: 2,
+            },
+            Op::Release { id: 2 },
+        ],
+    );
+    c.commit();
+    assert!(c.overlay_state.tooltips.is_empty());
+    assert!(c.key(made.overlay).is_err());
+}
+
+#[test]
+fn a_tooltip_element_that_is_a_hint_overlay_is_the_tooltip_itself() {
+    use StyleValue::Number;
+    let mut c = core();
+    add(&mut c, 2, Tag::View, ROOT_ID, &[("height", Number(40.0))]);
+    // As `nsh-base`'s `Tooltip` makes it: a hint overlay, out of the tree.
+    apply(
+        &mut c,
+        vec![
+            Op::Create {
+                id: 4,
+                tag: Tag::Overlay,
+            },
+            overlay_prop(
+                4,
+                crate::OverlayProp::Hint(Some(std::time::Duration::from_millis(300))),
+            ),
+            Op::SetProp {
+                id: 2,
+                prop: Prop::Tooltip(crate::overlay::TooltipContent::Node(4)),
+            },
+        ],
+    );
+    let wrapper = c.overlay_state.tooltips[&2].overlay;
+    c.commit();
+    let made = c.overlay_state.tooltips[&2];
+    assert_eq!(made.overlay, 4);
+    assert!(c.key(wrapper).is_err(), "the core's own overlay is gone");
+    let key = c.key(4).unwrap();
+    assert_eq!(c.nodes[c.nodes[key as usize].parent as usize].id, 2);
+    // Another tooltip: it leaves the element, still JS's.
+    apply(
+        &mut c,
+        vec![Op::SetProp {
+            id: 2,
+            prop: Prop::Tooltip(crate::overlay::TooltipContent::Text("Hi".into())),
+        }],
+    );
+    c.commit();
+    assert_eq!(c.nodes[c.key(4).unwrap() as usize].parent, NO_KEY);
+    assert_ne!(c.overlay_state.tooltips[&2].overlay, 4);
+}
+
+/// An image node `id` showing `source` (and `placeholder`), in the root.
+fn image_ops(id: NodeId, source: ImageSource, placeholder: Option<ImageSource>) -> Vec<Op> {
+    let mut ops = vec![
+        Op::Create {
+            id,
+            tag: Tag::Image,
+        },
+        Op::SetProp {
+            id,
+            prop: Prop::Source(Some(source)),
+        },
+    ];
+    if placeholder.is_some() {
+        ops.push(Op::SetProp {
+            id,
+            prop: Prop::Image(ImageProp::DefaultSource(placeholder)),
+        });
+    }
+    ops.push(Op::Insert {
+        parent: ROOT_ID,
+        child: id,
+        before: None,
+    });
+    ops
+}
+
+fn asset(uri: &str, scales: &[f32]) -> ImageSource {
+    ImageSource {
+        uri: uri.into(),
+        size: Some(crate::geometry::size_pt(40.0, 30.0)),
+        scales: scales.iter().copied().collect(),
+    }
+}
+
+/// The source and placeholder URIs of `id`'s last image item.
+fn image_uris(batch: &MountBatch, id: NodeId) -> Option<(Option<String>, Option<String>)> {
+    batch.items.iter().rev().find_map(|i| match i {
+        MountItem::Image {
+            id: i,
+            source,
+            options,
+            ..
+        } if *i == id => Some((
+            source.as_ref().map(|s| s.uri.to_string()),
+            options.placeholder.as_ref().map(|s| s.uri.to_string()),
+        )),
+        _ => None,
+    })
+}
+
+fn at_ratio(c: &mut Core<FakeEngine>, pixel_ratio: f32) {
+    c.set_environment(crate::ui::Environment {
+        pixel_ratio,
+        ..Default::default()
+    });
+}
+
+#[test]
+fn image_scales_pick_the_smallest_at_least_the_ratio_else_the_largest() {
+    let set: ImageScales = [1.0, 2.0, 3.0].into_iter().collect();
+    let picks: Vec<_> = [1.0, 1.5, 2.0, 2.625, 3.0, 3.5]
+        .into_iter()
+        .map(|r| set.pick(r))
+        .collect();
+    assert_eq!(
+        picks,
+        [
+            Some(1.0),
+            Some(2.0),
+            Some(2.0),
+            Some(3.0),
+            Some(3.0),
+            Some(3.0)
+        ]
+    );
+    let set = |values: [f32; 2]| values.into_iter().collect::<ImageScales>();
+    assert_eq!(set([1.0, 1.5]).pick(1.2), Some(1.5));
+    assert_eq!(set([2.0, 4.0]).pick(1.0), Some(2.0));
+    assert_eq!(ImageScales::NONE.pick(2.0), None);
+    assert_eq!(
+        IMAGE_SCALES
+            .into_iter()
+            .collect::<ImageScales>()
+            .iter()
+            .collect::<Vec<_>>(),
+        IMAGE_SCALES
+    );
+}
+
+#[test]
+fn image_scales_name_the_variants_and_keep_the_1x_file() {
+    let a = asset("asset:/img/a.png", &[1.0, 1.5, 2.0, 3.0, 4.0]);
+    let uris: Vec<_> = [1.0, 1.5, 2.0, 3.0, 4.0]
+        .into_iter()
+        .map(|r| a.uri_for(r).to_string())
+        .collect();
+    assert_eq!(
+        uris,
+        [
+            "asset:/img/a.png",
+            "asset:/img/a@1.5x.png",
+            "asset:/img/a@2x.png",
+            "asset:/img/a@3x.png",
+            "asset:/img/a@4x.png"
+        ]
+    );
+    // The 1x file is the URI itself, not a copy.
+    assert!(std::sync::Arc::ptr_eq(&a.uri_for(1.0), &a.uri));
+    assert_eq!(
+        &*asset("asset:/x.y/b", &[1.0, 2.0]).uri_for(2.0),
+        "asset:/x.y/b@2x"
+    );
+    assert_eq!(
+        &*asset("asset:/.hidden", &[1.0, 2.0]).uri_for(2.0),
+        "asset:/.hidden@2x"
+    );
+    assert_eq!(
+        &*asset("asset:/c.d.webp", &[3.0]).uri_for(1.0),
+        "asset:/c.d@3x.webp"
+    );
+}
+
+#[test]
+fn image_scales_leave_remote_and_file_uris_alone() {
+    for uri in [
+        "https://x.org/a.png",
+        "http://x.org/a.png",
+        "/tmp/a.png",
+        "file:///a.png",
+    ] {
+        let source = asset(uri, &[1.0, 2.0, 3.0]);
+        assert!(
+            std::sync::Arc::ptr_eq(&source.uri_for(3.0), &source.uri),
+            "{uri}"
+        );
+    }
+}
+
+/// A query or a fragment is no part of a bundled file's name: such an
+/// asset URI loads as it is, at every ratio.
+#[test]
+fn image_scales_leave_uris_with_a_query_or_a_fragment_alone() {
+    for uri in [
+        "asset:/a.png?v=2",
+        "asset:/a.png#frame",
+        "asset:/dir?x=1/a.png",
+        "asset:/a#b.png",
+    ] {
+        let source = asset(uri, &[1.0, 2.0, 3.0]);
+        for ratio in [1.0, 2.0, 3.0] {
+            assert!(
+                std::sync::Arc::ptr_eq(&source.uri_for(ratio), &source.uri),
+                "{uri} at {ratio}"
+            );
+        }
+        let mut c = core();
+        at_ratio(&mut c, 3.0);
+        apply(&mut c, image_ops(2, source, None));
+        let batch = c.commit().unwrap();
+        assert_eq!(image_uris(&batch, 2), Some((Some(uri.into()), None)));
+    }
+}
+
+#[test]
+fn image_scales_drop_invalid_values() {
+    let set: ImageScales = [f32::NAN, -2.0, 0.0, 2.5, 5.0, f32::INFINITY, 2.0]
+        .into_iter()
+        .collect();
+    assert_eq!(set.iter().collect::<Vec<_>>(), [2.0]);
+    assert!(
+        [f32::NAN, -1.0]
+            .into_iter()
+            .collect::<ImageScales>()
+            .is_empty()
+    );
+}
+
+/// The JS shapes, through the host decoding (a JSON stand-in for JS
+/// values).
+#[test]
+fn image_scales_decode_from_js() {
+    use crate::js::host::{HostCx, HostInput, HostList, HostValue};
+
+    struct J(serde_json::Value);
+    struct L(Vec<serde_json::Value>);
+    impl HostList for L {
+        type Item = J;
+        fn len(&self) -> usize {
+            self.0.len()
+        }
+        fn item(&self, i: usize) -> Option<J> {
+            self.0.get(i).cloned().map(J)
+        }
+    }
+    impl HostInput for J {
+        type List = L;
+        fn is_nullish(&self) -> bool {
+            self.0.is_null()
+        }
+        fn is_object(&self) -> bool {
+            self.0.is_object() || self.0.is_array()
+        }
+        fn as_bool(&self) -> Option<bool> {
+            self.0.as_bool()
+        }
+        fn as_number(&self) -> Option<f64> {
+            self.0.as_f64()
+        }
+        fn as_string(&self) -> Option<String> {
+            self.0.as_str().map(str::to_owned)
+        }
+        fn field(&self, key: &str) -> Option<J> {
+            self.0.get(key).cloned().map(J)
+        }
+        fn as_list(&self) -> Option<L> {
+            self.0.as_array().cloned().map(L)
+        }
+        fn entries(&self) -> Vec<(String, J)> {
+            Vec::new()
+        }
+        fn truthy(&self) -> bool {
+            !self.0.is_null()
+        }
+    }
+    let decode = |v: serde_json::Value| ImageSource::decode(&J(v), &mut HostCx::default());
+
+    let source = decode(serde_json::json!({
+        "uri": "asset:/a.png", "width": 40, "height": 30, "scales": [1, 2, "3", -1, 2.5, 3]
+    }))
+    .unwrap();
+    assert_eq!(source.size, Some(crate::geometry::size_pt(40.0, 30.0)));
+    assert_eq!(source.scales.iter().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
+    let plain = decode(serde_json::json!({ "uri": "asset:/a.png", "width": 40, "height": 30 }));
+    assert_eq!(plain.unwrap().scales, ImageScales::NONE);
+    assert_eq!(
+        decode(serde_json::json!("https://x.org/a.png"))
+            .unwrap()
+            .scales,
+        ImageScales::NONE
+    );
+    let odd = decode(serde_json::json!({ "uri": "asset:/a.png", "scales": "2" })).unwrap();
+    assert!(odd.scales.is_empty());
+    // Only the first entries are read.
+    let long = decode(serde_json::json!({
+        "uri": "asset:/a.png", "scales": [1, 1, 1, 1, 1, 1, 1, 1, 2]
+    }));
+    assert_eq!(long.unwrap().scales.iter().collect::<Vec<_>>(), [1.0]);
+}
+
+#[test]
+fn image_scales_mount_the_variant_for_the_pixel_ratio() {
+    for (ratio, file) in [
+        (1.0, "a.png"),
+        (2.0, "a@2x.png"),
+        (2.625, "a@3x.png"),
+        (3.0, "a@3x.png"),
+    ] {
+        let mut c = core();
+        at_ratio(&mut c, ratio);
+        let mut ops = image_ops(
+            2,
+            asset("asset:/a.png", &[1.0, 2.0, 3.0]),
+            Some(asset("asset:/p.png", &[1.0, 2.0])),
+        );
+        ops.extend(image_ops(3, asset("asset:/a.png", &[1.0, 2.0, 3.0]), None));
+        ops.push(style_op(3, &[("alignSelf", StyleValue::Str("flex-start"))]));
+        apply(&mut c, ops);
+        let batch = c.commit().unwrap();
+        let placeholder = if ratio > 1.0 { "p@2x.png" } else { "p.png" };
+        assert_eq!(
+            image_uris(&batch, 2),
+            Some((
+                Some(format!("asset:/{file}")),
+                Some(format!("asset:/{placeholder}"))
+            )),
+            "at {ratio}"
+        );
+        // The size in points does not depend on the variant.
+        assert_eq!(
+            frame_of(&batch, 3).map(|f| f.size),
+            Some(crate::geometry::size_pt(40.0, 30.0)),
+            "at {ratio}"
+        );
+    }
+}
+
+#[test]
+fn image_scales_change_nothing_without_scales() {
+    let mut c = core();
+    at_ratio(&mut c, 3.0);
+    let plain = asset("asset:/a.png", &[]);
+    apply(
+        &mut c,
+        image_ops(2, plain.clone(), Some(asset("asset:/a@3x.png", &[]))),
+    );
+    let batch = c.commit().unwrap();
+    let source = batch.items.iter().find_map(|i| match i {
+        MountItem::Image { id: 2, source, .. } => source.clone(),
+        _ => None,
+    });
+    assert_eq!(source, Some(plain));
+    assert_eq!(
+        image_uris(&batch, 2),
+        Some((Some("asset:/a.png".into()), Some("asset:/a@3x.png".into())))
+    );
+    // A ratio change sends nothing for them.
+    at_ratio(&mut c, 2.0);
+    let batch = c.commit();
+    assert!(
+        batch.is_none_or(|b| !b.items.iter().any(|i| matches!(i, MountItem::Image { .. }))),
+        "nothing for images without scales"
+    );
+}
+
+/// Rust components: an `asset!` image with variants (`ImageAsset::scales`)
+/// is picked as an imported one.
+mod asset_variants {
+    use super::*;
+    use crate::ui::{ImageAsset, prelude::*};
+
+    const FLAG: ImageAsset = ImageAsset {
+        uri: "asset:/@demo/flag.png",
+        size: crate::geometry::size_pt(17.0, 12.0),
+        scales: &[1.0, 2.0, 3.0],
+    };
+    const PLAIN: ImageAsset = ImageAsset {
+        uri: "asset:/@demo/plain.png",
+        size: crate::geometry::size_pt(10.0, 10.0),
+        scales: &[],
+    };
+
+    #[component]
+    fn Flags() -> impl IntoElement {
+        view()
+            .child(image(FLAG))
+            .child(image(PLAIN).placeholder(FLAG))
+    }
+
+    /// The image items' source and placeholder URIs, in mount order.
+    fn shown(pixel_ratio: f32) -> Vec<(Option<String>, Option<String>)> {
+        let mut c = core();
+        at_ratio(&mut c, pixel_ratio);
+        c.mount_root(&crate::ui::Root::new::<Flags>(|| ()));
+        let batch = c.commit().unwrap();
+        batch
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                MountItem::Image { id, .. } => image_uris(&batch, *id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn some(uri: &str) -> Option<String> {
+        Some(uri.to_owned())
+    }
+
+    #[test]
+    fn asset_variants_pick_for_the_pixel_ratio() {
+        assert_eq!(
+            shown(3.0),
+            [
+                (some("asset:/@demo/flag@3x.png"), None),
+                (
+                    some("asset:/@demo/plain.png"),
+                    some("asset:/@demo/flag@3x.png")
+                )
+            ]
+        );
+        assert_eq!(
+            shown(2.0),
+            [
+                (some("asset:/@demo/flag@2x.png"), None),
+                (
+                    some("asset:/@demo/plain.png"),
+                    some("asset:/@demo/flag@2x.png")
+                )
+            ]
+        );
+    }
+
+    #[test]
+    fn asset_variants_none_keep_the_file() {
+        assert_eq!(
+            shown(1.0),
+            [
+                (some("asset:/@demo/flag.png"), None),
+                (
+                    some("asset:/@demo/plain.png"),
+                    some("asset:/@demo/flag.png")
+                )
+            ]
+        );
+        let src: crate::ui::ImageSrc = PLAIN.into();
+        assert!(src.scales.is_empty());
+        let src: crate::ui::ImageSrc = FLAG.into();
+        assert_eq!(src.scales.iter().collect::<Vec<_>>(), [1.0, 2.0, 3.0]);
+        assert_eq!(src.size, Some((17.0, 12.0)));
     }
 }

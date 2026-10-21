@@ -23,8 +23,16 @@ unsafe extern "C" {
     fn js_submit(json: *const u8, len: usize);
     #[link_name = "request_frame"]
     fn js_request_frame();
+    #[link_name = "request_pump"]
+    fn js_request_pump();
     #[link_name = "report_error"]
     fn js_report_error(message: *const u8, len: usize);
+    /// A message of a test session's app for the dev server (JSON
+    /// `nsh_dev::protocol::ClientMessage`: its requests), sent over the
+    /// page's socket.
+    #[cfg(feature = "dev")]
+    #[link_name = "test_send"]
+    fn js_test_send(json: *const u8, len: usize);
     #[link_name = "log"]
     fn js_log(level: u32, message: *const u8, len: usize);
     #[link_name = "read_asset"]
@@ -131,6 +139,22 @@ pub(crate) fn submit(json: &str) {
 pub(crate) fn request_frame() {
     // SAFETY: no arguments.
     unsafe { js_request_frame() }
+}
+
+/// Asks for an `nsh_pump` soon: the engine has work that came outside a
+/// call into it (a task woken by a browser callback, through wasm-bindgen's
+/// glue) or that a pump left for the next. JS coalesces the requests into
+/// one pump per turn and never calls in while a call runs.
+pub(crate) fn request_pump() {
+    // SAFETY: no arguments.
+    unsafe { js_request_pump() }
+}
+
+/// Sends a test session's app's message to the dev server (JSON).
+#[cfg(feature = "dev")]
+pub(crate) fn test_send(json: &str) {
+    // SAFETY: the slice is valid for the call; JS copies it.
+    unsafe { js_test_send(json.as_ptr(), json.len()) }
 }
 
 /// Shows an app error.

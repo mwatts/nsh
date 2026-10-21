@@ -16,10 +16,9 @@ use nsh_core::{
 use nsh_engine::{HttpBody, HttpRequest};
 
 use crate::{
+    MemoryStorage,
     driver::{Driver, headless_only},
-    headless::{
-        self, MemoryStorage, RecordingNetwork, StubReply, StubResponse, StubRoute, default_answer,
-    },
+    headless::{self, RecordingNetwork, StubReply, StubResponse, StubRoute, default_answer},
     run::{OpenApp, Session},
 };
 
@@ -373,8 +372,10 @@ pub struct OpenOptions {
     pub locale: Option<String>,
     /// The user asked for less motion (false).
     pub reduced_motion: Option<bool>,
-    /// The platform the app believes it runs on (`"ios"`).
-    pub platform: Option<MobilePlatform>,
+    /// The platform the app believes it runs on headless (`"ios"`; a
+    /// desktop's: `"macos"`, `"windows"`, `"linux"`, `"web"`). On a real
+    /// platform it is that one.
+    pub platform: Option<Platform>,
     /// A manual clock for the app (none: the system's): its time moves only
     /// as the test moves it (`app.clock`), steps finish native animations
     /// at once, and `app.wait` moves it.
@@ -423,37 +424,24 @@ impl JsValue for Time {
 pub struct DragTarget(pub headless::DragTo);
 
 impl JsValue for DragTarget {
-    fn ts_type(_types: &mut TsTypes) -> String {
-        "string | { x: number; y: number }".into()
+    fn ts_type(types: &mut TsTypes) -> String {
+        format!("string | {}", <DragBy as JsValue>::ts_type(types))
     }
 
     fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
         if let Some(selector) = value.as_string() {
             return Ok(DragTarget(headless::DragTo::Onto(selector)));
         }
-        let expected = || value.expected("a selector or { x, y } points");
-        if value.kind() != JsKind::Object {
-            return Err(expected());
-        }
-        let number = |key: &str| -> Result<f32, PropError> {
-            let n = value
-                .field(key)?
-                .get()
-                .as_number()
-                .filter(|n| n.is_finite());
-            n.map(|n| n as f32).ok_or_else(expected)
-        };
-        let by = nsh_core::geometry::point(
-            nsh_core::geometry::px(number("x")?),
-            nsh_core::geometry::px(number("y")?),
-        );
-        Ok(DragTarget(headless::DragTo::By(by)))
+        let by = <DragBy as JsValue>::from_js(value)?;
+        Ok(DragTarget(headless::DragTo::By(nsh_core::geometry::point(
+            by.x, by.y,
+        ))))
     }
 
     fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
         match &self.0 {
             headless::DragTo::Onto(selector) => selector.to_js(host),
-            headless::DragTo::By(by) => serde_json::json!({ "x": by.x.0, "y": by.y.0 }).to_js(host),
+            headless::DragTo::By(by) => DragBy { x: by.x, y: by.y }.to_js(host),
         }
     }
 }
@@ -477,15 +465,28 @@ impl From<ColorScheme> for nsh_core::platform::ColorScheme {
     }
 }
 
-/// The mobile platform an app is opened as.
+/// The platform a headless app is opened as.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PropEnum)]
-pub enum MobilePlatform {
+pub enum Platform {
     /// iOS.
     #[default]
     Ios,
     /// Android.
     Android,
+    /// macOS: a desktop (keyboard shortcuts, the mouse's hover and context
+    /// menus).
+    Macos,
+    /// Windows: a desktop.
+    Windows,
+    /// Linux: a desktop.
+    Linux,
+    /// A browser, in the desktop idiom.
+    Web,
 }
+
+/// The platform a headless app is opened as.
+#[deprecated(note = "use `Platform`, which has the desktops too")]
+pub type MobilePlatform = Platform;
 
 /// A dialog the app showed (`AlertDialog.show`, an action sheet).
 #[derive(Debug, Clone, PartialEq, JsObject)]
@@ -548,6 +549,29 @@ pub struct WaitOptions {
     /// What it waits for: a view matching to show (`"shown"`, the default)
     /// or no view to match any more (`"gone"`).
     pub state: Option<WaitState>,
+}
+
+/// How far a drag moves the finger ([`App::drag`]), in points.
+#[derive(Debug, Default, Clone, Copy, PartialEq, JsObject)]
+pub(crate) struct DragBy {
+    /// Rightwards (negative: leftwards).
+    #[prop(default)]
+    pub x: Points,
+    /// Downwards (negative: upwards).
+    #[prop(default)]
+    pub y: Points,
+}
+
+/// An action of the context menu the app shows (`app.menu()`).
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct MenuEntry {
+    /// Its label; a submenu's actions after the submenu's (`"Share > Mail"`).
+    pub label: String,
+    /// It can be chosen.
+    pub enabled: bool,
+    /// Its check mark, when it is a checkable item.
+    #[prop(skip_none)]
+    pub checked: Option<bool>,
 }
 
 /// What [`WaitOptions`] waits for.
@@ -770,7 +794,7 @@ pub(crate) struct Launch {
     pub(crate) color_scheme: ColorScheme,
     pub(crate) locale: Option<String>,
     pub(crate) reduced_motion: bool,
-    pub(crate) platform: MobilePlatform,
+    pub(crate) platform: Platform,
     /// A manual clock's start.
     pub(crate) clock: Option<std::time::SystemTime>,
 }
@@ -1029,6 +1053,25 @@ impl Clock {
     }
 }
 
+/// The keyboard of an app (`app.keyboard`), as Playwright's
+/// `page.keyboard`: a hardware keyboard's keys.
+#[class]
+pub struct Keyboard {
+    steps: Steps,
+}
+
+#[class]
+impl Keyboard {
+    /// Presses `keys`, a keystroke as `nsh/keymap` names it (`"mod+k"`,
+    /// `"shift+/"`, `"escape"`; `mod` is the platform's command key): the
+    /// app's shortcut of it hears it (`onKeyCommand`), else the focused
+    /// input takes it, else Escape goes back.
+    pub async fn press(this: Instance<Self>, keys: String) -> Result<(), String> {
+        let steps = this.with(|k| k.steps.clone());
+        steps.run(move |app| app.press_key(&keys)).await
+    }
+}
+
 /// `ms` milliseconds, which a test gives as a number.
 fn duration(ms: f64) -> Result<Duration, String> {
     if ms.is_finite() && ms >= 0.0 {
@@ -1091,19 +1134,47 @@ impl App {
         .await
     }
 
-    /// Holds the pointer down on the middle of the view `selector` names,
-    /// moves it a display frame at a time to `to` (the middle of the view
-    /// a selector names, or `{ x, y }` points away), and lifts it, as a
-    /// mouse drag does: the views around it hear the touches and the
-    /// responder events (`onResponderGrant`, `onResponderMove`,
-    /// `onResponderRelease`), and a view with a native pan pans
-    /// (`onPanStart`, its `pan` values, `onPanEnd`).
+    /// Drags what `selector` names: a finger lands on its middle, rests for
+    /// 100 ms, moves by `{ x, y }` points (or onto the middle of the view a
+    /// second selector names), 10 per display frame, and lifts. A pan
+    /// moves with it (`onPanStart`, `onPanEnd`), the views listening to
+    /// touches hear them, a scroll view scrolls (pulled past its top, it
+    /// refreshes), and the press under the finger is cancelled. Onto a
+    /// view: headless runs only.
     pub async fn drag(
         this: Instance<Self>,
         selector: String,
         to: DragTarget,
     ) -> Result<(), String> {
         step(&this, move |app| app.drag(&selector, to.0)).await
+    }
+
+    /// The mouse's secondary button over the middle of what `selector`
+    /// names: it, or the nearest view around it listening, hears
+    /// `onContextMenu`, whose handler shows a menu (`Menu.popup`: read it
+    /// with `menu()`). Desktops and the web only: a phone has no mouse.
+    pub async fn right_click(this: Instance<Self>, selector: String) -> Result<(), String> {
+        step(&this, move |app| app.right_click(&selector)).await
+    }
+
+    /// Chooses the open context menu's action labelled `label` (a
+    /// submenu's: `"Share > Mail"`), as a click on it: the app hears
+    /// `onMenu`, then the menu closes.
+    pub async fn choose_menu_item(this: Instance<Self>, label: String) -> Result<(), String> {
+        step(&this, move |app| app.choose_menu_item(&label)).await
+    }
+
+    /// Closes the open context menu with nothing chosen, as Escape does.
+    pub async fn close_menu(this: Instance<Self>) -> Result<(), String> {
+        step(&this, move |app| app.close_menu()).await
+    }
+
+    /// Moves the mouse over the middle of what `selector` names: the views
+    /// under it hear `onHoverIn` (and the ones it left `onHoverOut`), take
+    /// their `hover:` styles and hear `onHoverMove`. Desktops and the web
+    /// only: a phone has no mouse.
+    pub async fn hover(this: Instance<Self>, selector: String) -> Result<(), String> {
+        step(&this, move |app| app.hover(&selector)).await
     }
 
     /// Lets the app run for `ms` milliseconds (timers and animations): on a
@@ -1216,11 +1287,13 @@ impl App {
 
     /// What the app's storage holds now.
     pub fn storage(&self) -> Result<Entries, String> {
-        let storage = self
-            .storage
-            .as_ref()
-            .ok_or_else(|| headless_only("`storage()`"))?;
-        Ok(Entries(storage.entries()))
+        if let Some(storage) = &self.storage {
+            return Ok(Entries(storage.entries()));
+        }
+        // On a real host: as the host's app keeps it.
+        let mut app = self.steps.app.lock().unwrap_or_else(|e| e.into_inner());
+        let driver = app.as_mut().ok_or("the app is closed")?;
+        Ok(Entries(driver.storage()?))
     }
 
     /// Goes back as the user does (a header's back button, swiping a sheet
@@ -1244,6 +1317,32 @@ impl App {
     /// The dialogs the app showed, in order.
     pub fn dialogs(&self) -> Result<Vec<Dialog>, String> {
         self.with(|app| Ok(app.dialogs()?.iter().map(Dialog::from).collect()))
+    }
+
+    /// The actions of the context menu the app shows (`Menu.popup`), a
+    /// submenu's after its label (`"Share > Mail"`); `null` when none is
+    /// open.
+    pub fn menu(&self) -> Result<Option<Vec<MenuEntry>>, String> {
+        self.with(|app| {
+            Ok(app.menu()?.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|e| MenuEntry {
+                        label: e.label,
+                        enabled: e.enabled,
+                        checked: e.checked,
+                    })
+                    .collect()
+            }))
+        })
+    }
+
+    /// The app's keyboard, whose keys the test presses.
+    #[getter]
+    pub fn keyboard(&self) -> Keyboard {
+        Keyboard {
+            steps: self.steps.clone(),
+        }
     }
 
     /// The app's manual clock (`open`'s `clock`), which the test moves.

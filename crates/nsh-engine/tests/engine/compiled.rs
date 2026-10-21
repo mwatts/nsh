@@ -76,6 +76,8 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         storage: None,
         clock: Default::default(),
         context: Default::default(),
+        pinned: Default::default(),
+        clipboard: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -233,6 +235,8 @@ fn start_app_with(app: &str, header_heights: (Points, Points)) -> (Engine, Recei
         storage: None,
         clock: Default::default(),
         context: Default::default(),
+        pinned: Default::default(),
+        clipboard: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -1199,7 +1203,7 @@ fn pages_place_their_header_without_a_native_one() {
 }
 
 const INPUT_AND_LIST: &str = r#"import { mount, signal, Input, Text, View } from "nsh";
-import { List } from "nsh/list";
+import { List } from "nsh";
 
 const items = signal<number[]>([]);
 const log = signal("log");

@@ -188,6 +188,12 @@ impl Variant {
     pub(crate) const ACTIVE: Self = Self::states(state::PRESSED);
     /// While disabled.
     pub(crate) const DISABLED: Self = Self::states(state::DISABLED);
+    /// While selected (set by the core from the accessibility state).
+    pub(crate) const SELECTED: Self = Self::states(state::SELECTED);
+    /// While checked (set by the core from the accessibility state).
+    pub(crate) const CHECKED: Self = Self::states(state::CHECKED);
+    /// While indeterminate (set by the core from the accessibility state).
+    pub(crate) const INDETERMINATE: Self = Self::states(state::INDETERMINATE);
     /// In dark appearance.
     const DARK: Self = Self {
         states: 0,
@@ -231,6 +237,9 @@ impl Variant {
             (state::FOCUSED, rank::FOCUS),
             (state::PRESSED, rank::ACTIVE),
             (state::DISABLED, rank::DISABLED),
+            (state::SELECTED, rank::SELECTED),
+            (state::CHECKED, rank::CHECKED),
+            (state::INDETERMINATE, rank::INDETERMINATE),
         ] {
             if self.states & bit != 0 {
                 r = r.max(rank);
@@ -2592,6 +2601,15 @@ pub trait Styled: Sized {
         self
     }
 
+    /// The tint color (Tailwind's `tint-*`): of template images, and of a
+    /// page header's buttons in [`super::Screen::header_style_with`].
+    fn tint_color(mut self, color: impl IntoReactive<AdaptiveColor>) -> Self {
+        self.style().bind_value(color, |s, color: AdaptiveColor| {
+            s.color(&[StyleKey::TintColor], color);
+        });
+        self
+    }
+
     /// The font size, in points.
     fn text_size(mut self, size: impl IntoReactive<Length>) -> Self {
         self.style().bind_value(size, |s, size: Length| {
@@ -2993,6 +3011,34 @@ pub trait Styled: Sized {
     fn dark(mut self, f: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
         let s = f(StyleRefinement::default());
         self.style().extend_as(Variant::DARK, s);
+        self
+    }
+
+    /// Styles while selected (Tailwind's `selected:`): the element's
+    /// accessibility state says so (a `Button`'s `selected`, a tab's).
+    fn selected(mut self, f: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
+        let s = f(StyleRefinement::default());
+        self.style().extend_as(Variant::SELECTED, s);
+        self
+    }
+
+    /// Styles while checked (Tailwind's `checked:`): the element's
+    /// accessibility state says so, not mixed (a checkbox's, a switch's, a
+    /// radio's), or the control it is a part of is
+    /// (`Interactive::project_checked`: a switch's thumb).
+    fn checked(mut self, f: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
+        let s = f(StyleRefinement::default());
+        self.style().extend_as(Variant::CHECKED, s);
+        self
+    }
+
+    /// Styles while indeterminate (Tailwind's `indeterminate:`): the
+    /// element's accessibility state says checked is mixed (a checkbox
+    /// that is neither), or the control it is a part of is
+    /// (`Interactive::project_indeterminate`: a checkbox's indicator).
+    fn indeterminate(mut self, f: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
+        let s = f(StyleRefinement::default());
+        self.style().extend_as(Variant::INDETERMINATE, s);
         self
     }
 

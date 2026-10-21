@@ -9,6 +9,8 @@ import CoreAnimated from "./core-animated";
 import CoreCanvas from "./core-canvas";
 import CoreElements from "./core-elements";
 import CoreList from "./core-list";
+import CoreOverlay from "./core-overlay";
+import CorePrimitives from "./core-primitives";
 import CoreReactive from "./core-reactive";
 import CoreRef from "./core-ref";
 import CoreResource from "./core-resource";
@@ -21,6 +23,8 @@ const cases: Record<string, () => JSX.Element> = {
   "core-canvas": CoreCanvas,
   "core-elements": CoreElements,
   "core-list": CoreList,
+  "core-overlay": CoreOverlay,
+  "core-primitives": CorePrimitives,
   "core-reactive": CoreReactive,
   "core-ref": CoreRef,
   "core-resource": CoreResource,

@@ -5,7 +5,7 @@
 
 use std::{rc::Rc, time::Duration};
 
-use nsh_base::theme;
+use nsh_base::{dialog, theme};
 use nsh_core::ui::{Registry, prelude::*};
 
 /// The module the tests' apps import these components from.
@@ -391,7 +391,7 @@ pub(crate) fn TextField(props: TextFieldProps, cx: Scope<TextFieldEvent>) -> imp
                 .value(move || props.value.get().as_str().to_owned())
                 .on_change(move |text: &str| change(text.to_owned())),
         )
-        .child(If::new(
+        .child(when(
             move || !props.value.with(|v| v.is_empty()),
             move || {
                 view()
@@ -424,8 +424,8 @@ pub(crate) struct SheetProps {
 #[component]
 pub(crate) fn Sheet(props: SheetProps) -> impl IntoElement {
     let children = props.children;
-    view().child(If::new(props.open, move || {
-        modal().animation(ModalAnimation::None).child(
+    view().child(when(props.open, move || {
+        dialog().animation(ModalAnimation::None).child(
             view()
                 .absolute()
                 .left_0()

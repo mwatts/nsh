@@ -1,16 +1,16 @@
 ---
-title: nsh/canvas
+title: Canvas
 description: Canvas、2D 绘图上下文、Path2D 与渐变，以及 NSH 支持的 HTML Canvas 2D 子集。
-order: 5
+order: 2.3
 demo: mod-canvas
 ---
 
-# nsh/canvas
+# Canvas
 
-`nsh/canvas` 提供与 HTML Canvas 2D 风格一致的绘图上下文。你的 `draw` 函数**记录**绘图操作，平台随后以屏幕分辨率在原生侧回放（iOS 上是 Core Graphics，Android 上是 `android.graphics.Canvas`）。绘图中的数字和颜色可以是[动画值](./nsh-animated.md)：它们做动画时，平台会自行重绘，无需再次运行 `draw`。
+`Canvas` 提供与 HTML Canvas 2D 风格一致的绘图上下文。你的 `draw` 函数**记录**绘图操作，平台随后以屏幕分辨率在原生侧回放（iOS 上是 Core Graphics，Android 上是 `android.graphics.Canvas`）。绘图中的数字和颜色可以是[动画值](./nsh-animated.md)：它们做动画时，平台会自行重绘，无需再次运行 `draw`。
 
 ```ts
-import { Canvas, CanvasGradient, CanvasRenderingContext2D, Path2D } from "nsh/canvas";
+import { Canvas, CanvasGradient, CanvasRenderingContext2D, Path2D } from "nsh";
 ```
 
 教程见[画布](../docs/canvas.md)，属性见 [`<Canvas>`](../elements/canvas.md)。
@@ -39,8 +39,7 @@ interface CanvasSize {
 通过样式给画布设置尺寸（`width` / `height`、`flex: 1`、`aspectRatio` 等）。坐标单位为点，原点在左上角。
 
 ```tsx
-import { mount, signal, Text, View } from "nsh";
-import { Canvas } from "nsh/canvas";
+import { Canvas, mount, signal, Text, View } from "nsh";
 
 function App() {
   const values = signal([12, 30, 22, 48, 36, 60, 52, 75]);
@@ -73,7 +72,7 @@ mount(App);
 
 ```tsx
 import { createAnimatedValue, Easing } from "nsh/animated";
-import { Canvas } from "nsh/canvas";
+import { Canvas } from "nsh";
 
 const progress = createAnimatedValue(0);
 
@@ -231,7 +230,7 @@ cx.fillRect(0, 0, width, height);
 drawImage(image: string | ImageAsset | { uri: string }, ...args: CanvasNumber[]): void;
 ```
 
-绘制一张图片，可以是 URL、导入的资源（`import logo from "./logo.png"`）或 `{ uri }`。图片在原生侧加载，加载完成后画布会重新绘制。与 HTML 一样有三种形式：
+绘制一张图片，可以是 URL、导入的资源（`import logo from "./logo.png"`）或 `{ uri }`。图片在原生侧加载，加载完成后画布会重新绘制。导入的资源绘制导入的文件本身；要在所有屏幕上绘制清晰，请导入 `@3x` 文件。与 HTML 一样有三种形式：
 
 - `drawImage(image, dx, dy)`：按原始尺寸绘制。
 - `drawImage(image, dx, dy, dw, dh)`：缩放到矩形内。

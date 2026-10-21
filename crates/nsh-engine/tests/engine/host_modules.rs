@@ -142,6 +142,8 @@ fn start(
         storage: None,
         clock: Default::default(),
         context,
+        pinned: Default::default(),
+        clipboard: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),

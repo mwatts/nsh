@@ -2,7 +2,8 @@
 
 The documentation site for nsh, published at <https://nsh.dev>
 (`src/lib/site.ts`). Astro (static output), Tailwind 4, Pagefind search,
-Shiki highlighting; [Bun](https://bun.com) runs everything.
+Shiki highlighting (the site's themes, `src/light.theme.json` / `src/dark.theme.json`, are Allsum's code
+palette, the one `TextView`'s built-in highlighting colors code with); [Bun](https://bun.com) runs everything.
 
 ```sh
 bun run dev        # http://localhost:4321, live reload (search needs a build)
@@ -46,7 +47,7 @@ Name the product **Native Shell** in formal places (page titles, the home page,
 a page's first mention, the README's opening, meta descriptions) and **NSH**
 everywhere else in prose, as GPUI is written: "NSH apps", "NSH's components",
 "NSH 应用". Lowercase `nsh` is for code only, in backticks: the CLI (`nsh run`),
-`nsh.json`, the modules (`nsh`, `nsh/list`), crates and packages. A short,
+`nsh.json`, the modules (`nsh`, `nsh/animated`), crates and packages. A short,
 uppercase name is one the community can build on (`nsh-*` crates, NSH plugins).
 
 Write in positive terms: say what nsh, a platform or a feature is and does,
@@ -99,6 +100,25 @@ demo: guide-getting-started     # optional; a demo from demos/<name>.tsx
   `> [!WARNING]`, `> [!CAUTION]`.
 - **Code blocks** highlight `tsx ts js json sh bash swift java kotlin rust
   toml diff xml html yaml css`.
+- **Code tabs**: consecutive fences whose info string holds the word `tabs`
+  become one block with a tab per fence, named after its language (`rust`
+  → Rust, `tsx` → TSX, others capitalized). The first tab is selected;
+  choosing another switches every group on the page and is remembered. Any
+  other text between the fences (a blank line is fine) ends the group.
+  Show examples Rust first, then TSX:
+
+  ````md
+  ```rust tabs
+  view().child(text("Hello"))
+  ```
+
+  ```tsx tabs
+  <View><Text>Hello</Text></View>
+  ```
+  ````
+
+  The `.md` endpoints and `llms-full.txt` print the fences as plain
+  consecutive blocks (`src/lib/remark-code-tabs.js`).
 
 Each page is also served as Markdown at its URL plus `.md`; `/llms.txt`
 lists every page and `/llms-full.txt` holds all English pages.
@@ -125,11 +145,39 @@ base64url).
 
 `demos/<name>.tsx` are small runnable nsh apps (try one with
 `nsh run website/demos/<name>.tsx`). A page with `demo: <name>` shows the demo
-after its first paragraph: a frame at phone width (390×844 points, scaled down) with
-the app running in an iframe of `play/index.html#<name>`, beside its source
-(wide pages) or behind a Preview / Source switch (narrow ones), plus an
-"Open in new tab" link. The home page runs `demos/counter.tsx` the same way
-(`src/components/DemoFrame.astro`, `variant="phone"`).
+after its first paragraph: a frame with the app running in an iframe of
+`play/index.html?idiom=…#<name>`, beside its source (wide pages, Mobile) or
+behind a Preview / Source switch (narrow ones), and two icon buttons: edit in
+the playground, open in a new tab. The home page runs `demos/counter.tsx` the
+same way (`src/components/DemoFrame.astro`, `variant="phone"`).
+
+The panel switches the demo between two layouts (`LAYOUTS` in
+`src/lib/demo.js`, `demo-client.ts`), and the app runs again with the idiom
+of the one chosen (the player's `?idiom=`). The visitor's choice applies to
+every demo and is remembered:
+
+| Layout | Frame | Idiom | What the app has |
+| --- | --- | --- | --- |
+| Mobile | 390×844 points, the default | `phone` | touches; menus as sheets, held fingers |
+| Desktop | 1024×640 points, scaled to the column, the source below | `desktop` | a pointer; hover, right clicks, popups, keyboard |
+
+The rules every demo follows, now and for the ones to come:
+
+- **Every element page has one.** Each page of `elements/` (its index aside)
+  names a demo, `el-<page>` unless one already shows the element
+  (`tests/content.test.ts` checks it).
+- **It works in both layouts.** Lay it out with flex so it fills either frame:
+  no width over 390 points, nothing that only fits one of them; give wide
+  content room with `maxWidth` or columns read from `windowSize()`. Where the
+  element behaves differently by device (menus, tooltips, context menus,
+  hover), the demo shows both behaviors and says on screen what to do
+  (`Platform.isDesktop ? "Right click a row" : "Hold a row"`).
+- **It shows the element, not the gallery.** A short screen of what the page
+  explains: the element's main props and events, its state printed on screen,
+  colours from `demos/palette.ts` (light and dark).
+- **It is checked in both.** `nsh test website/demos/<name>.tsx` runs it as a
+  phone; `nsh test website/demos/<name>.tsx --target web` (a browser) or
+  `--target linux` (a window) as a desktop. Look at both before adding it.
 
 The player in `public/play/` is the WebAssembly build of the nsh runtime
 (`crates/nsh-platform-web`, rendering to the DOM) with every demo bundled by
@@ -156,10 +204,11 @@ player, or editing a demo, invalidates Astro's content cache automatically
 | --- | --- |
 | `src/content.config.ts` | The six collections (three sections × two locales) and the schema |
 | `src/lib/sections.ts` | Section labels, page lists in sidebar order, routes |
-| `src/lib/remark-*.js`, `rehype-heading-anchors.js` | Title removal, callouts, `.md` links, demo insertion, heading anchors |
+| `src/lib/remark-*.js`, `rehype-heading-anchors.js` | Title removal, callouts, code tabs, `.md` links, demo insertion, heading anchors |
+| `src/lib/code-tabs-client.ts` | Switches code tabs, page-wide, and remembers the choice |
 | `src/lib/demo.js` | Demo sources, the demo frame and the demo panel markup |
 | `src/lib/markdown-endpoint.ts`, `llms.ts` | `<page>.md`, `llms.txt`, `llms-full.txt` |
 | `src/pages/[section]/[...slug].astro` | Content pages (and `zh-CN/`); `[section].md.ts` / `[...slug].md.ts` the Markdown |
 | `src/components/Home.astro` | The home page in both languages |
 | `src/styles/global.css` | Tokens and everything shared; see `DESIGN.md` |
-| `tests/` | `content.test.ts` (frontmatter, translations, demos), `links.test.ts` (built site) |
+| `tests/` | `content.test.ts` (frontmatter, translations, demos), `code-tabs.test.ts` (code tabs), `links.test.ts` (built site) |

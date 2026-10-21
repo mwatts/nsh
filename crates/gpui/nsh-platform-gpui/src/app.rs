@@ -67,6 +67,26 @@ pub fn set_ui_sets(sets: Vec<nsh_core::ui::Registry>) {
     *UI_SETS.write().unwrap_or_else(|e| e.into_inner()) = Some(sets);
 }
 
+/// The app's Rust root ([`set_root`]).
+#[cfg(feature = "dev")]
+static ROOT: RwLock<Option<fn() -> Root>> = RwLock::new(None);
+
+/// Sets the root of an app of Rust only (`nsh.json` `"root"`), which this
+/// development host runs when its dev server publishes the app as the
+/// host's root (`nsh test --target gpui` of such an app) instead of a
+/// bundle.
+#[cfg(feature = "dev")]
+pub fn set_root(root: fn() -> Root) {
+    *ROOT.write().unwrap_or_else(|e| e.into_inner()) = Some(root);
+}
+
+/// The app's Rust root, if the host has one ([`set_root`]).
+#[cfg(feature = "dev")]
+pub(crate) fn root() -> Option<Root> {
+    let root = *ROOT.read().unwrap_or_else(|e| e.into_inner());
+    root.map(|root| root())
+}
+
 /// The UI sets engines serve.
 pub(crate) fn ui_sets() -> Vec<nsh_core::ui::Registry> {
     UI_SETS
@@ -105,9 +125,6 @@ pub struct AppOptions {
     pub title: String,
     /// The initial window size in points.
     pub size: (i32, i32),
-    /// Steps run once the window shows (`wait 500; shot a.png; tap 10 20;
-    /// quit`): for checking a backend change without touching the screen.
-    pub script: Option<String>,
     /// The native components apps can use (`nsh/native`); shared by the
     /// views made with these options. See [`AppView::register_component`].
     pub components: crate::native::Components,
@@ -143,7 +160,6 @@ impl Default for AppOptions {
             app_id: "com.longbridge.nsh.host".to_owned(),
             title: "nsh".to_owned(),
             size: (1200, 800),
-            script: None,
             components: Default::default(),
             appearance: Appearance::System,
             fps: false,
@@ -290,7 +306,7 @@ impl AppView {
             app,
             viewport: nsh_core::Size::default(),
             trace: options.trace,
-            network: Some(crate::net::network()),
+            network: Some(nsh_engine::net::network()),
             websocket: None,
             filesystem: None,
             assets: Some(Arc::new(AssetReader(options.asset_base.clone()))),
@@ -304,6 +320,8 @@ impl AppView {
             storage: options.storage.clone(),
             clock: Default::default(),
             context: options.context.clone(),
+            pinned: Default::default(),
+            clipboard: None,
         };
         crate::image::set_asset_base(&self.surface, options.asset_base.clone());
         self.surface
@@ -778,7 +796,6 @@ pub fn open_app_window(
         inactive_frame_interval: None,
         ..Default::default()
     };
-    let script = options.script.clone();
     let handle = cx.open_window(window_options, move |window, cx| {
         let view: Entity<AppView> = cx.new(|cx| AppView::new(options, window, cx));
         view.read(cx).own_window(window, cx);
@@ -794,14 +811,11 @@ pub fn open_app_window(
         window.focus(&focus, cx);
         view
     })?;
-    if let Some(script) = script {
-        crate::script::run(handle, &script, cx);
-    }
     Ok(handle)
 }
 
 /// Runs `source` in a window until it is closed. Fails when the window
-/// cannot open or [`AppOptions::script`] failed.
+/// cannot open.
 pub fn run_app(source: AppSource, options: AppOptions) -> std::process::ExitCode {
     let ok = Rc::new(std::cell::Cell::new(true));
     let result = ok.clone();
@@ -820,7 +834,7 @@ pub fn run_app(source: AppSource, options: AppOptions) -> std::process::ExitCode
         }
         cx.activate(true);
     });
-    if result.get() && !crate::script::failed() {
+    if result.get() {
         std::process::ExitCode::SUCCESS
     } else {
         std::process::ExitCode::FAILURE

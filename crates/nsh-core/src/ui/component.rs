@@ -36,7 +36,7 @@ use super::{
 ///         .px_4()
 ///         .py_3()
 ///         .bg(move || theme().primary()) // nsh-base's theme
-///         .on_press(move |_: &()| cx.emit(ButtonEvent::Press))
+///         .on_press(move || cx.emit(ButtonEvent::Press))
 ///         .child(text(props.title))
 /// }
 /// ```
@@ -60,7 +60,10 @@ pub trait Component: 'static {
     /// makes (signals, effects, timers) goes with the component.
     fn view(props: Self::Props, cx: super::Scope<Self::Event>) -> impl IntoElement;
 
-    /// This component inside another one's view.
+    /// This component inside another one's view, given all its props.
+    /// A `#[component]` has a constructor of its own, which Rust views use
+    /// (`button().disabled(..)`); this stays for components implemented
+    /// by hand and for code generic over components.
     fn element(props: Self::Props) -> ComponentElement<Self>
     where
         Self: Sized,
@@ -241,6 +244,10 @@ pub enum PropKind {
     /// A value: decoded in the JS call ([`PropSpec::decode`]), set by the
     /// core.
     Value,
+    /// A render function (`Option<Renderer<T>>`): decoded in the JS call
+    /// as a value is (a function, or none), its content rendered by JS
+    /// when the core asks for it ([`super::JsEvent::Render`]).
+    Renderer,
     /// A named slot: JSX in a holder node.
     Slot,
     /// The JSX children.
@@ -284,6 +291,10 @@ pub struct EventSpec {
     pub data: String,
     /// Documentation.
     pub doc: &'static str,
+    /// The handler takes several arguments (`#[args(open, reason)]` on a
+    /// variant of as many fields): `data` is their list (`open: boolean,
+    /// reason: …`), the data a JS array of them.
+    pub spread: bool,
 }
 
 /// A component's props. Derive it: `#[derive(Props)]`.
@@ -354,7 +365,12 @@ impl Props for () {
     }
 }
 
-/// A component's events. Derive it: `#[derive(Event)]`.
+/// A component's events. Derive it: `#[derive(Event)]`. The element of a
+/// `#[component]` emitting them gets a listener method per event, named
+/// as its TSX handler in snake case (`onPress` is `.on_press(..)`): a
+/// unit variant's takes `move || ..`, a one-field variant's the value
+/// (`move |index: &u32| ..`), a named-field variant's the event itself
+/// ([`ComponentBuilder`](super::ComponentBuilder)).
 pub trait Event: 'static {
     /// The events (their named types declared in `types`).
     fn spec(types: &mut TsTypes) -> Vec<EventSpec>;
@@ -364,6 +380,12 @@ pub trait Event: 'static {
 
     /// Its data as a JS value of `host` (converted when JS hears it).
     fn data_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError>;
+
+    /// The handler takes the items of the data (an array) as its
+    /// arguments ([`EventSpec::spread`]).
+    fn spread(&self) -> bool {
+        false
+    }
 }
 
 /// The events of a component that has none.
@@ -433,6 +455,14 @@ impl ComponentSpec {
         self.props
             .iter()
             .filter(|p| p.kind == PropKind::Slot)
+            .map(|p| p.name)
+    }
+
+    /// Its render functions ([`PropKind::Renderer`]).
+    pub fn renderers(&self) -> impl Iterator<Item = &'static str> + '_ {
+        self.props
+            .iter()
+            .filter(|p| p.kind == PropKind::Renderer)
             .map(|p| p.name)
     }
 
@@ -1222,6 +1252,8 @@ pub fn declarations(registry: &Registry, omit: &[&str]) -> String {
             let handler = handler_name(e.name);
             let arg = if e.data == "void" {
                 String::new()
+            } else if e.spread {
+                e.data.clone()
             } else {
                 format!("{}: {}", e.arg, e.data)
             };

@@ -31,6 +31,28 @@ pub enum DevEvent {
         /// What to do.
         step: TestStep,
     },
+    /// What a test session's app starts with
+    /// ([`crate::protocol::ServerMessage::TestSetup`]): the storage it
+    /// finds. Its requests go to the test ([`DevClient::fetch`]).
+    TestSetup {
+        /// The storage's entries.
+        storage: Vec<(String, String)>,
+        /// Trace the app: log each commit's timings and send each batch
+        /// ([`DevClient::trace`]).
+        trace: bool,
+        /// What the test fixes of the app's environment, and its clipboard.
+        environment: crate::protocol::TestEnvironment,
+    },
+    /// The test's answer to request `id` ([`DevClient::fetch`]): one
+    /// event of it.
+    Fetch {
+        /// The request's id.
+        id: u64,
+        /// The event.
+        reply: crate::protocol::FetchReply,
+    },
+    /// Run the host's own Rust root (see [`crate::protocol::ServerMessage::Root`]).
+    Root,
     /// A rebuild started.
     Building,
     /// The build failed.
@@ -156,6 +178,23 @@ impl DevClient {
         Ok(DevClient { logs, replies })
     }
 
+    /// Forwards the app's request `id` to the test, which answers with
+    /// [`DevEvent::Fetch`]es of that id (a test session's).
+    pub fn fetch(&self, id: u64, request: crate::protocol::WireRequest) {
+        let _ = self.replies.send(ClientMessage::Fetch { id, request });
+    }
+
+    /// The app no longer wants the answer to request `id`.
+    pub fn fetch_cancel(&self, id: u64) {
+        let _ = self.replies.send(ClientMessage::FetchCancel { id });
+    }
+
+    /// Sends the mount items of a batch the traced app applied, a line
+    /// each ([`DevEvent::TestSetup`]), in order with the steps' outcomes.
+    pub fn trace(&self, items: Vec<String>) {
+        let _ = self.replies.send(ClientMessage::Trace { items });
+    }
+
     /// Sends the outcome of the step `id` ([`DevEvent::Step`]).
     pub fn step_done(&self, id: u64, outcome: StepOutcome) {
         let _ = self.replies.send(ClientMessage::StepDone { id, outcome });
@@ -233,6 +272,17 @@ fn session(
                     }
                 }
                 Ok(ServerMessage::Step { id, step }) => on_event(DevEvent::Step { id, step }),
+                Ok(ServerMessage::TestSetup {
+                    storage,
+                    trace,
+                    environment,
+                }) => on_event(DevEvent::TestSetup {
+                    storage,
+                    trace,
+                    environment,
+                }),
+                Ok(ServerMessage::Fetch { id, reply }) => on_event(DevEvent::Fetch { id, reply }),
+                Ok(ServerMessage::Root) => on_event(DevEvent::Root),
                 Ok(ServerMessage::Building) => on_event(DevEvent::Building),
                 Ok(ServerMessage::BuildFailed { message }) => {
                     on_event(DevEvent::BuildFailed(message))

@@ -62,6 +62,9 @@ export interface StateStyleProps {
    * is not checked): a checkbox, a switch or a radio styled by its
    * value. */
   checkedStyle?: StyleProp<ViewStyle>;
+  /** While `accessibilityState.checked` is `"mixed"` (`indeterminate:`):
+   * a checkbox that is neither checked nor unchecked. */
+  indeterminateStyle?: StyleProp<ViewStyle>;
 }
 
 /** iOS-only props of every element (`ios={{…}}`); elements add their own. */
@@ -91,6 +94,11 @@ export interface ImageAsset {
   uri: string;
   width: number;
   height: number;
+  /** The pixel densities it ships in, 1 being the imported file:
+   * `[1, 2, 3]` when `logo@2x.png` and `logo@3x.png` sit next to
+   * `logo.png`. The image loads the one for the screen's pixel ratio.
+   * Absent when the imported file is the only one. */
+  scales?: number[];
 }
 
 /** `<Image>` */
@@ -120,10 +128,18 @@ export interface InputProps extends CommonProps, InputHostProps {
 /** iOS-only props of `<Input>`. */
 export interface IOSInputProps extends IOSProps, IOSInputHostProps {}
 
+/** `<Overlay>`: its children shown on top of the root view it is in (the
+ * surface, or the dialog around it), outside its parent's layout and
+ * clipping; laid out as a `position: fixed` box of that root view, or
+ * placed against `anchor`. */
+export interface OverlayProps extends CommonProps, OverlayHostProps {
+  style?: StyleProp<ViewStyle>;
+}
+
 /** What JS sets on a Rust component's host itself: the app's classes
- * (appended to the component's own), its inline and state styles, its test id, layout
- * events and the ref (`ref.command(name, args)`). */
-export type ComponentHostProps = Pick<ViewProps, "class" | "classList" | "style" | "activeStyle" | "hoverStyle" | "focusStyle" | "disabledStyle" | "testID" | "onLayout" | "ref">;
+ * (appended to the component's own), its inline and state styles, its test id, its
+ * tooltip, layout events and the ref (`ref.command(name, args)`). */
+export type ComponentHostProps = Pick<ViewProps, "class" | "classList" | "style" | "activeStyle" | "hoverStyle" | "focusStyle" | "disabledStyle" | "testID" | "tooltip" | "onLayout" | "ref">;
 
 export interface Insets {
   top: number;
@@ -171,19 +187,31 @@ fn doc_comment(out: &mut String, doc: &str, indent: &str) {
 
 /// The declaration of export `name`.
 fn export(out: &mut String, name: &str, ts: Ts) {
+    export_moved(out, name, ts, None);
+}
+
+/// The declaration of export `name`, `@deprecated` when it is imported
+/// from module `moved_to` now.
+fn export_moved(out: &mut String, name: &str, ts: Ts, moved_to: Option<&str>) {
+    let doc = |doc: &str| match moved_to {
+        Some(to) => format!("{doc}\n\n@deprecated Import from \"{to}\"."),
+        None => doc.to_owned(),
+    };
     match ts {
-        Ts::Function(doc, signatures) => {
-            doc_comment(out, doc, "");
+        Ts::Function(text, signatures) => {
+            doc_comment(out, &doc(text), "");
             for signature in signatures {
                 let _ = writeln!(out, "export declare function {name}{signature};");
             }
         }
-        Ts::Const(doc, ty) => {
-            doc_comment(out, doc, "");
+        Ts::Const(text, ty) => {
+            doc_comment(out, &doc(text), "");
             let _ = writeln!(out, "export declare const {name}: {ty};");
         }
-        Ts::Class(doc, body) => {
-            doc_comment(out, doc, "");
+        // One declaration for both modules (a class declared twice is two
+        // types), which `nsh` re-exports: never deprecated.
+        Ts::Class(text, body) => {
+            doc_comment(out, text, "");
             let _ = writeln!(out, "export declare class {name}{body}");
         }
         Ts::Internal => return,
@@ -191,9 +219,35 @@ fn export(out: &mut String, name: &str, ts: Ts) {
     out.push('\n');
 }
 
-fn exports(out: &mut String, items: &[Item]) {
+fn exports(out: &mut String, items: &[Item], moved_to: Option<&str>) {
     for &(name, _, ts) in items {
-        export(out, name, ts);
+        export_moved(out, name, ts, moved_to);
+    }
+}
+
+/// What module `m` serves of module `other` (`nsh` of `nsh/list`): its
+/// values declared again, its classes and types re-exported from its file
+/// (`other_body`, the names it declares).
+fn also_part(out: &mut String, m: &NativeModule, other: &NativeModule, other_body: &str) {
+    let from = relative(&path_of(m.name), &path_of(other.name));
+    for &(name, _, ts) in other.exports {
+        match ts {
+            Ts::Class(..) => {
+                let _ = writeln!(out, "export {{ {name} }} from \"{from}\";");
+            }
+            ts => export(out, name, ts),
+        }
+    }
+    let values: Vec<&str> = other.exports.iter().map(|e| e.0).collect();
+    let mut any = false;
+    for name in exported_names(other_body) {
+        if !values.contains(&name.as_str()) {
+            let _ = writeln!(out, "export type {{ {name} }} from \"{from}\";");
+            any = true;
+        }
+    }
+    if any || other.exports.iter().any(|e| matches!(e.2, Ts::Class(..))) {
+        out.push('\n');
     }
 }
 
@@ -289,7 +343,7 @@ fn bodies(ui_sets: &[SetDescription]) -> Vec<(String, String)> {
     let mut files = vec![("nsh/types.d.ts".to_owned(), element_types())];
     let registries = nsh_core::runtime::registries();
     let declared = |m: &&NativeModule| m.exports.iter().any(|e| !matches!(e.2, Ts::Internal));
-    for m in MODULES.iter().filter(declared) {
+    let body_of = |m: &NativeModule| {
         let mut body = String::from(m.types);
         if !body.is_empty() {
             body.push('\n');
@@ -303,7 +357,18 @@ fn bodies(ui_sets: &[SetDescription]) -> Vec<(String, String)> {
         for set in ui_sets.iter().filter(|s| s.specifier == m.name) {
             set_part(&mut body, set);
         }
-        exports(&mut body, m.exports);
+        exports(&mut body, m.exports, m.moved_to);
+        body
+    };
+    for m in MODULES.iter().filter(declared) {
+        let mut body = body_of(m);
+        for other in m
+            .also
+            .iter()
+            .filter_map(|a| MODULES.iter().find(|o| o.name == *a))
+        {
+            also_part(&mut body, m, other, &body_of(other));
+        }
         files.push((path_of(m.name), body));
     }
     // The registries that are modules of their own (`nsh/base`, `nsh/image`).
@@ -442,6 +507,16 @@ pub(crate) fn exported_values(body: &str) -> Vec<String> {
         if rest.split_whitespace().next() == Some("default") {
             if !out.iter().any(|name| name == "default") {
                 out.push("default".to_owned());
+            }
+            continue;
+        }
+        // A value re-exported: `export { Path2D } from "./canvas";`.
+        if let Some(names) = rest.strip_prefix('{').and_then(|r| r.split_once('}')) {
+            for name in names.0.split(',').map(str::trim).filter(|n| !n.is_empty()) {
+                let name = name.rsplit(" as ").next().unwrap_or(name).to_owned();
+                if !out.contains(&name) {
+                    out.push(name);
+                }
             }
             continue;
         }
@@ -678,6 +753,21 @@ fn member_names(members: &str) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn variant_types_image_asset_lists_its_scales() {
+        let files = type_definitions(&[]);
+        let (_, types) = files
+            .iter()
+            .find(|(path, _)| path == "nsh/types.d.ts")
+            .expect("nsh/types.d.ts");
+        let at = types
+            .find("export interface ImageAsset {")
+            .expect("ImageAsset");
+        let asset = &types[at..at + types[at..].find("\n}").unwrap()];
+        assert!(asset.contains("  scales?: number[];"), "{asset}");
+        assert!(asset.contains("The image loads the one for the screen's pixel ratio."));
+    }
 
     #[test]
     fn default_export_statements_name_the_default_namespace_value() {

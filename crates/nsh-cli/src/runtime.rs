@@ -157,6 +157,16 @@ pub(crate) fn android(dev: bool) -> anyhow::Result<PathBuf> {
     }
 }
 
+/// The Android runtime `nsh test --target android` runs apps in: the
+/// development one, a Rust app's too ([`crate::rust_app::RustApp::test_android`]).
+pub(crate) fn test_android() -> anyhow::Result<PathBuf> {
+    let prebuilt = prebuilt_android(true)?;
+    match crate::rust_app::current() {
+        Some(app) => app.test_android(&prebuilt),
+        None => Ok(prebuilt),
+    }
+}
+
 fn prebuilt_android(dev: bool) -> anyhow::Result<PathBuf> {
     let variant = if dev { "dev" } else { "release" };
     if let Some(root) = env::var_os("NSH_RUNTIME") {
@@ -217,6 +227,10 @@ fn android_existing(dir: PathBuf, dev: bool) -> anyhow::Result<PathBuf> {
 pub(crate) struct WebRuntime {
     pub(crate) wasm: PathBuf,
     pub(crate) js: PathBuf,
+    /// The wasm-bindgen glue of an app's runtime whose crates call JS
+    /// through wasm-bindgen (`crate::bindgen`), served and packaged next to
+    /// `nsh.js`.
+    pub(crate) glue: Option<PathBuf>,
 }
 
 /// Which web runtime: the two differ in QuickJS only.
@@ -245,6 +259,15 @@ impl WebKind {
 /// The web runtime ([`WebRuntime`]) of `kind`. In a checkout it is built
 /// first when `build` is set; without it, the build that is there, if any
 /// (`None`).
+/// The web runtime `nsh test --target web` runs apps in: the development
+/// host's, a Rust app's too ([`crate::rust_app::RustApp::test_web`]).
+pub(crate) fn test_web() -> anyhow::Result<WebRuntime> {
+    match crate::rust_app::current() {
+        Some(app) => app.test_web(),
+        None => web(WebKind::Dev, true)?.context("no web runtime"),
+    }
+}
+
 pub(crate) fn web(kind: WebKind, build: bool) -> anyhow::Result<Option<WebRuntime>> {
     const WASM: &str = "wasm32-unknown-unknown";
     // An app with Rust components of its own: a runtime with its set.
@@ -255,6 +278,7 @@ pub(crate) fn web(kind: WebKind, build: bool) -> anyhow::Result<Option<WebRuntim
         let runtime = WebRuntime {
             wasm: dir.join(kind.file()),
             js: dir.join("nsh.js"),
+            glue: None,
         };
         (runtime.wasm.exists() && runtime.js.exists()).then_some(runtime)
     };
@@ -287,7 +311,7 @@ pub(crate) fn web(kind: WebKind, build: bool) -> anyhow::Result<Option<WebRuntim
         .join("web");
     let features: &[&str] = match kind {
         WebKind::Release => &["--features", "bytecode-only"],
-        WebKind::Dev => &[],
+        WebKind::Dev => &["--features", "dev"],
     };
     if build {
         let cargo = env::var_os("CARGO").unwrap_or_else(|| OsString::from("cargo"));
@@ -312,6 +336,7 @@ pub(crate) fn web(kind: WebKind, build: bool) -> anyhow::Result<Option<WebRuntim
     let runtime = WebRuntime {
         wasm: out.join(kind.file()),
         js: root.join("crates/nsh-platform-web/web/nsh.js"),
+        glue: None,
     };
     if runtime.wasm.exists() {
         return Ok(Some(runtime));
@@ -325,6 +350,15 @@ pub(crate) fn web(kind: WebKind, build: bool) -> anyhow::Result<Option<WebRuntim
 /// Path of the development host (`runner` false) or release runner for
 /// `platform` ([`Platform::binary`]): for an app with a Rust crate, its own
 /// build.
+/// The development host `nsh test --target` runs apps in on `platform`: a
+/// Rust app's too ([`crate::rust_app::RustApp::test_host`]).
+pub(crate) fn test_host(platform: Platform) -> anyhow::Result<PathBuf> {
+    match crate::rust_app::current() {
+        Some(app) => app.test_host(platform),
+        None => file(platform, false),
+    }
+}
+
 pub(crate) fn file(platform: Platform, runner: bool) -> anyhow::Result<PathBuf> {
     if let Some(app) = crate::rust_app::current() {
         return app.runtime(platform, runner);

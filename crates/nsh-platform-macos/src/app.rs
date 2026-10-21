@@ -40,6 +40,26 @@ pub fn set_ui_sets(sets: Vec<nsh_core::ui::Registry>) {
     *UI_SETS.write().unwrap_or_else(|e| e.into_inner()) = Some(sets);
 }
 
+/// The app's Rust root ([`set_root`]).
+#[cfg(feature = "dev")]
+static ROOT: RwLock<Option<fn() -> Root>> = RwLock::new(None);
+
+/// Sets the root of an app of Rust only (`nsh.json` `"root"`), which this
+/// development host runs when its dev server publishes the app as the
+/// host's root (`nsh test --target macos` of such an app) instead of a
+/// bundle.
+#[cfg(feature = "dev")]
+pub fn set_root(root: fn() -> Root) {
+    *ROOT.write().unwrap_or_else(|e| e.into_inner()) = Some(root);
+}
+
+/// The app's Rust root, if the host has one ([`set_root`]).
+#[cfg(feature = "dev")]
+pub(crate) fn root() -> Option<Root> {
+    let root = *ROOT.read().unwrap_or_else(|e| e.into_inner());
+    root.map(|root| root())
+}
+
 /// The UI sets engines serve.
 pub(crate) fn ui_sets() -> Vec<nsh_core::ui::Registry> {
     UI_SETS
@@ -74,6 +94,12 @@ pub struct AppOptions {
     /// Where bundled assets are (for [`AppSource::Bundle`]); dev servers
     /// serve them themselves.
     pub asset_base: Option<AssetBase>,
+    /// The directory `import()` loads a chunk from: the `.js` files `nsh
+    /// build --split` writes (each named after its chunk id), or a
+    /// directory the app keeps its own delivered modules in. Chunks load
+    /// as source (`Bundle::read`); `None` fails an `import()` the bundle
+    /// does not already hold.
+    pub chunks: Option<PathBuf>,
     /// The application id (`com.example.app`).
     pub app_id: String,
     /// The window title.
@@ -84,10 +110,6 @@ pub struct AppOptions {
     /// Reopening from the Dock shows the same window. Quit still stops the app.
     /// Only used by [`run_app`]; defaults to false.
     pub keep_alive_on_close: bool,
-    /// Steps run once the window shows (`wait 500; shot a.png; tap 10 20;
-    /// quit`): for checking a backend change without touching the screen.
-    /// See [`crate::script`].
-    pub script: Option<String>,
     /// The native components apps can use (`nsh/native`); shared by the
     /// views made with these options. See [`AppView::register_component`].
     pub components: crate::native::Components,
@@ -119,11 +141,11 @@ impl Default for AppOptions {
         AppOptions {
             trace: false,
             asset_base: None,
+            chunks: None,
             app_id: "com.longbridge.nsh.host".to_owned(),
             title: "nsh".to_owned(),
             size: (1200, 800),
             keep_alive_on_close: false,
-            script: None,
             components: Default::default(),
             appearance: Appearance::System,
             fps: false,
@@ -242,8 +264,11 @@ impl AppView {
             storage: options.storage.clone(),
             clock: Default::default(),
             context: Default::default(),
+            pinned: Default::default(),
+            clipboard: None,
         };
         crate::image::set_asset_base(&self.surface, options.asset_base.clone());
+        *self.surface.chunks.borrow_mut() = options.chunks.clone();
         self.surface
             .native
             .set_asset_base(options.asset_base.clone());
@@ -550,15 +575,7 @@ pub fn run_app(source: AppSource, options: AppOptions) -> std::process::ExitCode
     }
     window.makeKeyAndOrderFront(None);
     window.makeFirstResponder(Some(view.surface().root.ns()));
-    // A scripted run (screenshots, simulated input) keeps the process in
-    // the background: it must not steal focus from what the user is in.
-    // Presses in the script activate the app themselves when they need to.
-    if options.script.is_none() {
-        app.activate();
-    }
-    if let Some(script) = &options.script {
-        crate::script::run(&window, view.surface().clone(), script);
-    }
+    app.activate();
     RUNNING.with(|r| {
         *r.borrow_mut() = Some(Running {
             window,

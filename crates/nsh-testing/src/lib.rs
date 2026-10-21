@@ -31,13 +31,21 @@
 pub mod agent;
 #[cfg(feature = "js")]
 mod driver;
+// An engine on a thread of its own: not in WebAssembly, where only the
+// agent's model runs (the web's page).
+#[cfg(not(target_arch = "wasm32"))]
 mod headless;
+pub mod menu;
 #[cfg(feature = "js")]
 mod module;
 #[cfg(feature = "js")]
 mod run;
 #[cfg(feature = "js")]
 mod runner;
+mod screen;
+mod selector;
+mod storage;
+mod trace;
 
 #[cfg(feature = "bundle")]
 use std::{path::Path, sync::Arc};
@@ -49,25 +57,32 @@ use nsh_core::ui::description::SetDescription;
 #[cfg(feature = "bundle")]
 use nsh_engine::{Bundle, EngineConfig};
 
-#[cfg(feature = "live")]
+#[cfg(all(feature = "live", not(target_arch = "wasm32")))]
 pub use self::headless::UreqNetwork;
+#[cfg(not(target_arch = "wasm32"))]
 pub use self::headless::{
-    DialogAnswer, DirectoryAssets, DragTo, Headless, MemoryStorage, RecordingNetwork, Screen,
-    StubHandler, StubNetwork, StubReply, StubResponse, StubRoute, WAIT, default_answer,
-    print_batch, start,
+    DialogAnswer, DirectoryAssets, DragTo, Headless, RecordingNetwork, StubHandler, StubNetwork,
+    StubReply, StubResponse, StubRoute, WAIT, default_answer, print_batch, start,
 };
+#[cfg(feature = "js")]
+#[allow(deprecated)]
+pub use self::module::MobilePlatform;
 #[cfg(feature = "js")]
 pub use self::{
     driver::Host,
     module::{
-        App, ClockOptions, ColorScheme, Entries, Expectation, MobilePlatform, NetworkOption,
-        OpenOptions, RouteOption, SPECIFIER, SafeArea, StubRequest, Testing, registry,
+        App, ClockOptions, ColorScheme, Entries, Expectation, NetworkOption, OpenOptions, Platform,
+        RouteOption, SPECIFIER, SafeArea, StubRequest, Testing, registry,
     },
     run::{
         Built, Compile, Entry, Failure, HostOptions, Output, StartHost, TestResult, TestRun,
         TestStatus, run_file,
     },
     runner::{PROTOCOL, Reply, RunnerMessage, TestRequest, runner},
+};
+pub use self::{
+    screen::{Pick, Screen},
+    storage::MemoryStorage,
 };
 
 /// The sets the entry `nsh test` makes for a test file is built against

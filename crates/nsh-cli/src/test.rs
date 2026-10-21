@@ -8,7 +8,9 @@
 //! An app this command line serves runs in its process. An app with Rust
 //! crates of its own runs in the headless runner built with them
 //! (`rust_app.rs`, `nsh_testing::runner`), which asks this process to build
-//! each entry ([`RunnerMessage::Build`]): the runner links no bundler.
+//! each entry ([`RunnerMessage::Build`]): the runner links no bundler. On a
+//! real platform (`--target`) the apps run in its hosts, built with the
+//! app's crates (`test_host.rs`), and the test files in this process.
 
 use std::{
     collections::HashMap,
@@ -44,6 +46,7 @@ pub(crate) fn test(
     trace: bool,
     junit: Option<&Path>,
     target: Option<crate::run::Target>,
+    browser: Option<&Path>,
 ) -> anyhow::Result<()> {
     let app_dir = entry.parent().unwrap_or(Path::new(".")).to_path_buf();
     let work_dir = app_dir.join(".nsh/test");
@@ -73,13 +76,15 @@ pub(crate) fn test(
     };
     let start = Instant::now();
     let mut tally = Tally::default();
-    let host = target.map(crate::test_host::starter).transpose()?;
-    match crate::rust_app::current() {
-        Some(_) if host.is_some() => {
-            bail!(
-                "an app with Rust crates of its own runs its tests headless for now: leave out --target"
-            )
-        }
+    if browser.is_some() && target.is_none() {
+        bail!("--browser goes with --target web");
+    }
+    let host = target
+        .map(|target| crate::test_host::starter(target, browser, &work_dir))
+        .transpose()?;
+    // On a real platform the apps run in hosts built with the app's crates:
+    // the test files run here, whatever the app is.
+    match crate::rust_app::current().filter(|_| host.is_none()) {
         Some(app) => {
             let request = TestRequest {
                 protocol: nsh_testing::PROTOCOL,

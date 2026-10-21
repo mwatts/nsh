@@ -23,8 +23,8 @@ export const SECTIONS: Section[] = [
     id: 'elements',
     label: { en: 'Elements', 'zh-CN': '元素' },
     blurb: {
-      en: 'The host elements every UI is built from — View, Text, Image, scroll views, lists — and their props.',
-      'zh-CN': '构成所有界面的宿主元素——View、Text、Image、滚动视图、列表——及其属性。',
+      en: 'The primitives every UI is built from — View, Text, Image, scroll views, lists — and the base components of nsh/base, in Rust and TSX.',
+      'zh-CN': '构成所有界面的原语——View、Text、Image、滚动视图、列表——以及 nsh/base 的基础组件，均附 Rust 与 TSX 示例。',
     },
   },
   {
@@ -40,7 +40,8 @@ export const SECTIONS: Section[] = [
 /**
  * Sidebar groups, by the `group` frontmatter key. A section's pages are
  * sorted by `order`, so a group is a run of consecutive pages; the Guide
- * uses them to give every platform its own entry next to the others.
+ * uses them to give every platform its own entry next to the others. The
+ * Elements' groups list their pages by name, in the order of this table.
  */
 export const GROUPS: Record<string, Record<Lang, string>> = {
   start: { en: 'Start here', 'zh-CN': '入门' },
@@ -48,6 +49,9 @@ export const GROUPS: Record<string, Record<Lang, string>> = {
   delivery: { en: 'Delivery and security', 'zh-CN': '下发与安全' },
   ui: { en: 'Building UI', 'zh-CN': '构建界面' },
   tools: { en: 'Tools and internals', 'zh-CN': '工具与原理' },
+  // Elements: the primitives of `nsh`, then the base components of `nsh/base`.
+  primitives: { en: 'Primitives', 'zh-CN': '原语' },
+  base: { en: 'Base', 'zh-CN': 'Base' },
 };
 
 export interface Page {
@@ -87,9 +91,16 @@ async function load(lang: Lang): Promise<Page[]> {
     // A Chinese page sorts by its English counterpart, so both locales list
     // the same pages in the same order whatever the translated titles are.
     const english = lang === 'en' ? entries : await getCollection(collectionName(section.id, 'en'));
+    // Elements list each group's pages by name (the primitives, then the
+    // base components); the other sections by `order`.
+    const groups = Object.keys(GROUPS);
     const key = (entry: CollectionEntry<any>) => {
       const source = english.find((e) => e.id === entry.id) ?? entry;
-      return { order: source.data.order ?? 999, title: source.data.title as string };
+      const order =
+        section.id === 'elements' && source.data.group
+          ? 1000 + groups.indexOf(source.data.group as string)
+          : (source.data.order ?? 999);
+      return { order, title: source.data.title as string };
     };
     const sorted = [...entries].sort((a, b) => {
       if (a.id === 'index' || b.id === 'index') return a.id === 'index' ? -1 : 1;

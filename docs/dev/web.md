@@ -48,13 +48,15 @@ QuickJS is C, so the build needs a clang that targets wasm32 and an `llvm-ar` (C
 `Dev`): `runtime/web/nsh.wasm`, `nsh-dev.wasm` and `nsh.js` in the distribution (`cargo xtask dist` puts them there);
 in a checkout it builds `nsh-platform-web` with `--profile web --target wasm32-unknown-unknown` whatever its own
 profile (a debug build is several times larger and slower; `AR_wasm32_unknown_unknown` defaults to `llvm-ar`), with
-`--features bytecode-only` for the release one, copies the result to `nsh.wasm` / `nsh-dev.wasm` next to it (both
+`--features bytecode-only` for the release one and `--features dev` for the development host's, copies the result to `nsh.wasm` / `nsh-dev.wasm` next to it (both
 build to the same file) and takes `nsh.js` from the crate.
 
 - **`nsh package --target web`** writes a static site. Every file but `index.html` and `manifest.webmanifest` is
   content-addressed (`<stem>.<10 hex digits of SHA-256>.<ext>`, `web::hashed_name`), so hosts cache them for good
   (`immutable`) and only the page is revalidated. The page (template `crates/nsh-cli/src/web/index.html`) imports the
-  hashed `nsh.js`, preloads the wasm, the app's bytecode, the hardening's and its fonts, and passes `createPlayer` the wasm URL, `assets`
+  hashed `nsh.js`; a script in its head requests the wasm, the app's bytecode, the hardening's and its fonts while the page
+  is parsed (`fetches`, once each; not `<link rel=preload>`, see `pitfalls.md` "Web, browsers"), and the page passes
+  `createPlayer` the wasm's response, `assets`
   (each `asset:/<path>` to its hashed URL: images and videos load from there on demand) and `readAsset` (the fonts'
   bytes: the engine reads fonts synchronously, `Assets::read`, to measure text with them). Fonts the entry or the UI
   sets register are fetched before the app starts; one only chunks register (`font("asset:/…")` in their code) comes
@@ -72,13 +74,22 @@ build to the same file) and takes `nsh.js` from the crate.
   its own gets a runtime of its own ("Apps with Rust components"). `--run` serves the directory with `nsh_dev::SiteServer` (the cache headers a CDN should send) and
   prints its address.
 - **The development host** is a page the dev server serves (`DevServer::serve_web`: the page at `/`, `nsh.js` and
-  `nsh.wasm` next to it, all `no-cache`), from `crates/nsh-cli/src/web/dev.html`. `nsh dev` serves it whenever a web
+  `nsh.wasm` next to it, with a wasm-bindgen glue and its snippets when the runtime has one, all `no-cache`), from
+  `crates/nsh-cli/src/web/dev.html`. `nsh dev` serves it whenever a web
   runtime exists (`runtime::web(false)`), `nsh run --target web` builds one first and prints the page's address (the user opens it). The page
   speaks the dev protocol over the same port's WebSocket: its hello has platform `web` and an empty
   `bytecode_version` (the server then sends JS source, without the warning a mismatched version gets), it runs
   each bundle with its message's `app_id` (the app's storage), applies patches with `player.hotUpdate` (`nsh_hot_update`; when it reports a failure, `nsh_hot_failed`, the bundle that
   follows loads from scratch), shows build errors and `CannotRun` over the app, sends the app's log lines back, and
   reads fonts with a synchronous `XMLHttpRequest` from `/assets/`.
+- **Tests** (`nsh test --target web`, `docs/dev/tooling.md` "On a real platform"): the CLI opens the development host
+  in a headless Chromium browser it drives over the DevTools protocol (`nsh-cli/src/cdp.rs`, `test_web.rs`). When the
+  server's hello says `test`, the page calls `player.testStart()` (`nsh_test_start`): from the next bundle on, every
+  batch and error of the app also goes to an `nsh_testing::agent::Model` in the module (feature `dev`, `Sink`). Its
+  hello says `tests` (`player.takesTests`), so the server sends it steps; each `step` is answered at once with
+  `player.testStep`: `nsh_test_answer` answers what the model knows (selectors, texts, dialogs, activity) and whether
+  an animation runs, `testPage` what only the DOM knows (`getBoundingClientRect` in CSS pixels, the viewport, an
+  input's value, where a dialog's button is). The input itself is the browser's trusted input, sent by the CLI.
 
 `nsh_bundle_options` sets how the next `nsh_start` / `nsh_start_bytecode` runs: development settings by default (the
 player, the playground, the dev host), hardened (`Policy::default()`) for published apps, the declared capabilities,
@@ -178,6 +189,62 @@ Rust code meant for the web too uses the engine's services rather than threads a
 Rust app (2026-10) its `nsh.wasm` is 3.31 MB (1.06 MB gzipped, 0.75 MB with brotli): no QuickJS, so smaller than the
 prebuilt runtime, which a TSX entry (QuickJS) needs: the gallery under one was 5.26 MB (1.75 / 1.27 MB).
 
+### Crates that call JS through wasm-bindgen
+
+The runtime is a raw module (`nsh_*` exports, `nsh` / `env` imports), not a wasm-bindgen one, so an app crate's
+`web-sys` / `js-sys` imports have nothing to call by themselves. `RustApp::web` hands the built module to
+`bindgen::install`, whose reader (`bindgen::needs`: the import section and wasm-bindgen's custom section, the others
+skipped by size) decides by its imports: it needs wasm-bindgen's glue when it imports a JS function through it, a
+`__wbindgen_placeholder__` import named `__wbg_<name>_<hash>` or `__wbindgen_…`: web-sys, js-sys,
+a crate's own extern blocks, and wasm-bindgen intrinsics (`JsValue::as_string`, generic casts such as
+`JsValue::from_str`) all need glue. The descriptor (`__wbindgen_describe`), throw helper
+(`__wbg___wbindgen_throw_…` or `__wbindgen_throw`) and `__wbindgen_externref_xform__` imports alone do not
+trigger processing: linking wasm-bindgen can retain these even without calling JS (chrono's default
+`wasmbind` without `Utc::now`). Such a module is copied and served as before, without the CLI.
+Otherwise `bindgen::process` runs the `wasm-bindgen` CLI
+(`NSH_WASM_BINDGEN`, else `PATH`) of the version the module records (the first record of its
+`__wasm_bindgen_unstable` section, `{"schema_version":…,"version":"0.2.129"}`; `bindgen::check_cli` stops the build
+with both versions and the install command when the CLI's differs) with `--target web --no-typescript
+--omit-default-module-path` (the page hands the module over: the glue names no `<module>_bg.wasm`). It writes into
+`<module>-bindgen.tmp/`, which replaces `<module>-bindgen/` once the glue is adapted, and then renames
+wasm-bindgen's module over the built one (`nsh.wasm` / `nsh-dev.wasm` / `nsh-rust.wasm`) and the adapted glue to
+`<module>-bindgen.js`: a failed run leaves the previous build's module, glue and snippets together. A runtime rebuilt
+without the glue removes the earlier build's glue and directory.
+
+`bindgen::adapt` makes the glue `nsh.js`'s: the glue imports the module's other imports as ES modules (`import * as
+import1 from "nsh"`, a bare specifier no page resolves), which become empty objects `nsh.js` fills, and its
+`__wbg_get_imports` / `__wbg_finalize_init` are exported as `__nsh_imports` / `__nsh_finalize`. That is the glue of
+wasm-bindgen 0.2.129, the version it was tested with (`crates/nsh-cli/src/bindgen/wasm-bindgen-0.2.129.js`, that
+CLI's output, is the test's input); glue without those functions, or with a static import of a bare specifier left
+after adapting (another shape, or a crate's `raw_module = "pkg"`), is refused with the CLI's version rather than
+shipped broken. The JS snippets the glue imports (`#[wasm_bindgen(inline_js = …)]` and `module = …`:
+`snippets/<crate>-<hash>/…`, `bindgen::snippets`) stay in `<module>-bindgen/`; a snippet may import another one by
+its relative path, since both are served and published under the paths wasm-bindgen gave them.
+
+`WebRuntime::glue` carries it: the dev host serves it as `/nsh-bindgen.js` and its snippets at the paths it imports
+them by (`/snippets/…`; `dev.html`'s `GLUE`; all of them are part of `nsh.version`), and `nsh package --target web`
+(`web::publish_glue`) puts the snippets under one directory named by all of them and their paths
+(`snippets.<digest>/`, their paths under `snippets/` kept), points the glue at it (`bindgen::link_snippets`: the
+`./snippets/` prefix only), minifies the glue, names it by its content (`nsh-bindgen.<digest>.js`), preloads it
+(`<link rel="modulepreload">`) and passes it in `app.glue`. `createPlayer`'s option `glue` (a URL against the page)
+makes `Player.load` import it while the module compiles, check that it exports `__nsh_imports` and `__nsh_finalize`
+(wasm-bindgen's own output fails there, with its URL), merge `__nsh_imports()` into the import object (NSH's own
+`nsh` and `env` keys win), and call `__nsh_finalize(instance, module)` (its memory views, wasm-bindgen's externref
+table) right after instantiating, before `nsh_app_init`. The glue keeps its state at module level, so each player
+after the first imports it as `<url>?player=<n>` (`importGlue`): a module instance of its own, while the first keeps
+the URL the page preloads. `cargo test -p nsh-cli bindgen -- --ignored` runs the CLI on a real module
+(`wasm_bindgen_runs_on_a_real_module`: a crate built for `wasm32-unknown-unknown` with the CLI's wasm-bindgen; it
+needs the target, the CLI and the crates).
+
+The browser calls the glue's closures outside any `nsh_*` call (a WebSocket message), so a task they wake must make
+the page pump: `LocalEngine::set_wake` hooks the core's task notify and the posts' notify (each still sends
+`Message::Wake`), and `nsh_platform_web` sets it to the `request_pump` import, which `Player.requestPump` coalesces
+into one `nsh_pump` in a task of its own (`setTimeout` 0; `call` defers it while the engine runs). `pump` sets a flag
+while it runs (`LocalEngine::pumping`): what it wakes itself (spawns, task timers, `Callback::post`, the fetch replies
+it hands to tasks) its bounded loop runs without calling the wake, and only work that loop leaves calls it, once, at
+the end, so tasks woken only there (timers, fetch replies) request no pump of their own. The deadline scheduling
+(`schedule`) is unchanged.
+
 ## What WebAssembly changes in the shared crates
 
 - **No threads.** `nsh_engine::LocalEngine` drives the engine from the host's event loop: `pump()` handles what was
@@ -248,7 +315,8 @@ batch is being applied (a batch arrives inside a wasm call).
 
 A commit becomes one JSON array (`src/encode.rs`): `["c", id, kind]`, `["f", id, x, y, w, h]`, `["s", id, class,
 borderClass, tint]`, `["t", id, ...content, runs, styles, selectable, selectionClass]` (`styles`: a class per run
-style; `selectable` `null` when unset), `["in", id, config, class]`, `["css", class, text]`, and so on; `nsh.js` has one `op_<name>` method per
+style; `selectable` `null` when unset), `["vp", id, props]` (the view props as an object: `pointerEvents`, `hitSlop`,
+the accessibility props, `testID`, `focusable` when false, `selectionArea` when true), `["in", id, config, class]`, `["css", class, text]`, and so on; `nsh.js` has one `op_<name>` method per
 item. Views are absolutely positioned at the core's frames; borders are an overlay element (as UIKit draws layer
 borders) so they never move the content the core placed. Native animation items stay in Rust (`src/animation.rs`, a port
 of the Android animator); bound properties go out as `["a", id, prop, value]` after each batch and each
@@ -400,7 +468,7 @@ browsers' touches into what phones report:
   Rust, `nsh_key` matches a key on the spot with `Keymap::find` and `nsh_key_command` reports the binding; keys are
   passed as the character they type without modifiers, else the US layout's character of their `code`; `mod` was
   resolved by the browser's platform, `appleKeyboard` in the environment JSON); an open dialog (Escape presses its
-  cancel button); a focused field (Escape leaves it); selectable text with a selection (select all, Escape); a focused
+  cancel button); a focused field (Escape leaves it); selectable text with a selection (select all, in a selection area the whole area; Escape); a focused
   pressable (Return presses it, Space when released); going back (Escape, Alt+Left, Cmd+[, BrowserBack); scrolling the
   scroll view around the focus or under the mouse (arrows by 40 points, Page Up / Down and Space by 0.875 of a page,
   Home / End).
@@ -408,7 +476,7 @@ browsers' touches into what phones report:
   `focusable={false}` (a focused one that stops being a stop is blurred), so Tab and Shift+Tab reach them in DOM order; `focus:` states follow the keyboard focus (`:focus-visible`), which
   draws a ring inside the view; a popped page gives the focus back to what had it when the page was pushed
   (`screenGone`). A click never moves the focus (`mousedown` is prevented outside fields, selectable
-  text and hosted pages), as in native apps; it focuses the app's window in an iframe. The views under the newest
+  text, selection areas and hosted pages), as in native apps; it focuses the app's window in an iframe. The views under the newest
   `Dialog` or alert are `inert`; the focus one took comes back when it closes.
 - **Accessibility**: `op_vp` sets ARIA from the accessibility props (roles mapped by `ARIA_ROLES`, `aria-disabled`,
   `-selected`, `-checked`, `-busy`, `-expanded`, `-value*`, `-live`, `-hidden`, the hint as `aria-description`);
@@ -440,6 +508,15 @@ browsers' touches into what phones report:
   DOM order, each followed by its line's break when its end is selected (`Run::after`, the run tuple's fifth element:
   a newline, or the spaces a wrap dropped) and a newline between texts: the browser would run the absolutely placed
   runs together.
+- **Selection areas** (`SelectionArea`, `ViewProps::selection_area`): `op_vp` marks a view whose props have
+  `selectionArea` `nsh-area`, and the browser's own selection spans its texts (handles and long presses on phones
+  included). The area and everything in it is `user-select: text` in every idiom, inside views that take presses too,
+  except texts set off (`selectable={false}`: `nsh-noselect`, set by `op_t`), images and videos; an area inside
+  another is part of the outer one (`areaOf`). `textAt` takes the area's texts and `areaGap` its other places outside
+  views that take presses, so `mousedown` is not prevented there and a drag may start between texts, as between a
+  web page's paragraphs; pressables in the area keep their presses. Select all selects the whole area. Copying joins
+  the area's texts on one row (their boxes overlap vertically: a table's cells) with a tab instead of a newline and
+  leaves out attachments (U+FFFC), as `SelectionModel::text` does.
 - **Elsewhere**: no page context menu or iOS callout outside fields and selectable text; a mouse drag selects only in
   selectable text and fields; overflow is `clip`, never `hidden`, so that the browser cannot scroll a box the core
   laid out to show a focused field.
@@ -488,9 +565,10 @@ backends); zoom changes go to `nsh_zoom` (`EngineControl::zoom`) before the offs
   root for 2 or 3.5 s, also read out through the live region `Command::Announce` writes into.
 - **The clipboard**: `navigator.clipboard`, with a copy command as the fallback for writes. Reading (also for
   `hasString`, since browsers cannot tell without reading) needs a secure context and may ask the user.
-- **Images**: `<img>` with `object-fit` (`center` is `scale-down`), `defaultSource` as a second image until the load
-  (faded over `fadeDuration`), `blurRadius` as a CSS blur, a failed image hidden (`Image.getSize` / `prefetch`:
-  under Networking). `onProgress` is not reported.
+- **Images**: `<img>` with `object-fit` (`center` is `scale-down`; SVG files too: the browser draws them, so the
+  runtime links no SVG renderer and `tintColor`'s mask works on them as on bitmaps), `defaultSource` as a second
+  image until the load (faded over `fadeDuration`), `blurRadius` as a CSS blur, a failed image hidden
+  (`Image.getSize` / `prefetch`: under Networking). `onProgress` is not reported.
 - **Web views** are `<iframe>`s. HTML loads as `srcdoc` in a sandbox without `allow-same-origin` (an origin of its
   own: it cannot reach the player's page), after a bridge script (`webBridge`): the first message from the player
   carrying a random token hands it a `MessageChannel` port, over which `ReactNativeWebView.postMessage` reaches

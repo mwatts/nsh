@@ -11,14 +11,14 @@ use super::{
     Accessible, AnyElement, Interactive, IntoReactive,
     element::{ElNode, Element, IntoElement, IntoListener, Listener, ParentElement},
     events::{
-        self, Composition, KeyPress, NativeEvent, Selection, VideoInfo, VideoProgress,
-        WebNavigation,
+        self, Composition, KeyPress, NativeEvent, OverlayPosition, Selection, VideoInfo,
+        VideoProgress, WebNavigation,
     },
 };
 use crate::{
     AutoCapitalize, AutoFill, Color, EventKind, HeaderSlot, Hsla, JsonValue, KeyboardAppearance,
-    KeyboardType, ModalAnimation, ModalPresentation, ModalProp, NativeProp, Points, Prop,
-    ResizeMode, ReturnKeyType, Rgba, ScreenAnimation, ScreenProp, ScrollProp, Size,
+    KeyboardType, ModalAnimation, ModalPresentation, ModalProp, NativeProp, OverlayProp, Points,
+    Prop, ResizeMode, ReturnKeyType, Rgba, ScreenAnimation, ScreenProp, ScrollProp, Size,
     StatusBarSetting, SubmitBehavior, Tag, WebSource,
     canvas::{
         CanvasFont, CanvasGradient, CanvasImage, CanvasOp, CanvasTextAlign, CanvasTextBaseline,
@@ -26,6 +26,7 @@ use crate::{
     },
     geometry::{Bounds, Corners, Point, Radians, ScaledPixels},
     js::host::HostProps,
+    overlay::{Align, OverlayAnchor, Placement},
 };
 
 /// Whether `a` and `b` set the same property (their values aside).
@@ -64,9 +65,14 @@ crate::static_reactive!(ModalPresentation: ModalPresentation);
 crate::static_reactive!(ResizeMode: ResizeMode);
 crate::static_reactive!(ReturnKeyType: ReturnKeyType);
 crate::static_reactive!(SubmitBehavior: SubmitBehavior);
+crate::static_reactive!(crate::EllipsizeMode: crate::EllipsizeMode);
+crate::static_reactive!(JsonValue: JsonValue);
+crate::static_reactive!(StatusBarSetting: StatusBarSetting, crate::StatusBarStyle);
+crate::static_reactive!(Placement: Placement);
+crate::static_reactive!(Align: Align);
 
 /// Sets `prop` among `props`, replacing one of its kind.
-fn set_in(props: &mut Vec<Prop>, prop: Prop) {
+pub(crate) fn set_in(props: &mut Vec<Prop>, prop: Prop) {
     match props.iter_mut().find(|p| same_kind(p, &prop)) {
         Some(p) => *p = prop,
         None => props.push(prop),
@@ -114,6 +120,12 @@ macro_rules! host_element {
         impl Accessible for $name {}
         impl Interactive for $name {}
 
+        impl super::element::IntoTooltip for $name {
+            fn apply_tooltip(self, node: &mut ElNode) {
+                self.into_element().apply_tooltip(node);
+            }
+        }
+
         // Not every element has props of its own and events.
         #[allow(dead_code)]
         impl $name {
@@ -157,7 +169,8 @@ host_element! {
 }
 
 host_element! {
-    /// A native navigation stack (`<stack>`), made by [`stack`]:
+    /// A native navigation stack (`<stack>`, TS: `NavStack` of `nsh/base`),
+    /// made by `nsh_base::nav_stack`:
     /// UINavigationController on iOS (swipe back, native header), a stack
     /// with a toolbar and predictive back on Android. Its children are its
     /// [`Screen`]s, bottom to top.
@@ -165,14 +178,16 @@ host_element! {
 }
 
 host_element! {
-    /// One screen of a [`Stack`] (`<screen>`), made by [`screen`]: its
-    /// header options and its content (its children).
+    /// One page of a [`Stack`] (`<screen>`, TS: `NavPage` of `nsh/base`),
+    /// made by `nsh_base::nav_page`: its header options and its content (its
+    /// children).
     Screen
 }
 
 host_element! {
-    /// A modal (`<modal>`), made by [`modal`]: presented while it is in the
-    /// view, over everything else; its children are its content.
+    /// A dialog (`<modal>`, TS: `Dialog` of `nsh/base`), made by
+    /// `nsh_base::dialog`: presented while it is in the view, over everything
+    /// else; its children are its content.
     Modal
 }
 
@@ -204,6 +219,15 @@ host_element! {
     NativeView
 }
 
+host_element! {
+    /// Its children on top of the root view it is in (`<overlay>`, TS:
+    /// `Overlay` of `nsh`), made by [`overlay`]: the surface, or the dialog
+    /// around it; outside its parent's layout and clipping, while it stays
+    /// where it is for everything else (context, events, lifetime).
+    Overlay
+}
+
+impl ParentElement for Overlay {}
 impl ParentElement for Scroll {}
 impl ParentElement for Stack {}
 impl ParentElement for Screen {}
@@ -228,6 +252,17 @@ impl ParentElement for InputAccessoryView {
     }
 }
 
+/// An overlay: its children shown on top of the root view it is in (the
+/// surface, or the dialog around it), above what that root view shows and
+/// the overlays shown before it, while it is in the view (in a region:
+/// [`super::If`]). Without an anchor it is laid out as a `position: fixed`
+/// box of the root view (`.absolute().inset_0()` covers it); with one
+/// ([`Overlay::anchor`], [`Overlay::anchor_point`]) it goes on a side of it
+/// and follows it ([`crate::overlay`]).
+pub fn overlay() -> Overlay {
+    Overlay(ElNode::new(Tag::Overlay))
+}
+
 /// A text field.
 pub fn input() -> Input {
     Input(ElNode::new(Tag::Input))
@@ -241,12 +276,14 @@ pub fn scroll() -> Scroll {
 /// A native navigation stack of [`screen`]s: put a screen in to push it,
 /// leave it out to pop it. Give each screen a [`Element::key`] (its route)
 /// so the screens below keep their state.
+#[deprecated(note = "use nsh_base::nav_stack, as TSX's `NavStack` of `nsh/base`")]
 pub fn stack() -> Stack {
     Stack(ElNode::new(Tag::Stack))
 }
 
 /// A screen of a [`stack`]. What it shows reads its insets below the
 /// header ([`super::Scope::insets`]).
+#[deprecated(note = "use nsh_base::nav_page, as TSX's `NavPage` of `nsh/base`")]
 pub fn screen() -> Screen {
     let mut node = ElNode::new(Tag::Screen);
     // Its insets come with this event.
@@ -256,6 +293,7 @@ pub fn screen() -> Screen {
 
 /// A modal presenting its children. Put it in the view to present it (in
 /// a region: [`super::If`]), leave it out to dismiss it.
+#[deprecated(note = "use nsh_base::dialog, as TSX's `Dialog` of `nsh/base`")]
 pub fn modal() -> Modal {
     let mut node = ElNode::new(Tag::Modal);
     // Its insets (`Scope::insets` inside it) come with this event.
@@ -298,10 +336,11 @@ pub fn canvas(painter: impl IntoReactive<Painter>) -> CanvasView {
 
 crate::static_reactive!(Painter: Painter, Drawing);
 
-/// A web view loading `url`.
-pub fn web_view(url: &str) -> WebView {
-    WebView(ElNode::new(Tag::WebView))
-        .set(Prop::Native(NativeProp::Source(WebSource::Uri(url.into()))))
+/// A web view loading `url` (a bound one loads again when it changes).
+pub fn web_view(url: impl IntoReactive<String>) -> WebView {
+    WebView(ElNode::new(Tag::WebView)).bind_prop(url, |url: String| {
+        Prop::Native(NativeProp::Source(WebSource::Uri(url.into())))
+    })
 }
 
 /// A web view showing the page `html`, its relative links resolved against
@@ -310,9 +349,12 @@ pub fn web_view_html(html: impl IntoReactive<String>, base_url: Option<&str>) ->
     WebView(ElNode::new(Tag::WebView)).html(html, base_url)
 }
 
-/// A video playing the file or stream at `url`.
-pub fn video(url: &str) -> Video {
-    Video(ElNode::new(Tag::Video)).set(Prop::Native(NativeProp::Source(WebSource::Uri(url.into()))))
+/// A video playing the file or stream at `url` (a bound one plays the new
+/// one when it changes).
+pub fn video(url: impl IntoReactive<String>) -> Video {
+    Video(ElNode::new(Tag::Video)).bind_prop(url, |url: String| {
+        Prop::Native(NativeProp::Source(WebSource::Uri(url.into())))
+    })
 }
 
 /// The embedder's native component registered as `name`.
@@ -615,9 +657,44 @@ impl Screen {
 
     /// The header's colors: `backgroundColor`, `color` (the title's) and
     /// `tintColor` (the buttons'), as [`super::Style::from_decls`] makes
-    /// them (TS: `headerStyle`).
-    pub fn header_style(self, style: impl IntoReactive<super::Style>) -> Self {
-        self.bind_prop(style, |s: super::Style| Prop::HeaderStyle(s.0))
+    /// them (TS: `headerStyle`); a style of typed styles applies as
+    /// [`Self::header_style_with`]'s do.
+    pub fn header_style(mut self, style: impl IntoReactive<super::Style>) -> Self {
+        let style = match style.into_reactive() {
+            // Its bound parts are read in the binding, which follows them.
+            super::Reactive::Static(s) if s.1.is_bound() => {
+                super::Reactive::Bound(std::rc::Rc::new(move || s.clone()))
+            }
+            style => style,
+        };
+        self.0.bind_attr(style, |a, s: super::Style| {
+            set_in(&mut a.props, Prop::HeaderStyle(s.0));
+            if !s.1.is_empty() {
+                let typed = s.1.resolved();
+                let list = (!typed.is_empty()).then(|| Arc::new(typed.lower()));
+                set_in(&mut a.props, Prop::HeaderClassList(list));
+            }
+        });
+        self
+    }
+
+    /// The header's colors as typed styles: the background
+    /// ([`super::Styled::bg`]), the title's color
+    /// ([`super::Styled::text_color`]) and the buttons'
+    /// ([`super::Styled::tint_color`]), theme colors following the
+    /// appearance natively (TS: `headerClass`). `f` runs again when what it
+    /// reads changes. [`Self::header_style`] wins over it, key by key.
+    pub fn header_style_with(
+        self,
+        f: impl Fn(super::StyleRefinement) -> super::StyleRefinement + 'static,
+    ) -> Self {
+        let list = move || {
+            let style = f(super::StyleRefinement::default()).resolved();
+            (!style.is_empty()).then(|| Arc::new(style.lower()))
+        };
+        self.bind_prop(super::Reactive::Bound(std::rc::Rc::new(list)), |list| {
+            Prop::HeaderClassList(list)
+        })
     }
 
     /// The label of the back button leading back to this screen (iOS).
@@ -692,6 +769,122 @@ impl Screen {
             EventKind::BackRequest,
             listener.into_listener(),
             events::unit,
+        )
+    }
+}
+
+impl Overlay {
+    /// Places it against the element carrying `anchor` (rendered before
+    /// it), following it as it moves: on the [`Self::placement`] side, on
+    /// the other when only that one has room, kept inside the safe area.
+    pub fn anchor(self, anchor: &super::ElementRef) -> Self {
+        let anchor = *anchor;
+        self.bind_prop(
+            move || match anchor.node() {
+                Some(id) => OverlayAnchor::Node(id),
+                None => OverlayAnchor::None,
+            },
+            |a| Prop::Overlay(OverlayProp::Anchor(a)),
+        )
+    }
+
+    /// Places it against what the element carrying `anchor` draws: the box
+    /// around its children, so a trigger in a wrapper its parent stretches
+    /// is placed against what shows ([`OverlayAnchor::Content`]).
+    pub fn anchor_content(self, anchor: &super::ElementRef) -> Self {
+        let anchor = *anchor;
+        self.bind_prop(
+            move || match anchor.node() {
+                Some(id) => OverlayAnchor::Content(id),
+                None => OverlayAnchor::None,
+            },
+            |a| Prop::Overlay(OverlayProp::Anchor(a)),
+        )
+    }
+
+    /// Places it against a point of the root view (a touch's `page`: a
+    /// menu where the pointer is).
+    pub fn anchor_point(self, point: impl IntoReactive<Point<Points>>) -> Self {
+        self.bind_prop(point, |p| {
+            Prop::Overlay(OverlayProp::Anchor(OverlayAnchor::Point(p)))
+        })
+    }
+
+    /// The side of the anchor it goes on (default below).
+    pub fn placement(self, placement: impl IntoReactive<Placement>) -> Self {
+        self.bind_prop(placement, |p| Prop::Overlay(OverlayProp::Placement(p)))
+    }
+
+    /// How it lines up with the anchor along that side (default centered).
+    pub fn align(self, align: impl IntoReactive<Align>) -> Self {
+        self.bind_prop(align, |a| Prop::Overlay(OverlayProp::Align(a)))
+    }
+
+    /// The gap between the anchor and it.
+    pub fn offset(self, offset: impl IntoReactive<Points>) -> Self {
+        self.bind_prop(offset, |o| Prop::Overlay(OverlayProp::Offset(o)))
+    }
+
+    /// The distance it keeps from the edges of the safe area.
+    pub fn margin(self, margin: impl IntoReactive<Points>) -> Self {
+        self.bind_prop(margin, |m| Prop::Overlay(OverlayProp::Margin(m)))
+    }
+
+    /// A press went down outside it, its anchor and the overlays inside it
+    /// (where, in the root view). Closing is the listener's: leave it out
+    /// of the view.
+    pub fn on_press_outside<M>(self, listener: impl IntoListener<Point<Points>, M>) -> Self {
+        self.listen(
+            EventKind::PressOutside,
+            listener.into_listener(),
+            events::page_point,
+        )
+    }
+
+    /// Escape or the Android back button, while it is the top overlay
+    /// listening (it takes them from those below, the pages and
+    /// [`super::on_back_press`]).
+    pub fn on_cancel<M>(self, listener: impl IntoListener<(), M>) -> Self {
+        self.listen(EventKind::Cancel, listener.into_listener(), events::unit)
+    }
+
+    /// Makes it a hint (a tooltip): shown once the pointer rested on its
+    /// anchor (its parent without one) for `delay`, until the pointer
+    /// leaves or presses the anchor, on the desktops only; it is placed
+    /// against the anchor and should not take the pointer
+    /// ([`Interactive::pointer_events`] none). [`Self::hint_open`] decides
+    /// instead of the pointer.
+    pub fn hint(self, delay: impl IntoReactive<std::time::Duration>) -> Self {
+        self.bind_prop(delay, |d| Prop::Overlay(OverlayProp::Hint(Some(d))))
+    }
+
+    /// A hint shown (`Some(true)`) or hidden (`Some(false)`) whatever the
+    /// pointer does: its owner follows [`Self::on_hint_show`] /
+    /// [`Self::on_hint_hide`] (a `Tooltip` controlled by the app). `None`:
+    /// the pointer decides.
+    pub fn hint_open(self, open: impl IntoReactive<Option<bool>>) -> Self {
+        self.bind_prop(open, |o| Prop::Overlay(OverlayProp::Open(o)))
+    }
+
+    /// The pointer rested on a hint's anchor for its delay: it asks to
+    /// show (and shows, unless [`Self::hint_open`] decides).
+    pub fn on_hint_show<M>(self, listener: impl IntoListener<(), M>) -> Self {
+        self.listen(EventKind::Show, listener.into_listener(), events::unit)
+    }
+
+    /// The pointer left or pressed a hint's anchor, or the hint left the
+    /// view, after it asked to show: it asks to hide.
+    pub fn on_hint_hide<M>(self, listener: impl IntoListener<(), M>) -> Self {
+        self.listen(EventKind::Dismiss, listener.into_listener(), events::unit)
+    }
+
+    /// The core placed it against its anchor: the side it went on, its
+    /// frame and the room on that side.
+    pub fn on_position<M>(self, listener: impl IntoListener<OverlayPosition, M>) -> Self {
+        self.listen(
+            EventKind::Position,
+            listener.into_listener(),
+            events::overlay_position,
         )
     }
 }
@@ -991,9 +1184,13 @@ impl Video {
 }
 
 impl NativeView {
-    /// Its prop `name` (any JSON value), as JS's `nativeComponent` passes it.
-    pub fn prop(self, name: &str, value: JsonValue) -> Self {
-        self.set(Prop::ComponentProp(name.into(), Some(value)))
+    /// Its prop `name` (any JSON value), as JS's `nativeComponent` passes it;
+    /// a bound one is passed again when it changes.
+    pub fn prop(self, name: &str, value: impl IntoReactive<JsonValue>) -> Self {
+        let name: Arc<str> = name.into();
+        self.bind_prop(value, move |value| {
+            Prop::ComponentProp(name.clone(), Some(value))
+        })
     }
 
     /// It emitted an event.

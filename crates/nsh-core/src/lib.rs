@@ -11,6 +11,7 @@
 pub mod access;
 pub mod animation;
 pub mod canvas;
+pub mod clipboard;
 pub mod color;
 mod core;
 mod css;
@@ -21,22 +22,31 @@ mod fenwick;
 pub mod filesystem;
 pub mod geometry;
 mod grid;
+pub mod input;
 pub mod js;
 pub mod keymap;
 mod mount;
+pub mod navigation;
 mod ops;
+pub mod overlay;
 pub mod platform;
 mod props;
 pub mod reactive;
 pub mod resource;
 pub mod runtime;
+pub mod scroll;
+pub mod selection;
 pub mod shape;
 pub mod storage;
 mod style;
+#[cfg(feature = "svg")]
+pub mod svg;
 pub mod tailwind;
 mod text;
+pub mod text_edit;
 pub mod time;
 mod transform;
+pub mod transition;
 pub mod ui;
 pub mod websocket;
 
@@ -62,13 +72,13 @@ pub use crate::{
     },
     ops::{
         AutoCapitalize, AutoFill, CellSlot, Command, ContextMenuEvent, Dialog, DialogButton,
-        DialogButtonStyle, EventKind, EventMask, EventPayload, HeaderSlot, HoverEvent, ImageProp,
-        ImageSource, KeyboardAppearance, KeyboardDismissMode, KeyboardTaps, KeyboardType,
-        ListContentStyle, ModalAnimation, ModalPresentation, ModalProp, NativeProp, NodeId, Op,
-        PayloadValue, PressEvent, PressPosition, Prop, ROOT_ID, ResizeMode, ReturnKeyType,
-        ScreenAnimation, ScreenProp, ScrollProp, SelectionEvent, SnapAlignment, StatusBarConfig,
-        StatusBarSetting, StatusBarStyle, SubmitBehavior, Tag, TouchEvent, TouchPhase, TouchPoint,
-        Viewability, WebSource,
+        DialogButtonStyle, EventKind, EventMask, EventPayload, HeaderSlot, HoverEvent,
+        IMAGE_SCALES, ImageProp, ImageScales, ImageSource, KeyboardAppearance, KeyboardDismissMode,
+        KeyboardTaps, KeyboardType, ListContentStyle, ModalAnimation, ModalPresentation, ModalProp,
+        NativeProp, NodeId, Op, OverlayProp, PayloadValue, PressEvent, PressPosition, Prop,
+        ROOT_ID, ResizeMode, ReturnKeyType, ScreenAnimation, ScreenProp, ScrollProp,
+        SelectionEvent, SnapAlignment, StatusBarConfig, StatusBarSetting, StatusBarStyle,
+        SubmitBehavior, Tag, TouchEvent, TouchPhase, TouchPoint, Viewability, WebSource,
     },
     props::{
         Accessibility, AccessibilityActionDef, AccessibilityProp, AccessibilityRole,

@@ -20,7 +20,10 @@
 //!   quiet);
 //! - `tap <selector>`: presses the first view on screen `id:<testID>`,
 //!   `label:<accessibility label>` or `text:<text>` names, or its nearest
-//!   pressable ancestor (as `nsh test`'s `press`);
+//!   pressable ancestor (as `nsh test`'s `press`); `span:<text>` presses
+//!   the innermost pressable span (a nested `<Text>` with `onPress`, a
+//!   link) where `<text>` starts in the first text that contains it, else
+//!   the text's nearest pressable ancestor;
 //! - `wait <ms>`: lets timers and animations run;
 //! - `frame <selector> <x> <y> <width> <height>`: the first view on screen
 //!   the selector names (itself, pressable or not) is laid out at that
@@ -86,6 +89,9 @@
 //! - `keyboard <height> <duration>`: the software keyboard shows at
 //!   `<height>` points over the bottom of the surface, animated over
 //!   `<duration>` seconds (`0 0`: it hides);
+//! - `pixelratio <ratio>`: the surface moves to a screen of `<ratio>`
+//!   device pixels per point (1 at the start), as a window moved to
+//!   another screen does;
 //! - `statusbar <key>=<value>...`: the status bar the platform was last
 //!   told to show reads `<value>` for each `<key>` given (`foreground`:
 //!   `auto`, `light` or `dark`; `hidden`, `animated`: `true` or `false`;
@@ -95,8 +101,11 @@
 //!   verifies it).
 //!
 //! A selector is one word (`id:<testID>`, `label:<label>`, `text:<text>`,
-//! and `scroll:<selector>`, the nearest scroll view around the view the
-//! inner selector names: a list, by one of its rows);
+//! `scroll:<selector>`, the nearest scroll view around the view the
+//! inner selector names: a list, by one of its rows, and
+//! `parent:<selector>`, the view around it: a component's popup, by the
+//! app's content in it, and `below:<selector>`, its sibling below it: a
+//! popup's backdrop);
 //! the steps after `frame` also take the part after `:` quoted, for one
 //! with spaces: `text:"Taps: 0"`. Any error the app reports fails it. `NSH_API_APP=<name>` runs the fixtures whose name starts so; `NSH_API_DUMP=1` prints the texts
 //! on screen after each step, for writing scripts.
@@ -115,7 +124,7 @@ use std::{
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use nsh_core::{
     ApproxTextEngine, ContextMenuEvent, EventKind, EventPayload, HoverEvent, MountBatch, MountItem,
-    NodeId, PayloadValue, Points, Size, TouchEvent, TouchPhase, TouchPoint,
+    NodeId, PayloadValue, Points, Size, TextLink, TouchEvent, TouchPhase, TouchPoint,
     geometry::{DevicePixels, point, px},
     keymap::Modifiers,
     platform::{Environment, Idiom, Os},
@@ -183,6 +192,8 @@ struct View {
     test_id: Option<Arc<str>>,
     label: Option<Arc<str>>,
     text: Option<String>,
+    /// Its text's pressable spans.
+    links: Vec<TextLink>,
     frame: Option<Rect>,
     /// What the platform got for it, as `prop` and `style` read it.
     mounted: Mounted,
@@ -224,7 +235,9 @@ impl Views {
                     view.label = props.accessibility.label.clone();
                 }
                 MountItem::Text { id, text, .. } => {
-                    self.nodes.entry(*id).or_default().text = Some(text.text.clone());
+                    let view = self.nodes.entry(*id).or_default();
+                    view.text = Some(text.text.clone());
+                    view.links = text.links.clone();
                 }
                 MountItem::Frame { id, frame, .. } => {
                     self.nodes.entry(*id).or_default().frame = Some(Rect::from(*frame));
@@ -280,10 +293,36 @@ impl Views {
             .and_then(|id| self.pressable_from(id))
     }
 
+    /// For `span:<text>`, the innermost pressable span where `<text>`
+    /// starts in the first text that contains it.
+    fn link(&self, selector: &str) -> Option<NodeId> {
+        let want = selector.strip_prefix("span:")?;
+        let view = self.nodes.get(&self.find_view(selector)?)?;
+        let text = view.text.as_deref()?;
+        let at = text[..text.find(want)?].encode_utf16().count() as u32;
+        view.links
+            .iter()
+            .filter(|l| l.start <= at && at < l.end)
+            .min_by_key(|l| l.end - l.start)
+            .map(|l| l.node)
+    }
+
     /// The first view on screen `selector` names.
     fn find_view(&self, selector: &str) -> Option<NodeId> {
         if let Some(inner) = selector.strip_prefix("scroll:") {
             return self.scroll_around(inner);
+        }
+        // The view around another: a component's own part (a popup) that
+        // only the app's content in it names.
+        if let Some(inner) = selector.strip_prefix("parent:") {
+            return self.nodes.get(&self.find_view(inner)?)?.parent;
+        }
+        // The view below another among its siblings (a popup's backdrop).
+        if let Some(inner) = selector.strip_prefix("below:") {
+            let id = self.find_view(inner)?;
+            let siblings = self.children.get(&self.nodes.get(&id)?.parent?)?;
+            let at = siblings.iter().position(|&s| s == id)?;
+            return at.checked_sub(1).map(|i| siblings[i]);
         }
         let is = |value: &Option<Arc<str>>, want: &str| value.as_deref() == Some(want);
         let test: Box<dyn Fn(&View) -> bool> = if let Some(want) = selector.strip_prefix("id:") {
@@ -376,6 +415,8 @@ impl Run {
             storage: None,
             clock: Default::default(),
             context: Default::default(),
+            pinned: Default::default(),
+            clipboard: None,
         };
         let sink = Sink {
             batches: tx,
@@ -627,7 +668,7 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
             }
             "tap" => {
                 run.settle(TAP_WAIT);
-                let Some(id) = run.views.find(arg) else {
+                let Some(id) = run.views.link(arg).or_else(|| run.views.find(arg)) else {
                     return failed("nothing to press".into(), &run);
                 };
                 run.control
@@ -713,10 +754,14 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
             "listens" => {
                 let (selector, event) = selector(arg);
                 let event = event.trim();
-                let kind =
-                    event_kind(event).ok_or_else(|| format!("`{line}`: `{event}` is no event"))?;
-                let listens =
-                    |v: &Views| v.mounted(&selector).is_some_and(|(m, _)| m.listens(kind));
+                let kinds = event_kinds(event);
+                if kinds.is_empty() {
+                    return Err(format!("`{line}`: `{event}` is no event").into());
+                }
+                let listens = |v: &Views| {
+                    v.mounted(&selector)
+                        .is_some_and(|(m, _)| kinds.iter().any(|&k| m.listens(k)))
+                };
                 if !run.until(EXPECT_WAIT, listens) {
                     return failed(format!("`{event}` not reported"), &run);
                 }
@@ -730,15 +775,19 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
                 let (selector, rest) = selector(arg);
                 let rest = rest.trim();
                 let (name, fields) = rest.split_once(' ').unwrap_or((rest, ""));
-                let kind =
-                    event_kind(name).ok_or_else(|| format!("`{line}`: `{name}` is no event"))?;
+                let kinds = event_kinds(name);
+                if kinds.is_empty() {
+                    return Err(format!("`{line}`: `{name}` is no event").into());
+                }
                 let fields = parse_fields(fields).map_err(|e| format!("`{line}`: {e}"))?;
                 run.settle(TAP_WAIT);
-                let Some(id) = run
-                    .views
-                    .find_view(&selector)
-                    .and_then(|id| listener(&run.views, id, kind))
-                else {
+                // The first of the events the name may be that a view
+                // around reports (`onCancel`: a dialog's, an overlay's).
+                let Some((id, kind)) = run.views.find_view(&selector).and_then(|id| {
+                    kinds
+                        .iter()
+                        .find_map(|&k| listener(&run.views, id, k).map(|at| (at, k)))
+                }) else {
                     return failed(format!("nothing there reports `{name}`"), &run);
                 };
                 let payload = event_payload(&run.views, id, kind, fields, &mut device)
@@ -897,6 +946,13 @@ pub(crate) fn run(code: String, script: &str, dir: &Path) -> Result<(), Failure>
                     .ok_or_else(|| format!("`{line}`: keyboard <height> <duration>"))?;
                 environment.keyboard_height = px(height);
                 environment.keyboard_duration = duration;
+                run.control.set_environment(environment);
+            }
+            "pixelratio" => {
+                let [ratio] = numbers::<1>(arg)
+                    .filter(|[r]| *r > 0.0)
+                    .ok_or_else(|| format!("`{line}`: pixelratio <ratio>"))?;
+                environment.pixel_ratio = ratio;
                 run.control.set_environment(environment);
             }
             "statusbar" => {
@@ -1076,19 +1132,24 @@ fn parse_fields(text: &str) -> Result<Vec<(String, Field)>, String> {
 /// apps write it (`onChange`), a handler of `nsh/base`'s `NavPage` and
 /// `Dialog` (the runtime's own listeners of the platform's events), or the
 /// platform protocol's name (`onChangeText`).
-fn event_kind(name: &str) -> Option<EventKind> {
-    EventKind::from_handler(name)
-        .or(match name {
-            // `NavPage`.
-            "onDismiss" => Some(EventKind::Dismiss),
-            "onBackPress" => Some(EventKind::BackRequest),
-            // `Dialog`.
-            "onCancel" | "onOpenChange" => Some(EventKind::RequestClose),
-            "onOpen" => Some(EventKind::Show),
-            "onClose" => Some(EventKind::Dismiss),
-            _ => None,
-        })
-        .or_else(|| EventKind::from_prop(name))
+/// The events a handler's name may be, the components' first: a name a
+/// component handles itself (`Dialog`'s `onCancel`) may also be a host
+/// element's (`Overlay`'s).
+fn event_kinds(name: &str) -> Vec<EventKind> {
+    let component = match name {
+        // `NavPage`.
+        "onDismiss" => Some(EventKind::Dismiss),
+        "onBackPress" => Some(EventKind::BackRequest),
+        // `Dialog`.
+        "onCancel" | "onOpenChange" => Some(EventKind::RequestClose),
+        "onOpen" => Some(EventKind::Show),
+        "onClose" => Some(EventKind::Dismiss),
+        _ => None,
+    };
+    let host = EventKind::from_handler(name).or_else(|| EventKind::from_prop(name));
+    let mut kinds: Vec<EventKind> = component.into_iter().chain(host).collect();
+    kinds.dedup();
+    kinds
 }
 
 /// The payload of an `event` step, as the platforms make it for `kind`.

@@ -2,7 +2,7 @@
 //! bottom over a dimmed backdrop, dragged down to close. The drag and the springs run natively: the panel
 //! follows the finger with no engine work per frame.
 
-use nsh_base::theme;
+use nsh_base::{dialog, theme};
 use nsh_core::ui::prelude::*;
 
 use super::colors;
@@ -76,16 +76,16 @@ pub(crate) fn Sheet(props: SheetProps, cx: Scope<SheetEvent>) -> impl IntoElemen
         }
     });
     let children = props.children;
-    view().child(If::new(props.open, move || {
+    view().child(when(props.open, move || {
         let height = untracked(window).height;
-        modal()
+        dialog()
             .animation(ModalAnimation::None)
             // The sheet slides away itself before it goes: nothing closes
             // it natively, every attempt is reported to `on_cancel`.
             .close_on_escape(false)
             .close_on_backdrop_press(false)
             .close_on_swipe(false)
-            .on_cancel(move |_: &()| close())
+            .on_cancel(close)
             .child(
                 // The backdrop fades with the panel's position.
                 view()
@@ -97,7 +97,7 @@ pub(crate) fn Sheet(props: SheetProps, cx: Scope<SheetEvent>) -> impl IntoElemen
                     // For the pointer: Escape and the back button close it
                     // from the keyboard, which goes straight to the panel.
                     .focusable(false)
-                    .on_press(move |_: &()| close()),
+                    .on_press(close),
             )
             .child(
                 view()
