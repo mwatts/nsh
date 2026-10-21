@@ -218,4 +218,10 @@ final class Native {
 
     /** The characters waiting for the field that just focused. */
     static native String takeHold(long handle);
+
+    /**
+     * The {@code onKeyPress} name of an Android navigation key code, or null
+     * when the code is not one.
+     */
+    static native String navigationKey(int code);
 }

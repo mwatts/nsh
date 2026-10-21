@@ -16,7 +16,8 @@ use objc2::{
 };
 use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
 use objc2_foundation::{
-    NSArray, NSAttributedString, NSAttributedStringKey, NSDictionary, NSObject, NSRange, NSString,
+    NSArray, NSAttributedString, NSAttributedStringKey, NSDictionary, NSObject, NSRange, NSSet,
+    NSString,
 };
 use objc2_ui_kit::{
     NSFontAttributeName, NSForegroundColorAttributeName, NSTextAlignment, UIColor, UIControl,
@@ -89,6 +90,15 @@ define_class!(
             }
             // SAFETY: calling the superclass implementation.
             unsafe { msg_send![super(self), caretRectForPosition: position] }
+        }
+
+        /// A hardware navigation key, reported before UIKit moves the caret.
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
+            report_navigation_keys(self.as_ref(), presses);
+            // SAFETY: calling the superclass implementation.
+            let _: () =
+                unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
         }
 
         #[unsafe(method(deleteBackward))]
@@ -173,6 +183,15 @@ define_class!(
             unsafe { msg_send![super(self), caretRectForPosition: position] }
         }
 
+        /// A hardware navigation key, reported before UIKit moves the caret.
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
+            report_navigation_keys(self.as_ref(), presses);
+            // SAFETY: calling the superclass implementation.
+            let _: () =
+                unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
+        }
+
         #[unsafe(method(deleteBackward))]
         fn delete_backward(&self) {
             let empty = self.text().length() == 0;
@@ -203,6 +222,43 @@ define_class!(
         }
     }
 );
+
+/// Reports a hardware navigation key before UIKit acts on it.
+fn report_navigation_keys(view: &UIView, presses: &NSSet<AnyObject>) {
+    let objects = presses.allObjects();
+    for index in 0..objects.count() {
+        let press = objects.objectAtIndex(index);
+        // SAFETY: `UIPress.key` is a `UIKey`. Its unmodified characters are
+        // the function-key values UIKit uses for arrows, Home, End, and
+        // forward delete, or a tab.
+        let key: Option<Retained<AnyObject>> = unsafe { msg_send![&*press, key] };
+        let Some(key) = key else { continue };
+        let chars: Option<Retained<NSString>> =
+            unsafe { msg_send![&*key, charactersIgnoringModifiers] };
+        let Some(chars) = chars else { continue };
+        let text = chars.to_string();
+        let mut characters = text.chars();
+        let Some(character) = characters.next() else {
+            continue;
+        };
+        if characters.next().is_some() {
+            continue;
+        }
+        let Some(navigation) =
+            nsh_core::navigation_key::NavigationKey::from_uikit_character(character)
+        else {
+            continue;
+        };
+        // SAFETY: both input classes have a `delegate`, set to the target.
+        let delegate: Option<Retained<AnyObject>> = unsafe { msg_send![view, delegate] };
+        if let Some(target) = delegate
+            .as_deref()
+            .and_then(|d| d.downcast_ref::<EventTarget>())
+        {
+            target.key_press(view.tag() as NodeId, navigation.press_name().to_owned());
+        }
+    }
+}
 
 /// Reports `Backspace` for a delete in an empty input (to its delegate,
 /// the event target).

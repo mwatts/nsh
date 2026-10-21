@@ -1403,3 +1403,18 @@ extern "system" fn Java_com_longbridge_nsh_Native_takeHold<'local>(
     env.new_string(text)
         .unwrap_or_else(|_| JString::from(JObject::null()))
 }
+
+/// The `onKeyPress` name of an Android navigation key code, or null.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_longbridge_nsh_Native_navigationKey<'local>(
+    env: JNIEnv<'local>,
+    _: JClass<'local>,
+    code: jint,
+) -> JString<'local> {
+    match nsh_core::navigation_key::NavigationKey::from_android_keycode(code) {
+        Some(key) => env
+            .new_string(key.press_name())
+            .unwrap_or_else(|_| JString::from(JObject::null())),
+        None => JString::from(JObject::null()),
+    }
+}

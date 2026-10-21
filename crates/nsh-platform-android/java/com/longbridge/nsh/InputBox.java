@@ -65,7 +65,10 @@ final class InputBox extends FrameLayout implements Node {
             @Override
             public boolean onKeyDown(int code, android.view.KeyEvent event) {
                 // Hardware keys, and keys the keyboard sends as key events.
-                if (code == android.view.KeyEvent.KEYCODE_DEL) key("Backspace");
+                // Navigation keys are named before the field acts on them.
+                String navigation = Native.navigationKey(code);
+                if (navigation != null) key(navigation);
+                else if (code == android.view.KeyEvent.KEYCODE_DEL) key("Backspace");
                 else if (code == android.view.KeyEvent.KEYCODE_ENTER) key("Enter");
                 else if (event.getUnicodeChar() != 0) key(String.valueOf((char) event.getUnicodeChar()));
                 return super.onKeyDown(code, event);
