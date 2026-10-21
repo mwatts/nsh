@@ -13,7 +13,7 @@ use nsh_core::{
 use nsh_dev::protocol::TestStep;
 use serde_json::Value;
 
-use crate::headless::{DialogAnswer, Headless};
+use crate::headless::{DialogAnswer, DragTo, Headless};
 
 /// An app a test opened, driven by steps and read by queries.
 pub(crate) trait Driver: Send {
@@ -25,6 +25,7 @@ pub(crate) trait Driver: Send {
     fn submit(&mut self, selector: &str) -> Result<(), String>;
     fn clear(&mut self, selector: &str) -> Result<(), String>;
     fn scroll(&mut self, selector: &str, distance: Points) -> Result<(), String>;
+    fn drag(&mut self, selector: &str, to: DragTo) -> Result<(), String>;
     fn back(&mut self) -> Result<(), String>;
     fn wait(&mut self, time: Duration) -> Result<(), String>;
     fn wait_for_within(&mut self, selector: &str, timeout: Duration) -> Result<(), String>;
@@ -70,6 +71,9 @@ impl Driver for Headless {
     }
     fn scroll(&mut self, selector: &str, distance: Points) -> Result<(), String> {
         Headless::scroll(self, selector, distance)
+    }
+    fn drag(&mut self, selector: &str, to: DragTo) -> Result<(), String> {
+        Headless::drag(self, selector, to)
     }
     fn back(&mut self) -> Result<(), String> {
         Headless::back(self)
@@ -235,6 +239,9 @@ impl Driver for Remote {
             selector: selector.into(),
             distance: distance.0,
         })
+    }
+    fn drag(&mut self, _: &str, _: DragTo) -> Result<(), String> {
+        Err(headless_only("Dragging (`app.drag`)"))
     }
     fn back(&mut self) -> Result<(), String> {
         self.action(TestStep::Back)

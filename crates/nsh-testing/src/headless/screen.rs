@@ -11,7 +11,7 @@ use std::{
 
 use nsh_core::{
     AccessibilityRole, Bounds, Command, Dialog, EventKind, EventMask, InputConfig, MountBatch,
-    MountItem, NodeId, Points, Size, ViewKind, ui::PropEnum,
+    MountItem, NodeId, PanActivation, Point, Points, Size, ViewKind, ui::PropEnum,
 };
 
 use super::selector::{Matcher, Selector, TextMatch};
@@ -105,6 +105,8 @@ struct View {
     /// How long a press must last to be a long one (`delayLongPress`), in
     /// milliseconds.
     long_press_delay: Option<f32>,
+    /// When its touch responder waits for a pan (`panActivation`).
+    pan_activation: Option<PanActivation>,
 }
 
 /// Which views a selector matched, for a step that acts on one.
@@ -259,6 +261,7 @@ impl Screen {
                 view.role = props.accessibility.role;
                 view.disabled = props.accessibility.state.disabled;
                 view.long_press_delay = props.long_press_delay;
+                view.pan_activation = props.pan_activation;
             }
             MountItem::AccessibilityLabel { id, label } => {
                 self.nodes.entry(*id).or_default().label = label.clone();
@@ -718,6 +721,61 @@ impl Screen {
             [one] => Pick::One(one),
             ref all => Pick::Many(all.len()),
         }
+    }
+
+    /// The one view the selector names.
+    pub(crate) fn view(&self, selector: &Selector) -> Pick {
+        self.pick(selector, Some)
+    }
+
+    /// Where view `id` is in the surface: its frame moved by the frames
+    /// around it and the offsets of the scroll views it is in.
+    pub(crate) fn page_bounds(&self, id: NodeId) -> Option<Bounds<Points>> {
+        let view = self.nodes.get(&id)?;
+        let mut bounds = view.frame;
+        let mut at = view.parent;
+        while let Some(parent) = at {
+            let Some(view) = self.nodes.get(&parent) else {
+                break;
+            };
+            if let Some(scroll) = &view.scroll {
+                bounds.origin -= Point::new(scroll.x, scroll.y);
+            }
+            bounds.origin += view.frame.origin;
+            at = view.parent;
+        }
+        Some(bounds)
+    }
+
+    /// The innermost view in `id` (it included) under `at`, the topmost
+    /// first, as a pointer going down there finds it.
+    pub(crate) fn hit(&self, id: NodeId, at: Point<Points>) -> NodeId {
+        let inside = |id: &NodeId| self.page_bounds(*id).is_some_and(|b| b.contains(&at));
+        let mut hit = id;
+        while let Some(child) = self
+            .children
+            .get(&hit)
+            .and_then(|children| children.iter().rev().find(|c| inside(c)))
+        {
+            hit = *child;
+        }
+        hit
+    }
+
+    /// `id` and the views around it, innermost first.
+    pub(crate) fn chain(&self, id: NodeId) -> Vec<NodeId> {
+        let mut out = vec![id];
+        let mut at = self.nodes.get(&id).and_then(|v| v.parent);
+        while let Some(id) = at {
+            out.push(id);
+            at = self.nodes.get(&id).and_then(|v| v.parent);
+        }
+        out
+    }
+
+    /// View `id`'s `panActivation`.
+    pub(crate) fn pan_activation(&self, id: NodeId) -> Option<PanActivation> {
+        self.nodes.get(&id)?.pan_activation
     }
 
     /// The view a press on the selector's match goes to: it, or its nearest

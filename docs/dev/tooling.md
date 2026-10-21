@@ -238,6 +238,13 @@ and more than one fails the step; a press whose match, or a view between it and 
   points per frame within its content (`ScrollBeginDrag`, offsets with the applied count as platforms report them,
   `ScrollEndDrag`, `ScrollEnd`); the model applies `ScrollBy` and `ScrollTo` / `ScrollToEnd` and reports where a
   command moved the view;
+- `drag` (`headless/drag.rs`): a mouse drag from the middle of the match (the innermost view there) by an offset or
+  onto the middle of another match, 10 points per frame, as `nsh-platform-gpui`'s `input.rs` takes it: the views
+  around the pointer that listen to touches get `Touch` on the root (start, moves, end) for JS's responder system; a
+  `panActivation` around it decides on each move and sends the activation with the move; past 6 points the innermost
+  view with a native pan (`pan` values, `PanStart` / `PanEnd`) taking that direction pans (`PanStart`, its values
+  follow the pointer in the model's animator, `PanEnd` with translation, velocity and values) unless a JS responder
+  blocks native gestures (`SetJsResponder`); it drags no scroll view and presses nothing;
 - `wait`, `wait_for` / `wait_for_gone` / `wait_until` (until a selector matches, matches no more, a condition on the
   screen holds), `next_change` (one batch or animation frame: what `nsh/test`'s `waitUntil` waits for between calls
   of its JS condition), `idle` (until quiet for a while).

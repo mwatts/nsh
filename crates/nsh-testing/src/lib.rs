@@ -52,8 +52,9 @@ use nsh_engine::{Bundle, EngineConfig};
 #[cfg(feature = "live")]
 pub use self::headless::UreqNetwork;
 pub use self::headless::{
-    DialogAnswer, DirectoryAssets, Headless, MemoryStorage, RecordingNetwork, Screen, StubHandler,
-    StubNetwork, StubReply, StubResponse, StubRoute, WAIT, default_answer, print_batch, start,
+    DialogAnswer, DirectoryAssets, DragTo, Headless, MemoryStorage, RecordingNetwork, Screen,
+    StubHandler, StubNetwork, StubReply, StubResponse, StubRoute, WAIT, default_answer,
+    print_batch, start,
 };
 #[cfg(feature = "js")]
 pub use self::{

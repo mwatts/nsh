@@ -6,7 +6,7 @@
 //! native views ([`Screen`]) and takes steps on what they show, named by
 //! selectors (`id:save`, `label:Close`, `text:+1`, `view:12`, or a bare
 //! string): [`Headless::press`], [`Headless::type_text`],
-//! [`Headless::submit`], [`Headless::scroll`], [`Headless::wait`],
+//! [`Headless::submit`], [`Headless::scroll`], [`Headless::drag`], [`Headless::wait`],
 //! [`Headless::wait_for`]. Each step delivers the events a platform
 //! would, in its order, and fails with what is on screen when it cannot
 //! be taken or when the app throws. An observer ([`Headless::observe`])
@@ -27,6 +27,7 @@
 //! of an app's crate, which need no QuickJS for a Rust root.
 
 mod animation;
+mod drag;
 #[cfg(feature = "live")]
 mod live;
 mod net;
@@ -61,6 +62,7 @@ use self::{
     selector::Selector,
 };
 pub use self::{
+    drag::DragTo,
     net::DirectoryAssets,
     screen::Screen,
     stub::{

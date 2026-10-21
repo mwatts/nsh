@@ -142,6 +142,20 @@ fn selectors_find_one_view_and_steps_act_on_it() {
 }
 
 #[test]
+fn drags_reach_responders_pans_and_pan_activations() {
+    let run = TestRun {
+        ui_sets: vec![nsh_base::registry()],
+        compile: compiler(vec![nsh_base::registry()]),
+        ..test_run(None)
+    };
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/testing/drag");
+    let results = run_file(&run, &dir.join("App.test.tsx"), &mut |_| {}).unwrap();
+    let failed: Vec<_> = results.iter().filter(|r| r.failure.is_some()).collect();
+    assert!(failed.is_empty(), "{failed:#?}");
+    assert_eq!(results.len(), 5);
+}
+
+#[test]
 fn open_sets_the_environment_and_routes_answer_requests() {
     let run = TestRun {
         ui_sets: vec![nsh_base::registry()],

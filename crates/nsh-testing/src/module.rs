@@ -417,6 +417,47 @@ impl JsValue for Time {
     }
 }
 
+/// Where a drag lifts the pointer (`app.drag`): over the middle of the
+/// view a selector names, or `{ x, y }` points from where it went down.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DragTarget(pub headless::DragTo);
+
+impl JsValue for DragTarget {
+    fn ts_type(_types: &mut TsTypes) -> String {
+        "string | { x: number; y: number }".into()
+    }
+
+    fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
+        if let Some(selector) = value.as_string() {
+            return Ok(DragTarget(headless::DragTo::Onto(selector)));
+        }
+        let expected = || value.expected("a selector or { x, y } points");
+        if value.kind() != JsKind::Object {
+            return Err(expected());
+        }
+        let number = |key: &str| -> Result<f32, PropError> {
+            let n = value
+                .field(key)?
+                .get()
+                .as_number()
+                .filter(|n| n.is_finite());
+            n.map(|n| n as f32).ok_or_else(expected)
+        };
+        let by = nsh_core::geometry::point(
+            nsh_core::geometry::px(number("x")?),
+            nsh_core::geometry::px(number("y")?),
+        );
+        Ok(DragTarget(headless::DragTo::By(by)))
+    }
+
+    fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
+        match &self.0 {
+            headless::DragTo::Onto(selector) => selector.to_js(host),
+            headless::DragTo::By(by) => serde_json::json!({ "x": by.x.0, "y": by.y.0 }).to_js(host),
+        }
+    }
+}
+
 /// The system's appearance.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PropEnum)]
 pub enum ColorScheme {
@@ -999,6 +1040,21 @@ impl App {
             app.scroll(&selector, nsh_core::geometry::px(distance as f32))
         })
         .await
+    }
+
+    /// Holds the pointer down on the middle of the view `selector` names,
+    /// moves it a display frame at a time to `to` (the middle of the view
+    /// a selector names, or `{ x, y }` points away), and lifts it, as a
+    /// mouse drag does: the views around it hear the touches and the
+    /// responder events (`onResponderGrant`, `onResponderMove`,
+    /// `onResponderRelease`), and a view with a native pan pans
+    /// (`onPanStart`, its `pan` values, `onPanEnd`).
+    pub async fn drag(
+        this: Instance<Self>,
+        selector: String,
+        to: DragTarget,
+    ) -> Result<(), String> {
+        step(&this, move |app| app.drag(&selector, to.0)).await
     }
 
     /// Lets the app run for `ms` milliseconds (timers and animations): on a
