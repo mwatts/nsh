@@ -206,4 +206,10 @@ final class Native {
 
     /** Interaction states of view {@code id} the core tracks ({@code Mounter.STATE_*}). */
     static native void states(long handle, int id, int states);
+
+    /**
+     * The {@code onKeyPress} name of an Android navigation key code, or null
+     * when the code is not one.
+     */
+    static native String navigationKey(int code);
 }

@@ -1218,6 +1218,8 @@ impl Headless {
             Key::Delete => Some("Delete"),
             Key::Escape => Some("Escape"),
             Key::Tab => Some("Tab"),
+            Key::Home => Some("Home"),
+            Key::End => Some("End"),
             _ => None,
         };
         if let Some(name) = named {
@@ -2130,10 +2132,10 @@ mod tests {
             .child(text(move || format!("name: {}", name.get())))
     }
 
-    /// Arrows, Delete, and Enter are keys of the focused field even when
-    /// it cannot be edited, including while text is waiting for an editable
-    /// field. A plain character typed then waits, and the next editable
-    /// field takes it.
+    /// Arrows, Delete, Home, End, and Enter are keys of the focused field
+    /// even when it cannot be edited, including while text is waiting for
+    /// an editable field. A plain character typed then waits, and the next
+    /// editable field takes it.
     #[test]
     fn a_readonly_field_hears_navigation_keys_while_text_waits() {
         let mut config = EngineConfig::new(Root::of::<ReadOnlyKeys>());
@@ -2144,9 +2146,12 @@ mod tests {
         app.arm_text();
         app.press_key("down").unwrap();
         app.press_key("delete").unwrap();
+        app.press_key("home").unwrap();
+        app.press_key("end").unwrap();
         app.press_key("enter").unwrap();
         app.press_key("a").unwrap();
-        app.wait_for("log: ArrowDown|Delete|Enter").unwrap();
+        app.wait_for("log: ArrowDown|Delete|Home|End|Enter")
+            .unwrap();
         assert_eq!(app.screen().input_text("id:keys"), Ok(Some("")));
         assert_eq!(app.screen().input_text("id:name"), Ok(Some("")));
         app.type_text("id:name", "").unwrap();
