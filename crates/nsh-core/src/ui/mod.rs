@@ -413,7 +413,7 @@ pub mod prelude {
             on_back_press, on_key, on_key_with, os, os_version, pixel_ratio, prefetch_image,
             reduce_motion, request_animation_frame, round_to_nearest_pixel, rtl, safe_area,
             screen_reader, set_clipboard, set_clipboard_image, set_color_scheme, set_interval,
-            set_timeout, spawn, timer, timer_until, toast, tokens, window,
+            set_timeout, spawn, text_metrics, timer, timer_until, toast, tokens, window,
         },
         batch, catch_error, cleanup, component, computed, dynamic, each, effect, engine_context,
         provide_context, resource, resource_with_value, signal, signal_with, stored, untracked,
