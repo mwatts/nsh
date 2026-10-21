@@ -306,10 +306,29 @@ pub(crate) fn selection(p: &EventPayload) -> Option<Cow<'_, Selection>> {
 pub(crate) fn selection_event(p: &EventPayload) -> Option<Cow<'_, crate::SelectionEvent>> {
     Some(match p {
         EventPayload::Selection(e) => Cow::Borrowed(e),
-        _ => Cow::Owned(crate::SelectionEvent::new(
-            number(p, "start") as u32,
-            number(p, "end") as u32,
-        )),
+        _ => {
+            let start = number(p, "start") as u32;
+            let end = number(p, "end") as u32;
+            let caret = rect_field(p, "caretX", "caretY", "caretWidth", "caretHeight");
+            let first = rect_field(p, "firstX", "firstY", "firstWidth", "firstHeight");
+            Cow::Owned(match caret {
+                Some(caret) => crate::SelectionEvent::showing(start, end, caret, first),
+                None => crate::SelectionEvent::new(start, end),
+            })
+        }
+    })
+}
+
+/// A rectangle named `x`, `y`, `w`, `h` in a map payload. Absent when `x`
+/// is absent, so a zero coordinate is still a rectangle.
+fn rect_field(p: &EventPayload, x: &str, y: &str, w: &str, h: &str) -> Option<Bounds<Points>> {
+    field(p, x)?;
+    Some(Bounds {
+        origin: point(px(number(p, x)), px(number(p, y))),
+        size: Size {
+            width: px(number(p, w)),
+            height: px(number(p, h)),
+        },
     })
 }
 
@@ -515,6 +534,42 @@ mod tests {
         assert_eq!(*s, event);
         let plain = super::selection(&sent).unwrap();
         assert_eq!((plain.start, plain.end), (1, 4));
+        let caret = bounds(point(px(12.0), px(4.0)), size(px(2.0), px(18.0)));
+        let line = bounds(point(px(0.0), px(4.0)), size(px(40.0), px(18.0)));
+        let from_fields = EventPayload::Map(vec![
+            ("start", PayloadValue::Number(3.0)),
+            ("end", PayloadValue::Number(3.0)),
+            ("caretX", PayloadValue::Number(12.0)),
+            ("caretY", PayloadValue::Number(4.0)),
+            ("caretWidth", PayloadValue::Number(2.0)),
+            ("caretHeight", PayloadValue::Number(18.0)),
+            ("firstX", PayloadValue::Number(0.0)),
+            ("firstY", PayloadValue::Number(4.0)),
+            ("firstWidth", PayloadValue::Number(40.0)),
+            ("firstHeight", PayloadValue::Number(18.0)),
+        ]);
+        let s = super::selection_event(&from_fields).unwrap();
+        assert_eq!(
+            (s.start, s.end, s.caret, s.first_rect),
+            (3, 3, Some(caret), None)
+        );
+        let from_fields = EventPayload::Map(vec![
+            ("start", PayloadValue::Number(1.0)),
+            ("end", PayloadValue::Number(4.0)),
+            ("caretX", PayloadValue::Number(12.0)),
+            ("caretY", PayloadValue::Number(4.0)),
+            ("caretWidth", PayloadValue::Number(2.0)),
+            ("caretHeight", PayloadValue::Number(18.0)),
+            ("firstX", PayloadValue::Number(0.0)),
+            ("firstY", PayloadValue::Number(4.0)),
+            ("firstWidth", PayloadValue::Number(40.0)),
+            ("firstHeight", PayloadValue::Number(18.0)),
+        ]);
+        let s = super::selection_event(&from_fields).unwrap();
+        assert_eq!(
+            (s.start, s.end, s.caret, s.first_rect),
+            (1, 4, Some(caret), Some(line))
+        );
     }
 
     #[test]

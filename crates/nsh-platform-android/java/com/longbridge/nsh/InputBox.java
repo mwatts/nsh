@@ -83,10 +83,41 @@ final class InputBox extends FrameLayout implements Node {
             @Override
             protected void onSelectionChanged(int start, int end) {
                 super.onSelectionChanged(start, end);
-                if (mounter != null && mounter.wants(InputBox.this.id, Native.SELECTION_CHANGE)) {
+                if (mounter == null || !mounter.wants(InputBox.this.id, Native.SELECTION_CHANGE)) return;
+                android.text.Layout layout = getLayout();
+                if (layout == null || start < 0 || end < 0) {
                     mounter.eventMap(InputBox.this.id, Native.SELECTION_CHANGE, new String[] {"start", "end"},
                             new Object[] {(double) start, (double) end});
+                    return;
                 }
+                // Layout is in pixels. The event is in points, like the caret
+                // the GPUI backend sends.
+                float d = mounter.density;
+                int n = length();
+                int at = Math.min(Math.max(end, 0), n);
+                int line = layout.getLineForOffset(at);
+                double x = layout.getPrimaryHorizontal(at) / d;
+                double y = layout.getLineTop(line) / d;
+                double h = (layout.getLineBottom(line) - layout.getLineTop(line)) / d;
+                if (start == end) {
+                    mounter.eventMap(InputBox.this.id, Native.SELECTION_CHANGE,
+                            new String[] {"start", "end", "caretX", "caretY", "caretWidth", "caretHeight"},
+                            new Object[] {(double) start, (double) end, x, y, 2.0, h});
+                    return;
+                }
+                int a = Math.min(Math.max(Math.min(start, end), 0), n);
+                int b = Math.min(Math.max(Math.max(start, end), 0), n);
+                int lineA = layout.getLineForOffset(a);
+                int lineB = layout.getLineForOffset(Math.max(b - 1, a));
+                double x0 = layout.getPrimaryHorizontal(a) / d;
+                double x1 = lineA == lineB ? layout.getPrimaryHorizontal(b) / d : layout.getLineRight(lineA) / d;
+                double top = layout.getLineTop(lineA) / d;
+                double height = (layout.getLineBottom(lineA) - layout.getLineTop(lineA)) / d;
+                mounter.eventMap(InputBox.this.id, Native.SELECTION_CHANGE,
+                        new String[] {"start", "end", "caretX", "caretY", "caretWidth", "caretHeight",
+                                "firstX", "firstY", "firstWidth", "firstHeight"},
+                        new Object[] {(double) start, (double) end, x, y, 2.0, h,
+                                Math.min(x0, x1), top, Math.abs(x1 - x0), height});
             }
         };
         edit.setBackground(new ColorDrawable(0));

@@ -428,6 +428,22 @@ impl SelectionEvent {
             ..Self::default()
         }
     }
+
+    /// The selection `start..end` with the caret's rectangle. `first_line`
+    /// is the selection's first line. A caret (`start == end`) has none.
+    pub fn showing(
+        start: u32,
+        end: u32,
+        caret: Bounds<Points>,
+        first_line: Option<Bounds<Points>>,
+    ) -> Self {
+        Self {
+            start,
+            end,
+            caret: Some(caret),
+            first_rect: (start != end).then_some(first_line).flatten(),
+        }
+    }
 }
 
 /// Where a context menu was asked for ([`EventKind::ContextMenu`]), in
