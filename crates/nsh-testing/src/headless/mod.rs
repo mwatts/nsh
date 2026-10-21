@@ -2098,4 +2098,58 @@ mod tests {
         assert!(app.screen().sent(&Command::ExitApp));
         assert!(started.elapsed() < Duration::from_secs(2));
     }
+
+    /// A read-only field that logs its keys, and an editable field beside it.
+    #[component]
+    fn ReadOnlyKeys() -> impl IntoElement {
+        let log = signal(Vec::<String>::new());
+        let note = move |entry: String| log.update(|l| l.push(entry));
+        let name = signal(String::new());
+        let keyboard = element_ref();
+        let taken = std::rc::Rc::new(std::cell::Cell::new(false));
+        view()
+            .child(
+                input()
+                    .test_id("keys")
+                    .readonly(true)
+                    .element_ref(&keyboard)
+                    .on_layout(move |_: &Bounds<Points>| {
+                        if !taken.replace(true) {
+                            keyboard.focus();
+                        }
+                    })
+                    .on_key_press(move |key: &str| note(key.to_owned())),
+            )
+            .child(text(move || format!("log: {}", log.get().join("|"))))
+            .child(
+                input()
+                    .test_id("name")
+                    .value(move || name.get())
+                    .on_change(move |text: &str| name.set(text.to_owned())),
+            )
+            .child(text(move || format!("name: {}", name.get())))
+    }
+
+    /// Arrows, Delete, and Enter are keys of the focused field even when
+    /// it cannot be edited, including while text is waiting for an editable
+    /// field. A plain character typed then waits, and the next editable
+    /// field takes it.
+    #[test]
+    fn a_readonly_field_hears_navigation_keys_while_text_waits() {
+        let mut config = EngineConfig::new(Root::of::<ReadOnlyKeys>());
+        config.environment.os = nsh_core::platform::Os::Linux;
+        config.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = Headless::start(config).unwrap();
+        app.first_render().unwrap();
+        app.arm_text();
+        app.press_key("down").unwrap();
+        app.press_key("delete").unwrap();
+        app.press_key("enter").unwrap();
+        app.press_key("a").unwrap();
+        app.wait_for("log: ArrowDown|Delete|Enter").unwrap();
+        assert_eq!(app.screen().input_text("id:keys"), Ok(Some("")));
+        assert_eq!(app.screen().input_text("id:name"), Ok(Some("")));
+        app.type_text("id:name", "").unwrap();
+        app.wait_for("name: a").unwrap();
+    }
 }
