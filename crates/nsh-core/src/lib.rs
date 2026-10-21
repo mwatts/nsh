@@ -44,6 +44,7 @@ pub mod svg;
 pub mod tailwind;
 mod text;
 pub mod text_edit;
+pub mod text_hold;
 pub mod time;
 mod transform;
 pub mod transition;

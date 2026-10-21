@@ -56,6 +56,30 @@ public class NshView extends FrameLayout {
     private final TouchTracker touches;
 
     @Override
+    public void onWindowFocusChanged(boolean hasWindowFocus) {
+        super.onWindowFocusChanged(hasWindowFocus);
+        if (!hasWindowFocus && handle != 0) Native.disarmHold(handle);
+    }
+
+    @Override
+    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
+        if (event.getAction() == android.view.KeyEvent.ACTION_DOWN && handle != 0) {
+            android.view.View focus = findFocus();
+            if (!(focus instanceof android.widget.EditText)) {
+                if (event.getKeyCode() == android.view.KeyEvent.KEYCODE_ESCAPE) {
+                    Native.disarmHold(handle);
+                } else if (!event.isCtrlPressed() && !event.isAltPressed() && !event.isMetaPressed()) {
+                    int unicode = event.getUnicodeChar();
+                    if (unicode != 0 && Native.offerHold(handle, new String(Character.toChars(unicode)))) {
+                        return true;
+                    }
+                }
+            }
+        }
+        return super.dispatchKeyEvent(event);
+    }
+
+    @Override
     public boolean dispatchTouchEvent(android.view.MotionEvent e) {
         boolean tracking = touches.onTouch(e);
         // A tracked finger went down: hear the rest of the gesture even if

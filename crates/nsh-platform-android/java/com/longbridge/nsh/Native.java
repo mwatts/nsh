@@ -206,4 +206,16 @@ final class Native {
 
     /** Interaction states of view {@code id} the core tracks ({@code Mounter.STATE_*}). */
     static native void states(long handle, int id, int states);
+
+    /** A handled press ran. Hardware characters now wait for the next field. */
+    static native void armHold(long handle);
+
+    /** Drops hardware characters that were waiting for a field. */
+    static native void disarmHold(long handle);
+
+    /** Queues one hardware character. True when it was queued. */
+    static native boolean offerHold(long handle, String text);
+
+    /** The characters waiting for the field that just focused. */
+    static native String takeHold(long handle);
 }

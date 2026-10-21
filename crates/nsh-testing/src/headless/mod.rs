@@ -243,11 +243,9 @@ pub struct Headless {
     /// On a manual clock: the engine asked for a frame.
     wanted: Option<Arc<AtomicBool>>,
     /// Characters typed after a handled key, while no editable field has
-    /// the keyboard. The next field takes them. A second on [`Self::clock`]
-    /// drops them.
-    held: String,
-    /// When `held` expires, on [`Self::clock`].
-    held_until: Option<std::time::Instant>,
+    /// the keyboard. The next field takes them. Three seconds on
+    /// [`Self::clock`] drop them.
+    hold: nsh_core::text_hold::TextHold,
     /// The software keyboard shown while an editable field is focused on
     /// iOS or Android.
     software_keyboard: inset::SoftwareKeyboard,
@@ -283,8 +281,7 @@ impl Headless {
             observer: None,
             clock,
             wanted,
-            held: String::new(),
-            held_until: None,
+            hold: nsh_core::text_hold::TextHold::default(),
             software_keyboard: inset::SoftwareKeyboard::default(),
         })
     }
@@ -1028,6 +1025,21 @@ impl Headless {
         }
         if !path.is_empty() {
             self.send_touch(id, nsh_core::TouchPhase::End, path);
+        }
+        // The press handler has run, so a field it focused is focused.
+        self.settle();
+        // A press that focuses nothing drops characters that were waiting.
+        // A press the view heard arms the wait, as a handled key does.
+        let editable = self.screen.focused().is_some_and(|focused| {
+            self.screen
+                .input(focused)
+                .is_some_and(|input| input.config.editable)
+        });
+        if !editable {
+            self.hold.disarm();
+        }
+        if self.screen.hears(id, EventKind::Press) {
+            self.arm_text();
         }
         self.done()
     }
@@ -2260,5 +2272,81 @@ mod tests {
         app.wait_for("kb: 280").unwrap();
         app.press("Done").unwrap();
         app.wait_for("kb: 0").unwrap();
+
+    /// An editable field and a press that focuses nothing.
+    #[component]
+    fn HeldKeys() -> impl IntoElement {
+        let name = signal(String::new());
+        view()
+            .child(
+                input()
+                    .test_id("name")
+                    .value(move || name.get())
+                    .on_change(move |text: &str| name.set(text.to_owned())),
+            )
+            .child(text(move || format!("name: {}", name.get())))
+            .child(view().on_press(|| {}).child(text("Drop")))
+    }
+
+    fn open_held() -> Headless {
+        let mut config = EngineConfig::new(Root::of::<HeldKeys>());
+        config.environment.os = nsh_core::platform::Os::Ios;
+        Headless::start(config).unwrap()
+    }
+
+    /// A character typed while nothing is editable waits, and the next
+    /// field takes it. Escape, a press that focuses nothing, the window
+    /// going inactive, or three seconds drop it.
+    #[test]
+    fn held_characters_reach_the_next_field_until_they_are_dropped() {
+        let mut app = open_held();
+        app.first_render().unwrap();
+        app.arm_text();
+        app.press_key("a").unwrap();
+        app.type_text("id:name", "").unwrap();
+        app.wait_for("name: a").unwrap();
+        assert_eq!(app.screen().input_text("id:name"), Ok(Some("a")));
+
+        let mut dropped = open_held();
+        dropped.first_render().unwrap();
+        dropped.arm_text();
+        dropped.press_key("a").unwrap();
+        dropped.press_key("escape").unwrap();
+        dropped.type_text("id:name", "z").unwrap();
+        dropped.wait_for("name: z").unwrap();
+        assert_eq!(dropped.screen().input_text("id:name"), Ok(Some("z")));
+
+        let mut pressed = open_held();
+        pressed.first_render().unwrap();
+        pressed.arm_text();
+        pressed.press_key("a").unwrap();
+        pressed.press("Drop").unwrap();
+        pressed.type_text("id:name", "z").unwrap();
+        pressed.wait_for("name: z").unwrap();
+        assert_eq!(pressed.screen().input_text("id:name"), Ok(Some("z")));
+
+        let mut inactive = open_held();
+        inactive.first_render().unwrap();
+        inactive.arm_text();
+        inactive.press_key("a").unwrap();
+        inactive.deactivate();
+        inactive.type_text("id:name", "z").unwrap();
+        inactive.wait_for("name: z").unwrap();
+        assert_eq!(inactive.screen().input_text("id:name"), Ok(Some("z")));
+    }
+
+    #[test]
+    fn held_characters_drop_after_three_seconds() {
+        let mut config = EngineConfig::new(Root::of::<HeldKeys>());
+        config.environment.os = nsh_core::platform::Os::Ios;
+        config.clock = nsh_core::time::Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).unwrap();
+        app.first_render().unwrap();
+        app.arm_text();
+        app.press_key("a").unwrap();
+        app.fast_forward(std::time::Duration::from_secs(3)).unwrap();
+        app.type_text("id:name", "z").unwrap();
+        app.wait_for("name: z").unwrap();
+        assert_eq!(app.screen().input_text("id:name"), Ok(Some("z")));
     }
 }

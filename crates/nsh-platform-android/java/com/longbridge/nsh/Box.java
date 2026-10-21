@@ -377,6 +377,8 @@ class Box extends ViewGroup implements Node {
     private void onPressIn() {
         if (pressedIn || !tracking) return;
         pressedIn = true;
+        android.view.View focus = getRootView() == null ? null : getRootView().findFocus();
+        if (!(focus instanceof android.widget.EditText)) Native.disarmHold(mounter.handle());
         if (wants(Native.PRESS_IN)) mounter.event(id, Native.PRESS_IN);
         mounter.pressFeedback(this, id, true, pressX, pressY);
     }
@@ -523,7 +525,10 @@ class Box extends ViewGroup implements Node {
                     if (!pressedIn) onPressIn();
                     boolean press = !longPressed && wants(Native.PRESS);
                     pressOut();
-                    if (press) mounter.event(id, Native.PRESS);
+                    if (press) {
+                        mounter.event(id, Native.PRESS);
+                        Native.armHold(mounter.handle());
+                    }
                 }
                 pressOut();
                 panning = false;
@@ -592,7 +597,10 @@ class Box extends ViewGroup implements Node {
     @Override
     public boolean performClick() {
         super.performClick();
-        if (wants(Native.PRESS)) mounter.event(id, Native.PRESS);
+        if (wants(Native.PRESS)) {
+            mounter.event(id, Native.PRESS);
+            Native.armHold(mounter.handle());
+        }
         return true;
     }
 }

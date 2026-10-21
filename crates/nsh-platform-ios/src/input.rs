@@ -386,6 +386,17 @@ impl Input {
         &self.container
     }
 
+    /// Characters that waited while focus moved, at the caret.
+    pub(crate) fn insert_text(&self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let view = self.editor_view();
+        let string = NSString::from_str(text);
+        // SAFETY: both editors implement `UIKeyInput.insertText:`.
+        let _: () = unsafe { msg_send![view, insertText: &*string] };
+    }
+
     /// The view that edits (first responder).
     pub(crate) fn editor_view(&self) -> &UIView {
         match &self.editor {
