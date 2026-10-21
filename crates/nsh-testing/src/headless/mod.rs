@@ -1008,7 +1008,7 @@ impl Headless {
         self.step(format!("pressSpan({selector})"));
         let span = self
             .screen
-            .span(&parsed)
+            .span_hit(&parsed)
             .map_err(|e| format!("{e}; {}", self.on_screen()))?;
         let pick = self.screen.span_press_target(span);
         let id = self.picked(pick, selector, "pressable span")?;

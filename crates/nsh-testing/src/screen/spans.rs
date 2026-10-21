@@ -116,8 +116,9 @@ impl Screen {
         Ok(found)
     }
 
-    /// The one span `selector` names.
-    pub(crate) fn span(&self, selector: &Selector) -> Result<SpanHit, String> {
+    /// The one span `selector` names. Distinct from [`Screen::span`],
+    /// which looks up a pressable span by node id.
+    pub(crate) fn span_hit(&self, selector: &Selector) -> Result<SpanHit, String> {
         match self.spans(selector)?[..] {
             [one] => Ok(one),
             [] => Err(format!("no span matches `{selector}`")),
@@ -153,7 +154,7 @@ impl Screen {
     /// background of a nested `<Text>`'s `backgroundColor`); an error when
     /// none or several match.
     pub fn span_style(&self, selector: &str) -> Result<ResolvedTextStyle, String> {
-        let span = self.span(&Selector::parse(selector)?)?;
+        let span = self.span_hit(&Selector::parse(selector)?)?;
         let style = self
             .nodes
             .get(&span.view)
