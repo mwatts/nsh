@@ -42,6 +42,7 @@ pub mod description;
 pub mod desktop;
 pub(crate) mod element;
 mod element_ref;
+mod engine_context;
 pub(crate) mod env;
 mod events;
 pub(crate) mod flow;
@@ -128,6 +129,7 @@ pub use self::{
         View, image, text, view,
     },
     element_ref::{ComponentRef, ElementRef},
+    engine_context::{EngineContext, EngineContextGuard, engine_context},
     env::Environment,
     events::{
         Composition, FileDropEvent, GestureEvent, ImageProgress, KeyPress, NativeEvent, PanEvent,
@@ -400,8 +402,9 @@ pub mod prelude {
             safe_area, screen_reader, set_clipboard, set_clipboard_image, set_color_scheme,
             set_interval, set_timeout, spawn, timer, timer_until, toast, tokens, window,
         },
-        batch, catch_error, cleanup, component, computed, dynamic, effect, provide_context,
-        resource, resource_with_value, signal, signal_with, stored, untracked, use_context,
+        batch, catch_error, cleanup, component, computed, dynamic, effect, engine_context,
+        provide_context, resource, resource_with_value, signal, signal_with, stored, untracked,
+        use_context,
     };
 }
 

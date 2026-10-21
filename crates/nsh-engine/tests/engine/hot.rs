@@ -175,6 +175,7 @@ fn edits_replace_modules_and_keep_unrelated_state() {
         data_dir: None,
         storage: None,
         clock: Default::default(),
+        context: Default::default(),
     };
     let engine = Engine::start(
         config,
@@ -325,6 +326,7 @@ fn entry_edits_keep_navigation_and_state() {
             data_dir: None,
             storage: None,
             clock: Default::default(),
+            context: Default::default(),
         };
         let engine = Engine::start(
             config,

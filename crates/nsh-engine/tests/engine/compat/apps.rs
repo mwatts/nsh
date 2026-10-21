@@ -375,6 +375,7 @@ impl Run {
             data_dir,
             storage: None,
             clock: Default::default(),
+            context: Default::default(),
         };
         let sink = Sink {
             batches: tx,

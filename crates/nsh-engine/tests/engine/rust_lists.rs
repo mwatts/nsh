@@ -35,6 +35,7 @@ fn start(root: Root) -> (Engine, Receiver<MountBatch>) {
         data_dir: None,
         storage: None,
         clock: Default::default(),
+        context: Default::default(),
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -333,6 +334,7 @@ fn start_js(app: &str) -> (Engine, Receiver<MountBatch>) {
         data_dir: None,
         storage: None,
         clock: Default::default(),
+        context: Default::default(),
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
