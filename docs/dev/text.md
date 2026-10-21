@@ -10,6 +10,9 @@
   offset nearest a point of the block (`TextEngine::index_at` on the last final layout, answered on the engine thread
   with the layout of the commit it goes out with, as `measure()` is; the GPUI and approximate engines answer, the
   others `None` so far).
+  A text out of the layout (`display: none` on it or on a view around it, `hidden`) is sent with an empty layout (its
+  text unchanged, for tests and screen readers): its box is zero, and the web, which does not clip text to its box,
+  would still draw the glyphs laid out in it.
   `selectable` (or `select-text`): range selection, drawing only (`AttributedText::selectable` /
   `selection_color`, not part of layout). iOS (`text_selection.rs`): the CoreText `TextView` adopts `UITextInput`
   (non-editable: no keyboard, `inputView` is empty) and a `UITextInteraction` (`NonEditable`) attached only while the text
