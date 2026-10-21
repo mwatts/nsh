@@ -120,6 +120,8 @@ pub(crate) fn install(
 ) {
     if surface.wants_window_focus.take() && !focus.is_focused(window) {
         let focus = focus.clone();
+        // After this paint. Text already queued for the next field stays
+        // queued: this only moves the window's focus handle.
         window.defer(cx, move |window, cx| window.focus(&focus, cx));
     }
     // The focused field's caret shows while the surface has the window's
@@ -128,11 +130,29 @@ pub(crate) fn install(
     if crate::text_input::window_focus(surface, has_focus) {
         window.refresh();
     }
-    if crate::text_input::wants_text(surface)
+    // Register while this view contains the window's focus, even with no
+    // field. A paint that waits until a field is focused drops the
+    // characters of the turn the field takes the keyboard: that focus is
+    // deferred, so the turn's keys find no handler. A native component
+    // that has the keyboard keeps its own characters; registering here
+    // would hand them to the next field.
+    let target = if crate::native::focused(surface, window) {
+        None
+    } else if focus.is_focused(window) {
+        Some(focus.clone())
+    } else if focus.contains_focused(window, cx) {
+        window.focused(cx)
+    } else {
+        None
+    };
+    let mut live = false;
+    if let Some(target) = target
         && let Some(view) = view.upgrade()
     {
-        window.handle_input(focus, gpui::ElementInputHandler::new(bounds, view), cx);
+        window.handle_input(&target, gpui::ElementInputHandler::new(bounds, view), cx);
+        live = true;
     }
+    crate::text_input::set_handler_live(surface, live);
 
     if hitbox.is_hovered(window) {
         let (x, y) = root_point(surface, window.mouse_position());
@@ -163,6 +183,7 @@ pub(crate) fn install(
         }
         if button == 0 && crate::input::window_drag(&s, x, y) {
             window.start_window_move();
+            crate::text_input::disarm(&s);
             return;
         }
         s.input_pressed.set(s.input_pressed.get() | 1 << button);
@@ -182,6 +203,11 @@ pub(crate) fn install(
             },
         );
         cx.stop_propagation();
+        // A press that did not focus a field cancels text waiting for one.
+        // The press handler then arms a fresh wait if the app handled it.
+        if crate::text_input::focused(&s).is_none() {
+            crate::text_input::disarm(&s);
+        }
         crate::rt::flush(cx);
     });
 
@@ -350,6 +376,9 @@ pub(crate) fn install(
             repeat: e.is_held,
             modifiers: crate::keys::modifiers(&e.keystroke.modifiers),
         };
+        if vk == crate::keys::VK_ESCAPE {
+            crate::text_input::disarm(&s);
+        }
         let handled = if crate::native::focused(&s, window) {
             crate::input::component_key(&s, event)
         } else {
@@ -358,6 +387,19 @@ pub(crate) fn install(
         if handled {
             cx.stop_propagation();
             window.prevent_default();
+        } else if !crate::native::focused(&s, window)
+            && let Some(text) = e.keystroke.key_char.as_deref()
+            && !crate::text_input::handler_live(&s)
+        {
+            // The handler is registered on a later paint. Take the
+            // character now so this turn does not drop it. When a handler
+            // is up, the input method delivers the character instead.
+            let text: String = text.chars().filter(|c| !c.is_control()).collect();
+            if !text.is_empty() {
+                crate::text_input::typed_without_handler(&s, &text);
+                cx.stop_propagation();
+                window.prevent_default();
+            }
         }
         crate::rt::flush(cx);
     });

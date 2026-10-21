@@ -275,6 +275,10 @@ fn windows(cx: &mut TestAppContext) {
     menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx);
     the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx);
     js_and_rust_view_shortcuts_fire_together_in_either_order(cx);
+    text_typed_as_a_field_mounts_reaches_it(cx);
+    text_typed_with_no_action_does_not_reach_a_later_field(cx);
+    text_typed_after_a_shortcut_reaches_a_field_mounted_later(cx);
+    text_typed_after_a_shortcut_is_dropped_once_the_second_passes(cx);
 }
 
 /// Runs the window until the focused field's text satisfies `done`, and
@@ -1255,6 +1259,252 @@ function App() {{
 mount(App);
 "#
     )
+}
+
+/// Dispatches one key and does not park. The following input stays in the
+/// same turn as a shortcut that focuses a field on the next one.
+fn type_key(cx: &mut VisualTestContext, key: &str) {
+    let keystroke = gpui::Keystroke::parse(key).unwrap();
+    cx.update(|window, cx| {
+        window.dispatch_keystroke(keystroke, cx);
+    });
+}
+
+/// No field yet. `n` mounts and focuses one on the next turn. `abc` is
+/// typed in that same turn, with no wait between the two.
+const FIELD_ON_THE_NEXT_TURN: &str = r#"
+import { Input, View, mount, signal } from "nsh";
+import { keymap } from "nsh/keymap";
+import { Window } from "nsh/desktop";
+
+function App() {
+  const shown = signal(false);
+  Window.setTitle("ready");
+  keymap.bind("n", () => {
+    setTimeout(() => shown.set(true), 0);
+  }, { when: "always" });
+  return (
+    <View style={{ flex: 1 }}>
+      <If when={shown()}>
+        <Input autoFocus style={{ height: 30 }} />
+      </If>
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn text_typed_as_a_field_mounts_reaches_it(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", FIELD_ON_THE_NEXT_TURN, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if cx.window_title().as_deref() == Some("ready") {
+            cx.run_until_parked();
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the window never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    type_key(cx, "n");
+    cx.simulate_input("abc");
+    let start = Instant::now();
+    loop {
+        if field_text(&view, cx).as_deref() == Some("abc") {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "text typed as the field mounts, saw {:?}",
+            field_text(&view, cx)
+        );
+        cx.run_until_parked();
+    }
+}
+
+/// A field is on screen and not focused. Nothing arms the queue.
+const UNFOCUSED_FIELD: &str = r#"
+import { Input, View, mount } from "nsh";
+
+function App() {
+  return (
+    <View style={{ flex: 1 }}>
+      <Input style={{ height: 30 }} />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn text_typed_with_no_action_does_not_reach_a_later_field(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", UNFOCUSED_FIELD, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        let laid_out = view.read_with(cx, |view, _| {
+            fn height(view: &crate::view::NshView) -> f32 {
+                if view.state().input.is_some() {
+                    return view.state().frame.size.height.0;
+                }
+                let mut found = 0.0_f32;
+                view.with_children(|children| {
+                    for child in children {
+                        found = found.max(height(child));
+                    }
+                });
+                found
+            }
+            height(&view.surface().root)
+        });
+        if laid_out > 0.0 {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the field never mounted"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    type_key(cx, "x");
+    let place = view.read_with(cx, |view, _| {
+        fn find(view: &crate::view::NshView) -> Option<(f32, f32, f32, f32)> {
+            if view.state().input.is_some() {
+                let frame = view.state().frame;
+                return Some((
+                    frame.origin.x.0,
+                    frame.origin.y.0,
+                    frame.size.width.0,
+                    frame.size.height.0,
+                ));
+            }
+            let mut found = None;
+            view.with_children(|children| {
+                for child in children {
+                    if found.is_none() {
+                        found = find(child);
+                    }
+                }
+            });
+            found
+        }
+        let origin = view.surface().origin.get();
+        (origin, find(&view.surface().root))
+    });
+    let bar = if cfg!(target_os = "macos") { 0.0 } else { 28.0 };
+    let (x, y) = match place.1 {
+        Some((fx, fy, _, fh)) => (place.0.0 + fx + 8.0, place.0.1 + fy + fh / 2.0),
+        None => (20.0, bar + 15.0),
+    };
+    cx.simulate_click(
+        gpui::point(gpui::px(x), gpui::px(y)),
+        gpui::Modifiers::default(),
+    );
+    assert_eq!(
+        field_text(&view, cx).as_deref(),
+        Some(""),
+        "a letter with no action stays out of the field at {place:?} click {x} {y}"
+    );
+}
+
+/// `n` mounts the field over several frames. `abc` is typed before any of
+/// those frames, and the field still receives it.
+const FIELD_AFTER_SEVERAL_TURNS: &str = r#"
+import { Input, View, mount, signal } from "nsh";
+import { keymap } from "nsh/keymap";
+import { Window } from "nsh/desktop";
+
+function App() {
+  const shown = signal(false);
+  Window.setTitle("later");
+  keymap.bind("n", () => {
+    let left = 3;
+    const step = () => {
+      left -= 1;
+      if (left === 0) shown.set(true);
+      else requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }, { when: "always" });
+  return (
+    <View style={{ flex: 1 }}>
+      <If when={shown()}>
+        <Input autoFocus style={{ height: 30 }} />
+      </If>
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn text_typed_after_a_shortcut_reaches_a_field_mounted_later(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", FIELD_AFTER_SEVERAL_TURNS, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if cx.window_title().as_deref() == Some("later") {
+            cx.run_until_parked();
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the window never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    type_key(cx, "n");
+    type_key(cx, "a");
+    type_key(cx, "b");
+    type_key(cx, "c");
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if field_text(&view, cx).as_deref() == Some("abc") {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the field reads {:?}, not abc",
+            field_text(&view, cx)
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The same shortcut and text, then the surface clock passes the wait
+/// before the field mounts. The field stays empty.
+fn text_typed_after_a_shortcut_is_dropped_once_the_second_passes(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", FIELD_ON_THE_NEXT_TURN, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if cx.window_title().as_deref() == Some("ready") {
+            cx.run_until_parked();
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the window never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    type_key(cx, "n");
+    type_key(cx, "a");
+    type_key(cx, "b");
+    type_key(cx, "c");
+    view.read_with(cx, |view, _| view.surface().advance_clock(3.0));
+    cx.run_until_parked();
+    assert_eq!(
+        field_text(&view, cx).as_deref(),
+        Some(""),
+        "text older than a few seconds is not inserted"
+    );
 }
 
 fn js_and_rust_view_shortcuts_fire_together_in_either_order(cx: &mut TestAppContext) {

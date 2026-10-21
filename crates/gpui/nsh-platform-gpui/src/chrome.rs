@@ -574,15 +574,28 @@ pub(crate) fn shortcut(surface: &Rc<Surface>, event: &KeyEvent, editing: bool) -
         if !event.repeat {
             choose(surface, id, role);
         }
+        arm_text(surface, event);
         return true;
     }
     if pressed == primary('w') {
         if !event.repeat {
             push(surface, Op::Close);
         }
+        arm_text(surface, event);
         return true;
     }
-    menus::mnemonic(surface, &pressed)
+    let took = menus::mnemonic(surface, &pressed);
+    if took {
+        arm_text(surface, event);
+    }
+    took
+}
+
+/// A menu shortcut may open a field. Escape cancels waiting text instead.
+fn arm_text(surface: &Rc<Surface>, event: &KeyEvent) {
+    if event.vk != crate::keys::VK_ESCAPE {
+        crate::text_input::arm(surface);
+    }
 }
 
 // --- The window -------------------------------------------------------------------------

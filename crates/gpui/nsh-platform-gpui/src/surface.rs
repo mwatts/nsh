@@ -163,6 +163,8 @@ pub(crate) struct Surface {
     /// Frame statistics, while they are logged ([`crate::stats`]).
     pub(crate) stats: RefCell<Option<crate::stats::FrameStats>>,
     epoch: std::time::Instant,
+    /// Added to [`Surface::clock`]. Tests move a deadline without sleeping.
+    clock_offset: Cell<f64>,
     on_error: Handler<dyn Fn(&AppError)>,
     /// A dev session's error overlay: hears the errors besides `on_error`.
     #[cfg(feature = "dev")]
@@ -235,6 +237,7 @@ impl Surface {
             test_model: RefCell::default(),
             stats: RefCell::new(None),
             epoch: std::time::Instant::now(),
+            clock_offset: Cell::new(0.0),
             on_error: RefCell::new(None),
             #[cfg(feature = "dev")]
             on_dev_error: RefCell::new(None),
@@ -281,7 +284,14 @@ impl Surface {
 
     /// Seconds since the surface was made (the animation clock).
     pub(crate) fn clock(&self) -> f64 {
-        self.epoch.elapsed().as_secs_f64()
+        self.epoch.elapsed().as_secs_f64() + self.clock_offset.get()
+    }
+
+    /// Moves [`Surface::clock`] forward. A test drives a deadline with this
+    /// instead of sleeping.
+    #[cfg(test)]
+    pub(crate) fn advance_clock(&self, seconds: f64) {
+        self.clock_offset.set(self.clock_offset.get() + seconds);
     }
 
     /// Starts `config`'s app, replacing what ran.

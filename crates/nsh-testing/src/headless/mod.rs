@@ -241,6 +241,12 @@ pub struct Headless {
     clock: Clock,
     /// On a manual clock: the engine asked for a frame.
     wanted: Option<Arc<AtomicBool>>,
+    /// Characters typed after a handled key, while no editable field has
+    /// the keyboard. The next field takes them. A second on [`Self::clock`]
+    /// drops them.
+    held: String,
+    /// When `held` expires, on [`Self::clock`].
+    held_until: Option<std::time::Instant>,
 }
 
 impl Headless {
@@ -273,6 +279,8 @@ impl Headless {
             observer: None,
             clock,
             wanted,
+            held: String::new(),
+            held_until: None,
         })
     }
 
@@ -551,6 +559,7 @@ impl Headless {
         }
         self.animator.tick();
         self.report_finished();
+        self.deliver_held();
     }
 
     /// Applies the next batch, waiting until `deadline` at most, while the
@@ -583,6 +592,7 @@ impl Headless {
                 recv(self.batches) -> batch => match batch {
                     Ok(batch) => {
                         self.apply(&batch);
+                        self.deliver_held();
                         return Pumped::Batch;
                     }
                     Err(_) => return Pumped::Timeout,

@@ -1731,8 +1731,16 @@ fn press_in(surface: &Rc<Surface>, press: &mut Press, at: (f32, f32)) {
 /// Ends a press: `onPressUp`, then `onPress` if `fire` (released inside)
 /// and it was no long press, with the pointer at `at` (root coordinates).
 fn press_out(surface: &Rc<Surface>, press: &mut Press, fire: bool, at: (f32, f32)) {
-    for kind in press.press_out(fire) {
+    let kinds: Vec<_> = press.press_out(fire).collect();
+    let pressed = kinds.contains(&EventKind::Press);
+    for kind in kinds {
         press_event(surface, press, kind, at);
+    }
+    // A press the app handled may move focus. Text typed after it waits
+    // for the field. A press that focuses nothing has already dropped
+    // whatever was waiting.
+    if pressed {
+        crate::text_input::arm(surface);
     }
 }
 

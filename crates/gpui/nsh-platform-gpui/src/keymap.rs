@@ -80,11 +80,26 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent, editing: bool) -> boo
     }
     let found = table.find(keystroke, editing, repeat);
     if let KeyMatch::Fire(id) = found {
+        let plain = matches!(keystroke.key, Key::Char(_))
+            && !keystroke.modifiers.ctrl
+            && !keystroke.modifiers.alt
+            && !keystroke.modifiers.cmd
+            && crate::text_input::character_is_text(surface);
+        // A list still focused binds Space. While text is waiting for the
+        // next field, that character is part of the text.
+        if plain {
+            return false;
+        }
         surface.event(
             ROOT_ID,
             EventKind::KeyCommand,
             EventPayload::Value(PayloadValue::Number(id as f64)),
         );
+        // Escape cancels text waiting for a field. Every other binding may
+        // move focus, so text typed straight after it waits for that field.
+        if event.vk != keys::VK_ESCAPE {
+            crate::text_input::arm(surface);
+        }
     }
     found.consumed()
 }

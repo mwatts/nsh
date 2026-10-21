@@ -256,6 +256,12 @@ pub struct AppView {
 }
 
 impl AppView {
+    /// Characters typed after an action that moves focus, still waiting
+    /// for a field. The caller inserts them. Empty when nothing is waiting.
+    pub fn take_pending_text(&self) -> String {
+        crate::text_input::take_pending(&self.surface)
+    }
+
     /// A view with no app yet (in `cx.new(|cx| AppView::new(...))`).
     pub fn new(options: AppOptions, window: &mut Window, cx: &mut Context<Self>) -> AppView {
         crate::rt::init(cx);
