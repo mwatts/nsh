@@ -591,6 +591,51 @@ fn calls_of_a_components_methods() {
     );
 }
 
+const ASYNC_METHODS: &str = r#"import { mount, signal, Text, View } from "nsh";
+import { Stepper, type StepperRef } from "test/ui";
+
+const shown = signal("waiting");
+let stepper!: StepperRef;
+setTimeout(async () => {
+  // An `async` method's promise settles when its task ends: the value set
+  // while it waited is the one it reads.
+  const later: Promise<number> = stepper.valueAfter(30);
+  setTimeout(() => stepper.setValue(7), 5);
+  const value = await later;
+  let refused = "no rejection";
+  try { await stepper.valueAfter(-1); } catch (e) { refused = `${e.message}`; }
+  shown.set(`got ${value} | ${refused}`);
+}, 0);
+
+mount(() => (
+  <View>
+    <Stepper ref={stepper} defaultValue={1} max={50} />
+    <Text>{shown()}</Text>
+  </View>
+));
+"#;
+
+#[test]
+fn async_methods_of_a_component_answer_when_they_finish() {
+    let (_engine, rx) = start(ASYNC_METHODS);
+    let mut shown = Vec::new();
+    while let Ok(batch) = rx.recv_timeout(Duration::from_millis(500)) {
+        for item in batch.items {
+            if let MountItem::Text { text, .. } = item {
+                shown.push(text.text.clone());
+            }
+        }
+        if shown.iter().any(|t| t.starts_with("got")) {
+            break;
+        }
+    }
+    assert_eq!(
+        shown.last().map(String::as_str),
+        Some("got 7 | -1 ms is in the past"),
+        "{shown:?}"
+    );
+}
+
 const ALERT: &str = r#"import { mount, signal, Text } from "nsh";
 import { AlertDialog } from "nsh/base";
 

@@ -165,6 +165,10 @@ impl<C: Component> super::component::AnyInstance for OnceInstance<C> {
         super::reactive::call_api(self.host, call)
     }
 
+    fn start(&mut self, task: super::MethodTask) -> Option<super::ModuleFuture> {
+        super::reactive::start_api(self.host, task)
+    }
+
     fn owner(&self) -> Option<Owner> {
         self.owner
     }

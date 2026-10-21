@@ -1186,7 +1186,11 @@ pub fn style_helpers(input: TokenStream) -> TokenStream {
 /// calls it and moves on, and a wrong argument throws). The view
 /// registers the API with
 /// `cx.methods(api)`, and the component names it in its spec with
-/// `#[component(methods = StepperApi)]`.
+/// `#[component(methods = StepperApi)]`. An `async fn` gives JS a
+/// `Promise` its future settles: started in order with the props set
+/// before it, it runs as a task of the component (holding the API), and
+/// the promise rejects with an `Err`'s message, a panic's, or when the
+/// component goes before it finishes.
 #[proc_macro_attribute]
 pub fn methods(attr: TokenStream, item: TokenStream) -> TokenStream {
     if !attr.is_empty() {
@@ -1256,15 +1260,19 @@ fn methods_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
             });
             call_args.push(quote!(#local));
         }
+        let is_async = f.sig.asyncness.is_some();
+        // An `async` method always gives a promise (`Promise<void>` for
+        // `()`), which its task settles.
+        let nothing = if is_async {
+            quote!(::core::option::Option::Some(#private::ret_ts::<()>()))
+        } else {
+            quote!(::core::option::Option::None)
+        };
         let (returns, finish) = match &f.sig.output {
-            ReturnType::Type(_, ty) if is_unit(ty) => (
-                quote!(::core::option::Option::None),
-                quote!(#private::boxed(__result)),
-            ),
-            ReturnType::Default => (
-                quote!(::core::option::Option::None),
-                quote!(#private::boxed(__result)),
-            ),
+            ReturnType::Type(_, ty) if is_unit(ty) => {
+                (nothing.clone(), quote!(#private::boxed(__result)))
+            }
+            ReturnType::Default => (nothing, quote!(#private::boxed(__result))),
             ReturnType::Type(_, ty) => match result_ok(ty) {
                 Some(ok) => (
                     quote!(::core::option::Option::Some(#private::ret_ts::<#ok>())),
@@ -1280,6 +1288,38 @@ fn methods_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
             let ty = result_ok(ty).unwrap_or(&**ty);
             refs.push(quote!(#private::ret_classes::<#ty>(__out);));
         }
+        let call = if is_async {
+            // Started with the API (held by the task), run as a task of the
+            // component.
+            quote! {
+                #ui::MethodRun::Async(|host| {
+                    let _ = host;
+                    #(#decode)*
+                    ::core::result::Result::Ok(::std::boxed::Box::new(
+                        move |api: ::std::rc::Rc<dyn ::core::any::Any>| {
+                            let this = api.downcast::<Self>().ok()?;
+                            let __future: #ui::ModuleFuture = ::std::boxed::Box::pin(async move {
+                                let __result = Self::#ident(&this, #(#call_args),*).await;
+                                #finish
+                            });
+                            ::core::option::Option::Some(__future)
+                        },
+                    ))
+                })
+            }
+        } else {
+            quote! {
+                #ui::MethodRun::Op(|host| {
+                    let _ = host;
+                    #(#decode)*
+                    ::core::result::Result::Ok(::std::boxed::Box::new(move |api: &dyn ::core::any::Any| {
+                        let this = api.downcast_ref::<Self>()?;
+                        let __result = Self::#ident(this, #(#call_args),*);
+                        ::core::option::Option::Some(#finish)
+                    }))
+                })
+            }
+        };
         let cfgs = f.attrs.iter().filter(|a| a.path().is_ident("cfg"));
         entries.push(quote! {
             #(#cfgs)*
@@ -1292,15 +1332,7 @@ fn methods_impl(mut item: ItemImpl) -> syn::Result<TokenStream2> {
                     let _ = &__out;
                     #(#refs)*
                 },
-                call: |host| {
-                    let _ = host;
-                    #(#decode)*
-                    ::core::result::Result::Ok(::std::boxed::Box::new(move |api: &dyn ::core::any::Any| {
-                        let this = api.downcast_ref::<Self>()?;
-                        let __result = Self::#ident(this, #(#call_args),*);
-                        ::core::option::Option::Some(#finish)
-                    }))
-                },
+                call: #call,
             }
         });
     }

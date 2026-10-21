@@ -4154,7 +4154,10 @@ mod components {
         // Converted in the JS call: a value of another type fails there.
         let call = |method: usize, args| {
             let host = JsonHost::with_args(args);
-            (methods[method].call)(&host)
+            match methods[method].call {
+                crate::ui::MethodRun::Op(make) => make(&host),
+                crate::ui::MethodRun::Async(_) => panic!("not async"),
+            }
         };
         assert!(call(0, vec![json!("x")]).is_err());
         for (n, (method, args, host)) in [
@@ -4189,6 +4192,177 @@ mod components {
                 json!({ "c": 2, "e": "stuck at 3" }),
                 json!({ "c": 3, "e": "node 40 hosts no Rust component" }),
             ]
+        );
+    }
+
+    /// Turns once it is told to, by what its ref's `async` methods say.
+    #[derive(Default)]
+    struct Dimmer;
+
+    #[derive(Clone, PartialEq, Props)]
+    struct DimmerProps {}
+
+    #[derive(Clone, Copy)]
+    struct DimmerApi {
+        at: crate::ui::Signal<i32>,
+        go: crate::ui::Signal<bool>,
+    }
+
+    impl DimmerApi {
+        /// Until `go` is set.
+        async fn told(&self) {
+            std::future::poll_fn(|cx| {
+                if self.go.get_untracked() {
+                    std::task::Poll::Ready(())
+                } else {
+                    cx.waker().wake_by_ref();
+                    std::task::Poll::Pending
+                }
+            })
+            .await;
+        }
+    }
+
+    #[crate::ui::methods]
+    impl DimmerApi {
+        /// Turns it by `by` once told; where it is then.
+        pub(crate) async fn turn(&self, by: i32) -> i32 {
+            self.told().await;
+            self.at.update(|at| *at += by);
+            self.at.get_untracked()
+        }
+
+        /// Fails once told.
+        pub(crate) async fn stuck(&self) -> Result<(), String> {
+            self.told().await;
+            Err(format!("stuck at {}", self.at.get_untracked()))
+        }
+
+        /// Panics once told.
+        pub(crate) async fn broken(&self) {
+            self.told().await;
+            panic!("broken at {}", self.at.get_untracked());
+        }
+
+        /// Lets the methods waiting go on.
+        pub(crate) fn tell(&self) {
+            self.go.set(true);
+        }
+    }
+
+    impl Component for Dimmer {
+        type Props = DimmerProps;
+        type Event = crate::ui::NoEvent;
+        const METHODS: crate::ui::Methods = crate::ui::Methods::of::<DimmerApi>();
+
+        fn view(_: DimmerProps, cx: Scope<crate::ui::NoEvent>) -> impl IntoElement {
+            let (at, go) = (signal(0), signal(false));
+            cx.methods(DimmerApi { at, go });
+            text(move || format!("at {}", at.get()))
+        }
+    }
+
+    #[test]
+    fn async_methods_settle_their_promises_when_their_tasks_end() {
+        use crate::ui::{RustOp, json_host::JsonHost};
+        let mut c = core();
+        let mut registry = Registry::new();
+        registry.register::<Dimmer>();
+        c.set_components(registry);
+        let dimmer = |id| {
+            vec![
+                Op::Create { id, tag: Tag::View },
+                Op::SetProp {
+                    id,
+                    prop: Prop::Component(std::any::type_name::<Dimmer>().into()),
+                },
+                Op::Insert {
+                    parent: ROOT_ID,
+                    child: id,
+                    before: None,
+                },
+            ]
+        };
+        apply(&mut c, dimmer(2).into_iter().chain(dimmer(4)).collect());
+        assert_eq!(texts(&c.commit().unwrap()), ["at 0", "at 0"]);
+        let methods = <DimmerApi as crate::ui::Api>::METHODS;
+        let by_name = |name| methods.iter().find(|m| m.name == name).unwrap();
+        assert_eq!(
+            by_name("turn")
+                .returns
+                .map(|ts| ts(&mut Default::default()))
+                .as_deref(),
+            Some("number")
+        );
+        assert_eq!(
+            by_name("broken")
+                .returns
+                .map(|ts| ts(&mut Default::default()))
+                .as_deref(),
+            Some("void")
+        );
+        assert!(by_name("tell").returns.is_none());
+        let call = |c: &mut Core<_>, n: u32, name, args, host| {
+            let run = by_name(name)
+                .call
+                .start(&JsonHost::with_args(args), host)
+                .unwrap_or_else(|_| panic!("converts"));
+            c.apply(Op::Rust(RustOp { call: n, run })).unwrap();
+        };
+        // A wrong argument fails in the JS call.
+        assert!(
+            by_name("turn")
+                .call
+                .start(&JsonHost::with_args(vec![json!("x")]), 2)
+                .is_err()
+        );
+        call(&mut c, 1, "turn", vec![json!(3)], 2);
+        call(&mut c, 2, "stuck", vec![], 2);
+        call(&mut c, 3, "broken", vec![], 2);
+        call(&mut c, 4, "turn", vec![json!(1)], 4);
+        call(&mut c, 5, "turn", vec![json!(1)], 40);
+        c.commit();
+        c.run_component_tasks();
+        let replies = |c: &mut Core<_>| -> Vec<_> {
+            js_events(c)
+                .into_iter()
+                .map(|(_, _, payload)| match payload {
+                    EventPayload::Native { data, .. } => data,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        // Started, they wait to be told; only the call to no component
+        // answered.
+        assert_eq!(
+            replies(&mut c),
+            [json!({ "c": 5, "e": "node 40 hosts no Rust component" })]
+        );
+        call(&mut c, 0, "tell", vec![], 2);
+        c.commit();
+        c.run_component_tasks();
+        assert_eq!(texts(&c.commit().unwrap()), ["at 3"]);
+        assert_eq!(
+            replies(&mut c),
+            [
+                json!({ "c": 1, "v": 3 }),
+                json!({ "c": 2, "e": "stuck at 3" }),
+                json!({ "c": 3, "e": "broken at 3" }),
+            ]
+        );
+        // The other dimmer goes before it is told: its call is rejected.
+        c.apply(Op::Remove {
+            parent: ROOT_ID,
+            child: 4,
+        })
+        .unwrap();
+        c.apply(Op::Release { id: 4 }).unwrap();
+        c.commit();
+        c.run_component_tasks();
+        c.commit();
+        assert_eq!(
+            replies(&mut c),
+            [json!({ "c": 4, "e": "the component went away before the method finished" })]
         );
     }
 

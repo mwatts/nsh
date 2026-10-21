@@ -91,6 +91,11 @@ pub type TaskStart = Box<dyn FnOnce() -> ModuleFuture>;
 /// API the component registered (`None`: an API of another type).
 pub type MethodCall = Box<dyn FnOnce(&dyn Any) -> Option<JsResult>>;
 
+/// An `async` method of a component's ref, its arguments decoded: given
+/// the API the component registered, its future (`None`: an API of another
+/// type), which the core runs as a task of the component's owner.
+pub type MethodTask = Box<dyn FnOnce(Rc<dyn Any>) -> Option<ModuleFuture>>;
+
 /// What a call JS made into Rust does, carried by an op.
 pub enum RustCall {
     /// A module function with a context.
@@ -99,6 +104,8 @@ pub enum RustCall {
     Task(TaskStart),
     /// A method of the ref of the component on node `0`.
     Method(NodeId, MethodCall),
+    /// An `async` method of the ref of the component on node `0`.
+    MethodTask(NodeId, MethodTask),
     /// The place of a JS call posted during a synchronous call from JS
     /// ([`Posts::park`]): applied (dropped), the call runs after what the
     /// ops before it post.
@@ -120,6 +127,7 @@ impl fmt::Debug for RustOp {
             RustCall::Op(_) => "Op",
             RustCall::Task(_) => "Task",
             RustCall::Method(..) => "Method",
+            RustCall::MethodTask(..) => "MethodTask",
             RustCall::Post(_) => "Post",
         };
         write!(f, "RustOp({kind}, call {})", self.call)

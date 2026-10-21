@@ -12,7 +12,7 @@ use rustc_hash::FxHashMap;
 
 use super::{
     Children, IntoElement, PropError, Slot, TsType, TsTypes,
-    call::{AnyValue, JsResult, MethodCall},
+    call::{AnyValue, JsResult, MethodCall, MethodTask, RustCall},
     class::{Class, ClassDef, ClassSpec, MemberKind, Thrown},
     element::{ComponentElement, ElNode},
     js::{JsHost, JsIn, JsOwned},
@@ -120,7 +120,41 @@ pub struct Method {
     /// runs with the API, in order with the props set before it. A wrong
     /// argument's error starts with the method's name; the host puts its
     /// component's before it (`Stepper.setValue: ...`).
-    pub call: fn(&dyn JsHost) -> Result<MethodCall, Thrown>,
+    pub call: MethodRun,
+}
+
+/// How a method of a component's ref runs ([`Method::call`]), its
+/// arguments converted in the JS call.
+#[derive(Clone, Copy)]
+pub enum MethodRun {
+    /// With the API, in order with the props set before it: its result
+    /// settles the call there.
+    Op(fn(&dyn JsHost) -> Result<MethodCall, Thrown>),
+    /// An `async fn`: started with the API in order with the props set
+    /// before it, then run as a task of the component's owner; its result
+    /// settles the call's `Promise` when the task ends (rejected when the
+    /// component goes first).
+    Async(fn(&dyn JsHost) -> Result<MethodTask, Thrown>),
+}
+
+impl MethodRun {
+    /// What a call on the ref of the component on `host` does, its
+    /// arguments converted from `js`.
+    pub fn start(self, js: &dyn JsHost, host: crate::NodeId) -> Result<RustCall, Thrown> {
+        match self {
+            MethodRun::Op(make) => make(js).map(|call| RustCall::Method(host, call)),
+            MethodRun::Async(make) => make(js).map(|task| RustCall::MethodTask(host, task)),
+        }
+    }
+}
+
+impl fmt::Debug for MethodRun {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            MethodRun::Op(_) => "Op",
+            MethodRun::Async(_) => "Async",
+        })
+    }
 }
 
 /// What a component's ref does in JS: a handle its view makes, holding the
@@ -188,7 +222,7 @@ pub struct MethodSpec {
     /// The TypeScript type of its result; `None`: nothing (`void`).
     pub returns: Option<String>,
     /// Its call (the arguments converted in the JS call).
-    pub call: fn(&dyn JsHost) -> Result<MethodCall, Thrown>,
+    pub call: MethodRun,
 }
 
 impl MethodSpec {
@@ -454,6 +488,9 @@ pub(crate) trait AnyInstance {
     /// A method of its ref (its arguments decoded); `None` when it has no
     /// ref of the method's type.
     fn call(&mut self, call: MethodCall) -> Option<JsResult>;
+    /// The task of an `async` method of its ref (its arguments decoded);
+    /// `None` when it has no ref of the method's type.
+    fn start(&mut self, task: MethodTask) -> Option<super::ModuleFuture>;
     /// Its view's owner, once its view is made.
     fn owner(&self) -> Option<super::Owner>;
     /// Where a failure of its code goes first: its owner, or where it is
@@ -1450,6 +1487,14 @@ mod tests {
             0.0
         }
 
+        /// Writes the value down.
+        pub(crate) async fn flush(&self) {}
+
+        /// The value once it settles, within `within` ms.
+        pub(crate) async fn settled(&self, within: f64) -> Result<f64, String> {
+            Ok(within)
+        }
+
         /// A helper without `pub`: not a method of the ref.
         #[allow(dead_code)]
         fn clamp(&self, value: f64) -> f64 {
@@ -1487,13 +1532,15 @@ mod tests {
             "export interface StepperRef {",
             "  /** Jumps to `value`. */\n  jumpTo(value: number): void;",
             "  value(): Promise<number>;",
+            "  /** Writes the value down. */\n  flush(): Promise<void>;",
+            "  /** The value once it settles, within `within` ms. */\n  settled(within: number): Promise<number>;",
             "export interface StepperProps extends Omit<ComponentHostProps, \"ref\"> {\n  ref?: StepperRef | ((ref: StepperRef) => void);",
             "export declare const Stepper: ((props: StepperProps) => JSX.Element);",
         ] {
             assert!(ts.contains(line), "missing {line:?} in\n{ts}");
         }
         assert!(!ts.contains("clamp"), "a helper is not a method:\n{ts}");
-        assert_eq!(StepperApi::METHODS.len(), 2);
+        assert_eq!(StepperApi::METHODS.len(), 4);
         let mut props = StepperProps::initial();
         let size = |json| {
             let specs = StepperProps::spec(&mut TsTypes::default());

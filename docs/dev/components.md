@@ -338,7 +338,13 @@ a method returning `()` gives `void`, with no reply (JS calls it and moves on, a
 one returning `Result<(), E>` gives `Promise<void>` (rejected with the `Err`'s message: the method runs at the
 commit, after the JS call returned, so it cannot throw); one returning a value gives `Promise<T>` (a wrong argument
 rejects it). Promises settle from the core's events (`JsEvent::Reply`, the boxed value converted then) in the same
-frame's commit rounds. Rust calls the methods directly: `ComponentRef::api::<CounterApi>()`.
+frame's commit rounds. An `async fn` method gives `Promise<T>` (`Promise<void>` for `()`) that answers when its work
+ends (`MethodRun::Async`): its arguments are converted in the JS call (a wrong argument rejects), its op
+(`RustCall::MethodTask`) starts it with the API in order with the props set before it, and it runs as a task of the
+component's owner holding the API (`Rc`), so it awaits timers, `fetch`, `background` work or signals as any task of
+the view does; its value, an `Err`'s message or a panic's settles the promise (`Action::Return`), and the component
+going first rejects it ("the component went away before the method finished"). Rust calls the methods directly:
+`ComponentRef::api::<CounterApi>()` (an `async` one is awaited there).
 
 ## Modules
 

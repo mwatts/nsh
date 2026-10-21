@@ -106,8 +106,8 @@ pub use self::{
     },
     asset::{AssetFile, AssetKind, FileAsset, FontAsset, ImageAsset, ImageSrc},
     call::{
-        AnyValue, EventToJs, JsEvent, JsResult, MethodCall, OpCall, ParkedPost, Posts, RustCall,
-        RustOp, TaskStart, ToJs,
+        AnyValue, EventToJs, JsEvent, JsResult, MethodCall, MethodTask, OpCall, ParkedPost, Posts,
+        RustCall, RustOp, TaskStart, ToJs,
     },
     callback::{
         Callback, CallbackArgs, CallbackHandle, CallbackRet, Exception, JsCall, Trace, Tracer,
@@ -117,8 +117,8 @@ pub use self::{
         MemberCall, MemberKind, MemberSpec, Ret, Thrown,
     },
     component::{
-        Api, Component, ComponentError, ComponentSpec, Event, EventSpec, Method, MethodSpec,
-        Methods, NoEvent, Param, PropDecode, PropKind, PropSpec, Props, Registry, Root,
+        Api, Component, ComponentError, ComponentSpec, Event, EventSpec, Method, MethodRun,
+        MethodSpec, Methods, NoEvent, Param, PropDecode, PropKind, PropSpec, Props, Registry, Root,
         declarations,
     },
     element::{

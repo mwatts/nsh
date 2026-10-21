@@ -1251,6 +1251,57 @@ impl<M: TextEngine> Core<M> {
                 }
                 self.settle(call, result);
             }
+            RustCall::MethodTask(host, task) => {
+                let mut failed = None;
+                let started = match self
+                    .components
+                    .instances
+                    .get_mut(&host)
+                    .map(|i| &mut i.inner)
+                {
+                    Some(Inner::Component(inner)) => {
+                        // Its view's owner: the API is registered there.
+                        let owner = inner.failure_owner();
+                        match caught(|| inner.start(task)) {
+                            Ok(Some(future)) => Ok((owner, future)),
+                            Ok(None) => {
+                                Err(format!("{} has no ref of this method's type", inner.name()))
+                            }
+                            Err(message) => {
+                                failed = Some(message.clone());
+                                Err(message)
+                            }
+                        }
+                    }
+                    _ => {
+                        drop_caught(task);
+                        Err(format!("node {host} hosts no Rust component"))
+                    }
+                };
+                self.apply_actions();
+                if let Some(message) = failed {
+                    self.component_failed(host, message);
+                }
+                match started {
+                    Ok((owner, future)) => {
+                        let reply = Reply {
+                            call,
+                            executor: Rc::downgrade(&self.components.executor),
+                            sent: false,
+                        };
+                        // A task of the component: it ends with it, and the
+                        // reply's drop rejects the call then.
+                        drop(owner.scope(|| {
+                            crate::ui::ambient::spawn(async move {
+                                let mut reply = reply;
+                                let result = crate::ui::module::catching(future).await;
+                                reply.send(result);
+                            })
+                        }));
+                    }
+                    Err(message) => self.settle(call, Err(message.into())),
+                }
+            }
             // Its place, released: the call runs there.
             RustCall::Post(place) => drop(place),
         }
@@ -4612,6 +4663,38 @@ impl<M: TextEngine> Core<M> {
                 }
             }
             None => self.events.push(JsEvent::Component { host, event }),
+        }
+    }
+}
+
+/// Settles call `call` with what an `async` method's task gives, or
+/// rejects it when the task is dropped first (its component went).
+struct Reply {
+    call: u32,
+    executor: std::rc::Weak<Executor>,
+    sent: bool,
+}
+
+impl Reply {
+    fn send(&mut self, result: JsResult) {
+        self.sent = true;
+        match self.executor.upgrade() {
+            Some(executor) if self.call != 0 => executor.act(Action::Return(self.call, result)),
+            _ => {
+                if let Err(e) = &result {
+                    log::warn!(target: "js", "an async method failed: {e}");
+                }
+            }
+        }
+    }
+}
+
+impl Drop for Reply {
+    fn drop(&mut self) {
+        if !self.sent {
+            self.send(Err(
+                "the component went away before the method finished".into()
+            ));
         }
     }
 }

@@ -901,14 +901,12 @@ unsafe extern "C" fn call_method(
     let make = method.call;
     // A wrong argument's error names the component (`Stepper.setValue`).
     crate::classes::send(cx, this, args, method.promises(), |host| {
-        make(host)
-            .map(|call| RustCall::Method(id, call))
-            .map_err(|e| match e {
-                nsh_core::ui::Thrown::Type(m) => {
-                    nsh_core::ui::Thrown::Type(format!("{}.{m}", spec.export))
-                }
-                other => other,
-            })
+        make.start(host, id).map_err(|e| match e {
+            nsh_core::ui::Thrown::Type(m) => {
+                nsh_core::ui::Thrown::Type(format!("{}.{m}", spec.export))
+            }
+            other => other,
+        })
     })
 }
 

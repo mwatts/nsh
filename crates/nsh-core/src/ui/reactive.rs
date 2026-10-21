@@ -107,6 +107,17 @@ pub(crate) fn call_api(host: crate::NodeId, call: super::MethodCall) -> Option<s
     call(&*entry.api)
 }
 
+/// Starts `task` (an `async` method its arguments were decoded for) with
+/// the API of the component on `host`; `None` without one, or with one of
+/// another type.
+pub(crate) fn start_api(
+    host: crate::NodeId,
+    task: super::MethodTask,
+) -> Option<super::ModuleFuture> {
+    let entry = with_data(|d| d.apis.get(&host).cloned())?;
+    task(entry.api)
+}
+
 /// Runs `f` on the entered runtime's data.
 pub(crate) fn with_data<R>(f: impl FnOnce(&mut RustData) -> R) -> R {
     f(&mut graph().data)

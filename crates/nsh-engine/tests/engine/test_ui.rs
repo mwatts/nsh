@@ -283,6 +283,16 @@ impl StepperApi {
     pub(crate) fn value(&self) -> f64 {
         self.value.get_untracked()
     }
+
+    /// The value shown after `ms` milliseconds; refused for a negative
+    /// time.
+    pub(crate) async fn value_after(&self, ms: f64) -> Result<f64, String> {
+        if ms < 0.0 {
+            return Err(format!("{ms} ms is in the past"));
+        }
+        timer(Duration::from_secs_f64(ms / 1000.0)).await;
+        Ok(self.value.get_untracked())
+    }
 }
 
 /// A number with − and + buttons ([`StepperProps`]).
