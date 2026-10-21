@@ -11,7 +11,7 @@ use std::{
 
 use nsh_core::{
     AccessibilityRole, Bounds, Command, Dialog, EventKind, EventMask, InputConfig, MountBatch,
-    MountItem, NodeId, PanActivation, Point, Points, Size, ViewKind, ui::PropEnum,
+    MountItem, NodeId, PanActivation, Point, PointerEvents, Points, Size, ViewKind, ui::PropEnum,
 };
 
 use super::selector::{Matcher, Selector, TextMatch};
@@ -20,6 +20,11 @@ mod spans;
 
 /// The surface's root view: every app view hangs below it.
 const ROOT: NodeId = 1;
+
+/// The ids the model gives a canvas's nodes ([`nsh_core::canvas::CanvasNode`]),
+/// counting down from the top of the id space, where the core and JS
+/// never reach.
+const FIRST_CANVAS_NODE: NodeId = NodeId::MAX;
 
 /// Whether view `v` shows a text `want` matches: its own, or an input's
 /// (what it holds, or while empty its placeholder).
@@ -83,6 +88,10 @@ pub struct Screen {
     back_asked: bool,
     /// The app's keyboard shortcuts (`MountItem::Keymap`).
     keymap: Option<Arc<nsh_core::keymap::Keymap>>,
+    /// The nodes each canvas's drawing has, as views of the model.
+    canvas_nodes: HashMap<NodeId, Vec<NodeId>>,
+    /// The id the next canvas node gets.
+    next_canvas_node: NodeId,
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +120,10 @@ struct View {
     long_press_delay: Option<f32>,
     /// When its touch responder waits for a pan (`panActivation`).
     pan_activation: Option<PanActivation>,
+    /// Which touches it and its subtree receive (`pointerEvents`).
+    pointer_events: PointerEvents,
+    /// A node of a canvas's drawing, not a view of its own.
+    canvas_node: bool,
 }
 
 /// Which views a selector matched, for a step that acts on one.
@@ -241,6 +254,7 @@ impl Screen {
                 self.closed.remove(id);
             }
             MountItem::Delete { id } => {
+                self.canvas(*id, &[]);
                 self.detach(*id);
                 self.nodes.remove(id);
                 self.children.remove(id);
@@ -266,7 +280,9 @@ impl Screen {
                 view.disabled = props.accessibility.state.disabled;
                 view.long_press_delay = props.long_press_delay;
                 view.pan_activation = props.pan_activation;
+                view.pointer_events = props.pointer_events;
             }
+            MountItem::Canvas { id, drawing } => self.canvas(*id, &drawing.nodes),
             MountItem::AccessibilityLabel { id, label } => {
                 self.nodes.entry(*id).or_default().label = label.clone();
             }
@@ -321,6 +337,46 @@ impl Screen {
             }
             _ => {}
         }
+    }
+
+    /// The nodes of canvas `id`'s drawing become its children in the
+    /// model, in place of those it had.
+    fn canvas(&mut self, id: NodeId, nodes: &[nsh_core::canvas::CanvasNode]) {
+        for old in self.canvas_nodes.remove(&id).unwrap_or_default() {
+            self.detach(old);
+            self.nodes.remove(&old);
+        }
+        if nodes.is_empty() {
+            return;
+        }
+        let mut ids = Vec::with_capacity(nodes.len());
+        for node in nodes {
+            if self.next_canvas_node == 0 {
+                self.next_canvas_node = FIRST_CANVAS_NODE;
+            }
+            let child = self.next_canvas_node;
+            self.next_canvas_node -= 1;
+            self.nodes.insert(
+                child,
+                View {
+                    parent: Some(id),
+                    test_id: node.test_id.clone(),
+                    label: Some(node.label.clone()),
+                    // What it names is drawn: it shows as text does.
+                    text: Some(node.label.to_string()),
+                    frame: node.bounds,
+                    role: node.role,
+                    canvas_node: true,
+                    ..View::default()
+                },
+            );
+            ids.push(child);
+        }
+        self.children
+            .entry(id)
+            .or_default()
+            .extend(ids.iter().copied());
+        self.canvas_nodes.insert(id, ids);
     }
 
     /// What a platform view does with `command`, as far as the model
@@ -768,6 +824,48 @@ impl Screen {
         hit
     }
 
+    /// The center of canvas node `id` in the surface; `None` for a view.
+    pub(crate) fn canvas_node_center(&self, id: NodeId) -> Option<Point<Points>> {
+        if !self.nodes.get(&id)?.canvas_node {
+            return None;
+        }
+        Some(self.page_bounds(id)?.center())
+    }
+
+    /// The view a pointer at `at` (in the surface) reaches: the topmost,
+    /// innermost one there that receives touches (`pointerEvents`), as
+    /// platforms hit-test; canvas nodes are not views.
+    fn hit_pointer(&self, at: Point<Points>) -> NodeId {
+        let shown: HashSet<NodeId> = self.attached().into_iter().collect();
+        self.hit_in(ROOT, at, &shown).unwrap_or(ROOT)
+    }
+
+    fn hit_in(&self, id: NodeId, at: Point<Points>, shown: &HashSet<NodeId>) -> Option<NodeId> {
+        let receives = self
+            .nodes
+            .get(&id)
+            .map_or(PointerEvents::Auto, |v| v.pointer_events);
+        if receives == PointerEvents::None
+            || id != ROOT && !self.page_bounds(id).is_some_and(|b| b.contains(&at))
+        {
+            return None;
+        }
+        if receives != PointerEvents::BoxOnly
+            && let Some(children) = self.children.get(&id)
+        {
+            for &child in children.iter().rev() {
+                let node = self.nodes.get(&child).is_some_and(|v| v.canvas_node);
+                if node || !shown.contains(&child) {
+                    continue;
+                }
+                if let Some(hit) = self.hit_in(child, at, shown) {
+                    return Some(hit);
+                }
+            }
+        }
+        (receives != PointerEvents::BoxNone).then_some(id)
+    }
+
     /// `id` and the views around it, innermost first.
     pub(crate) fn chain(&self, id: NodeId) -> Vec<NodeId> {
         let mut out = vec![id];
@@ -789,6 +887,20 @@ impl Screen {
     /// it or a view on the way is disabled.
     pub(crate) fn pressable(&self, selector: &Selector) -> Pick {
         let matches = self.resolve(selector);
+        if let [id] = matches[..]
+            && let Some(at) = self.canvas_node_center(id)
+        {
+            let Some(target) = self.up_to(self.hit_pointer(at), |v| {
+                v.events.contains(EventKind::Press)
+            }) else {
+                return Pick::None;
+            };
+            return if self.disabled_from(target, None) {
+                Pick::Disabled
+            } else {
+                Pick::One(target)
+            };
+        }
         if !matches.is_empty()
             && matches.iter().all(|id| {
                 let target = self.up_to(*id, |v| v.events.contains(EventKind::Press));
