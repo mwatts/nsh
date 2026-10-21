@@ -24,7 +24,9 @@ impl Headless {
     /// Backspace and Delete delete (reported as `Backspace`), Enter is the
     /// return key, `mod+a` selects all, and a character key types (Shift
     /// as on the US layout). A character typed after a handled key, while
-    /// no editable field has the keyboard, waits for the next one. Escape
+    /// no editable field has the keyboard, waits for the next one. Arrows,
+    /// Delete, Backspace, and Enter still reach a focused field that is
+    /// not editable. Escape
     /// drops that wait, and with nothing focused goes back as the
     /// desktops' back key does when there is something to go back from.
     pub fn press_key(&mut self, keys: &str) -> Result<(), String> {
@@ -70,10 +72,15 @@ impl Headless {
         if found.consumed() {
             return self.done();
         }
+        // A plain character waits for an editable field. Every other key
+        // still reaches the focused field, including one that is read-only.
+        let plain = matches!(stroke.key, Key::Char(_)) && !(m.ctrl || m.alt || m.cmd);
         if let Some(input) = focused.filter(|&id| {
-            self.screen
-                .input(id)
-                .is_some_and(|input| input.config.editable)
+            !plain
+                || self
+                    .screen
+                    .input(id)
+                    .is_some_and(|input| input.config.editable)
         }) {
             self.input_key(input, stroke, apple);
             return self.done();
