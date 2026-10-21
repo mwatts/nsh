@@ -34,7 +34,7 @@ NSH-owned declarations and behavior rather than copying the upstream API into it
 2. **A rename adds the new name and keeps the old one** as an alias of the same implementation (the same function or
    class object at run time), declared `@deprecated` with the new name, and kept for good. The same goes for moving an
    export between modules: the old module keeps exporting it.
-3. **Types only widen.** A union gains alternatives, a function gains overloads or trailing optional parameters, a
+3. **Types only widen.** A union gains alternatives (an object literal alternative may gain optional members), a function gains overloads or trailing optional parameters, a
    parameter becomes optional, a prop accepts more values, a function or method that returned `void` returns a value
    (a callback an app passes in keeps returning `void`, and its parameters change only by gaining trailing optional ones, or an object literal it is handed gaining optional members). Nothing else narrows or changes a return type, and what apps
    pass in (props, styles, options, configs) gains optional members only. Parameter names are not part of a type:

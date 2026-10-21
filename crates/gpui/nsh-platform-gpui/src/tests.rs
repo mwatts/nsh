@@ -271,6 +271,7 @@ fn windows(cx: &mut TestAppContext) {
     quit_and_close_requests_go_to_the_handler_instead_of_acting(cx);
     an_auto_hidden_menu_bar_shows_on_alt_alone_and_while_a_menu_is_open(cx);
     asset_uris_resolve_in_the_first_directory_that_has_the_file(cx);
+    menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx);
 }
 
 /// Runs the window until the focused field's text satisfies `done`, and
@@ -922,4 +923,74 @@ fn asset_uris_resolve_in_the_first_directory_that_has_the_file(cx: &mut TestAppC
     let report = wait_until(&view, cx, |t| t.contains('|'));
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(report, "app 2x3|cover 4x5");
+}
+
+/// A field that keeps its focus on Return, under a menu whose items add
+/// their names to it: three that leave a focused field the keys it uses
+/// (`when: "auto"`) and one that takes its key everywhere (the default).
+const MENU_OVER_FIELD: &str = r#"
+import { Input, mount, signal, View } from "nsh";
+import { Menu } from "nsh/desktop";
+
+function App() {
+  const text = signal("abcd");
+  const chose = (name: string) => () => text.set(`${text()} ${name}`);
+  Menu.setApplicationMenu([
+    {
+      label: "Edit",
+      submenu: [
+        { label: "Revert", shortcut: "mod+z", when: "auto", onSelect: chose("revert") },
+        { label: "Remove", shortcut: "delete", when: "auto", onSelect: chose("remove") },
+        { label: "Send", shortcut: "mod+enter", when: "auto", onSelect: chose("send") },
+        { label: "Purge", shortcut: "shift+delete", onSelect: chose("purge") },
+      ],
+    },
+  ]);
+  return (
+    <View style={{ flex: 1 }}>
+      <Input
+        autoFocus
+        submitBehavior="submit"
+        value={text()}
+        onChange={(t) => text.set(t)}
+        style={{ height: 30 }}
+      />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", MENU_OVER_FIELD, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    let primary = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    wait_for(&view, cx, "abcd");
+    cx.simulate_keystrokes("end");
+    cx.simulate_input("e");
+    wait_for(&view, cx, "abcde");
+    cx.simulate_keystrokes(&format!("{primary}-z"));
+    wait_for(&view, cx, "abcd");
+    cx.simulate_keystrokes("home delete");
+    wait_for(&view, cx, "bcd");
+    cx.simulate_keystrokes(&format!("{primary}-enter"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-delete");
+    wait_for(&view, cx, "bcd purge");
+    cx.simulate_keystrokes("escape");
+    wait_until_window(cx, "Escape takes the focus from the field", |cx| {
+        field_text(&view, cx).is_none()
+    });
+    cx.simulate_keystrokes(&format!("{primary}-z delete {primary}-enter"));
+    cx.run_until_parked();
+    let bar = if cfg!(target_os = "macos") { 0.0 } else { 28.0 };
+    cx.simulate_click(
+        gpui::point(gpui::px(20.0), gpui::px(bar + 15.0)),
+        gpui::Modifiers::default(),
+    );
+    wait_for(&view, cx, "bcd purge revert remove send");
 }

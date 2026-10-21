@@ -57,6 +57,13 @@ export type MenuItem =
        * `home`, `end`, `pageup`, `pagedown`, `f1`–`f24`: the keystrokes of
        * `nsh/keymap`. A role has its platform's by default. */
       shortcut?: string;
+      /** When its shortcut chooses it while a text field has the keyboard
+       * focus: `"always"` (the default), `"auto"` (unless the field uses
+       * the keystroke itself: keys that type, move the caret or delete,
+       * and the editing shortcuts, as `nsh/keymap`'s bindings) or
+       * `"notEditing"` (never). A key the item leaves goes to the field.
+       * On the GPUI backend. */
+      when?: "always" | "auto" | "notEditing";
       /** It can be chosen (default true). */
       enabled?: boolean;
       /** A check mark: set (true or false) for a checkable item. */

@@ -5,7 +5,8 @@
 //!   an interface, a global;
 //! - a runtime value keeps its kind (a function stays callable);
 //! - a declaration keeps its text (comments, spacing and parameter names
-//!   aside), or widens it: a union gains alternatives, a function gains
+//!   aside), or widens it: a union gains alternatives or an object literal
+//!   alternative of it gains optional members, a function gains
 //!   overloads or trailing optional parameters, a parameter becomes
 //!   optional, a function's or method's `void` result becomes a value (a
 //!   callback an app passes in keeps its `void`, and its parameters only
@@ -234,6 +235,13 @@ fn members_added(old: &str, new: &str) -> bool {
     let (Some(o), Some(n)) = (top_level(old, ':'), top_level(new, ':')) else {
         return false;
     };
+    old[..o] == new[..n] && literal_widened(&old[o + 1..], &new[n + 1..])
+}
+
+/// `{ a: X }` → `{ a: X; b?: Y }`: an object literal type that keeps its
+/// members and gains optional ones. It takes every object the old one
+/// took, and an object of it is one of the old type.
+fn literal_widened(old: &str, new: &str) -> bool {
     let literal = |ty: &str| -> Option<Vec<String>> {
         let body = ty.trim().strip_prefix('{')?.strip_suffix('}')?;
         Some(
@@ -244,12 +252,10 @@ fn members_added(old: &str, new: &str) -> bool {
                 .collect(),
         )
     };
-    let (Some(old_members), Some(new_members)) = (literal(&old[o + 1..]), literal(&new[n + 1..]))
-    else {
+    let (Some(old_members), Some(new_members)) = (literal(old), literal(new)) else {
         return false;
     };
-    old[..o] == new[..n]
-        && old_members.iter().all(|m| new_members.contains(m))
+    old_members.iter().all(|m| new_members.contains(m))
         && new_members
             .iter()
             .filter(|m| !old_members.contains(m))
@@ -408,7 +414,8 @@ fn union_widened(old: &str, new: &str) -> bool {
     old[..=o] == new[..=n] && type_widened(&old[o + 1..], &new[n + 1..])
 }
 
-/// The same type, or a union of more alternatives.
+/// The same type, or a union of more alternatives; an object literal
+/// alternative may gain optional members ([`literal_widened`]).
 fn type_widened(old: &str, new: &str) -> bool {
     let alternatives = |s: &str| -> Vec<String> {
         split_top(s.trim().trim_start_matches('|'), '|')
@@ -417,7 +424,10 @@ fn type_widened(old: &str, new: &str) -> bool {
             .collect()
     };
     let (old, new) = (alternatives(old), alternatives(new));
-    !old.is_empty() && old.iter().all(|a| new.contains(a))
+    !old.is_empty()
+        && old
+            .iter()
+            .all(|a| new.iter().any(|b| a == b || literal_widened(a, b)))
 }
 
 /// A top-level declaration of a file.
@@ -805,6 +815,18 @@ mod tests {
         assert!(compatible(
             "type OS = \"ios\" | \"android\"",
             "type OS = \"ios\" | \"android\" | \"web\""
+        ));
+        assert!(compatible(
+            "type T = | { type: \"s\" } | { a?: X; b: Y; }",
+            "type T = | { type: \"s\" } | { a?: X; c?: Z; b: Y; }"
+        ));
+        assert!(!compatible(
+            "type T = | { type: \"s\" } | { a?: X; }",
+            "type T = | { type: \"s\" } | { a?: X; c: Z; }"
+        ));
+        assert!(!compatible(
+            "type T = | { type: \"s\" } | { a?: X; b: Y; }",
+            "type T = | { type: \"s\" } | { a?: X; }"
         ));
         assert!(compatible(
             "export declare function f(a: number): void",
