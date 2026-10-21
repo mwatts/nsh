@@ -115,6 +115,9 @@ struct View {
     role: AccessibilityRole,
     /// It takes no presses (`disabled`, its accessibility state).
     disabled: bool,
+    /// It is selected (`selected`, its accessibility state; a canvas node's
+    /// `selected`).
+    selected: bool,
     /// How long a press must last to be a long one (`delayLongPress`), in
     /// milliseconds.
     long_press_delay: Option<f32>,
@@ -278,6 +281,7 @@ impl Screen {
                 view.label = props.accessibility.label.clone();
                 view.role = props.accessibility.role;
                 view.disabled = props.accessibility.state.disabled;
+                view.selected = props.accessibility.state.selected;
                 view.long_press_delay = props.long_press_delay;
                 view.pan_activation = props.pan_activation;
                 view.pointer_events = props.pointer_events;
@@ -366,6 +370,7 @@ impl Screen {
                     text: Some(node.label.to_string()),
                     frame: node.bounds,
                     role: node.role,
+                    selected: node.selected,
                     canvas_node: true,
                     ..View::default()
                 },
@@ -701,6 +706,18 @@ impl Screen {
                 Ok(!self.disabled_from(id, None)
                     && self.input(id).is_none_or(|i| i.config.editable))
             }
+            [] => Err(format!("no view matches `{selector}`")),
+            ref all => Err(format!("`{selector}` matches {} views", all.len())),
+        }
+    }
+
+    /// Whether the view `selector` names is selected (its accessibility
+    /// state, or a canvas node's `selected`); an error when none or several
+    /// match.
+    pub fn selected(&self, selector: &str) -> Result<bool, String> {
+        let parsed = Selector::parse(selector)?;
+        match self.resolve(&parsed)[..] {
+            [id] => Ok(self.nodes.get(&id).is_some_and(|v| v.selected)),
             [] => Err(format!("no view matches `{selector}`")),
             ref all => Err(format!("`{selector}` matches {} views", all.len())),
         }
