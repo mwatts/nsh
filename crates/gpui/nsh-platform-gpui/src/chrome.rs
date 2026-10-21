@@ -535,10 +535,11 @@ pub(crate) fn window_key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
 
 /// A key down after the app's bindings (`nsh/keymap`): the application
 /// menu's shortcuts, the standalone window's Ctrl+W / Cmd+W and Alt + a
-/// menu's initial. True when it took the key. An item whose `when` leaves
-/// the key to the focused field does not take it
+/// menu's initial. True when it took the key. While `editing` (a text
+/// field or a native component has the keyboard focus), an item whose
+/// `when` leaves the key to it does not take it
 /// ([`MenuAction::fires_while_editing`](nsh_core::desktop::MenuAction::fires_while_editing)).
-pub(crate) fn shortcut(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
+pub(crate) fn shortcut(surface: &Rc<Surface>, event: &KeyEvent, editing: bool) -> bool {
     let c = &surface.chrome;
     if !c.standalone.get() {
         return false;
@@ -546,7 +547,6 @@ pub(crate) fn shortcut(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
     let Some(pressed) = pressed(event) else {
         return false;
     };
-    let editing = crate::text_input::focused(surface).is_some();
     let found = {
         let menu = c.menu.borrow();
         menu.as_deref().and_then(|items| {

@@ -1044,10 +1044,11 @@ pub(crate) fn key(surface: &Rc<Surface>, event: KeyEvent) -> bool {
     // The window's shortcuts (full screen, the dev host's reload) work
     // wherever the focus is.
     let shortcut = surface.shortcuts.borrow().iter().any(|f| f(&event));
+    let editing = crate::text_input::focused(surface).is_some();
     let handled = shortcut
         || crate::system::key(surface, &event)
-        || crate::keymap::key(surface, &event)
-        || crate::chrome::shortcut(surface, &event)
+        || crate::keymap::key(surface, &event, editing)
+        || crate::chrome::shortcut(surface, &event, editing)
         || crate::text_input::key(surface, &event)
         || crate::text::key(surface, &event)
         || crate::navigation::key_pressed(surface, &event)
@@ -1058,6 +1059,28 @@ pub(crate) fn key(surface: &Rc<Surface>, event: KeyEvent) -> bool {
         || tab(surface, &event);
     if handled && event.modifiers.alt {
         input.alt_combo.set(true);
+    }
+    handled
+}
+
+/// A key from the window while one of the surface's native components has
+/// the keyboard focus; true when handled. GPUI gives the component the key
+/// first (its key bindings, then its key listeners), so this sees only
+/// keys the component let through: the window's shortcuts (the reserved
+/// quit key among them), then the app's bindings and the menu's shortcuts
+/// as while a text field is edited (the component may be a text editor:
+/// those that leave a field the keys it uses leave them to the
+/// component). Every other key stays the component's.
+pub(crate) fn component_key(surface: &Rc<Surface>, event: KeyEvent) -> bool {
+    if !event.down {
+        crate::keymap::released(surface, &event);
+        return event.vk == VK_MENU && surface.input.alt_combo.replace(false);
+    }
+    let handled = surface.shortcuts.borrow().iter().any(|f| f(&event))
+        || crate::keymap::key(surface, &event, true)
+        || crate::chrome::shortcut(surface, &event, true);
+    if handled && event.modifiers.alt {
+        surface.input.alt_combo.set(true);
     }
     handled
 }

@@ -272,6 +272,7 @@ fn windows(cx: &mut TestAppContext) {
     an_auto_hidden_menu_bar_shows_on_alt_alone_and_while_a_menu_is_open(cx);
     asset_uris_resolve_in_the_first_directory_that_has_the_file(cx);
     menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx);
+    the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx);
 }
 
 /// Runs the window until the focused field's text satisfies `done`, and
@@ -993,4 +994,134 @@ fn menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx: &mut TestAppContext
         gpui::Modifiers::default(),
     );
     wait_for(&view, cx, "bcd purge revert remove send");
+}
+
+/// A native component that takes the keyboard and records each key down
+/// it sees, letting every key go on; it shares its focus handle once drawn.
+struct KeyLog {
+    keys: Rc<std::cell::RefCell<Vec<String>>>,
+    focus: Rc<std::cell::RefCell<Option<gpui::FocusHandle>>>,
+}
+
+impl NativeComponent for KeyLog {
+    fn render(&mut self, _: &mut Window, cx: &mut GpuiApp) -> Option<AnyElement> {
+        use gpui::InteractiveElement as _;
+        let focus = self
+            .focus
+            .borrow_mut()
+            .get_or_insert_with(|| cx.focus_handle())
+            .clone();
+        let keys = self.keys.clone();
+        Some(
+            div()
+                .size_full()
+                .track_focus(&focus)
+                .on_key_down(move |e, _, _| keys.borrow_mut().push(e.keystroke.unparse()))
+                .into_any_element(),
+        )
+    }
+
+    fn focus_handle(&self) -> Option<gpui::FocusHandle> {
+        self.focus.borrow().clone()
+    }
+
+    fn set_prop(
+        &mut self,
+        _: &str,
+        _: Option<&serde_json::Value>,
+        _: &mut Window,
+        _: &mut GpuiApp,
+    ) {
+    }
+}
+
+/// A field showing which of the app's shortcuts fired, above a component
+/// that takes the keyboard: a binding that fires everywhere (`mod+k`), one
+/// that leaves text editing its keys (`j`), a menu item that does too
+/// (`mod+z`) and one that takes its key everywhere (`mod+shift+n`).
+const SHORTCUTS_OVER_COMPONENT: &str = r#"
+import { Input, mount, signal, View } from "nsh";
+import { Menu } from "nsh/desktop";
+import { keymap } from "nsh/keymap";
+import { nativeComponent } from "nsh/native";
+
+const KeyLog = nativeComponent<{}, {}>("test.keylog", { props: [], events: [] });
+
+function App() {
+  const fired = signal("fired");
+  const fire = (name: string) => () => fired.set(`${fired()} ${name}`);
+  keymap.bind("mod+k", fire("bound"), { when: "always" });
+  keymap.bind("j", fire("j"));
+  Menu.setApplicationMenu([
+    {
+      label: "Edit",
+      submenu: [
+        { label: "Revert", shortcut: "mod+z", when: "auto", onSelect: fire("revert") },
+        { label: "New", shortcut: "mod+shift+n", onSelect: fire("new") },
+      ],
+    },
+  ]);
+  return (
+    <View style={{ flex: 1 }}>
+      <Input value={fired()} style={{ height: 30 }} />
+      <KeyLog style={{ height: 40 }} />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx: &mut TestAppContext) {
+    use std::cell::RefCell;
+    let code = nsh_bundler::compile_module("App.tsx", SHORTCUTS_OVER_COMPONENT, &[]).unwrap();
+    let keys = Rc::new(RefCell::new(Vec::new()));
+    let focus = Rc::new(RefCell::new(None));
+    let asked = Rc::new(RefCell::new(Vec::new()));
+    let (component_keys, component_focus, log) = (keys.clone(), focus.clone(), asked.clone());
+    let (view, cx) = owned_view(cx, code, move |view| {
+        view.register_component(
+            "test.keylog",
+            Rc::new(move |_| {
+                Box::new(KeyLog {
+                    keys: component_keys.clone(),
+                    focus: component_focus.clone(),
+                })
+            }),
+        );
+        view.on_close_request(move |request, _, _| log.borrow_mut().push(request));
+    });
+    wait_until_window(cx, "the component is drawn", |_| focus.borrow().is_some());
+    let handle = focus.borrow().clone().unwrap();
+    cx.update(|window, cx| window.focus(&handle, cx));
+    cx.run_until_parked();
+    let primary = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    cx.simulate_keystrokes(&format!("a j {primary}-z {primary}-k"));
+    // GPUI's test window sends no releases: K's comes to the keymap while
+    // the component has the focus, so the next Ctrl+K is no repeat.
+    cx.simulate_event(gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse(&format!("{primary}-k")).unwrap(),
+    });
+    cx.simulate_keystrokes(&format!("{primary}-k shift-{primary}-n {primary}-q"));
+    wait_until_window(cx, "the quit key asks Quit", |_| {
+        *asked.borrow() == [crate::CloseRequest::Quit]
+    });
+    // The component saw every key first, the typed ones and Undo among
+    // them; its focus never moved.
+    assert_eq!(
+        keys.borrow()[..4],
+        ["a", "j", &format!("{primary}-z"), &format!("{primary}-k")],
+    );
+    cx.update(|window, _| assert!(handle.is_focused(window), "the component lost the focus"));
+    // Only the shortcuts that fire while text is edited fired: both Ctrl+K
+    // presses (a released key is not held), and the menu's New.
+    let bar = if cfg!(target_os = "macos") { 0.0 } else { 28.0 };
+    cx.simulate_click(
+        gpui::point(gpui::px(20.0), gpui::px(bar + 15.0)),
+        gpui::Modifiers::default(),
+    );
+    wait_for(&view, cx, "fired bound bound new");
 }

@@ -50,7 +50,11 @@
   (`NativeComponent::render(window, cx) -> Option<AnyElement>`, any GPUI / GPUI Kit element or `Entity` view): the
   surface element's prepaint lays it out at the box's window bounds and prepaints it (`prepaint_as_root`, clipped to the
   clipping ancestors), the tree paints it where it draws the box (NSH content drawn later covers it), and a `BlockMouse`
-  hitbox under it keeps NSH's input away; keys go to it while focus is inside it, and one that returns its widget's
+  hitbox under it keeps NSH's input away; keys go to it first while focus is inside it (GPUI dispatches its key
+  bindings, then its key listeners, then the surface's), and the keys it lets through reach the window's shortcuts
+  (the reserved quit key, so an owned window's `on_close_request`), then the app's `nsh/keymap` bindings and the
+  menu's shortcuts as from a focused text field (`when: "auto"` leaves it the keys text editing uses), and nothing
+  else of NSH's (`input::component_key`); one that returns its widget's
   handle from `NativeComponent::focus_handle` is a Tab stop among the text fields (in tree order, in the newest modal's
   scope). Props and commands reach it with the next frame, before `render`, with the window and `App` (`set_prop(name,
   value, window, cx)`, `command(name, args, window, cx)`), so it can update its entities. `render` is also called while
