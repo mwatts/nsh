@@ -10,10 +10,11 @@ use nsh_core::{
 use nsh_engine::EngineControl;
 use objc2::{
     ClassType, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
-    rc::Retained, runtime::ProtocolObject,
+    rc::Retained,
+    runtime::{AnyObject, ProtocolObject},
 };
-use objc2_core_foundation::CGPoint;
-use objc2_foundation::{NSObject, NSObjectProtocol, NSRange, NSString};
+use objc2_core_foundation::{CGPoint, CGRect};
+use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSRange, NSString};
 use objc2_quartz_core::CADisplayLink;
 use objc2_ui_kit::{
     UIControl, UIGestureRecognizer, UIGestureRecognizerDelegate, UIGestureRecognizerState,
@@ -544,21 +545,22 @@ impl EventTarget {
         });
     }
 
-    /// `onSelectionChange` of the input `view` belongs to.
+    /// `onSelectionChange` of the input `view` belongs to. The caret rect
+    /// is `UITextInput`'s, in the input's coordinates.
     fn selection_changed(&self, view: &UIView) {
         let id = view.tag() as NodeId;
         let Some((start, end)) = input::selection(view) else {
             return;
         };
+        let (caret, first_line) = selection_geometry(view);
         self.with_mounter(move |m| {
-            m.input_event(
-                id,
-                EventKind::SelectionChange,
-                EventPayload::Map(vec![
-                    ("start", nsh_core::PayloadValue::Number(start as f64)),
-                    ("end", nsh_core::PayloadValue::Number(end as f64)),
-                ]),
-            )
+            let payload = match caret {
+                Some(caret) => EventPayload::Selection(nsh_core::SelectionEvent::showing(
+                    start, end, caret, first_line,
+                )),
+                None => EventPayload::Selection(nsh_core::SelectionEvent::new(start, end)),
+            };
+            m.input_event(id, EventKind::SelectionChange, payload);
         });
     }
 
@@ -650,4 +652,38 @@ impl EventTarget {
             });
         }
     }
+}
+
+/// The caret and the selection's first line, in `view`'s coordinates.
+fn selection_geometry(
+    view: &UIView,
+) -> (
+    Option<nsh_core::Bounds<nsh_core::Points>>,
+    Option<nsh_core::Bounds<nsh_core::Points>>,
+) {
+    let range: Option<Retained<AnyObject>> = unsafe { msg_send![view, selectedTextRange] };
+    let Some(range) = range else {
+        return (None, None);
+    };
+    let end: Retained<AnyObject> = unsafe { msg_send![&*range, end] };
+    let caret_rect: CGRect = unsafe { msg_send![view, caretRectForPosition: &*end] };
+    let rects: Option<Retained<NSArray<AnyObject>>> =
+        unsafe { msg_send![view, selectionRectsForRange: &*range] };
+    let first_line = rects.and_then(|rects| {
+        let count: usize = unsafe { msg_send![&*rects, count] };
+        if count == 0 {
+            return None;
+        }
+        let item: Retained<AnyObject> = unsafe { msg_send![&*rects, objectAtIndex: 0_usize] };
+        let rect: CGRect = unsafe { msg_send![&*item, rect] };
+        Some(shown_rect(rect))
+    });
+    (Some(shown_rect(caret_rect)), first_line)
+}
+
+fn shown_rect(rect: CGRect) -> nsh_core::Bounds<nsh_core::Points> {
+    nsh_core::geometry::bounds(
+        point(px(rect.origin.x as f32), px(rect.origin.y as f32)),
+        nsh_core::geometry::size(px(rect.size.width as f32), px(rect.size.height as f32)),
+    )
 }
