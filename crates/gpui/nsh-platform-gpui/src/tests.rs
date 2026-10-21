@@ -245,6 +245,7 @@ fn windows(cx: &mut TestAppContext) {
     keys_reach_the_fields_of_a_surface_showing_a_native_component(cx);
     compositions_are_reported_and_hold_values_until_they_end(cx);
     presses_carry_the_modifier_keys_and_click_count(cx);
+    presses_carry_the_point_text_index_at_reads(cx);
     selections_carry_the_caret_and_first_line_rectangles(cx);
     keys_are_reported_before_the_field_acts_and_bindings_take_them_first(cx);
 }
@@ -339,6 +340,93 @@ fn presses_carry_the_modifier_keys_and_click_count(cx: &mut TestAppContext) {
         &view,
         cx,
         "ctrl false shift false alt false meta false clicks 2",
+    );
+}
+
+/// A Rust app: a line of ten "m"s inside 8 points of padding, over a
+/// focused field. The field first reads the width of one "m" and the
+/// line's height; a press on the line then writes where it was in the
+/// line and in the window, and the caret offset `text_index_at` finds
+/// there.
+mod press_point {
+    use nsh_core::{EventKind, EventPayload, PressEvent, TextLine, ui::prelude::*};
+
+    #[component]
+    pub(super) fn PressPoint() -> impl IntoElement {
+        let report = signal(String::from("none"));
+        let line = element_ref();
+        view()
+            .flex_1()
+            .p(px(8.0))
+            .child(
+                text("mmmmmmmmmm")
+                    .focusable(false)
+                    .element_ref(&line)
+                    .on_text_layout(move |lines: &[TextLine]| {
+                        if let Some(first) = lines.first() {
+                            report.set(format!(
+                                "m {:.2} line {:.2}",
+                                first.width.0 / 10.0,
+                                first.height.0
+                            ));
+                        }
+                    })
+                    .on(EventKind::Press, move |p: &EventPayload| {
+                        let EventPayload::Press(PressEvent {
+                            position: Some(at), ..
+                        }) = *p
+                        else {
+                            report.set("no position".into());
+                            return;
+                        };
+                        spawn(async move {
+                            let index = line.text_index_at(at.location).await;
+                            let (l, g) = (at.location, at.page);
+                            report.set(format!(
+                                "at {:.1} {:.1} in {:.1} {:.1} index {index:?}",
+                                l.x.0, l.y.0, g.x.0, g.y.0
+                            ));
+                        });
+                    }),
+            )
+            .child(
+                input()
+                    .auto_focus(true)
+                    .value(move || report.get())
+                    .h(px(30.0)),
+            )
+    }
+}
+
+fn presses_carry_the_point_text_index_at_reads(cx: &mut TestAppContext) {
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| {
+        view.load(App::Rust(crate::Root::of::<press_point::PressPoint>()))
+    });
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    let metrics = wait_until(&view, cx, |t| t.starts_with("m "));
+    let n: Vec<f32> = metrics.split(' ').filter_map(|w| w.parse().ok()).collect();
+    let [m, line] = n[..] else {
+        panic!("{metrics:?}")
+    };
+    assert!(m > 1.0 && line > 1.0, "{metrics}");
+    // A quarter into the third "m", half way down the line: the line's
+    // point is the window's less the padding, and the caret offset there
+    // is the third character's (2).
+    let (x, y) = (2.25 * m, line / 2.0);
+    cx.simulate_click(
+        gpui::point(gpui::px(8.0 + x), gpui::px(8.0 + y)),
+        gpui::Modifiers::default(),
+    );
+    wait_for(
+        &view,
+        cx,
+        &format!(
+            "at {x:.1} {y:.1} in {:.1} {:.1} index Some(2)",
+            8.0 + x,
+            8.0 + y
+        ),
     );
 }
 

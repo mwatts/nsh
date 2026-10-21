@@ -1514,20 +1514,20 @@ fn down(
                 SCROLL_PRESS_DELAY,
                 |surface, p| {
                     if let Some(press) = &mut p.press {
-                        press_in(surface, press);
+                        press_in(surface, press, (p.x, p.y));
                     }
                 },
             );
         } else {
-            press_in(surface, press);
+            press_in(surface, press, (x, y));
         }
         if press.events.contains(EventKind::LongPress) {
             let delay = press.long_delay.max(0.0) as u64;
             after(surface, key, generation, delay, |surface, p| {
                 let Some(press) = &mut p.press else { return };
-                press_in(surface, press);
+                press_in(surface, press, (p.x, p.y));
                 press.long = true;
-                press_event(surface, press, EventKind::LongPress);
+                press_event(surface, press, EventKind::LongPress, (p.x, p.y));
             });
         }
     }
@@ -1704,13 +1704,14 @@ fn finish(surface: &Rc<Surface>, mut p: Pointer, cancelled: bool) {
         Mode::Thumb(view, _) => crate::scroll::thumb_end(surface, &view),
         Mode::Idle | Mode::Free => {
             if let Some(mut press) = p.press.take() {
+                let at = (p.x, p.y);
                 if cancelled {
-                    press_out(surface, &mut press, false);
+                    press_out(surface, &mut press, false, at);
                 } else {
                     // A quick tap inside a scroll view: the press in now.
-                    press_in(surface, &mut press);
+                    press_in(surface, &mut press, at);
                     let inside = released_inside(&press.view, p.x, p.y);
-                    press_out(surface, &mut press, inside);
+                    press_out(surface, &mut press, inside, at);
                 }
             }
         }
@@ -1850,43 +1851,53 @@ fn find_press(
     })
 }
 
-fn press_in(surface: &Rc<Surface>, press: &mut Press) {
+/// Starts a press with the pointer at `at` (root coordinates):
+/// `onPressDown`.
+fn press_in(surface: &Rc<Surface>, press: &mut Press, at: (f32, f32)) {
     if press.pressed {
         return;
     }
     press.pressed = true;
     if press.events.contains(EventKind::PressDown) {
-        press_event(surface, press, EventKind::PressDown);
+        press_event(surface, press, EventKind::PressDown, at);
     }
 }
 
 /// Ends a press: `onPressUp`, then `onPress` if `fire` (released inside)
-/// and it was no long press.
-fn press_out(surface: &Rc<Surface>, press: &mut Press, fire: bool) {
+/// and it was no long press, with the pointer at `at` (root coordinates).
+fn press_out(surface: &Rc<Surface>, press: &mut Press, fire: bool, at: (f32, f32)) {
     if !press.pressed {
         return;
     }
     press.pressed = false;
     if press.events.contains(EventKind::PressUp) {
-        press_event(surface, press, EventKind::PressUp);
+        press_event(surface, press, EventKind::PressUp, at);
     }
     if fire && !press.long && press.events.contains(EventKind::Press) {
-        press_event(surface, press, EventKind::Press);
+        press_event(surface, press, EventKind::Press, at);
     }
 }
 
-fn press_event(surface: &Surface, press: &Press, kind: EventKind) {
+/// Sends `kind` of `press` with the pointer at `(x, y)` (root
+/// coordinates), which its event gives in the press's view too.
+fn press_event(surface: &Surface, press: &Press, kind: EventKind, (x, y): (f32, f32)) {
     log::debug!(target: "nsh::input", "{} on {}", kind.prop_name(), press.node);
+    let (location_x, location_y) = local(&press.view, x, y);
+    let mut position = nsh_core::PressPosition::default();
+    position.location = nsh_core::geometry::point(Points(location_x), Points(location_y));
+    position.page = nsh_core::geometry::point(Points(x), Points(y));
     let event = nsh_core::PressEvent {
         modifiers: press.modifiers.core(),
         clicks: press.clicks,
+        position: Some(position),
     };
     surface.event(press.node, kind, EventPayload::Press(event));
 }
 
 fn cancel_press(surface: &Rc<Surface>, p: &mut Pointer) {
+    let at = (p.x, p.y);
     if let Some(mut press) = p.press.take() {
-        press_out(surface, &mut press, false);
+        press_out(surface, &mut press, false, at);
     }
 }
 
