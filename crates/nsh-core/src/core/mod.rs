@@ -2254,6 +2254,10 @@ impl<M: TextEngine> Core<M> {
                 if props.test_id != value {
                     props.test_id = value;
                     flags |= dirty::VIEW_PROPS;
+                    // A span's is in its block's text.
+                    if node.kind == Kind::Text && node.inline {
+                        self.mark_text_block(key);
+                    }
                 }
             }
             Prop::WindowDrag(value) => {
@@ -3529,6 +3533,13 @@ impl<M: TextEngine> Core<M> {
                             end: out.len_utf16(),
                             node: child.id,
                             events: child.events,
+                        });
+                    }
+                    if let Some(test_id) = child.props.as_ref().and_then(|p| p.test_id.clone()) {
+                        out.test_ids.push(crate::text::SpanTestId {
+                            start,
+                            end: out.len_utf16(),
+                            test_id,
                         });
                     }
                 }

@@ -6,7 +6,7 @@
 use std::time::Duration;
 
 use nsh_core::{
-    Dialog,
+    Dialog, ResolvedTextStyle,
     geometry::{Points, Size},
     platform::ColorScheme,
 };
@@ -20,6 +20,7 @@ pub(crate) trait Driver: Send {
     /// Names the step the batches that come next belong to (`--trace`).
     fn step(&mut self, name: &str);
     fn press(&mut self, selector: &str) -> Result<(), String>;
+    fn press_span(&mut self, selector: &str) -> Result<(), String>;
     fn long_press(&mut self, selector: &str) -> Result<(), String>;
     fn type_text(&mut self, selector: &str, text: &str) -> Result<(), String>;
     fn submit(&mut self, selector: &str) -> Result<(), String>;
@@ -44,6 +45,7 @@ pub(crate) trait Driver: Send {
     fn enabled(&mut self, selector: &str) -> Result<bool, String>;
     fn shows(&mut self, selector: &str) -> Result<bool, String>;
     fn value(&mut self, selector: &str) -> Result<Option<String>, String>;
+    fn span_style(&mut self, selector: &str) -> Result<ResolvedTextStyle, String>;
     fn dialogs(&mut self) -> Result<Vec<Dialog>, String>;
     fn clipboard(&mut self) -> Result<Option<String>, String>;
     /// A picture of the app's window, as a PNG.
@@ -56,6 +58,9 @@ impl Driver for Headless {
     }
     fn press(&mut self, selector: &str) -> Result<(), String> {
         Headless::press(self, selector)
+    }
+    fn press_span(&mut self, selector: &str) -> Result<(), String> {
+        Headless::press_span(self, selector)
     }
     fn long_press(&mut self, selector: &str) -> Result<(), String> {
         Headless::long_press(self, selector)
@@ -141,6 +146,10 @@ impl Driver for Headless {
     fn value(&mut self, selector: &str) -> Result<Option<String>, String> {
         self.catch_up();
         Ok(self.screen().input_text(selector)?.map(str::to_owned))
+    }
+    fn span_style(&mut self, selector: &str) -> Result<ResolvedTextStyle, String> {
+        self.catch_up();
+        self.screen().span_style(selector)
     }
     fn dialogs(&mut self) -> Result<Vec<Dialog>, String> {
         self.catch_up();
@@ -242,6 +251,12 @@ impl Driver for Remote {
     }
     fn drag(&mut self, _: &str, _: DragTo) -> Result<(), String> {
         Err(headless_only("Dragging (`app.drag`)"))
+    }
+    fn press_span(&mut self, _: &str) -> Result<(), String> {
+        Err(headless_only("Pressing a span (`app.pressSpan`)"))
+    }
+    fn span_style(&mut self, _: &str) -> Result<ResolvedTextStyle, String> {
+        Err(headless_only("Reading a span's style (`app.spanStyle`)"))
     }
     fn back(&mut self) -> Result<(), String> {
         self.action(TestStep::Back)

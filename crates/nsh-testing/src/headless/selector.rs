@@ -117,6 +117,18 @@ impl Selector {
     }
 }
 
+impl Selector {
+    /// The selector without its last part (`None` when it has one part):
+    /// what the last part looks inside.
+    pub(crate) fn scope(&self) -> Option<Selector> {
+        let (_, before) = self.parts.split_last()?;
+        (!before.is_empty()).then(|| Selector {
+            parts: before.to_vec(),
+            source: self.source.clone(),
+        })
+    }
+}
+
 impl Matcher {
     fn parse(s: &str, whole: &str) -> Result<Self, String> {
         Ok(match s.split_once(':') {

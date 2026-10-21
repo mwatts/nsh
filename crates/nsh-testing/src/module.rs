@@ -502,6 +502,44 @@ pub struct Dialog {
     pub sheet: bool,
 }
 
+/// The style of a span as the app resolved it (`app.spanStyle`): what it
+/// inherits from the text around it and sets itself. Colors are
+/// `#rrggbbaa`.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct SpanStyle {
+    /// Its text color.
+    pub color: String,
+    /// The background a nested `<Text>`'s `backgroundColor` gives it, if
+    /// any.
+    #[prop(skip_none)]
+    pub background_color: Option<String>,
+    /// Its font size, in points.
+    pub font_size: f64,
+    /// Its font weight (400 regular, 700 bold).
+    pub font_weight: f64,
+    /// Whether it is italic.
+    pub italic: bool,
+    /// Whether it is underlined.
+    pub underline: bool,
+    /// Whether it is struck through.
+    pub line_through: bool,
+}
+
+impl From<nsh_core::ResolvedTextStyle> for SpanStyle {
+    fn from(style: nsh_core::ResolvedTextStyle) -> Self {
+        let css = |color: nsh_core::Color| format!("#{:08x}", color.0);
+        SpanStyle {
+            color: css(style.color),
+            background_color: style.background.map(|b| css(b.color)),
+            font_size: f64::from(style.font_size.0),
+            font_weight: f64::from(style.font_weight),
+            italic: style.italic,
+            underline: style.decoration.underline,
+            line_through: style.decoration.line_through,
+        }
+    }
+}
+
 /// How a wait waits.
 #[derive(Debug, Default, Clone, Copy, JsObject)]
 pub struct WaitOptions {
@@ -1011,6 +1049,17 @@ impl App {
         step(&this, move |app| app.press(&selector)).await
     }
 
+    /// Presses the characters of a text that `selector` names, as a tap on
+    /// the first of them does: the innermost nested `<Text>` with
+    /// `onPress` there hears it, else the text or the nearest view around
+    /// it that hears presses. The selector's last part names the
+    /// characters: `id:<testID>` a nested `<Text>`'s, `text:<text>` (or
+    /// `/<regex>/`) where the text reads it; the parts before it name the
+    /// views to look in (`id:note >> text:here`).
+    pub async fn press_span(this: Instance<Self>, selector: String) -> Result<(), String> {
+        step(&this, move |app| app.press_span(&selector)).await
+    }
+
     /// Types `text` at the end of the input `selector` names (or the first
     /// input in it; `text:` matches an input's text or placeholder too),
     /// key by key; a line break in a single line is the return key.
@@ -1157,6 +1206,12 @@ impl App {
     /// The text of the input `selector` names, `null` when none matches.
     pub fn value(&self, selector: String) -> Result<Option<String>, String> {
         self.with(|app| app.value(&selector))
+    }
+
+    /// The style of the characters `selector` names (`pressSpan`'s
+    /// selectors) as the app resolved it: the first character's.
+    pub fn span_style(&self, selector: String) -> Result<SpanStyle, String> {
+        self.with(|app| app.span_style(&selector).map(SpanStyle::from))
     }
 
     /// What the app's storage holds now.

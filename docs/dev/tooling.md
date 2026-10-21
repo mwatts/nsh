@@ -217,6 +217,13 @@ and more than one fails the step; a press whose match, or a view between it and 
 (the accessibility state) fails too. Each step sends what a platform would, to the views that report it:
 
 - `press`: the match or its nearest pressable ancestor gets `PressIn`, `PressOut`, `Press`;
+- `press_span` (`headless/screen/spans.rs`): characters of a text view, named by a selector whose last part matches
+  them instead of views (`id:<testID>` a nested `<Text>`'s span, from `AttributedText::test_ids`; `text:<text>` or
+  `/regex/` each place a text reads it; a bare string a test id, else a text; the parts before it name the views to
+  look in): the press lands on the first character, where `AttributedText::link_at` finds the innermost pressable
+  span as the platforms' link hit testing does (that span's node gets `PressIn`, `PressOut`, `Press`), else the text
+  view or its nearest pressable ancestor; `Screen::span_style` reads the first character's `ResolvedTextStyle` (its
+  color, font, decoration and a nested `<Text>`'s background), `nsh/test`'s `app.pressSpan` / `app.spanStyle`;
 - `long_press`: the match or its nearest ancestor hearing long presses or presses gets `PressIn`, then after its
   `delayLongPress` (500 ms) `LongPress` and `PressOut`;
 - `clear`: the input takes the focus, gets a `KeyPress` of `Backspace` and an edit to nothing;

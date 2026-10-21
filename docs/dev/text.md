@@ -56,6 +56,10 @@
   resizes them and builds the block again (`check_attachments`). They take presses of their own; copying leaves the
   placeholders out.
 
+- **Span test ids**: a nested `<Text>`'s `testID` is listed in `AttributedText::test_ids` (UTF-16 range and id), so
+  headless tests name the span (`headless/screen/spans.rs`); a span's `testID` set later builds its block's text
+  again. Platforms draw nothing of it.
+
 - **Rust components** nest texts the same way: `text("a ").child(text("b").underline().on_press(..)).child(view())` is
   one block; a plain string child is a raw text node (as JS's strings), a text's own content its first piece
   (`core/components.rs`, `Part::Raw`).

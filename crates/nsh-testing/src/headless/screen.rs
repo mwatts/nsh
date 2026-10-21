@@ -16,6 +16,8 @@ use nsh_core::{
 
 use super::selector::{Matcher, Selector, TextMatch};
 
+mod spans;
+
 /// The surface's root view: every app view hangs below it.
 const ROOT: NodeId = 1;
 
@@ -91,6 +93,8 @@ struct View {
     test_id: Option<Arc<str>>,
     label: Option<Arc<str>>,
     text: Option<String>,
+    /// A text view's content: its spans' styles, links and test ids.
+    attributed: Option<Arc<nsh_core::AttributedText>>,
     frame: Bounds<Points>,
     input: Option<Input>,
     scroll: Option<Scroll>,
@@ -267,7 +271,9 @@ impl Screen {
                 self.nodes.entry(*id).or_default().label = label.clone();
             }
             MountItem::Text { id, text, .. } => {
-                self.nodes.entry(*id).or_default().text = Some(text.text.clone());
+                let view = self.nodes.entry(*id).or_default();
+                view.text = Some(text.text.clone());
+                view.attributed = Some(text.clone());
             }
             MountItem::Input { id, config } => {
                 if let Some(input) = self.input_mut(*id) {
@@ -911,11 +917,19 @@ impl Screen {
         None
     }
 
-    /// Whether view `id` reports `event`.
+    /// Whether view `id`, or the pressable span `id`, reports `event`.
     pub(crate) fn hears(&self, id: NodeId, event: EventKind) -> bool {
-        self.nodes
-            .get(&id)
-            .is_some_and(|v| v.events.contains(event))
+        match self.nodes.get(&id) {
+            Some(v) => v.events.contains(event),
+            // A pressable span: no view of its own, its block lists it.
+            None => self.nodes.values().any(|v| {
+                v.attributed.as_ref().is_some_and(|t| {
+                    t.links
+                        .iter()
+                        .any(|l| l.node == id && l.events.contains(event))
+                })
+            }),
+        }
     }
 
     pub(crate) fn input(&self, id: NodeId) -> Option<&Input> {

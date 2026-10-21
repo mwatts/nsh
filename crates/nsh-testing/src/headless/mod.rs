@@ -924,6 +924,27 @@ impl Headless {
         self.done()
     }
 
+    /// The step `pressSpan(<selector>)`: presses the characters of a text
+    /// view `selector` names ([`Screen::span_style`]'s selectors: `id:` a
+    /// nested `<Text>`'s test id, `text:` the characters), as a tap on its
+    /// first character does: the innermost pressable span there hears
+    /// `onPressDown`, `onPressUp` and `onPress` (the platforms' link hit
+    /// testing), else the text view or its nearest pressable ancestor.
+    pub fn press_span(&mut self, selector: &str) -> Result<(), String> {
+        let parsed = Selector::parse(selector)?;
+        self.step(format!("pressSpan({selector})"));
+        let span = self
+            .screen
+            .span(&parsed)
+            .map_err(|e| format!("{e}; {}", self.on_screen()))?;
+        let pick = self.screen.span_press_target(span);
+        let id = self.picked(pick, selector, "pressable span")?;
+        for kind in [EventKind::PressDown, EventKind::PressUp, EventKind::Press] {
+            self.send(id, kind, EventPayload::None);
+        }
+        self.done()
+    }
+
     /// The step `longPress(<selector>)`: holds a finger on what `selector`
     /// names (or the nearest view around it that hears long presses or
     /// presses) for its `delayLongPress` (500 ms), as a long press does:

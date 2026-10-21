@@ -278,6 +278,9 @@ pub struct AttributedText {
     pub shadow: Option<TextShadow>,
     /// Nested `<text>` spans that take presses (they may nest).
     pub links: Vec<TextLink>,
+    /// Nested `<text>` spans with a `testID` (they may nest), for tests
+    /// that name a span; platforms draw nothing of them.
+    pub test_ids: Vec<SpanTestId>,
     /// `writingDirection`: right to left (`Some(true)`), left to right, or
     /// from the content (`None`).
     pub writing_direction: Option<bool>,
@@ -325,6 +328,18 @@ pub struct TextLink {
     pub node: NodeId,
     /// Its listeners.
     pub events: EventMask,
+}
+
+/// A nested `<text>` span with a `testID` (see
+/// [`AttributedText::test_ids`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpanTestId {
+    /// Start offset (UTF-16 units, inclusive).
+    pub start: u32,
+    /// End offset (UTF-16 units, exclusive).
+    pub end: u32,
+    /// Its `testID`.
+    pub test_id: Arc<str>,
 }
 
 impl AttributedText {
