@@ -344,6 +344,8 @@ pub(crate) struct Mounter {
     mac_idiom: bool,
     /// The focused input.
     focused: Option<NodeId>,
+    /// Characters typed from a hardware keyboard while focus is moving.
+    hold: nsh_core::text_hold::TextHold,
     /// Height of the software keyboard over the surface.
     keyboard: f32,
     /// The scroll view given a bottom inset to clear the keyboard.
@@ -429,6 +431,7 @@ impl Mounter {
             mac_idiom: UIDevice::currentDevice(mtm).userInterfaceIdiom()
                 == UIUserInterfaceIdiom::Mac,
             focused: None,
+            hold: nsh_core::text_hold::TextHold::default(),
             keyboard: 0.0,
             avoiding: None,
             layout_animation: None,
@@ -1284,6 +1287,15 @@ impl Mounter {
         }
         if focused {
             self.focused = Some(id);
+            let waiting = self.hold.take(std::time::Instant::now());
+            if !waiting.is_empty()
+                && let Some(Slot {
+                    native: Native::Input(input),
+                    ..
+                }) = self.slot(id)
+            {
+                input.insert_text(&waiting);
+            }
             // Moving between fields with the keyboard up.
             if self.keyboard > 0.0 {
                 self.avoid_keyboard(0.25);
@@ -2707,6 +2719,9 @@ impl Mounter {
 
     /// A finger went down on (or left) a pressable view.
     pub(crate) fn press_changed(&mut self, id: NodeId, pressed: bool) {
+        if pressed && self.focused.is_none() {
+            self.hold.disarm();
+        }
         self.report_state(id, nsh_core::tailwind::state::PRESSED, pressed);
         let Some(s) = self.slot(id) else { return };
         let event = if pressed {
@@ -2721,12 +2736,45 @@ impl Mounter {
 
     /// The finger lifted on a pressable view.
     pub(crate) fn pressed(&mut self, id: NodeId) {
-        if let Some(s) = self.slot(id)
-            && s.events.contains(EventKind::Press)
-        {
+        let heard = self
+            .slot(id)
+            .is_some_and(|s| s.events.contains(EventKind::Press));
+        if heard {
             self.control
                 .dispatch_event(id, EventKind::Press, EventPayload::None);
         }
+        if self.focused.is_none() {
+            self.hold.disarm();
+        }
+        if heard {
+            self.hold.arm(std::time::Instant::now());
+        }
+    }
+
+    /// Whether an input has the keyboard.
+    pub(crate) fn input_is_focused(&self) -> bool {
+        self.focused.is_some()
+    }
+
+    /// Drops characters that were waiting for a field.
+    pub(crate) fn disarm_text(&mut self) {
+        self.hold.disarm();
+    }
+
+    /// A hardware key with no field focused. Escape drops the wait. A plain
+    /// character waits when the wait is armed. True when the character was
+    /// queued, so the view should not also deliver it.
+    pub(crate) fn hardware_character(&mut self, text: &str) -> bool {
+        if text == "\u{1b}" {
+            self.hold.disarm();
+            return false;
+        }
+        self.hold.offer(
+            std::time::Instant::now(),
+            text,
+            self.focused.is_some(),
+            false,
+        )
     }
 
     /// A press was held for half a second.

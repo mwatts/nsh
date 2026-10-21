@@ -14,16 +14,16 @@ use nsh_engine::{
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
     rc::{Retained, Weak},
-    runtime::ProtocolObject,
+    runtime::{AnyObject, ProtocolObject},
 };
 use objc2_core_foundation::{CGRect, CGSize};
 use objc2_foundation::{
     NSNotification, NSNotificationCenter, NSNumber, NSObject, NSObjectProtocol, NSOperationQueue,
-    NSValue,
+    NSSet, NSString, NSValue,
 };
 use objc2_ui_kit::{
-    NSValueUIGeometryExtensions, UIDevice, UIFont, UIFontTextStyleBody,
-    UIKeyboardAnimationDurationUserInfoKey, UIKeyboardFrameEndUserInfoKey,
+    NSValueUIGeometryExtensions, UIApplicationWillResignActiveNotification, UIDevice, UIFont,
+    UIFontTextStyleBody, UIKeyboardAnimationDurationUserInfoKey, UIKeyboardFrameEndUserInfoKey,
     UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIResponder,
     UITraitCollection, UITraitEnvironment, UIUserInterfaceIdiom, UIUserInterfaceStyle, UIView,
 };
@@ -173,6 +173,16 @@ define_class!(
             // SAFETY: calling the superclass implementation.
             let _: () = unsafe { msg_send![super(self), traitCollectionDidChange: previous] };
             self.publish_environment();
+        }
+
+        /// A hardware key with no text field focused. A plain character
+        /// waits for the next field. The software keyboard never comes here.
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
+            if !self.take_hardware_keys(presses) {
+                // SAFETY: calling the superclass implementation.
+                let _: () = unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
+            }
         }
     }
 );
@@ -324,6 +334,55 @@ impl RootView {
                 )
             });
         }
+        let weak = Weak::from_retained(this);
+        let resign = RcBlock::new(move |_: NonNull<NSNotification>| {
+            let Some(view) = weak.load() else { return };
+            view.with_mounter(|m| m.disarm_text());
+        });
+        // SAFETY: an immutable UIKit constant. The window going inactive
+        // drops characters that were waiting for a field.
+        observers.push(unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(UIApplicationWillResignActiveNotification),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &resign,
+            )
+        });
+    }
+
+    fn with_mounter(&self, f: impl FnOnce(&mut Mounter)) {
+        let Some(running) = self.ivars().running.borrow().as_ref() else {
+            return;
+        };
+        let Some(mounter) = running.mounter.get(self.mtm()).borrow_mut().as_mut() else {
+            return;
+        };
+        f(mounter);
+    }
+
+    /// Queues hardware characters while no input is focused. True when one
+    /// was queued.
+    fn take_hardware_keys(&self, presses: &NSSet<AnyObject>) -> bool {
+        let objects = presses.allObjects();
+        let mut queued = false;
+        self.with_mounter(|m| {
+            if m.input_is_focused() {
+                return;
+            }
+            for index in 0..objects.count() {
+                let press = objects.objectAtIndex(index);
+                // SAFETY: `UIPress.key` is a `UIKey`, and
+                // `charactersIgnoringModifiers` is its unmodified text.
+                let key: Option<Retained<AnyObject>> = unsafe { msg_send![&*press, key] };
+                let Some(key) = key else { continue };
+                let chars: Option<Retained<NSString>> =
+                    unsafe { msg_send![&*key, charactersIgnoringModifiers] };
+                let Some(chars) = chars else { continue };
+                queued |= m.hardware_character(&chars.to_string());
+            }
+        });
+        queued
     }
 
     fn keyboard_changed(&self, note: &NSNotification) {

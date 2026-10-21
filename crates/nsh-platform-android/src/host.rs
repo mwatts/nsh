@@ -52,6 +52,8 @@ pub(crate) struct Host {
     seq: AtomicU64,
     ui: Mutex<UiAnimation>,
     epoch: Instant,
+    /// Characters typed from a hardware keyboard while focus is moving.
+    hold: Mutex<nsh_core::text_hold::TextHold>,
     /// What the embedding app grants loaded apps at most
     /// (`NshView.setGrantedCapabilities`).
     granted: Mutex<Option<nsh_engine::Capabilities>>,
@@ -424,6 +426,7 @@ extern "system" fn Java_com_longbridge_nsh_Native_create(
         seq: AtomicU64::new(0),
         ui: Mutex::new(UiAnimation::default()),
         epoch: Instant::now(),
+        hold: Mutex::new(nsh_core::text_hold::TextHold::default()),
         granted: Mutex::new(None),
         limits: Mutex::new(nsh_engine::Limits::default()),
         data_dir,
@@ -1339,4 +1342,64 @@ extern "system" fn Java_com_longbridge_nsh_Native_componentSize(
     if let Some(control) = host.control() {
         control.set_component_size(id as NodeId, Size::new(Points(width), Points(height)));
     }
+}
+
+fn text_hold(host: &Host) -> std::sync::MutexGuard<'_, nsh_core::text_hold::TextHold> {
+    host.hold.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// A handled press just ran. Characters typed before the next field wait.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_longbridge_nsh_Native_armHold(
+    _: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+) {
+    // SAFETY: Java passes its live handle.
+    let host = unsafe { host(handle) };
+    text_hold(host).arm(Instant::now());
+}
+
+/// Drops characters that were waiting for a field.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_longbridge_nsh_Native_disarmHold(
+    _: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+) {
+    // SAFETY: Java passes its live handle.
+    let host = unsafe { host(handle) };
+    text_hold(host).disarm();
+}
+
+/// Queues a hardware character typed while no field has the keyboard.
+/// True when it was queued.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_longbridge_nsh_Native_offerHold(
+    mut env: JNIEnv<'_>,
+    _: JClass<'_>,
+    handle: jlong,
+    text: JString<'_>,
+) -> jboolean {
+    // SAFETY: Java passes its live handle.
+    let host = unsafe { host(handle) };
+    let Ok(text) = env.get_string(&text) else {
+        return 0;
+    };
+    let queued = text_hold(host).offer(Instant::now(), &String::from(text), false, false);
+    jboolean::from(queued)
+}
+
+/// The characters waiting for the field that just focused.
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_longbridge_nsh_Native_takeHold<'local>(
+    env: JNIEnv<'local>,
+    _: JClass<'local>,
+    handle: jlong,
+) -> JString<'local> {
+    // SAFETY: Java passes its live handle.
+    let host = unsafe { host(handle) };
+    let text = text_hold(host).take(Instant::now());
+    env.new_string(text)
+        .unwrap_or_else(|_| JString::from(JObject::null()))
 }

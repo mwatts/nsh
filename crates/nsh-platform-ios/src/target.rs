@@ -535,7 +535,11 @@ impl EventTarget {
     }
 
     pub(crate) fn key_press(&self, id: NodeId, key: String) {
+        let escape = key == "Escape";
         self.with_mounter(move |m| {
+            if escape {
+                m.disarm_text();
+            }
             m.input_event(
                 id,
                 EventKind::KeyPress,

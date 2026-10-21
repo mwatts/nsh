@@ -53,11 +53,14 @@ impl Headless {
         if let Key::Char(c) = stroke.key
             && !(m.ctrl || m.alt || m.cmd)
             && self.editable_focus().is_none()
-            && self.text_armed()
         {
             let c = if m.shift { shifted(c) } else { c };
-            self.held.push(c);
-            return self.done();
+            if self
+                .hold
+                .offer(self.clock.now(), &c.to_string(), false, false)
+            {
+                return self.done();
+            }
         }
         if let KeyMatch::Fire(id) = found {
             self.engine.control().dispatch_event(
@@ -87,11 +90,14 @@ impl Headless {
         }
         if let Key::Char(c) = stroke.key
             && !(m.ctrl || m.alt || m.cmd)
-            && self.text_armed()
         {
             let c = if m.shift { shifted(c) } else { c };
-            self.held.push(c);
-            return self.done();
+            if self
+                .hold
+                .offer(self.clock.now(), &c.to_string(), false, false)
+            {
+                return self.done();
+            }
         }
         if stroke.key == Key::Escape
             && !(m.ctrl || m.alt || m.cmd || m.shift)
@@ -106,25 +112,17 @@ impl Headless {
     /// before an editable field has the keyboard, wait three seconds. A test
     /// that dispatches the command itself calls this too.
     pub fn arm_text(&mut self) {
-        self.held_until = Some(self.clock.now() + std::time::Duration::from_secs(3));
+        self.hold.arm(self.clock.now());
+    }
+
+    /// The window went inactive. Characters that were waiting are dropped.
+    pub fn deactivate(&mut self) {
+        self.hold.disarm();
     }
 
     /// Drops text that was waiting for a field.
     fn disarm_text(&mut self) {
-        self.held.clear();
-        self.held_until = None;
-    }
-
-    /// Whether text typed now waits for a field.
-    fn text_armed(&mut self) -> bool {
-        match self.held_until {
-            Some(until) if self.clock.now() < until => true,
-            Some(_) => {
-                self.disarm_text();
-                false
-            }
-            None => false,
-        }
+        self.hold.disarm();
     }
 
     /// The editable field that has the keyboard, if one does.
@@ -139,14 +137,16 @@ impl Headless {
     /// An editable field took the keyboard: the characters that waited go
     /// in at its caret.
     pub(super) fn deliver_held(&mut self) {
-        if self.held.is_empty() || !self.text_armed() {
+        if self.editable_focus().is_none() {
+            return;
+        }
+        let text = self.hold.take(self.clock.now());
+        if text.is_empty() {
             return;
         }
         let Some(id) = self.editable_focus() else {
             return;
         };
-        let text = std::mem::take(&mut self.held);
-        self.held_until = None;
         let caret = self.screen.input(id).map_or(0, |input| input.caret);
         self.edit(id, caret, caret, &text);
     }
