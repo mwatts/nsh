@@ -493,6 +493,9 @@ impl Session {
         };
         let mut app = Headless::start(config)
             .map_err(|e| format!("open({entry:?}): the engine did not start: {e}"))?;
+        if let Some(height) = launch.keyboard_height {
+            app.set_software_keyboard(height);
+        }
         if let Some(out) = &self.run.trace {
             let out = out.clone();
             app.observe(move |step, batch| {

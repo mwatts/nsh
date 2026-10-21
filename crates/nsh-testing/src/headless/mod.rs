@@ -28,6 +28,7 @@
 //! of an app's crate, which need no QuickJS for a Rust root.
 
 mod animation;
+mod inset;
 mod keyboard;
 #[cfg(feature = "live")]
 mod live;
@@ -247,6 +248,9 @@ pub struct Headless {
     held: String,
     /// When `held` expires, on [`Self::clock`].
     held_until: Option<std::time::Instant>,
+    /// The software keyboard shown while an editable field is focused on
+    /// iOS or Android.
+    software_keyboard: inset::SoftwareKeyboard,
 }
 
 impl Headless {
@@ -281,7 +285,34 @@ impl Headless {
             wanted,
             held: String::new(),
             held_until: None,
+            software_keyboard: inset::SoftwareKeyboard::default(),
         })
+    }
+
+    /// The height the software keyboard takes while an editable field is
+    /// focused on iOS or Android (`open`'s `keyboard_height`).
+    pub(crate) fn set_software_keyboard(&mut self, height: Points) {
+        self.software_keyboard.set(height);
+        self.sync_keyboard();
+    }
+
+    /// Publishes the software keyboard for the field that has focus.
+    fn sync_keyboard(&mut self) {
+        let editable = self.screen.focused().is_some_and(|id| {
+            self.screen
+                .input(id)
+                .is_some_and(|input| input.config.editable)
+        });
+        let phone = matches!(
+            self.environment.os,
+            nsh_core::platform::Os::Ios | nsh_core::platform::Os::Android
+        );
+        let next = self.software_keyboard.height(phone, editable);
+        if self.environment.keyboard_height == next {
+            return;
+        }
+        self.environment.keyboard_height = next;
+        self.engine.control().set_environment(self.environment);
     }
 
     /// The app's clock (`EngineConfig::clock`).
@@ -494,6 +525,7 @@ impl Headless {
         if let Some(observer) = &mut self.observer {
             observer(&self.step, batch);
         }
+        self.sync_keyboard();
         self.react();
     }
 
@@ -1144,6 +1176,7 @@ impl Headless {
             }
             self.screen.set_focused(Some(id));
             self.send(id, EventKind::Focus, EventPayload::None);
+            self.sync_keyboard();
         }
         Ok(id)
     }
@@ -1377,6 +1410,7 @@ impl Headless {
         if behavior == SubmitBehavior::BlurAndSubmit {
             self.screen.set_focused(None);
             self.send(id, EventKind::Blur, EventPayload::None);
+            self.sync_keyboard();
         }
     }
 
@@ -2151,5 +2185,80 @@ mod tests {
         assert_eq!(app.screen().input_text("id:name"), Ok(Some("")));
         app.type_text("id:name", "").unwrap();
         app.wait_for("name: a").unwrap();
+    }
+
+    /// Shows the software keyboard's height, an editable field, a read-only
+    /// field, and buttons that blur or focus the read-only field.
+    #[component]
+    fn PhoneKeyboard() -> impl IntoElement {
+        let locked = element_ref();
+        view()
+            .child(text(move || {
+                format!("kb: {}", keyboard_height().0 as i32)
+            }))
+            .child(input().test_id("note"))
+            .child(
+                input()
+                    .test_id("locked")
+                    .readonly(true)
+                    .element_ref(&locked),
+            )
+            .child(
+                view()
+                    .on_press(|| dismiss_keyboard())
+                    .child(text("Done")),
+            )
+            .child(view().on_press(move || locked.focus()).child(text("Lock")))
+    }
+
+    /// On iOS the software keyboard is up while an editable field is
+    /// focused, and down when that field blurs or a read-only field takes
+    /// the focus.
+    #[test]
+    fn an_editable_field_on_ios_lifts_the_software_keyboard() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<PhoneKeyboard>())).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("kb: 0").unwrap();
+        app.type_text("id:note", "a").unwrap();
+        app.wait_for("kb: 336").unwrap();
+        app.press("Lock").unwrap();
+        app.wait_for("kb: 0").unwrap();
+        app.type_text("id:note", "b").unwrap();
+        app.wait_for("kb: 336").unwrap();
+        app.press("Done").unwrap();
+        app.wait_for("kb: 0").unwrap();
+    }
+
+    #[test]
+    fn an_editable_field_on_android_lifts_the_software_keyboard() {
+        let mut config = EngineConfig::new(Root::of::<PhoneKeyboard>());
+        config.environment.os = nsh_core::platform::Os::Android;
+        let mut app = Headless::start(config).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("kb: 0").unwrap();
+        app.type_text("id:note", "a").unwrap();
+        app.wait_for("kb: 336").unwrap();
+    }
+
+    #[test]
+    fn a_desktop_field_leaves_the_software_keyboard_down() {
+        let mut config = EngineConfig::new(Root::of::<PhoneKeyboard>());
+        config.environment.os = nsh_core::platform::Os::Linux;
+        config.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = Headless::start(config).unwrap();
+        app.first_render().unwrap();
+        app.type_text("id:note", "a").unwrap();
+        app.wait_for("kb: 0").unwrap();
+    }
+
+    #[test]
+    fn open_sets_the_software_keyboard_height() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<PhoneKeyboard>())).unwrap();
+        app.set_software_keyboard(px(280.0));
+        app.first_render().unwrap();
+        app.type_text("id:note", "a").unwrap();
+        app.wait_for("kb: 280").unwrap();
+        app.press("Done").unwrap();
+        app.wait_for("kb: 0").unwrap();
     }
 }

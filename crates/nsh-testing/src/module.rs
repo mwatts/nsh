@@ -258,6 +258,7 @@ impl Testing {
             clock: options
                 .clock
                 .map(|c| c.time.map_or_else(std::time::SystemTime::now, |t| t.0)),
+            keyboard_height: options.keyboard_height,
         };
         let opening = blocking(move || session.open(&entry, launch));
         let (app, storage, requests) = serve(server.as_ref(), opening)
@@ -380,6 +381,10 @@ pub struct OpenOptions {
     /// as the test moves it (`app.clock`), steps finish native animations
     /// at once, and `app.wait` moves it.
     pub clock: Option<ClockOptions>,
+    /// The software keyboard's height while an editable field is focused,
+    /// on `platform: "ios"` or `"android"` (336 points). A desktop stays
+    /// at 0, and so does a focused control that is not an editable field.
+    pub keyboard_height: Option<Points>,
 }
 
 /// The manual clock `open` gives the app (`clock: {}`).
@@ -797,6 +802,8 @@ pub(crate) struct Launch {
     pub(crate) platform: Platform,
     /// A manual clock's start.
     pub(crate) clock: Option<std::time::SystemTime>,
+    /// The software keyboard while an editable field is focused.
+    pub(crate) keyboard_height: Option<Points>,
 }
 
 /// The network an app opens with, made where it starts (it is `Send`).
