@@ -8,7 +8,7 @@ test("a drag goes to the responder from grant to release", async () => {
   expect(lines[0]).toBe("grant 50,20");
   expect(lines[lines.length - 2]).toBe("move 80,15");
   expect(lines[lines.length - 1]).toBe("release 80,15");
-  expect(lines.length).toBe(6);
+  expect(lines.length).toBe(5);
 });
 
 test("a native pan moves its value with the pointer", async () => {

@@ -1705,7 +1705,10 @@ mod tests {
 
     #[test]
     fn keys_go_to_bindings_first_then_the_field_at_its_caret() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<KeyLog>())).unwrap();
+        // Shortcuts fire on desktops only.
+        let mut config = EngineConfig::new(Root::of::<KeyLog>());
+        config.environment.os = nsh_core::platform::Os::Linux;
+        let mut app = Headless::start(config).unwrap();
         app.first_render().unwrap();
         app.wait_for("value: abcd").unwrap();
         // Typing goes in at the selection, which replaces it.
