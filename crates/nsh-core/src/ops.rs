@@ -150,7 +150,7 @@ macro_rules! events {
 // The order is part of the platform protocols (`encode.rs`, `Native.java`):
 // append new kinds at the end.
 events! {
-    Press = "onPress": "A tap / click (payload: [`EventPayload::Press`] where the backend knows the modifier keys, else none).",
+    Press = "onPress": "A tap / click (payload: [`EventPayload::Press`] where the backend knows the modifier keys or the pointer, else none).",
     LongPress = "onLongPress": "A press held for about half a second (payload as `Press`).",
     PanStart = "onPanStart": "A drag started (payload: [`EventPayload::Pan`]).",
     PanEnd = "onPanEnd": "A drag ended (payload: [`EventPayload::Pan`] with velocity).",
@@ -358,9 +358,10 @@ pub struct HoverEvent {
     pub modifiers: crate::keymap::Modifiers,
 }
 
-/// The modifier keys and click count of a press ([`EventKind::Press`],
-/// [`EventKind::LongPress`], [`EventKind::PressDown`],
-/// [`EventKind::PressUp`]), on backends that know them.
+/// The modifier keys, click count and pointer position of a press
+/// ([`EventKind::Press`], [`EventKind::LongPress`],
+/// [`EventKind::PressDown`], [`EventKind::PressUp`]), on backends that
+/// know them.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PressEvent {
     /// The modifier keys held when the press began.
@@ -368,6 +369,24 @@ pub struct PressEvent {
     /// Consecutive clicks at the same place: 1 for a click, 2 for a
     /// double click, ...
     pub clicks: u32,
+    /// Where the pointer was when this event was sent (for `PressUp` and
+    /// `Press`, where it was let go or left), on backends that know it.
+    pub position: Option<PressPosition>,
+}
+
+/// Where the pointer was at a press's event ([`PressEvent::position`]),
+/// in points.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
+pub struct PressPosition {
+    /// Position in the pressed view, its transforms undone (for a pressed
+    /// span of a text, in that text's view): what
+    /// [`ElementRef::text_index_at`](crate::ui::ElementRef::text_index_at)
+    /// takes.
+    pub location: Point<Points>,
+    /// Position in the root view the view is in (the surface, or its
+    /// modal), as touches' `page`.
+    pub page: Point<Points>,
 }
 
 /// An input's selection ([`EventKind::SelectionChange`]): its range and,
@@ -531,8 +550,8 @@ pub enum EventPayload {
     Hover(HoverEvent),
     /// A context menu asked for over a view (`onContextMenu`).
     ContextMenu(ContextMenuEvent),
-    /// The modifier keys and click count of a press (`onPress`, `onLongPress`,
-    /// `onPressDown`, `onPressUp`).
+    /// The modifier keys, click count and pointer position of a press
+    /// (`onPress`, `onLongPress`, `onPressDown`, `onPressUp`).
     Press(PressEvent),
     /// An input's selection and where it shows (`onSelectionChange`).
     Selection(SelectionEvent),

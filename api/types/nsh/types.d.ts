@@ -388,7 +388,7 @@ export interface HoverEvent {
   shiftKey: boolean;
 }
 
-/** The modifier keys held when a press began and its click count: the payload of `onPress`, `onLongPress`, `onPressDown` and `onPressUp` on backends that know them (none otherwise). */
+/** The modifier keys held when a press began, its click count and where the pointer was: the payload of `onPress`, `onLongPress`, `onPressDown` and `onPressUp` on backends that know them (none otherwise). */
 export interface PressEvent {
   altKey: boolean;
   ctrlKey: boolean;
@@ -397,6 +397,12 @@ export interface PressEvent {
   shiftKey: boolean;
   /** Consecutive clicks at the same place: 1 for a click, 2 for a double click. */
   clickCount: number;
+  /** Where the pointer was in the pressed view (points, its transforms undone; a pressed span's text view), on backends that know it. */
+  locationX?: number;
+  locationY?: number;
+  /** Where the pointer was in the root view the view is in (the surface or its modal), as touches' `pageX`. */
+  pageX?: number;
+  pageY?: number;
 }
 
 /** Where a context menu was asked for: the payload of `onContextMenu`. */

@@ -1104,6 +1104,12 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             obj.set("metaKey", e.modifiers.cmd)?;
             obj.set("shiftKey", e.modifiers.shift)?;
             obj.set("clickCount", e.clicks)?;
+            if let Some(at) = e.position {
+                obj.set("locationX", at.location.x.0)?;
+                obj.set("locationY", at.location.y.0)?;
+                obj.set("pageX", at.page.x.0)?;
+                obj.set("pageY", at.page.y.0)?;
+            }
         }
         EventPayload::Selection(e) => {
             obj.set("start", e.start)?;
@@ -1926,6 +1932,7 @@ const report = (v) => text(String(v));
                 ..Default::default()
             },
             clicks: 2,
+            position: None,
         };
         host.cx.with(|cx| {
             let value = payload_object(&cx, &EventPayload::Press(event)).unwrap();
@@ -1941,6 +1948,34 @@ const report = (v) => text(String(v));
                 (true, false, false, false)
             );
             assert_eq!(obj.get::<_, u32>("clickCount").unwrap(), 2);
+            assert!(!obj.contains_key("locationX").unwrap());
+        });
+    }
+
+    #[test]
+    fn press_payload_has_the_position() {
+        let host = Host::new().unwrap();
+        let mut position = nsh_core::PressPosition::default();
+        position.location = point(px(3.0), px(4.5));
+        position.page = point(px(30.0), px(40.5));
+        let event = nsh_core::PressEvent {
+            clicks: 1,
+            position: Some(position),
+            ..Default::default()
+        };
+        host.cx.with(|cx| {
+            let value = payload_object(&cx, &EventPayload::Press(event)).unwrap();
+            let obj = value.as_object().unwrap();
+            let num = |k: &str| obj.get::<_, f64>(k).unwrap();
+            assert_eq!(
+                (
+                    num("locationX"),
+                    num("locationY"),
+                    num("pageX"),
+                    num("pageY")
+                ),
+                (3.0, 4.5, 30.0, 40.5)
+            );
         });
     }
 
