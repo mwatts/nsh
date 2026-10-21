@@ -84,6 +84,9 @@ export interface MenuModule {
   popup(items: readonly (MenuItem | null | undefined | false)[], at?: { x: number; y: number }): Promise<void>;
 }
 
+/** When the window's menu bar shows (`Window.setMenuBar`), where the app's window draws one (the GPUI backend on Windows and Linux). */
+export type MenuBarMode = "shown" | "autoHide";
+
 /** How the window's title bar looks (`Window.setTitleBar`). */
 export type TitleBarStyle = "default" | "hidden";
 
@@ -112,6 +115,8 @@ export interface WindowModule {
   setTitle(title: string): void;
   /** Shows the system's title bar (`"default"`) or hides it (`"hidden"`): the app then fills the window up to its top edge and draws a title bar of its own, made draggable with `desktop={{ windowDrag: true }}`; the system's window controls stay, in the area `titleBar()` reports. `height` is the app's bar's height in points: the controls are centered in it (Windows' caption buttons fill it); the platform's own without it. On macOS, it selects compact chrome up to 44 points and regular chrome above; use `titleBar().height` to lay out the bar at AppKit's actual height. An embedding host's existing toolbar keeps its own style and height. */
   setTitleBar(style: TitleBarStyle, height?: number | null): void;
+  /** When the menu bar shows on Windows and Linux, where the window draws the application menu as a bar above the app: `"shown"` (the default) always; `"autoHide"` only after Alt is pressed and released alone, until Alt alone hides it again, as in Windows and GNOME apps. F10 and Alt with a menu's initial still open a menu, and the bar shows while it is open. macOS's menu bar is the system's and always shows. */
+  setMenuBar(mode: MenuBarMode): void;
   /** Minimizes the window. */
   minimize(): void;
   /** Maximizes the window, or restores it when it is maximized. */
