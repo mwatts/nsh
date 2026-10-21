@@ -244,9 +244,12 @@ shots of macOS and Windows.
   corners, but glyphs, borders, videos and native components are cut by its rectangle.
 - **Effects GPUI cannot draw**: `filter: blur()`, `backdropFilter` and `mixBlendMode` are not drawn (no offscreen
   passes); shadows are not cut out of a translucent fill; `borderCurve: "continuous"` draws circular corners.
-- **Canvas text** is approximated: clipped to its clip's bounds, upright under rotations, made smaller rather than
-  narrower for `maxWidth`, gradients paint it in their middle color, `strokeText` fills, its shadows are not blurred,
-  composite operations and `clearRect` do not apply to it.
+- **Canvas text** is shaped by GPUI's text system and drawn as the font's glyph outlines, rasterized with the rest of
+  the drawing (`canvas.rs`), so it is exact: transformed, clipped, stroked, shadowed and composited as any shape.
+  Glyphs without a font file or an outline (emoji, a font GPUI fell back to, any drawn before the system's fonts are
+  found) are approximated: GPUI glyphs above the pixmap, clipped to their clip's bounds, upright under rotations,
+  made smaller rather than narrower for `maxWidth`, in a gradient's middle color, filled for `strokeText`, with
+  unblurred shadows, and without composite operations or `clearRect`.
 - **Zooming scroll views**: `zoomTo` and the zoom props are ignored.
 - **Video** needs feature `video`, which is built on Linux only (GStreamer); on macOS and Windows a video is a neutral
   placeholder reporting `onError`. Rounded clips do not cut the picture; audio-only sources show nothing.
