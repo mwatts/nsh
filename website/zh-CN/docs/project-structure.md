@@ -126,7 +126,7 @@ mount(App);
 | `minRuntime` | string | `publish` | 能运行该签名包的最低 NSH 运行时版本，例如 `0.2.0`。默认：CLI 的版本（[签名包](./signed-packages.md#哪些运行时能运行包)）。 |
 | `icon` | string | `package` | 一张正方形 PNG，最好是 1024×1024，路径相对于 `nsh.json`。 |
 | `tailwind` | object | 每次构建 | 扩展 `class` 字符串所依据的 Tailwind 主题（[Tailwind](./tailwind.md)）。 |
-| `theme` | string 或 object | 每次构建 | 应用的 Rust 组件绘制时使用的主题：相对于 `nsh.json` 的主题文件路径，或直接内联的主题（[用 Rust 开发](./rust.md#主题)）。 |
+| `theme` | string 或 object | 每次构建 | 应用的设计令牌（shadcn/ui 的 `cssVars`，叠加在默认的 `neutral` 主题之上），供 token 类名、`token()` 和 Rust 组件绘制时使用：相对于 `nsh.json` 的主题文件路径，或直接内联的主题（[用 Rust 开发](./rust.md#主题)、[主题 token](./tailwind.md#主题-token)）。 |
 | `statusBar` | object | 每次构建、`package` | 所有页面和对话框之下的状态栏默认值（iOS 和 Android）：`{ "foreground": "auto" \| "light" \| "dark", "hidden": boolean }`，两个字段都可省略。打包的 iOS 应用从启动屏起就使用它（[状态栏](../modules/nsh-base.md#status-bar)）。 |
 | `capabilities` | object | 每次构建 | 应用可以访问 VM 之外的哪些资源：网络主机、网页视图主机、状态栏（[沙箱与权限](./sandbox-and-capabilities.md)）。 |
 | `resolve` | object | 每次构建 | 裸导入如何解析：npm 包的导出条件和别名（[npm 包](#npm-包)）。 |
@@ -171,7 +171,7 @@ NSH 不需要 `node_modules`。取而代之的是，每个构建应用的命令�
 }
 ```
 
-`.nsh/tsconfig.json` 把 `nsh` 的导入和应用自己的 crate 指向 `.nsh/types`，包含全局声明和资源声明，并设置 NSH 应用使用的编译选项（`lib`、`jsx`、`strict` 等）。NSH 会让它保持最新：新版本增加了库或路径时，应用在下一次构建时就会得到，而你的 `tsconfig.json` 保持你写的样子。你在 `tsconfig.json` 中添加的选项会覆盖 NSH 的设置。
+`.nsh/tsconfig.json` 把 `nsh` 的导入和应用自己的 crate 指向 `.nsh/types`，包含全局声明、资源声明和令牌声明，并设置 NSH 应用使用的编译选项（`lib`、`jsx`、`strict` 等）。NSH 会让它保持最新：新版本增加了库或路径时，应用在下一次构建时就会得到，而你的 `tsconfig.json` 保持你写的样子。你在 `tsconfig.json` 中添加的选项会覆盖 NSH 的设置。
 
 | `.nsh/types/nsh/` 中的文件 | 声明的内容 |
 |---|---|
@@ -180,6 +180,7 @@ NSH 不需要 `node_modules`。取而代之的是，每个构建应用的命令�
 | `jsx-runtime.d.ts` | TypeScript 通过 `jsxImportSource` 解析的 JSX 运行时（`JSX` 命名空间） |
 | `globals.d.ts` | `If` 和 `Each`；`console`、定时器、`requestAnimationFrame`、`fetch` 及其他[全局 API](../modules/globals.md) |
 | `assets.d.ts` | 导入图片或字体得到的值 |
+| `tokens.d.ts` | `Tokens`：应用的设计令牌，来自它的 `"theme"`，为 [`token()`](../modules/nsh.md#token) 提供类型 |
 | `animated.d.ts`、`device.d.ts` 等 | 每个模块一个文件（`nsh/animated`、`nsh/device` 等） |
 | `base.d.ts` | `nsh/base` |
 
@@ -226,7 +227,7 @@ const open = async () => {
 | `nsh/base` | 应用界面的无样式基础：导航栈及其页面（`NavStack`、`NavPage`、`createNavStack`）、对话框（`Dialog`）、按压目标（`Button`）、安全区域（`SafeAreaView`、`safeArea`、`safeAreaInsets`）、系统警告对话框（`AlertDialog`）、软键盘（`Keyboard`、`keyboardFrame`、`KeyboardAvoidingView`）；页面和对话框设置状态栏（`statusBar`）（[参考](../modules/nsh-base.md)） |
 | `nsh/animated` | 原生动画 |
 | `nsh/gesture` | `PanResponder` |
-| `nsh/device` | `Platform`、`windowSize`、`colorScheme`、`fontScale`、`PixelRatio`、`I18nManager` |
+| `nsh/device` | `platform`、`windowSize`、`colorScheme`、`fontScale`、`pixelRatio`、`locale` |
 | `nsh/accessibility` | 读屏与减少动态效果的状态、朗读通知 |
 | `nsh/native` | 嵌入应用注册的组件和函数 |
 | `nsh/ios`, `nsh/android` | 平台专属 API |
@@ -260,7 +261,7 @@ declare module "node-polyfill";
 ```rust tabs
 use nsh_core::ui::{FontAsset, ImageAsset, asset};
 
-const LOGO: ImageAsset = asset!("logo@2x.png");      // its uri, and its size: 64×64 points
+const LOGO: ImageAsset = asset!("logo@2x.png");      // its url, and its size: 64×64 points
 const INTER: FontAsset = asset!("Inter.ttf");        // its uri, and its family: "Inter"
 
 image(LOGO)
@@ -269,7 +270,7 @@ text("Hello").font_family(INTER.family)
 
 ```tsx tabs
 import { Image, Text } from "nsh";
-import logo from "./assets/logo@2x.png";   // { uri: "asset:/assets/logo@2x.png", width: 64, height: 64 }
+import logo from "./assets/logo@2x.png";   // { url: "asset:/assets/logo@2x.png", size: { width: 64, height: 64 } }
 import Inter from "./assets/Inter.ttf";     // "Inter"
 
 <Image src={logo} />
@@ -278,7 +279,7 @@ import Inter from "./assets/Inter.ttf";     // "Inter"
 
 | 扩展名 | 导入得到 |
 |---|---|
-| `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic` | 一个 `ImageAsset`：`{ uri, width, height, scales? }`，单位为点。文件名带 `@2x` / `@3x` 后缀时，像素尺寸除以 2 / 3。不带后缀的文件还会发布它的 `@1.5x`–`@4x` 同名文件（列在 `scales` 中），并加载适合屏幕的变体（[像素密度](./images-and-assets.md#像素密度)）。 |
+| `.png`, `.jpg`, `.jpeg`, `.gif`, `.webp`, `.heic` | 一个 `ImageAsset`：`{ url, size, scales? }`，单位为点。文件名带 `@2x` / `@3x` 后缀时，像素尺寸除以 2 / 3。不带后缀的文件还会发布它的 `@1.5x`–`@4x` 同名文件（列在 `scales` 中），并加载适合屏幕的变体（[像素密度](./images-and-assets.md#像素密度)）。 |
 | `.svg` | 一个 `ImageAsset`，尺寸取自 SVG 的 `width` 和 `height`（或 `viewBox`），单位为点。 |
 | `.ttf`, `.otf` | 字体的族名，一个字符串。字体会在第一帧之前注册。 |
 | `.json` | 解析后的 JSON |

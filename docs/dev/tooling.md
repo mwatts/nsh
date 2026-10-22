@@ -11,10 +11,12 @@
   `nsh/jsx-runtime.d.ts` (where `jsxImportSource` finds `JSX`: no intrinsic elements, so every tag is checked as the
   component it names and generic ones are inferred: `native-pipeline.md`), `nsh/globals.d.ts` (console, timers,
   frames, the web APIs and the control flow components `If` / `Each`), and from the bundler `nsh/assets.d.ts` (what
-  image and font imports give). Each file declares its own names; the `import type` lines between them are worked out
+  image and font imports give) and `nsh/tokens.d.ts` (`nsh_bundler::tokens_declaration`: `interface Tokens` of `nsh`,
+  every design token of the app's theme, `nsh.json` `"theme"` over the default, by name with its type, which types
+  `token()`; a theme that does not parse gives the default's names, and the build reports it). Each file declares its own names; the `import type` lines between them are worked out
   from the names each uses. Next to them nsh writes `.nsh/tsconfig.json` (`nsh_bundler::TSCONFIG_BASE`): the
   compiler options mapping `nsh` and `nsh/*` there (`jsxImportSource: "nsh"`, no DOM library, `ESNext.Disposable`)
-  and the globals and assets files; the `tsconfig.json` `nsh init` writes (`nsh_bundler::TSCONFIG`) only extends it
+  and the globals, assets and tokens files; the `tsconfig.json` `nsh init` writes (`nsh_bundler::TSCONFIG`) only extends it
   and includes the app's sources, so editors type-check apps without `node_modules` and a change of nsh's settings
   (a new `lib`, a path) reaches existing apps with the next build, without an edit of theirs. An app's
   `tsconfig.json` that an earlier `nsh init` wrote and the app never changed (`templates/tsconfig/*.json`, compared
@@ -72,6 +74,12 @@ NSH-generated declarations, runner workspaces, tests and default build/package o
 Default bundles and packages are `.nsh/out/`; `--out` still overrides that location. Cargo keeps its normal
 `target/` cache and existing `CARGO_TARGET_DIR` behavior. NSH does not add Cargo configuration to relocate it.
 Existing directories are never deleted automatically. Follow the CoC project constraint in `AGENTS.md`.
+
+## LayerFS trial
+
+The opt-in [LayerFS trial](layerfs.md) exercises Git, Cargo, build-output snapshots and branch isolation on Linux.
+Its generated inputs and receipts live under `.nsh/layerfs/`; it reuses the normal Cargo cache and has a manual
+GitHub Actions workflow. It is separate from the platform checks.
 
 ## Output
 
@@ -260,8 +268,8 @@ and more than one fails the step; a press whose match, or a view between it and 
 - `submit`: the return key as the input's `submitBehavior` resolves (`InputConfig::submit`): `KeyPress` `Enter` and
   `SubmitEditing` (then `Blur` for blur-and-submit), or a line break;
 - `scroll`: the scroll view (the match, the nearest one around it, else the first in it) moves along its axis 10
-  points per frame within its content (`ScrollBeginDrag`, offsets with the applied count as platforms report them,
-  `ScrollEndDrag`, `ScrollEnd`), and fails on one the user cannot scroll (`scrollEnabled={false}`); the model applies `ScrollBy` and `ScrollTo` / `ScrollToEnd` and reports where a
+  points per frame within its content (`ScrollDragStart`, offsets with the applied count as platforms report them,
+  `ScrollDragEnd`, `ScrollEnd`), and fails on one the user cannot scroll (`scrollable={false}`); the model applies `ScrollBy` and `ScrollTo` / `ScrollToEnd` and reports where a
   command moved the view;
 - `drag` (`headless/pointer.rs`): a finger lands on the match's middle (`Screen::bounds_in_root`), rests 100 ms,
   moves 10 points a frame by an offset or onto the middle of another match (`DragTo`) and lifts, and what takes it is decided as the desktop backends decide it, with
@@ -426,10 +434,20 @@ moves to the first responder only), keystrokes (`press_keys`: macOS's posted key
 takes no made-up keys; the phones, without app shortcuts, refuse them),
 `back`, dialogs, screenshots, the window's size and appearance),
 then waits until neither a batch came nor a native animation ran for 100 ms (2 s at most; the web's page counts its own
-finite animations too: a screen sliding in). `Native`'s calls do their work
+finite animations too: a screen sliding in; Android counts a scroll view drawing, as its overscroll stretch relaxes
+without moving a view, and a touch then only catches the stretch). `Native`'s calls do their work
 on the platform's main thread and return when the input is posted. Screenshots come back as PNG bytes (base64): the
-test's side saves them, as the host may run on another machine. A manual clock does not exist on a real platform:
-`runFor` waits, and `fastForward` and `setSystemTime` fail. `open`'s locale, reduced motion and safe area reach the
+test's side saves them, as the host may run on another machine. `open`'s manual clock reaches the host in the
+test's setup (`TestEnvironment::clock`, its start in Unix milliseconds): `Model::set_up_engine` starts the engine on
+`Clock::manual(start).with_frames()`, and the host hands the started engine back (`Model::engine_started`). The
+test's `clock` steps are `TestStep::Clock` (`ClockChange::RunFor`, `FastForward`, `SetSystemTime`; the web's
+`SceneQuery::Clock`, after which the page pumps its engine), which `Model::move_clock` takes as the headless driver
+does, through `EngineControl::advance_clock`; `wait` moves the clock by its time too (`driver.rs`'s `Remote`). A
+clock that moves with frames (`Clock::moves_with_frames`) is the display's pace on a real platform: each frame the
+platform shows moves it to a frame after the last (`nsh_core::time::FRAME`, 1/60 s) before it runs, and while the
+engine moves it (`Driver::advance` with `frames`) the frames the app waits for run on the way, a frame apart, as a
+headless display's do; the platform's own animations run in real time, as do stubbed responses' delays (the test's
+side holds them, outside the app's clock). `open`'s locale, reduced motion and safe area reach the
 host in the test's setup (`TestEnvironment`, `DevServer::set_test_environment`) and its engine pins them
 (`EngineConfig::pinned`, `EnvironmentPins`: applied to every environment the platform reports); its clipboard is the
 test's (`EngineConfig::clipboard`: the core serves the app's clipboard commands from a `ClipboardBackend`, here a

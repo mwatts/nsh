@@ -145,14 +145,14 @@ fn Own() -> impl IntoElement {
             .separator(|| view().h(px(1.0)).bg(rgb(0xeeeeee)))
             .sticky_header_indices([0])
             .keyboard_dismiss_mode(KeyboardDismissMode::OnDrag)
-            .end_reached_threshold(0.5)
+            .load_more_threshold(0.5)
             .initial_scroll_index(2)
             .minimum_view_time(Duration::from_millis(100))
-            .on_viewable_items_changed(move |rows: &ViewableItems| {
+            .on_viewable_items_change(move |rows: &ViewableItems| {
                 let rows = rows.indices();
                 visible.set(format!("{}-{}", rows.start(), rows.end()));
             })
-            .on_end_reached(move |_: &()| {
+            .on_load_more(move |_: &()| {
                 if !emptied.replace(true) {
                     count.set(0);
                 }
@@ -209,7 +209,7 @@ fn rust_lists_have_headers_footers_separators_and_empty_views() {
     let viewable = |first: f64, last: f64| {
         engine.control().dispatch_event(
             list,
-            EventKind::ViewableItemsChanged,
+            EventKind::ViewableItemsChange,
             EventPayload::Map(vec![
                 ("first", PayloadValue::Number(first)),
                 ("last", PayloadValue::Number(last)),
@@ -228,7 +228,7 @@ fn rust_lists_have_headers_footers_separators_and_empty_views() {
     // component's.
     engine
         .control()
-        .dispatch_event(list, EventKind::EndReached, EventPayload::None);
+        .dispatch_event(list, EventKind::LoadMore, EventPayload::None);
     tree.drain(&rx);
     assert!(tree.shows("nothing"), "{:?}", tree.texts);
     let nothing = tree.find("nothing").unwrap();
@@ -261,7 +261,7 @@ fn Stocks() -> impl IntoElement {
             .header(text(move || {
                 format!("{} ended {}", pressed.get(), ended.get())
             }))
-            .on_end_reached(move |_: &()| ended.update(|e| *e += 1)),
+            .on_load_more(move |_: &()| ended.update(|e| *e += 1)),
         ),
     )
 }
@@ -293,7 +293,7 @@ fn rust_components_fill_a_list_views_rows() {
     // Its list's events are the component's too.
     engine
         .control()
-        .dispatch_event(list, EventKind::EndReached, EventPayload::None);
+        .dispatch_event(list, EventKind::LoadMore, EventPayload::None);
     tree.drain(&rx);
     assert!(tree.shows("pressed 1 ended 1"), "{:?}", tree.texts);
 }
@@ -355,7 +355,7 @@ const rows = Array.from({ length: 100 }, (_, i) => `row ${i}`);
 mount(() => (
   <View style={{ flex: 1 }}>
     <Text>{`ends ${ends()}`}</Text>
-    <ListView each={rows} onEndReached={() => ends.set(ends() + 1)}>
+    <ListView each={rows} onLoadMore={() => ends.set(ends() + 1)}>
       {(row) => <Text>{row()}</Text>}
     </ListView>
   </View>
@@ -371,10 +371,10 @@ fn the_apps_handlers_on_a_list_views_rows_run() {
     let row = tree.find("row 1").expect("rows");
     let (list, _) = tree.cell(row).expect("in a list");
     // The list is a slot of the component (its node is JS's): the app's
-    // `onEndReached` gets the event.
+    // `onLoadMore` gets the event.
     engine
         .control()
-        .dispatch_event(list, EventKind::EndReached, EventPayload::None);
+        .dispatch_event(list, EventKind::LoadMore, EventPayload::None);
     tree.drain(&rx);
     assert!(tree.shows("ends 1"), "{:?}", tree.texts);
 }

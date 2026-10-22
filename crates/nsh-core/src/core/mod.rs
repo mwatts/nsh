@@ -287,7 +287,7 @@ struct ComponentState {
 #[derive(Debug)]
 struct ScrollState {
     horizontal: bool,
-    shows_indicator: bool,
+    scrollbar_visible: bool,
     refreshing: bool,
     scroll_value: Option<crate::animation::NodeId>,
     keyboard_dismiss: KeyboardDismissMode,
@@ -313,7 +313,7 @@ impl Default for ScrollState {
         Self {
             horizontal: false,
             // React Native shows scroll indicators by default.
-            shows_indicator: true,
+            scrollbar_visible: true,
             refreshing: false,
             scroll_value: None,
             keyboard_dismiss: KeyboardDismissMode::None,
@@ -397,6 +397,8 @@ struct Node {
     events: EventMask,
     /// `zIndex`: native views are ordered by it (stable) among siblings.
     z_index: i32,
+    /// `verticalAlign`: where it sits in its line as an attachment.
+    vertical_align: crate::style::VerticalAlign,
     /// Laid out right to left (the resolved `direction`).
     rtl: bool,
     /// `direction`: `None` inherits.
@@ -510,6 +512,7 @@ impl Node {
             insets: None,
             events: EventMask::default(),
             z_index: 0,
+            vertical_align: crate::style::VerticalAlign::Baseline,
             rtl: false,
             direction: None,
             logical: None,
@@ -547,6 +550,7 @@ impl Node {
 /// Taffy context of a text block.
 struct TextContext<P> {
     text: Arc<AttributedText>,
+    alignments: crate::AttachmentAlignments,
     /// `text.layout_hash()`, computed once per content.
     layout_hash: u64,
     /// Platform typesetting state, created on first use.
@@ -562,6 +566,7 @@ impl<P> TextContext<P> {
     fn new(text: Arc<AttributedText>) -> Self {
         Self {
             layout_hash: text.layout_hash(),
+            alignments: Default::default(),
             text,
             prepared: None,
             cache: None,
@@ -673,6 +678,10 @@ pub struct Core<M: TextEngine> {
     status_bars_moved: bool,
     /// The user's preferred text size (1.0 is the default).
     font_scale: f32,
+    /// The font text is drawn with unless it sets its own: the tokens'
+    /// `font-sans` (`None`: the system's), as a page's is Tailwind's
+    /// `--font-sans`.
+    default_font: Option<crate::style::FontFamily>,
     queue: Vec<Key>,
     needs_layout: bool,
     /// Parsed classes and the theme.
@@ -720,6 +729,9 @@ impl<M: TextEngine + 'static> Core<M> {
 impl<M: TextEngine> Core<M> {
     fn with_engine(text_engine: M, viewport: Size<Points>) -> Self {
         let mut layout = TaffyTree::with_capacity(256);
+        // The core rounds layouts itself (`rounded`): Taffy's pass walks the
+        // absolutely positioned nodes through lists it can leave stale.
+        layout.disable_rounding();
         let root_layout = layout.new_leaf(root_style(viewport)).expect("taffy root");
         let mut nodes = Slab::with_capacity(256);
         let mut root = Node::new(ROOT_ID, Kind::View);
@@ -759,6 +771,7 @@ impl<M: TextEngine> Core<M> {
             status_bar_nodes: Vec::new(),
             status_bars_moved: false,
             font_scale: 1.0,
+            default_font: None,
             queue: Vec::new(),
             needs_layout: true,
             tailwind: Tailwind::new(),
@@ -827,6 +840,21 @@ impl<M: TextEngine> Core<M> {
             return;
         }
         self.font_scale = scale;
+        self.relayout_text();
+    }
+
+    /// Sets the font text is drawn with unless it sets its own (the
+    /// tokens' `font-sans`): text is laid out again.
+    pub(crate) fn set_default_font(&mut self, family: Option<crate::style::FontFamily>) {
+        if family == self.default_font {
+            return;
+        }
+        self.default_font = family;
+        self.relayout_text();
+    }
+
+    /// Lays every text and input out again.
+    fn relayout_text(&mut self) {
         let blocks: Vec<(Key, Kind)> = self
             .nodes
             .iter()
@@ -978,7 +1006,7 @@ impl<M: TextEngine> Core<M> {
     }
 
     /// Moves what the core hands JS (events it raised, such as
-    /// `onEndReached` and `onLayout`, Rust components' events, calls'
+    /// `onLoadMore` and `onLayout`, Rust components' events, calls'
     /// results) into `out`, in order.
     pub fn take_events(&mut self, out: &mut Vec<crate::ui::JsEvent>) {
         out.append(&mut self.events);
@@ -1706,6 +1734,7 @@ impl<M: TextEngine> Core<M> {
             text,
             animated,
             z_index,
+            vertical_align,
             direction,
             logical,
             pending: _,
@@ -1758,10 +1787,17 @@ impl<M: TextEngine> Core<M> {
         let text_changed = node.text_style != text || span_background_changed;
         let animation_changed = node.animated != animated;
         let z_changed = node.z_index != z_index;
+        // An attachment's place in its line is part of its block's text.
+        let align_changed =
+            node.vertical_align != vertical_align && node.inline && node.kind != Kind::Text;
         node.view_style = view;
         node.text_style = text;
         node.animated = animated;
         node.z_index = z_index;
+        node.vertical_align = vertical_align;
+        if align_changed {
+            self.mark_text_block(key);
+        }
         if z_changed {
             self.restack(key);
         }
@@ -1933,11 +1969,31 @@ impl<M: TextEngine> Core<M> {
                 refuse(self, "the image", &source.uri, "network");
                 Prop::Source(None)
             }
-            Prop::Image(ImageProp::DefaultSource(Some(source)))
+            Prop::Image(ImageProp::Placeholder(Some(source)))
                 if !self.access.allows_media(&source.uri) =>
             {
                 refuse(self, "the placeholder", &source.uri, "network");
-                Prop::Image(ImageProp::DefaultSource(None))
+                Prop::Image(ImageProp::Placeholder(None))
+            }
+            Prop::Native(NativeProp::Src(Some(url)))
+                if kind == Kind::Video && !self.access.allows_media(&url) =>
+            {
+                refuse(self, "the video", &url, "network");
+                Prop::Native(NativeProp::Src(None))
+            }
+            Prop::Native(NativeProp::Src(Some(url)))
+                if kind == Kind::WebView && !self.access.allows_webview(&url) =>
+            {
+                refuse(self, "the web page", &url, "webview.hosts");
+                Prop::Native(NativeProp::Src(None))
+            }
+            Prop::Native(NativeProp::Html(Some(_)))
+                if kind == Kind::WebView && !self.access.allows_webviews() =>
+            {
+                self.deny(
+                    "web views are not granted: add `webview` to capabilities in nsh.json".into(),
+                );
+                Prop::Native(NativeProp::Html(None))
             }
             Prop::Native(NativeProp::Source(crate::WebSource::Uri(uri)))
                 if kind == Kind::Video && !self.access.allows_media(&uri) =>
@@ -2015,7 +2071,7 @@ impl<M: TextEngine> Core<M> {
             Prop::Image(option) => {
                 if let Some(image) = node.image.as_mut() {
                     match option {
-                        ImageProp::DefaultSource(source) => image.options.placeholder = source,
+                        ImageProp::Placeholder(source) => image.options.placeholder = source,
                         ImageProp::BlurRadius(r) => image.options.blur_radius = r.max(Points::ZERO),
                         ImageProp::FadeDuration(ms) => image.options.fade_ms = ms,
                     }
@@ -2047,9 +2103,9 @@ impl<M: TextEngine> Core<M> {
                     }
                 }
             }
-            Prop::ShowsIndicator(shows) => {
+            Prop::Scrollbar(shows) => {
                 if let Some(scroll) = node.scroll.as_mut() {
-                    scroll.shows_indicator = shows;
+                    scroll.scrollbar_visible = shows;
                     flags |= dirty::SCROLL;
                 }
             }
@@ -2159,6 +2215,11 @@ impl<M: TextEngine> Core<M> {
                     list.set_sticky(indices);
                 }
             }
+            Prop::StickyOffset(offset) => {
+                if let Some(list) = node.list.as_mut() {
+                    list.set_sticky_offset(offset.0);
+                }
+            }
             Prop::ListContent(content) => {
                 if let Some(list) = node.list.as_mut() {
                     list.set_content(content);
@@ -2172,7 +2233,7 @@ impl<M: TextEngine> Core<M> {
                     list.dirty = true;
                 }
             }
-            Prop::EndReachedThreshold(threshold) => {
+            Prop::LoadMoreThreshold(threshold) => {
                 if let Some(list) = node.list.as_mut() {
                     list.end_threshold = threshold.max(0.0);
                 }
@@ -2301,7 +2362,8 @@ impl<M: TextEngine> Core<M> {
                 return Ok(());
             }
             Prop::LayoutDirection(rtl) => {
-                // The surface's direction (the root's): JS's `I18nManager`.
+                // The surface's direction (the root's): the user's language, as
+                // JS or the policy sets it.
                 if key == self.root && node.direction != Some(rtl) {
                     node.direction = Some(rtl);
                     self.mount.push(MountItem::LayoutDirection { rtl });
@@ -2504,7 +2566,7 @@ impl<M: TextEngine> Core<M> {
                     let c = &mut root.screen;
                     match prop {
                         ScreenProp::Title(v) => c.title = v,
-                        ScreenProp::HeaderShown(v) => c.header_shown = v,
+                        ScreenProp::HeaderVisible(v) => c.header_visible = v,
                         ScreenProp::HeaderLargeTitle(v) => c.large_title = v,
                         ScreenProp::HeaderTransparent(v) => c.header_transparent = v,
                         ScreenProp::HeaderBackTitle(v) => c.back_title = v,
@@ -2579,8 +2641,8 @@ impl<M: TextEngine> Core<M> {
                     }
                 }
             }
-            // `scrollEnabled` of scroll views and lists.
-            Prop::Native(NativeProp::ScrollEnabled(on)) if node.scroll.is_some() => {
+            // `scrollable` of scroll views and lists.
+            Prop::Native(NativeProp::Scrollable(on)) if node.scroll.is_some() => {
                 if let Some(scroll) = node.scroll.as_mut() {
                     scroll.behavior.enabled = on;
                     flags |= dirty::SCROLL_BEHAVIOR;
@@ -2704,8 +2766,8 @@ impl<M: TextEngine> Core<M> {
                         c.auto_focus = on;
                         false
                     }
-                    Prop::CaretHidden(on) => {
-                        c.caret_hidden = on;
+                    Prop::Caret(on) => {
+                        c.caret_hidden = !on;
                         false
                     }
                     Prop::InputAccessoryViewId(name) => {
@@ -2893,7 +2955,6 @@ impl<M: TextEngine> Core<M> {
                 self.layout
                     .remove_child(parent_layout, layout)
                     .expect("taffy remove");
-                self.forget_hoisted(parent);
             }
             self.needs_layout = true;
             if emit_remove
@@ -2904,49 +2965,6 @@ impl<M: TextEngine> Core<M> {
                 self.mount.push(MountItem::Remove { id });
             }
         }
-    }
-
-    /// Taffy keeps the absolutely placed children a node laid out last
-    /// (its "hoisted" children) until it lays the node out again with
-    /// children, which a node left without any never is: an absolute child
-    /// removed from it stays listed, and once its node is freed the next
-    /// layout fails. Such a node gets a fresh layout node.
-    fn forget_hoisted(&mut self, key: Key) {
-        let Some(old) = self.nodes[key as usize].layout else {
-            return;
-        };
-        let childless = self.layout.children(old).is_ok_and(|c| c.is_empty());
-        let hoisting = self
-            .layout
-            .hoisted_children(old)
-            .is_ok_and(|h| !h.is_empty());
-        if !childless || !hoisting {
-            return;
-        }
-        let style = self.layout.style(old).expect("taffy style").clone();
-        let fresh = match self.layout.get_node_context_mut(old) {
-            Some(context) => {
-                let context = std::mem::replace(context, LeafContext::Image(None));
-                self.layout.new_leaf_with_context(style, context)
-            }
-            None => self.layout.new_leaf(style),
-        }
-        .expect("taffy leaf");
-        if let Some(parent) = self.layout.parent(old) {
-            let index = self
-                .layout
-                .children(parent)
-                .expect("taffy children")
-                .iter()
-                .position(|&c| c == old)
-                .expect("taffy child");
-            self.layout
-                .replace_child_at_index(parent, index, fresh)
-                .expect("taffy replace");
-        }
-        self.layout.remove(old).expect("taffy remove");
-        self.nodes[key as usize].layout = Some(fresh);
-        self.needs_layout = true;
     }
 
     /// A page's or dialog's `statusBar`: changed in place while the node
@@ -3384,7 +3402,7 @@ impl<M: TextEngine> Core<M> {
                     self.mount.push(MountItem::ScrollConfig {
                         id,
                         horizontal: scroll.horizontal,
-                        shows_indicator: scroll.shows_indicator,
+                        scrollbar_visible: scroll.scrollbar_visible,
                         scroll_value: scroll.scroll_value,
                         keyboard_dismiss: scroll.keyboard_dismiss,
                         mirrored: node.kind == Kind::List && scroll.horizontal && node.rtl,
@@ -3602,6 +3620,15 @@ impl<M: TextEngine> Core<M> {
     /// The text style `key` inherits from the views around it, as CSS
     /// does: `color` / `text-white` on a container styles the text in it
     /// (React Native views ignore text styles).
+    /// The style text inherits at the root: React Native's defaults with
+    /// the app's font.
+    fn base_text_style(&self) -> ResolvedTextStyle {
+        ResolvedTextStyle {
+            font_family: self.default_font,
+            ..ResolvedTextStyle::default()
+        }
+    }
+
     fn inherited_text_style(&self, key: Key) -> ResolvedTextStyle {
         let mut chain: Vec<Key> = Vec::new();
         let mut k = self.nodes[key as usize].parent;
@@ -3615,7 +3642,7 @@ impl<M: TextEngine> Core<M> {
         chain
             .iter()
             .rev()
-            .fold(ResolvedTextStyle::default(), |style, &k| {
+            .fold(self.base_text_style(), |style, &k| {
                 style.inherit(&self.nodes[k as usize].text_style)
             })
     }
@@ -3697,7 +3724,8 @@ impl<M: TextEngine> Core<M> {
         let base = inherited.inherit(&node.text_style);
         let multiplier = node.paragraph.font_multiplier(self.font_scale);
         let inserted = self.update_attachments(key);
-        self.collect_text(key, base, &mut text);
+        let mut alignments = crate::AttachmentAlignments::default();
+        self.collect_text(key, base, &mut text, &mut alignments);
         if multiplier != 1.0 {
             for span in &mut text.spans {
                 span.style = scaled(span.style, multiplier);
@@ -3707,20 +3735,21 @@ impl<M: TextEngine> Core<M> {
             .layout
             .expect("text block has layout");
         let cx = self.text_cx(layout);
-        if *cx.text == text {
+        if *cx.text == text && cx.alignments == alignments {
             if inserted {
                 // New attachment views: placed with the next final layout.
                 cx.laid_out = None;
             }
             return inserted;
         }
-        let same_layout = cx.text.layout_eq(&text);
+        let same_layout = cx.text.layout_eq(&text) && cx.alignments == alignments;
+        cx.alignments = alignments;
         cx.text = Arc::new(text);
         // Platform typesetting state embeds colors too: always rebuild it.
         cx.prepared = None;
         cx.laid_out = None;
         if !same_layout {
-            cx.layout_hash = cx.text.layout_hash();
+            cx.layout_hash = cx.alignments.layout_hash(&cx.text);
             cx.cache = None;
             self.layout.mark_dirty(layout).expect("taffy dirty");
             self.needs_layout = true;
@@ -3728,7 +3757,13 @@ impl<M: TextEngine> Core<M> {
         true
     }
 
-    fn collect_text(&self, key: Key, style: ResolvedTextStyle, out: &mut AttributedText) {
+    fn collect_text(
+        &self,
+        key: Key,
+        style: ResolvedTextStyle,
+        out: &mut AttributedText,
+        alignments: &mut crate::AttachmentAlignments,
+    ) {
         for &c in &self.nodes[key as usize].children {
             let child = &self.nodes[c as usize];
             match child.kind {
@@ -3739,7 +3774,7 @@ impl<M: TextEngine> Core<M> {
                     if let Some(b) = span_background(&child.view_style, child.id) {
                         inner.background = Some(b);
                     }
-                    self.collect_text(c, inner, out);
+                    self.collect_text(c, inner, out, alignments);
                     if pressable(child.events) {
                         out.links.push(crate::text::TextLink {
                             start,
@@ -3761,9 +3796,11 @@ impl<M: TextEngine> Core<M> {
                 // An attachment, laid out by `update_attachments`.
                 _ => {
                     if let Some(l) = child.layout {
-                        let size = self.layout.layout(l).expect("taffy layout").size;
-                        out.push_attachment(
+                        let size = self.rounded_layout(l).size;
+                        alignments.push(
+                            out,
                             crate::geometry::size_pt(size.width, size.height),
+                            child.vertical_align,
                             style,
                         );
                     }
@@ -3890,6 +3927,39 @@ impl<M: TextEngine> Core<M> {
         }
     }
 
+    /// Where the layout of the node around `layout` is in its layout root
+    /// (the sum of the unrounded locations above it), as Taffy's rounding
+    /// carries it down: added from the root down, in Taffy's order, so the
+    /// sum is the same to the last bit of an `f32` (an edge at x.5 rounds
+    /// one way or the other on it).
+    fn layout_origin(&self, layout: LayoutId) -> taffy::Point<f32> {
+        let mut above = Vec::new();
+        let mut at = self.layout.parent(layout);
+        while let Some(node) = at {
+            above.push(node);
+            at = self.layout.parent(node);
+        }
+        above
+            .iter()
+            .rev()
+            .fold(taffy::Point::ZERO, |origin, &node| {
+                let l = self.layout.unrounded_layout(node);
+                taffy::Point {
+                    x: origin.x + l.location.x,
+                    y: origin.y + l.location.y,
+                }
+            })
+    }
+
+    /// `layout`'s layout, rounded to whole points as Taffy's rounding pass
+    /// does ([`rounded`]).
+    fn rounded_layout(&self, layout: LayoutId) -> taffy::Layout {
+        rounded(
+            self.layout.unrounded_layout(layout),
+            self.layout_origin(layout),
+        )
+    }
+
     /// Lays out the main tree if it changed. Returns true if it did.
     fn layout_main(&mut self) -> bool {
         let root = self.nodes[self.root as usize].layout.expect("root layout");
@@ -3897,7 +3967,7 @@ impl<M: TextEngine> Core<M> {
             width: AvailableSpace::Definite(self.viewport.width.0),
             height: AvailableSpace::Definite(self.viewport.height.0),
         };
-        // Even a clean root costs a full rounding walk in taffy: skip it.
+        // A clean root has nothing new to lay out, nor frames to emit.
         let main = self.layout.dirty(root).unwrap_or(true);
         if main {
             self.layout_root(root, available);
@@ -4013,7 +4083,7 @@ impl<M: TextEngine> Core<M> {
         let parent = self.nodes[key as usize].parent;
         let p = self.nodes.get(parent as usize)?;
         let stack_layout = p.layout.filter(|_| p.kind == Kind::Stack)?;
-        let s = self.layout.layout(stack_layout).ok()?.size;
+        let s = self.rounded_layout(stack_layout).size;
         Some(size_pt(s.width, s.height))
     }
 
@@ -4042,8 +4112,7 @@ impl<M: TextEngine> Core<M> {
         self.layout_detached(item);
         self.nodes[item as usize]
             .layout
-            .and_then(|l| self.layout.layout(l).ok())
-            .map_or(0.0, |l| l.size.height)
+            .map_or(0.0, |l| self.rounded_layout(l).size.height)
     }
 
     fn layout_detached(&mut self, key: Key) {
@@ -4073,7 +4142,7 @@ impl<M: TextEngine> Core<M> {
                     .filter(|_| !c.large_title && !c.header_transparent);
                 let header = if !native_header {
                     drawn_header
-                } else if !c.header_shown {
+                } else if !c.header_visible {
                     0.0
                 } else if let Some(measured) = measured {
                     measured
@@ -4222,7 +4291,7 @@ impl<M: TextEngine> Core<M> {
             };
             let state = list.list.as_ref().expect("list");
             let horizontal = state.horizontal;
-            let size = self.layout.layout(list_layout).expect("taffy layout").size;
+            let size = self.rounded_layout(list_layout).size;
             let cross = if horizontal { size.height } else { size.width };
             let item_cross = state.column(cross, 0).1;
             let extra_cross = state.full_width(cross).1;
@@ -4362,9 +4431,13 @@ impl<M: TextEngine> Core<M> {
             if !created {
                 continue;
             }
-            let boxed = self.layout.layout(layout).expect("taffy layout");
-            let mut content = content_box(boxed);
-            let hidden = boxed.size == taffy::Size::ZERO && self.displays_none(key);
+            // Whatever Taffy keeps for it (`emit_frames_in`).
+            let hidden = self.displays_none(key);
+            let mut content = if hidden {
+                Bounds::default()
+            } else {
+                content_box(&self.rounded_layout(layout))
+            };
             let engine = &self.text_engine;
             let cache = &mut self.measure_cache;
             let Some(LeafContext::Text(cx)) = self.layout.get_node_context_mut(layout) else {
@@ -4410,8 +4483,8 @@ impl<M: TextEngine> Core<M> {
                 if matches!(&cx.laid_out, Some((r, _)) if *r == content) {
                     continue;
                 }
-                let text = Arc::new(fitted(engine, &cx.text, size, min));
-                let prepared = engine.prepare(&text);
+                let text = Arc::new(fitted(engine, &cx.text, &cx.alignments, size, min));
+                let prepared = engine.prepare_aligned(&text, &cx.alignments);
                 let text_layout = engine.layout(&prepared, size);
                 cx.laid_out = Some((content, text_layout.clone()));
                 if report_lines {
@@ -4437,7 +4510,9 @@ impl<M: TextEngine> Core<M> {
                 // Only moved (padding, vertical alignment): the same layout.
                 Some((r, l)) if r.size == size => l.clone(),
                 _ => {
-                    let prepared = cx.prepared.get_or_insert_with(|| engine.prepare(&cx.text));
+                    let prepared = cx
+                        .prepared
+                        .get_or_insert_with(|| engine.prepare_aligned(&cx.text, &cx.alignments));
                     let layout = engine.layout(prepared, size);
                     if report_lines {
                         self.events.push(crate::ui::JsEvent::Event(
@@ -4478,7 +4553,7 @@ impl<M: TextEngine> Core<M> {
             let Some(l) = self.nodes[a as usize].layout else {
                 continue;
             };
-            let size = self.layout.layout(l).expect("taffy layout").size;
+            let size = self.rounded_layout(l).size;
             let (x, y) = match points.get(i).copied().flatten() {
                 Some(p) => (content.origin.x.0 + p.x.0, content.origin.y.0 + p.y.0),
                 // Far away, like unbound list cells.
@@ -4491,12 +4566,57 @@ impl<M: TextEngine> Core<M> {
 
     /// Emits the frame of `key` and its subtree (if changed).
     fn emit_frames(&mut self, key: Key) {
+        let parent = self.nodes[key as usize].parent;
+        let hidden = parent != NO_KEY && self.displays_none(parent);
+        let origin = self.nodes[key as usize]
+            .layout
+            .map_or(taffy::Point::ZERO, |l| self.layout_origin(l));
+        self.emit_frames_in(key, hidden, origin);
+    }
+
+    /// [`Core::emit_frames`] of `key`, `hidden` when a view around it is
+    /// `display: none`. A view in such a subtree has no frame whatever
+    /// Taffy keeps for it: Taffy can leave a node moved into a hidden
+    /// subtree with its former layout (its dirty marking stops at the
+    /// first node whose cache is empty, which hidden nodes' always are),
+    /// and never rounds the absolutely positioned ones there (they are
+    /// rounded through their containing block, which hidden layout does
+    /// not record), so their native views would keep showing at their
+    /// former size in a parent of no size.
+    ///
+    /// `origin` is where the layout of the view around it is in its layout
+    /// root, unrounded ([`Core::layout_origin`]), carried down the walk.
+    fn emit_frames_in(&mut self, key: Key, hidden: bool, origin: taffy::Point<f32>) {
         let node = &self.nodes[key as usize];
         let Some(layout) = node.layout else { return };
         if !node.created {
             return;
         }
-        let l = self.layout.layout(layout).expect("taffy layout");
+        let hidden = hidden
+            || self
+                .layout
+                .style(layout)
+                .is_ok_and(|s| s.display == taffy::Display::None);
+        if hidden {
+            self.set_frame(key, Bounds::default());
+            if self.nodes[key as usize].kind.is_container() {
+                let children = std::mem::take(&mut self.nodes[key as usize].children);
+                for &child in &children {
+                    if !self.nodes[child as usize].kind.is_root() {
+                        self.emit_frames_in(child, true, origin);
+                    }
+                }
+                self.nodes[key as usize].children = children;
+            }
+            return;
+        }
+        let node = &self.nodes[key as usize];
+        let unrounded = self.layout.unrounded_layout(layout);
+        let inner = taffy::Point {
+            x: origin.x + unrounded.location.x,
+            y: origin.y + unrounded.location.y,
+        };
+        let l = rounded(unrounded, origin);
         let mut frame = rect(l.location.x, l.location.y, l.size.width, l.size.height);
         // Children of a right-to-left horizontal scroll view: mirrored in
         // its content.
@@ -4517,7 +4637,7 @@ impl<M: TextEngine> Core<M> {
         self.set_frame(key, frame);
         let kind = self.nodes[key as usize].kind;
         if kind == Kind::Input {
-            let content = content_box(self.layout.layout(layout).expect("taffy layout"));
+            let content = content_box(&l);
             let node = &mut self.nodes[key as usize];
             let input = node.input.as_mut().expect("input state");
             if input.content != Some(content) {
@@ -4535,7 +4655,6 @@ impl<M: TextEngine> Core<M> {
             // Scrollable extent: the overflow rectangle is measured from the
             // padding box origin and stops at the children's border boxes, so
             // add the leading border and trailing padding.
-            let l = self.layout.layout(layout).expect("taffy layout");
             let o = l.scrollable_overflow_rect;
             let size = size_pt(
                 l.size.width.max(l.border.left + o.right + l.padding.right),
@@ -4551,7 +4670,7 @@ impl<M: TextEngine> Core<M> {
             let children = std::mem::take(&mut self.nodes[key as usize].children);
             for &child in &children {
                 if !self.nodes[child as usize].kind.is_root() {
-                    self.emit_frames(child);
+                    self.emit_frames_in(child, false, inner);
                 }
             }
             self.nodes[key as usize].children = children;
@@ -4654,10 +4773,7 @@ impl<M: TextEngine> Core<M> {
             }
             let (id, events) = (node.id, node.events);
             let horizontal = list.horizontal;
-            let l = *self
-                .layout
-                .layout(node.layout.expect("list layout"))
-                .expect("taffy layout");
+            let l = self.rounded_layout(node.layout.expect("list layout"));
             let (main, cross) = if horizontal {
                 (l.size.width, l.size.height)
             } else {
@@ -4677,7 +4793,7 @@ impl<M: TextEngine> Core<M> {
             let mut anchor = 0.0;
             for &(index, cell) in &ready {
                 if let Some(cell_layout) = self.nodes.get(cell as usize).and_then(|c| c.layout) {
-                    let size = main_of(self.layout.layout(cell_layout).expect("taffy layout").size);
+                    let size = main_of(self.rounded_layout(cell_layout).size);
                     let list = self.nodes[key as usize].list.as_mut().expect("list");
                     anchor += list.measured(index, size);
                 }
@@ -4689,7 +4805,7 @@ impl<M: TextEngine> Core<M> {
                 if let Some(cell_layout) =
                     self.nodes.get(extra.cell as usize).and_then(|c| c.layout)
                 {
-                    let size = main_of(self.layout.layout(cell_layout).expect("taffy layout").size);
+                    let size = main_of(self.rounded_layout(cell_layout).size);
                     let list = self.nodes[key as usize].list.as_mut().expect("list");
                     anchor += list.measured_extra(kind, size);
                 }
@@ -4789,14 +4905,14 @@ impl<M: TextEngine> Core<M> {
             if list.update_window(&mut binds) {
                 self.events.push(crate::ui::JsEvent::Event(
                     id,
-                    EventKind::EndReached,
+                    EventKind::LoadMore,
                     EventPayload::None,
                 ));
             }
             if !binds.is_empty() {
                 self.list_binds.push(ListBind { list: id, binds });
             }
-            if events.contains(EventKind::ViewableItemsChanged) {
+            if events.contains(EventKind::ViewableItemsChange) {
                 let viewable = list.viewable_items();
                 if viewable != list.viewable {
                     list.viewable = viewable;
@@ -4804,7 +4920,7 @@ impl<M: TextEngine> Core<M> {
                         viewable.map_or((-1.0, -1.0), |(f, l)| (f as f64, l as f64));
                     self.events.push(crate::ui::JsEvent::Event(
                         id,
-                        EventKind::ViewableItemsChanged,
+                        EventKind::ViewableItemsChange,
                         EventPayload::Map(vec![
                             ("first", PayloadValue::Number(first)),
                             ("last", PayloadValue::Number(last)),
@@ -4869,7 +4985,7 @@ impl<M: TextEngine> Core<M> {
             let mut sticky_cells = Vec::new();
             let place = |this: &mut Self, cell: Key, at: f32, row: f32, (x, width): (f32, f32)| {
                 let cell_layout = this.nodes.get(cell as usize).and_then(|c| c.layout)?;
-                let size = this.layout.layout(cell_layout).expect("taffy layout").size;
+                let size = this.rounded_layout(cell_layout).size;
                 let list = this.nodes[key as usize].list.as_ref().expect("list");
                 let main_at = list.to_content(at, row.max(main_of(size)));
                 let frame = if horizontal {
@@ -4991,6 +5107,48 @@ impl<M: TextEngine> Core<M> {
 const HIDDEN: f32 = 1.0e6;
 
 /// The content box (inside padding and border) of a laid-out node.
+/// Taffy's rounding of a coordinate.
+fn round(value: f32) -> f32 {
+    (value + 0.5).floor()
+}
+
+/// `layout` rounded as Taffy's rounding pass (`taffy::round_layout`) rounds
+/// it, `origin` being the unrounded position of the node around it in its
+/// layout root: edges are rounded where they are in the root, so adjacent
+/// views stay adjacent. The core rounds itself: Taffy's pass reaches the
+/// absolutely positioned nodes through their containing block's list,
+/// which it can leave holding removed nodes (a panic) or never fill (a
+/// hidden subtree's), while here every node is reached through its parent,
+/// its containing block (the core has no `position: static`).
+fn rounded(layout: &taffy::Layout, origin: taffy::Point<f32>) -> taffy::Layout {
+    let mut out = *layout;
+    let (x, y) = (origin.x + layout.location.x, origin.y + layout.location.y);
+    out.location.x = round(x) - round(origin.x);
+    out.location.y = round(y) - round(origin.y);
+    out.size.width = round(x + layout.size.width) - round(x);
+    out.size.height = round(y + layout.size.height) - round(y);
+    out.scrollbar_size.width = round(layout.scrollbar_size.width);
+    out.scrollbar_size.height = round(layout.scrollbar_size.height);
+    out.border.left = round(x + layout.border.left) - round(x);
+    out.border.right =
+        round(x + layout.size.width) - round(x + layout.size.width - layout.border.right);
+    out.border.top = round(y + layout.border.top) - round(y);
+    out.border.bottom =
+        round(y + layout.size.height) - round(y + layout.size.height - layout.border.bottom);
+    out.padding.left = round(x + layout.padding.left) - round(x);
+    out.padding.right =
+        round(x + layout.size.width) - round(x + layout.size.width - layout.padding.right);
+    out.padding.top = round(y + layout.padding.top) - round(y);
+    out.padding.bottom =
+        round(y + layout.size.height) - round(y + layout.size.height - layout.padding.bottom);
+    let o = layout.scrollable_overflow_rect;
+    out.scrollable_overflow_rect.left = round(x + o.left) - round(x);
+    out.scrollable_overflow_rect.right = round(x + o.right) - round(x);
+    out.scrollable_overflow_rect.top = round(y + o.top) - round(y);
+    out.scrollable_overflow_rect.bottom = round(y + o.bottom) - round(y);
+    out
+}
+
 fn content_box(l: &taffy::Layout) -> Bounds<Points> {
     rect(
         l.padding.left + l.border.left,
@@ -5043,6 +5201,7 @@ fn text_lines<M: TextEngine>(
 fn fitted<M: TextEngine>(
     engine: &M,
     text: &AttributedText,
+    alignments: &crate::AttachmentAlignments,
     size: Size<Points>,
     min: f32,
 ) -> AttributedText {
@@ -5062,9 +5221,11 @@ fn fitted<M: TextEngine>(
             max_lines: 0,
             ..t.clone()
         };
-        let full = engine.measure(&engine.prepare(&all), Some(size.width));
+        let full = engine.measure(&engine.prepare_aligned(&all, alignments), Some(size.width));
         let limited = if t.max_lines > 0 {
-            engine.measure(&engine.prepare(t), Some(size.width)).height
+            engine
+                .measure(&engine.prepare_aligned(t, alignments), Some(size.width))
+                .height
         } else {
             Points(f32::INFINITY)
         };
@@ -5104,7 +5265,9 @@ fn measure_text<M: TextEngine>(
     let size = match cache.get(cx.layout_hash, typed) {
         Some(size) => size,
         None => {
-            let prepared = cx.prepared.get_or_insert_with(|| engine.prepare(&cx.text));
+            let prepared = cx
+                .prepared
+                .get_or_insert_with(|| engine.prepare_aligned(&cx.text, &cx.alignments));
             let size = engine.measure(prepared, typed);
             // Round up so rendering never truncates the last glyph.
             let size = size.map(Points::ceil);
@@ -5134,10 +5297,44 @@ fn apply_native(control: &mut NativeProps, prop: NativeProp) {
     use NativeProp as P;
     match (control, prop) {
         (NativeProps::WebView(p), P::Source(v)) => p.source = v,
+        // `src`, `html` and `baseUrl` make one source: `html` shows over
+        // `src`, with the base URL set before or after it.
+        (NativeProps::WebView(p), P::Src(Some(url))) => {
+            if !matches!(p.source, crate::WebSource::Html { .. }) {
+                p.source = crate::WebSource::Uri(url.clone());
+            }
+            p.src = Some(url);
+        }
+        (NativeProps::WebView(p), P::Src(None)) => {
+            p.src = None;
+            if matches!(p.source, crate::WebSource::Uri(_)) {
+                p.source = crate::WebSource::None;
+            }
+        }
+        (NativeProps::WebView(p), P::Html(Some(html))) => {
+            p.source = crate::WebSource::Html {
+                html,
+                base_url: p.base_url.clone(),
+            };
+        }
+        (NativeProps::WebView(p), P::Html(None)) => {
+            if matches!(p.source, crate::WebSource::Html { .. }) {
+                p.source = match &p.src {
+                    Some(url) => crate::WebSource::Uri(url.clone()),
+                    None => crate::WebSource::None,
+                };
+            }
+        }
+        (NativeProps::WebView(p), P::BaseUrl(url)) => {
+            if let crate::WebSource::Html { base_url, .. } = &mut p.source {
+                base_url.clone_from(&url);
+            }
+            p.base_url = url;
+        }
         (NativeProps::WebView(p), P::InjectedJavaScript(v)) => p.injected_js = v,
         (NativeProps::WebView(p), P::InjectedJavaScriptBefore(v)) => p.injected_js_before = v,
         (NativeProps::WebView(p), P::UserAgent(v)) => p.user_agent = v,
-        (NativeProps::WebView(p), P::ScrollEnabled(v)) => p.scroll_enabled = v,
+        (NativeProps::WebView(p), P::Scrollable(v)) => p.scrollable = v,
         (NativeProps::WebView(p), P::JavaScriptEnabled(v)) => p.javascript_enabled = v,
         (NativeProps::WebView(p), P::BackForwardGestures(v)) => p.back_forward_gestures = v,
         (NativeProps::Video(p), P::Source(v)) => {
@@ -5146,6 +5343,7 @@ fn apply_native(control: &mut NativeProps, prop: NativeProp) {
                 _ => None,
             }
         }
+        (NativeProps::Video(p), P::Src(v)) => p.source = v,
         (NativeProps::Video(p), P::Paused(v)) => p.paused = v,
         (NativeProps::Video(p), P::Muted(v)) => p.muted = v,
         (NativeProps::Video(p), P::Volume(v)) => p.volume = v.clamp(0.0, 1.0),

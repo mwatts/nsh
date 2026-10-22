@@ -113,6 +113,7 @@ pub(crate) struct NativeModule {
 
 /// `nsh`: the API apps write against.
 const NSH: &[Item] = &[
+    crate::env::TOKEN_EXPORT,
     (
         "signal",
         Export::Function(reactive::signal, 2),
@@ -309,6 +310,13 @@ export interface Context<T> extends Accessor<T> {
 
 /** A component: a function of its props rendering elements. */
 export type Component<P = {}> = (props: P) => JSX.Element;
+
+/**
+ * The design tokens of the app's theme by name, and what `token()` gives
+ * for each: a color or a font family as a string, a number. nsh declares
+ * the app's (`.nsh/types/nsh/tokens.d.ts`, from `nsh.json` `"theme"`).
+ */
+export interface Tokens {}
 "#;
 
 /// The modules that exported primitives before `nsh` did: `nsh` serves
@@ -348,7 +356,7 @@ pub(crate) const MODULES: &[NativeModule] = &[
         exports: env::ACCESSIBILITY_EXPORTS,
         also: &[],
         moved_to: None,
-        types: decl!(env::ACCESSIBILITY_TYPES),
+        types: "",
     },
     NativeModule {
         name: "nsh/android",
@@ -446,7 +454,7 @@ const IMAGE_EXPORTS: &[Item] = &[(
         image
     }),
     Ts::value(
-        "An image (a URL or `import logo from \"./logo.png\"`), decoded and cached\nnatively; `Image.getSize(uri)` and `Image.prefetch(uri)` ask about one\nwithout showing it.",
+        "An image (a URL or `import logo from \"./logo.png\"`), decoded and cached\nnatively; `Image.getSize(src)` and `Image.prefetch(src)` ask about one\nwithout showing it.",
         "((props: ImageProps) => YNode) & ImageModule",
     ),
 )];
@@ -715,7 +723,7 @@ impl ModuleTable {
             registry_exports(registry, &mut out);
         }
         // nsh's own export wins over a registry's of the same name (it
-        // builds on it: `AccessibilityInfo`).
+        // builds on it: `BackHandler`).
         let mut seen = std::collections::HashSet::new();
         out.retain(|(name, _)| seen.insert(name.clone()));
         found.then_some(out)

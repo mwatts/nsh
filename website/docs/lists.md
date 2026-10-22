@@ -151,7 +151,7 @@ In both, measurements stay with their rows, and when rows are inserted above the
 
 ## Props
 
-A list takes every scrolling prop of the scroll view that makes sense for a list (`pagingEnabled`, `snapToInterval`, `snapToOffsets`, `snapToAlignment`, `decelerationRate`, `disableIntervalMomentum`, `bounces`, `scrollEnabled`, `contentInset`, `contentOffset`, `keyboardShouldPersistTaps`, `keyboardDismissMode`, `scrollEventThrottle`, `onScroll`, `onScrollBeginDrag`, `onScrollEndDrag`, `onMomentumScrollBegin`, `onMomentumScrollEnd`, `onScrollEnd`, `scrollValue`; in Rust the same methods as a scroll view's), described in [Scrolling](./scrolling.md). Lists keep a scale of 1. Its own props:
+A list takes every scrolling prop of the scroll view that makes sense for a list (`pagingEnabled`, `snapToInterval`, `snapToOffsets`, `snapToAlignment`, `decelerationRate`, `disableIntervalMomentum`, `bounces`, `scrollable`, `contentInset`, `contentOffset`, `keyboardShouldPersistTaps`, `keyboardDismissMode`, `scrollEventThrottle`, `onScroll`, `onScrollDragStart`, `onScrollDragEnd`, `onMomentumStart`, `onMomentumEnd`, `onScrollEnd`, `scrollValue`; in Rust the same methods as a scroll view's), described in [Scrolling](./scrolling.md). Lists keep a scale of 1. Its own props:
 
 | Prop | Rust | Type | Default | Description |
 |---|---|---|---|---|
@@ -163,6 +163,7 @@ A list takes every scrolling prop of the scroll view that makes sense for a list
 | `inverted` | `.inverted()` | `boolean` | `false` | Item 0 at the bottom (chat); starts at the end and keeps its distance from the end. |
 | `maintainVisibleContentPosition` | `.follow_end(px(..))` | `{ autoscrollToBottomThreshold?: number }` | | A list that is not inverted stays at the end while it is within that many points of it, as content grows (see below). |
 | `stickyHeaderIndices` | `.sticky_header_indices(..)` | `number[]` | | Items that stick to the top while scrolled past (one column, not inverted). |
+| `stickyHeaderOffset` | `.sticky_header_offset(px(..))` | `number` | `0` | How far below the top the sticky items stick, as CSS `position: sticky`'s `top`; the content scrolls on under the space above them. |
 | `contentStyle` | `.content_padding(..)`, `.content_padding_x(..)`, ..., `.row_gap(..)`, `.column_gap(..)` | `{ padding*, gap, rowGap, columnGap }` | | Padding and gaps of the content, numbers only. |
 | `contentClass` | | `string` | | The same as classes (`p-*`, `gap-*`); `contentStyle` wins over them. |
 | `header` | `.header(..)` | component or element | | Before the items. |
@@ -170,13 +171,13 @@ A list takes every scrolling prop of the scroll view that makes sense for a list
 | `empty` | `.empty(..)` | component or element | | Shown instead of the items while there are none. |
 | `separator` | `.separator(\|\| ..)` | component or element | | Between items (one column). |
 | `initialScrollIndex` | `.initial_scroll_index(i)` | `number` | | Scrolls to this item before the first frame. |
-| `onEndReached` | `.on_end_reached(..)` | `() => void` | | The end is near (see below). |
-| `onEndReachedThreshold` | `.end_reached_threshold(..)` | `number` | `1` | How close to the end, in viewports, `onEndReached` fires. |
-| `onViewableItemsChanged` | `.on_viewable_items_changed(..)` | `(info) => void` | | Items became or stopped being viewable. |
+| `onLoadMore` | `.on_load_more(..)` | `() => void` | | The end is near (see below). |
+| `loadMoreThreshold` | `.load_more_threshold(..)` | `number` | `1` | How close to the end, in viewports, `onLoadMore` fires. |
+| `onViewableItemsChange` | `.on_viewable_items_change(..)` | `(info) => void` | | Items became or stopped being viewable. |
 | `viewabilityConfig` | `.viewability(..)`, `.minimum_view_time(..)` | `ViewabilityConfig` | | When items count as viewable. |
 | `keyExtractor` | `.keys(..)` | `(item, index) => string` | | The key in viewability tokens; in Rust, the rows' identities. |
 | `refreshing` / `onRefresh` | `.refreshing(..)` / `.on_refresh(..)` | `boolean` / `() => void` | | Pull to refresh. |
-| `showsIndicator` | `.shows_indicator(..)` | `boolean` | `true` | The scroll indicator shows. On the desktop and in desktop browsers a horizontal view keeps it: it is the mouse's scroll bar. |
+| `scrollbar` | `.scrollbar(..)` | `boolean` | `true` | The scroll indicator shows. On the desktop and in desktop browsers a horizontal view keeps it: it is the mouse's scroll bar. |
 | `ref` | `.element_ref(&list)` | `YNode` | | `scrollToIndex`, `scrollToOffset`, `scrollToEnd`, `scrollTo`. |
 
 The header, footer and empty slots take an element (in TSX also a component: `header={Header}`). They are cells of their own, never recycled, and they are reactive like any other element.
@@ -274,9 +275,11 @@ for (const [letter, names] of groups) {
 
 Because a cell may show a header now and a name later, the row decides what to render with [`when` / `<If>`](../elements/control-flow.md), which switches when the row changes. Sticky headers need one column and a list that is not inverted.
 
+`stickyHeaderOffset` (`.sticky_header_offset(..)` in Rust) makes the headers stick that many points below the top instead, as CSS `position: sticky`'s `top` does: under a translucent bar 56 points tall, `stickyHeaderOffset={56}` (`.sticky_header_offset(px(56.0))`) keeps each header below the bar while the rows scroll on under it, and the next header pushes it out from there. A negative offset leaves part of a header out of view.
+
 ## Chat: inverted lists
 
-`inverted` lays the list out from the end: item 0 is at the bottom, the list starts scrolled to the end, and it keeps its distance from the end as items change. Keep the newest message first; prepend to add one, append to load older ones with `onEndReached` (the "end" of an inverted list is the top).
+`inverted` lays the list out from the end: item 0 is at the bottom, the list starts scrolled to the end, and it keeps its distance from the end as items change. Keep the newest message first; prepend to add one, append to load older ones with `onLoadMore` (the "end" of an inverted list is the top).
 
 ```rust tabs
 use nsh_base::keyboard_avoiding_view;
@@ -341,8 +344,8 @@ pub fn chat() -> impl IntoElement {
     .content_padding(px(12.0))
     .row_gap(px(6.0))
     .keyboard_dismiss_mode(KeyboardDismissMode::Interactive)
-    .on_end_reached(load_older)
-    .end_reached_threshold(0.5)
+    .on_load_more(load_older)
+    .load_more_threshold(0.5)
     .flex_1();
     keyboard_avoiding_view()
         .flex_1()
@@ -395,8 +398,8 @@ function Chat() {
         style={{ flex: 1 }}
         contentStyle={{ padding: 12, gap: 6 }}
         keyboardDismissMode="interactive"
-        onEndReached={loadOlder}
-        onEndReachedThreshold={0.5}
+        onLoadMore={loadOlder}
+        loadMoreThreshold={0.5}
       >
         {(m) => (
           <View
@@ -469,7 +472,7 @@ virtual_list(count, move |at| {
 .estimated_item_size(px(232.0))
 .snap_interval(px(232.0))
 .deceleration(0.99)
-.shows_indicator(false)
+.scrollbar(false)
 .content_padding_x(px(16.0))
 .column_gap(px(12.0))
 .h(px(140.0))
@@ -482,7 +485,7 @@ virtual_list(count, move |at| {
   estimatedItemSize={232}
   snapToInterval={232}
   decelerationRate="fast"
-  showsIndicator={false}
+  scrollbar={false}
   style={{ height: 140 }}
   contentStyle={{ paddingHorizontal: 16, gap: 12 }}
 >
@@ -492,9 +495,9 @@ virtual_list(count, move |at| {
 
 Right to left, horizontal lists start at the right and run leftwards.
 
-## Loading more: onEndReached
+## Loading more: onLoadMore
 
-`onEndReached` (`.on_end_reached(..)`) fires when the viewport comes within `onEndReachedThreshold` viewports of the end (1 by default: one screen ahead). Append the next page; the list fires again when the new end comes near.
+`onLoadMore` (`.on_load_more(..)`) fires when the viewport comes within `loadMoreThreshold` viewports of the end (1 by default: one screen ahead). Append the next page; the list fires again when the new end comes near.
 
 ```rust tabs
 let posts = signal(Vec::<Post>::new());
@@ -521,8 +524,8 @@ load_more();
 
 virtual_list(move || posts.with(Vec::len), move |at| post_row(posts, at))
     .estimated_item_size(px(72.0))
-    .on_end_reached(load_more)
-    .end_reached_threshold(0.5)
+    .on_load_more(load_more)
+    .load_more_threshold(0.5)
     .footer(text("Loading…").p_4().text_center().text_color(rgb(0x8c959f)))
     .flex_1()
 ```
@@ -548,8 +551,8 @@ loadMore();
   each={posts()}
   estimatedItemSize={72}
   style={{ flex: 1 }}
-  onEndReached={loadMore}
-  onEndReachedThreshold={0.5}
+  onLoadMore={loadMore}
+  loadMoreThreshold={0.5}
   footer={<Text style={{ padding: 16, textAlign: "center", color: "#8c959f" }}>Loading…</Text>}
 >
   {(post) => <PostRow post={post()} />}
@@ -560,7 +563,7 @@ Guard against overlapping loads as above: the end may be reported again while a 
 
 ## Viewability
 
-`onViewableItemsChanged` (`.on_viewable_items_changed(..)`) reports which items are on screen, for analytics, autoplaying the visible video, or marking messages read. In TSX it gets `{ viewableItems, changed }`, arrays of tokens `{ item, key, index, isViewable }`; in Rust, `ViewableItems` with the first and last viewable row (`viewable`) and the rows whose state changed (`changed()`). Viewability is computed natively; your code only hears about changes.
+`onViewableItemsChange` (`.on_viewable_items_change(..)`) reports which items are on screen, for analytics, autoplaying the visible video, or marking messages read. In TSX it gets `{ viewableItems, changed }`, arrays of tokens `{ item, key, index, isViewable }`; in Rust, `ViewableItems` with the first and last viewable row (`viewable`) and the rows whose state changed (`changed()`). Viewability is computed natively; your code only hears about changes.
 
 | `viewabilityConfig` | Rust | Description |
 |---|---|---|
@@ -580,7 +583,7 @@ virtual_list(count, move |at| video_card(videos.clone(), at))
         ..Viewability::default()
     })
     .minimum_view_time(Duration::from_millis(250))
-    .on_viewable_items_changed(move |rows: &ViewableItems| {
+    .on_viewable_items_change(move |rows: &ViewableItems| {
         playing.set(rows.viewable.map(|(first, _)| first))
     })
     .flex_1()
@@ -593,7 +596,7 @@ virtual_list(count, move |at| video_card(videos.clone(), at))
   style={{ flex: 1 }}
   keyExtractor={(v) => v.slug}
   viewabilityConfig={{ itemVisiblePercentThreshold: 60, minimumViewTime: 250 }}
-  onViewableItemsChanged={({ viewableItems }) => playing.set(viewableItems[0]?.key ?? null)}
+  onViewableItemsChange={({ viewableItems }) => playing.set(viewableItems[0]?.key ?? null)}
 >
   {(v) => <VideoCard video={v()} />}
 </List>

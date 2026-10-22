@@ -408,10 +408,9 @@ impl ClipboardAnswer {
         // can hold (the web's player encodes its own).
         answer.image = uri
             .filter(|u| u.starts_with("data:") && crate::platform::clipboard::uri_within_limit(u))
-            .map(|uri| crate::ui::ClipboardImage {
-                uri,
-                width: pixels(width),
-                height: pixels(height),
+            .map(|url| crate::ui::ClipboardImage {
+                url,
+                size: crate::geometry::Size::new(pixels(width), pixels(height)),
             });
         answer
     }
@@ -469,7 +468,7 @@ pub(super) struct Components {
     /// Image sizes asked for (`Image.getSize`), by request id: their answers.
     image_infos: FxHashMap<u32, AnswerSlot<Result<ImageSize, String>>>,
     next_image_info: u32,
-    /// Clipboard reads (`Clipboard.getString` / `hasString`), by request
+    /// Clipboard reads (`Clipboard.readText` / `hasText`), by request
     /// id: their answers.
     clipboard_reads: FxHashMap<u32, ClipboardRead>,
     next_clipboard_read: u32,
@@ -699,6 +698,12 @@ impl<M: TextEngine> Core<M> {
         self.tokens_changed();
     }
 
+    /// The design tokens the app is drawn with now: the app's, under the
+    /// embedding app's. A new value (not the same `Arc`) when they change.
+    pub fn tokens(&self) -> &Arc<Tokens> {
+        &self.components.tokens
+    }
+
     /// The tokens drawn with now: a signal of the surface, so only the
     /// bindings that read them run again, and only when they changed.
     fn tokens_changed(&mut self) {
@@ -718,6 +723,12 @@ impl<M: TextEngine> Core<M> {
                 .runtime
                 .set_tokens(self.components.tokens.clone());
         }
+        let font = self
+            .components
+            .tokens
+            .font(crate::ui::FONT_SANS)
+            .map(|f| crate::style::FontFamily::new(f));
+        self.set_default_font(font);
         self.class_tokens_changed();
     }
 
@@ -1693,7 +1704,9 @@ impl<M: TextEngine> Core<M> {
                 break;
             }
             key = Some(parent);
-            let id = self.nodes[parent as usize].id;
+            // A component may return another component as its root. The
+            // innermost one owns the content's placement context.
+            let id = self.base_of(self.nodes[parent as usize].id);
             // What JS made is under a component through its JS children:
             // under where it places them.
             let owner = self
@@ -4022,7 +4035,7 @@ impl<M: TextEngine> Core<M> {
         let payload = virtual_list::viewable_payload(state.latest, state.reported);
         state.reported = state.latest;
         let owner = state.owner;
-        self.handle(owner, list, EventKind::ViewableItemsChanged, &payload);
+        self.handle(owner, list, EventKind::ViewableItemsChange, &payload);
     }
 
     fn release_id(&mut self, id: NodeId) {
@@ -4209,8 +4222,7 @@ impl<M: TextEngine> Core<M> {
             return self.handle(base, base, kind, payload);
         }
         // A component's own list reports its viewable rows as they settle.
-        if kind == EventKind::ViewableItemsChanged
-            && self.components.virtual_lists.contains_key(&id)
+        if kind == EventKind::ViewableItemsChange && self.components.virtual_lists.contains_key(&id)
         {
             self.viewable_changed(id, payload);
             return true;
@@ -4404,7 +4416,6 @@ impl<M: TextEngine> Core<M> {
             Action::ReportViewable(list) => self.report_viewable(list),
             Action::Hint(overlay) => self.hint_due(overlay),
             Action::Frame(answer) => self.wait_frame(answer),
-            Action::Direction(change) => self.change_direction(change),
             Action::Appearance(appearance) => self.set_appearance(appearance),
             Action::Measure(id, answer) => self.components.measures.push((id, answer)),
             Action::TextIndex(id, at, answer) => {
@@ -4556,7 +4567,7 @@ impl<M: TextEngine> Core<M> {
             }
             Some(ClipboardRead::Image(slot)) => slot
                 .borrow_mut()
-                .deliver(image.filter(|i| !i.uri.is_empty())),
+                .deliver(image.filter(|i| !i.url.is_empty())),
             Some(ClipboardRead::Files(slot)) => slot.borrow_mut().deliver(files),
             None => {}
         }

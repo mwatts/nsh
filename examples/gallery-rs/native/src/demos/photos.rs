@@ -156,7 +156,7 @@ fn tile(photo: Memo<Option<Photo>>) -> impl IntoElement {
                 .rounded(px(radius::CARD))
                 .border_curve(BorderCurve::Continuous)
                 .cursor_pointer()
-                // The card's fill: Tailwind's `paper-card` / `graphite-card`.
+                // The card's fill: the gallery theme's `card` (TS `hover:bg-card`).
                 .hover(|s| s.bg(colors::SURFACE))
                 .child(
                     image(field(|p| {
@@ -421,7 +421,7 @@ pub(crate) fn Photos() -> impl IntoElement {
                 .scroll_value(&scroll_y)
                 .refreshing(refreshing)
                 .on_refresh(on_refresh)
-                .on_end_reached(load_more)
+                .on_load_more(load_more)
                 .header(header(false))
                 .footer(footer())
         }
@@ -441,7 +441,7 @@ pub(crate) fn Photos() -> impl IntoElement {
             .scroll_value(&scroll_y)
             .refreshing(refreshing)
             .on_refresh(on_refresh)
-            .on_end_reached(load_more)
+            .on_load_more(load_more)
             .header(header(true))
             .footer(footer())
     };

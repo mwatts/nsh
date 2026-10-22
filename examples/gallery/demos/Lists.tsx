@@ -1,9 +1,9 @@
 import { computed, Input, List, Scroll, signal, Text, View, type YNode } from "nsh";
 import { LayoutAnimation } from "nsh/animated";
-import { Platform } from "nsh/device";
-import { keyboardFrame, KeyboardAvoidingView, safeAreaInsets } from "nsh/base";
+import { platform } from "nsh/device";
+import { keyboardFrame, KeyboardAvoidingView, safeAreaInsets, Tab, Tabs } from "nsh/base";
 import { Icon, type IconName } from "../icons";
-import { Appear, Badge, bindRefresh, Button, colors, columnsFor, desktop, finish, hint, IconTile, Meter, mono, Press, radius, RoundButton, Section, Segmented, type Tone, toneColor, toneTint } from "../ui";
+import { Appear, Badge, bindRefresh, Button, colors, columnsFor, desktop, finish, hint, IconTile, Meter, mono, Press, radius, RoundButton, Section, Segmented, tabPress, type Tone, toneColor, toneTint } from "../ui";
 
 const tones: Tone[] = ["accent", "info", "warn", "up", "danger", "neutral"];
 
@@ -49,7 +49,7 @@ function Grid() {
       style={{ flex: 1 }}
       contentStyle={wide ? { padding: 24, gap: 12 } : { padding: 16, gap: 8 }}
       viewabilityConfig={{ itemVisiblePercentThreshold: 50 }}
-      onViewableItemsChanged={({ viewableItems }) => {
+      onViewableItemsChange={({ viewableItems }) => {
         first.set(viewableItems.length ? viewableItems[0].index : -1);
         last.set(viewableItems.length ? viewableItems[viewableItems.length - 1].index : -1);
       }}
@@ -273,8 +273,8 @@ function Chat() {
         style={{ flex: 1 }}
         contentStyle={{ paddingHorizontal: 16, paddingVertical: 12, gap: 6 }}
         keyboardDismissMode="interactive"
-        onEndReached={loadOlder}
-        onEndReachedThreshold={0.5}
+        onLoadMore={loadOlder}
+        loadMoreThreshold={0.5}
       >
         {(m) => (
           <View style={{ alignSelf: m().mine ? "flex-end" : "flex-start", maxWidth: "78%", gap: 3, alignItems: m().mine ? "flex-end" : "flex-start" }}>
@@ -376,18 +376,18 @@ function More() {
             </View>
           </View>
           {/* The mouse does not pull scroll views down: desktops refresh here. */}
-          <If when={Platform.isDesktop}>
+          <If when={platform.idiom === "desktop"}>
             <Button label="Refresh" variant="secondary" disabled={refreshing()} onPress={refresh} />
           </If>
         </Section>
 
         <Section title="Horizontal scroll view" note={range()}>
           <View style={{ marginHorizontal: -14 }}>
-            <Scroll horizontal showsIndicator={false}>
-              <View style={{ flexDirection: "row", gap: 8, paddingHorizontal: 14 }}>
+            <Scroll horizontal scrollbar={false}>
+              <Tabs style={{ flexDirection: "row", gap: 8, paddingHorizontal: 14 }}>
                 <Each of={ranges}>
                   {(label) => (
-                    <Press onPress={() => range.set(label())} hitSlop={4} role="tab" accessibilityState={{ selected: range() === label() }}>
+                    <Tab selected={range() === label()} onPress={() => range.set(label())} style={tabPress.style} activeStyle={tabPress.activeStyle}>
                       <View
                         style={{
                           height: 36,
@@ -402,17 +402,17 @@ function More() {
                       >
                         <Text style={{ fontSize: 13, fontWeight: "600", color: range() === label() ? colors.onLight : colors.muted }}>{label()}</Text>
                       </View>
-                    </Press>
+                    </Tab>
                   )}
                 </Each>
-              </View>
+              </Tabs>
             </Scroll>
           </View>
         </Section>
 
         <Section title="Horizontal list" note="1,000 recycled cards">
           <View style={{ marginHorizontal: -14 }}>
-            <List each={cards} horizontal estimatedItemSize={130} showsIndicator={false} style={{ height: 124 }} contentStyle={{ paddingHorizontal: 14, gap: 10 }}>
+            <List each={cards} horizontal estimatedItemSize={130} scrollbar={false} style={{ height: 124 }} contentStyle={{ paddingHorizontal: 14, gap: 10 }}>
               {(i) => {
                 const tone = () => tones[i() % (tones.length - 1)];
                 const load = () => ((i() * 37) % 100) / 100;
@@ -487,7 +487,7 @@ function More() {
   );
 }
 
-type Tab = "grid" | "sections" | "chat" | "more";
+type ListTab = "grid" | "sections" | "chat" | "more";
 
 const tabs = [
   { value: "grid", label: "Grid" },
@@ -497,7 +497,7 @@ const tabs = [
 ] as const;
 
 export function Lists() {
-  const tab = signal<Tab>("grid");
+  const tab = signal<ListTab>("grid");
   return (
     <View style={{ flex: 1, backgroundColor: colors.background }}>
       <View style={desktop() ? { paddingHorizontal: 24, paddingTop: 16, paddingBottom: 4, width: "100%", maxWidth: 600 } : { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 8 }}>

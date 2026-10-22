@@ -333,7 +333,7 @@ define_class!(
 
         #[unsafe(method(scrollViewDidEndDecelerating:))]
         fn scroll_view_did_end_decelerating(&self, scroll: &UIScrollView) {
-            self.scroll_event(scroll, EventKind::MomentumScrollEnd);
+            self.scroll_event(scroll, EventKind::MomentumEnd);
             self.scroll_event(scroll, EventKind::ScrollEnd);
         }
 
@@ -343,9 +343,9 @@ define_class!(
             self.with_mounter(|m| m.cancel_touches());
             // Caught while gliding: the glide ended.
             if scroll.isDecelerating() {
-                self.scroll_event(scroll, EventKind::MomentumScrollEnd);
+                self.scroll_event(scroll, EventKind::MomentumEnd);
             }
-            self.scroll_event(scroll, EventKind::ScrollBeginDrag);
+            self.scroll_event(scroll, EventKind::ScrollDragStart);
         }
 
         /// Snaps a fling to `snapToInterval` / `snapToOffsets` / pages.
@@ -374,9 +374,9 @@ define_class!(
         fn scroll_view_did_end_dragging(&self, scroll: &UIScrollView, decelerate: bool) {
             let (id, offset) = (scroll.tag() as NodeId, scroll.contentOffset());
             self.with_mounter(move |m| m.drag_ended(id, offset));
-            self.scroll_event(scroll, EventKind::ScrollEndDrag);
+            self.scroll_event(scroll, EventKind::ScrollDragEnd);
             if decelerate {
-                self.scroll_event(scroll, EventKind::MomentumScrollBegin);
+                self.scroll_event(scroll, EventKind::MomentumStart);
             } else {
                 self.scroll_event(scroll, EventKind::ScrollEnd);
             }

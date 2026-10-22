@@ -161,7 +161,7 @@ events! {
     PanStart = "onPanStart": "A drag started (payload: [`EventPayload::Pan`]).",
     PanEnd = "onPanEnd": "A drag ended (payload: [`EventPayload::Pan`] with velocity).",
     Refresh = "onRefresh": "Pull-to-refresh was triggered on a scroll or list.",
-    EndReached = "onEndReached": "A list was scrolled close to its end.",
+    LoadMore = "onLoadMore": "A list was scrolled close to its end.",
     ScrollEnd = "onScrollEnd": "Scrolling came to rest (payload: [`EventPayload::Scroll`]).",
     Load = "onLoad": "An image loaded (payload: [`EventPayload::Image`]).",
     Error = "onError": "An image failed to load (payload: [`EventPayload::Error`]).",
@@ -187,13 +187,13 @@ events! {
     Progress = "onProgress": "Video playback progressed (payload: `currentTime`, `duration`).",
     End = "onEnd": "A video played to its end.",
     Buffer = "onBuffer": "A video started or stopped buffering (payload: `isBuffering`).",
-    ViewableItemsChanged = "onViewableItemsChanged": "The range of visible list items changed (payload: `first`, `last`).",
+    ViewableItemsChange = "onViewableItemsChange": "The range of visible list items changed (payload: `first`, `last`).",
     BackPress = "onBackPress" as "": "The Android back button was pressed and nothing native handled it (root only).",
     Scroll = "onScroll": "A scroll view moved, at most once per frame (payload: `x`, `y`, `contentWidth`, `contentHeight`, `width`, `height`).",
-    ScrollBeginDrag = "onScrollBeginDrag": "The user started dragging a scroll view (payload: [`EventPayload::Scroll`]).",
-    ScrollEndDrag = "onScrollEndDrag": "The user let go of a scroll view (payload: [`EventPayload::Scroll`]).",
-    MomentumScrollBegin = "onMomentumScrollBegin": "A scroll view started gliding after a fling (payload: [`EventPayload::Scroll`]).",
-    MomentumScrollEnd = "onMomentumScrollEnd": "A scroll view stopped gliding (payload: [`EventPayload::Scroll`]).",
+    ScrollDragStart = "onScrollDragStart": "The user started dragging a scroll view (payload: [`EventPayload::Scroll`]).",
+    ScrollDragEnd = "onScrollDragEnd": "The user let go of a scroll view (payload: [`EventPayload::Scroll`]).",
+    MomentumStart = "onMomentumStart": "A scroll view started gliding after a fling (payload: [`EventPayload::Scroll`]).",
+    MomentumEnd = "onMomentumEnd": "A scroll view stopped gliding (payload: [`EventPayload::Scroll`]).",
     Dialog = "onDialog": "An alert or action sheet closed (root only; payload: `id`, `index`, -1 when dismissed).",
     Touch = "onTouch": "Touches on the view or inside it, for the JS touch and responder handlers (payload: [`EventPayload::Touch`]).",
     SelectionChange = "onSelectionChange": "The selection (or caret) of an input moved (payload: `start`, `end` in UTF-16 units, as [`EventPayload::Selection`] where the backend also knows where the caret is, else a map).",
@@ -361,10 +361,10 @@ pub struct TouchPoint {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct HoverEvent {
     /// Position in the view, its transforms undone.
-    pub location: Point<Points>,
+    pub position: Point<Points>,
     /// Position in the root view the view is in (the surface, or its
     /// modal), as touches' `page`.
-    pub page: Point<Points>,
+    pub page_position: Point<Points>,
     /// The modifier keys held.
     pub modifiers: crate::keymap::Modifiers,
 }
@@ -451,10 +451,10 @@ impl SelectionEvent {
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ContextMenuEvent {
     /// Position in the view, its transforms undone.
-    pub location: Point<Points>,
+    pub position: Point<Points>,
     /// Position in the root view the view is in (the surface, or its
     /// modal): where `Menu.popup` opens a menu.
-    pub page: Point<Points>,
+    pub page_position: Point<Points>,
     /// The modifier keys held.
     pub modifiers: crate::keymap::Modifiers,
 }
@@ -527,6 +527,12 @@ pub enum PayloadValue {
     Str(String),
     /// `null`.
     Null,
+    /// A position (`{ x, y }`).
+    Point(Point<Points>),
+    /// An extent (`{ width, height }`).
+    Size(Size<Points>),
+    /// A position and an extent (`{ origin, size }`).
+    Bounds(Bounds<Points>),
 }
 
 /// Data delivered with an event.
@@ -873,9 +879,9 @@ pub enum KeyboardTaps {
 /// How an `<image>` is shown, besides its source.
 #[derive(Debug, Clone, PartialEq, HostProps)]
 pub enum ImageProp {
-    /// `defaultSource`: shown until `src` has loaded (best a local asset).
-    #[prop(js = "defaultSource", on = IMAGE)]
-    DefaultSource(Option<ImageSource>),
+    /// `placeholder`: shown until `src` has loaded (best a local asset).
+    #[prop(js = "placeholder", on = IMAGE, shared)]
+    Placeholder(Option<ImageSource>),
     /// `blurRadius`: blurs the image by this radius in points (decoded once, off
     /// the main thread).
     #[prop(js = "blurRadius", on = IMAGE)]
@@ -915,7 +921,7 @@ pub enum ScrollProp {
     #[prop(js = "contentInset", on = SCROLLING)]
     ContentInset(EdgeInsets),
     /// `contentOffset`: where it starts.
-    #[prop(js = "contentOffset", with = crate::js::host_values::content_offset, once, ts = "{ x?: number; y?: number }", on = SCROLLING)]
+    #[prop(js = "contentOffset", with = crate::js::host_values::content_offset, once, ts = "Partial<Point>", on = SCROLLING)]
     ContentOffset(Point<Points>),
     /// `keyboardShouldPersistTaps`: whether a tap dismisses the keyboard: `"never"`
     /// (default: the tap only dismisses it), `"always"` (never dismisses),
@@ -944,8 +950,8 @@ pub enum ScrollProp {
     /// true).
     #[prop(js = "bouncesZoom", default = true, on = SCROLL)]
     BouncesZoom(bool),
-    /// `pinchGestureEnabled`: the user can pinch to zoom (default true).
-    #[prop(js = "pinchGestureEnabled", default = true, on = SCROLL)]
+    /// `zoomable`: the user can pinch to zoom (default true).
+    #[prop(js = "zoomable", default = true, on = SCROLL)]
     Pinch(bool),
     /// `centerContent`: content smaller than the viewport (zoomed out) is centered.
     #[prop(js = "centerContent", on = SCROLL)]
@@ -1015,17 +1021,17 @@ pub enum ScreenAnimation {
     None,
 }
 
-/// A screen option (`<NavPage title headerShown ...>`).
+/// A screen option (`<NavPage title headerVisible ...>`).
 #[derive(Debug, Clone, PartialEq, HostProps)]
 pub enum ScreenProp {
     /// `title`: the header's title (iOS and Android: the system header;
     /// ignored on the desktops and the web, which show the app's `header`).
     #[prop(js = "title", on = SCREEN)]
     Title(Option<Arc<str>>),
-    /// `headerShown`: the system header shows (default true; iOS and
+    /// `headerVisible`: the system header shows (default true; iOS and
     /// Android).
-    #[prop(js = "headerShown", default = true, on = SCREEN)]
-    HeaderShown(bool),
+    #[prop(js = "headerVisible", default = true, on = SCREEN)]
+    HeaderVisible(bool),
     /// `headerLargeTitle` (iOS: the system header; ignored elsewhere): a
     /// large title; the content scrolls under the header.
     #[prop(js = "headerLargeTitle", on = SCREEN)]
@@ -1137,7 +1143,7 @@ pub enum OverlayProp {
     /// as touches' `pageX` / `pageY`) it is placed against, following a
     /// view as it moves; without one it is laid out as a `position: fixed`
     /// box of its root view.
-    #[prop(js = "anchor", with = crate::js::host_values::overlay_anchor, reset = OverlayProp::Anchor(OverlayAnchor::None), ts = "YNode | { x: number; y: number } | null", on = OVERLAY)]
+    #[prop(js = "anchor", with = crate::js::host_values::overlay_anchor, reset = OverlayProp::Anchor(OverlayAnchor::None), ts = "YNode | Point | null", on = OVERLAY)]
     Anchor(OverlayAnchor),
     /// `placement`: the side of the anchor it goes on (default `"bottom"`);
     /// the other side when only that one has room.
@@ -1284,7 +1290,7 @@ pub enum Command {
         /// The call to answer.
         call: u32,
     },
-    /// Put `text` on the system clipboard (on the root; `Clipboard.setString`).
+    /// Put `text` on the system clipboard (on the root; `Clipboard.writeText`).
     SetClipboard(String),
     /// Read the system clipboard and report it as [`EventKind::Clipboard`]
     /// `id` (on the root): `has` and, unless `has_only`, `text`. Asking
@@ -1292,11 +1298,11 @@ pub enum Command {
     ReadClipboard {
         /// The request.
         id: u32,
-        /// Only whether it holds text (`Clipboard.hasString`).
+        /// Only whether it holds text (`Clipboard.hasText`).
         has_only: bool,
     },
     /// Put the image of a `data:` URI on the system clipboard, replacing
-    /// what it holds (on the root; `Clipboard.setImage`).
+    /// what it holds (on the root; `Clipboard.writeImage`).
     SetClipboardImage(String),
     /// Read the image on the system clipboard and report it as
     /// [`EventKind::Clipboard`] `id` (on the root): `has` and, unless
@@ -1508,7 +1514,7 @@ pub enum Prop {
     /// to its default.
     RustProp(&'static str, Option<crate::ui::AnyValue>),
     /// `src`: a URL, `asset:/path`, or an imported asset.
-    #[prop(js = "src", on = IMAGE)]
+    #[prop(js = "src", on = IMAGE, shared)]
     Source(Option<ImageSource>),
     /// `resizeMode`: how an image (or a video) fits its box.
     #[prop(js = "resizeMode", on = IMAGE | VIDEO)]
@@ -1519,10 +1525,10 @@ pub enum Prop {
     /// Scrolling behavior of a scroll view or list.
     #[prop(nested)]
     Scroll(ScrollProp),
-    /// `showsIndicator`: the scroll indicator shows (default true). On the
+    /// `scrollbar`: the scroll indicator shows (default true). On the
     /// desktop a horizontal view keeps it: it is the mouse's scroll bar.
-    #[prop(js = "showsIndicator", default = true, on = SCROLL | LIST)]
-    ShowsIndicator(bool),
+    #[prop(js = "scrollbar", default = true, on = SCROLL | LIST)]
+    Scrollbar(bool),
     /// `refreshing`: the pull-to-refresh spinner shows.
     #[prop(js = "refreshing", on = SCROLL | LIST)]
     Refreshing(bool),
@@ -1559,6 +1565,11 @@ pub enum Prop {
     /// (one column, not inverted).
     #[prop(js = "stickyHeaderIndices", with = crate::js::host_values::sticky, reset = Prop::StickyIndices(Vec::new()), on = LIST)]
     StickyIndices(Vec<u32>),
+    /// `stickyHeaderOffset`: how far from the start of the viewport sticky
+    /// items stick, as CSS `position: sticky`'s `top` (negative: partly out
+    /// of view); the content scrolls under the space before them.
+    #[prop(js = "stickyHeaderOffset", default = Points(0.0), on = LIST)]
+    StickyOffset(Points),
     /// `contentStyle`: padding and gaps of the content.
     #[prop(js = "contentStyle", on = LIST)]
     ListContent(ListContentStyle),
@@ -1568,9 +1579,9 @@ pub enum Prop {
     /// `viewabilityConfig`: when items count as viewable.
     #[prop(js = "viewabilityConfig", on = LIST)]
     Viewability(Viewability),
-    /// How close to the end `onEndReached` fires, in viewports.
-    #[prop(js = "endReachedThreshold", default = 1.0, internal)]
-    EndReachedThreshold(f32),
+    /// How close to the end `onLoadMore` fires, in viewports.
+    #[prop(js = "loadMoreThreshold", default = 1.0, internal)]
+    LoadMoreThreshold(f32),
     /// The item index a list cell now renders (set by the runtime after
     /// each bind, in the same batch as the cell's new content).
     #[prop(js = "cellIndex", internal)]
@@ -1598,7 +1609,7 @@ pub enum Prop {
     #[prop(js = "defaultValue", once, on = INPUT)]
     DefaultValue(String),
     /// `placeholder`: shown while the input is empty.
-    #[prop(js = "placeholder", on = INPUT)]
+    #[prop(js = "placeholder", on = INPUT, shared)]
     Placeholder(String),
     /// The placeholder's color (Rust components; TS sets the
     /// `placeholderColor` style key or `placeholder:text-*`).
@@ -1642,9 +1653,9 @@ pub enum Prop {
     /// `autoFocus`: focused when it appears.
     #[prop(js = "autoFocus", on = INPUT)]
     AutoFocus(bool),
-    /// `caretHidden`: no caret is drawn.
-    #[prop(js = "caretHidden", on = INPUT)]
-    CaretHidden(bool),
+    /// `caret`: the caret is drawn (default true; `false` hides it).
+    #[prop(js = "caret", default = true, on = INPUT)]
+    Caret(bool),
     /// `inputAccessoryViewID`: the `nativeID` of an `InputAccessoryView`
     /// (`nsh/ios`) shown over the keyboard while the input has focus.
     #[prop(ios = "inputAccessoryViewID", on = INPUT)]
@@ -1675,7 +1686,7 @@ pub enum Prop {
     #[prop(js = "pointerEvents")]
     PointerEvents(PointerEvents),
     /// `hitSlop`: extends the touch area beyond the bounds.
-    #[prop(js = "hitSlop", with = crate::js::host_values::hit_slop, reset = Prop::HitSlop(EdgeInsets::default()), ts = "number | { top?: number; right?: number; bottom?: number; left?: number }")]
+    #[prop(js = "hitSlop", with = crate::js::host_values::hit_slop, reset = Prop::HitSlop(EdgeInsets::default()), ts = "number | Partial<Edges>")]
     HitSlop(EdgeInsets),
     /// `panActivation`: the view's touch responder waits for a pan that the
     /// platform activates past an offset on one axis (and fails past one on
@@ -1721,8 +1732,8 @@ pub enum Prop {
     /// `Screen::header_style_with`), in place of `headerClass`;
     /// `headerStyle` wins over them. Set by components, never by JS.
     HeaderClassList(Option<Arc<crate::tailwind::ClassList>>),
-    /// The surface lays out right to left (on the root, from
-    /// `I18nManager`).
+    /// The surface lays out right to left (on the root, from the user's
+    /// language).
     #[prop(js = "layoutDirectionRtl", internal)]
     LayoutDirection(bool),
     /// The app's appearance (on the root, from `nsh.json` and
@@ -1847,7 +1858,7 @@ pub enum Prop {
 pub enum WebSource {
     /// Nothing.
     None,
-    /// A URL.
+    /// A URL (`src`).
     Uri(Arc<str>),
     /// HTML, with the URL relative links resolve against.
     Html {
@@ -1866,10 +1877,19 @@ pub enum NativeProp {
     /// say it is disabled (its accessibility state).
     #[prop(js = "disabled")]
     Disabled(bool),
-    /// `source` of a web view or video: a URL, `{ uri }`, or (web views) `{ html,
-    /// baseUrl }`.
-    #[prop(js = "source", default = WebSource::None, on = WEBVIEW | VIDEO)]
+    /// What a web view or video loads, as Rust sets it (TS sets `src`,
+    /// `html` and `baseUrl`).
     Source(WebSource),
+    /// `src` of a web view or video: the URL it loads.
+    #[prop(js = "src", on = WEBVIEW | VIDEO, shared)]
+    Src(Option<Arc<str>>),
+    /// `html` (web views): the page to show instead of loading `src`.
+    #[prop(js = "html", on = WEBVIEW)]
+    Html(Option<Arc<str>>),
+    /// `baseUrl` (web views): the URL the relative links of `html`
+    /// resolve against.
+    #[prop(js = "baseUrl", on = WEBVIEW)]
+    BaseUrl(Option<Arc<str>>),
     /// `injectedJavaScript` (web views): runs after each page loads.
     #[prop(js = "injectedJavaScript", on = WEBVIEW)]
     InjectedJavaScript(Option<Arc<str>>),
@@ -1880,9 +1900,9 @@ pub enum NativeProp {
     /// `userAgent` (web views): the browser's user agent string.
     #[prop(js = "userAgent", on = WEBVIEW)]
     UserAgent(Option<Arc<str>>),
-    /// `scrollEnabled`: the user can scroll it (default true).
-    #[prop(js = "scrollEnabled", default = true, on = WEBVIEW | SCROLLING)]
-    ScrollEnabled(bool),
+    /// `scrollable`: the user can scroll it (default true).
+    #[prop(js = "scrollable", default = true, on = WEBVIEW | SCROLLING)]
+    Scrollable(bool),
     /// `javaScriptEnabled` (web views): pages run scripts (default true).
     #[prop(js = "javaScriptEnabled", default = true, on = WEBVIEW)]
     JavaScriptEnabled(bool),

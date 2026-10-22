@@ -790,8 +790,8 @@ fn context_menu(surface: &Rc<Surface>, x: f32, y: f32, modifiers: Modifiers) {
         if listens {
             let (location_x, location_y) = local(&v, x, y);
             let event = nsh_core::ContextMenuEvent {
-                location: nsh_core::geometry::point(Points(location_x), Points(location_y)),
-                page: nsh_core::geometry::point(Points(x), Points(y)),
+                position: nsh_core::geometry::point(Points(location_x), Points(location_y)),
+                page_position: nsh_core::geometry::point(Points(x), Points(y)),
                 modifiers: modifiers.core(),
             };
             surface.event(id, EventKind::ContextMenu, EventPayload::ContextMenu(event));
@@ -951,9 +951,9 @@ pub(crate) fn key(surface: &Rc<Surface>, event: KeyEvent) -> bool {
 /// first (its key bindings, then its key listeners), so this sees only
 /// keys the component let through: the window's shortcuts (the reserved
 /// quit key among them), then the app's bindings and the menu's shortcuts
-/// as while a text field is edited (the component may be a text editor:
-/// those that leave a field the keys it uses leave them to the
-/// component). Every other key stays the component's.
+/// as while a text field is edited (one whose `when` is `auto` leaves the
+/// component the keys it types, moves or deletes with). Every other key
+/// stays the component's.
 pub(crate) fn component_key(surface: &Rc<Surface>, event: KeyEvent) -> bool {
     if !event.down {
         crate::keymap::released(surface, &event);
@@ -2111,8 +2111,8 @@ fn hover_moved(surface: &Surface, x: f32, y: f32, modifiers: Modifiers) {
         };
         let (location_x, location_y) = local(&v, x, y);
         let event = nsh_core::HoverEvent {
-            location: nsh_core::geometry::point(Points(location_x), Points(location_y)),
-            page: nsh_core::geometry::point(Points(x), Points(y)),
+            position: nsh_core::geometry::point(Points(location_x), Points(location_y)),
+            page_position: nsh_core::geometry::point(Points(x), Points(y)),
             modifiers: modifiers.core(),
         };
         surface.event(id, EventKind::HoverMove, EventPayload::Hover(event));

@@ -427,8 +427,8 @@ function Hover() {
         testID="hover-pad"
         onHoverIn={() => over.set(true)}
         onHoverOut={() => over.set(false)}
-        onHoverMove={(e) => at.set({ x: Math.round(e.locationX), y: Math.round(e.locationY) })}
-        class="hover:bg-paper-card dark:hover:bg-graphite-card"
+        onHoverMove={(e) => at.set({ x: Math.round(e.position.x), y: Math.round(e.position.y) })}
+        class="hover:bg-card"
         style={{ ...stage(), height: 100, alignItems: "center", justifyContent: "center" }}
       >
         <Text style={{ fontSize: 14, color: colors.muted }}>{over() ? `Pointer at ${at().x}, ${at().y}` : "Pointer away"}</Text>

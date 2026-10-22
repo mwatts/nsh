@@ -120,7 +120,7 @@ New views carry no style at all until you give them one, so unstyled wrappers co
 
 ## Colors
 
-In Rust, colors are typed values: `rgb(0x0099ff)`, `rgba(0x0099ffcc)`, `hsla(..)`, `white()`, `black()`, and Tailwind's palette as `nsh_core::ui::palette` (`BLUE.shade(500)`). Color methods take an `AdaptiveColor`, a light and a dark value: `AdaptiveColor::rgb(0xffffff, 0x0d1117)` switches with the system appearance natively, with no render. Colors from the app's theme (`theme().primary()` from `nsh_base`) are adaptive too ([Rust](./rust.md#theme)).
+In Rust, colors are typed values: `rgb(0x0099ff)`, `rgba(0x0099ffcc)`, `hsla(..)`, `white()`, `black()`, and Tailwind's palette as `nsh_core::ui::palette` (`BLUE.shade(500)`). Color methods take an `AdaptiveColor`, a light and a dark value: `AdaptiveColor::rgb(0xffffff, 0x0d1117)` switches with the system appearance natively, with no render. Colors from the app's theme (`theme().primary` from `nsh_base`) are adaptive too ([Rust](./rust.md#theme)).
 
 In TSX, color properties accept CSS color strings:
 
@@ -256,7 +256,7 @@ view()
 
 Color stops are placed by percentages or lengths (`px`, `pt`, `rem`; plain numbers are points) along a linear or radial gradient, and by percentages or angles (`deg`, `turn`, `rad`, `grad`) around a conic one. A stop with two positions (`#8250df 0 12px`) is a band of one color, as are two stops at the same position. Lengths are measured along the gradient line at the view's current size, so a 12px band stays 12px wide as the view resizes.
 
-`experimental_backgroundImage` is accepted too, as an alias of `backgroundImage`. Text elements do not draw gradients on iOS.
+Text elements do not draw gradients on iOS.
 
 ## Filters and blending
 

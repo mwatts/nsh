@@ -1052,9 +1052,9 @@ fn menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx: &mut TestAppContext
     });
     cx.simulate_keystrokes(&format!("{primary}-z delete {primary}-enter"));
     cx.run_until_parked();
-    let bar = if cfg!(target_os = "macos") { 0.0 } else { 28.0 };
+    let (x, y) = view.read_with(cx, |view, _| view.surface().origin.get());
     cx.simulate_click(
-        gpui::point(gpui::px(20.0), gpui::px(bar + 15.0)),
+        gpui::point(gpui::px(x + 20.0), gpui::px(y + 15.0)),
         gpui::Modifiers::default(),
     );
     wait_for(&view, cx, "bcd purge revert remove send");
@@ -1182,9 +1182,9 @@ fn the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx: &m
     cx.update(|window, _| assert!(handle.is_focused(window), "the component lost the focus"));
     // Only the shortcuts that fire while text is edited fired: both Ctrl+K
     // presses (a released key is not held), and the menu's New.
-    let bar = if cfg!(target_os = "macos") { 0.0 } else { 28.0 };
+    let (x, y) = view.read_with(cx, |view, _| view.surface().origin.get());
     cx.simulate_click(
-        gpui::point(gpui::px(20.0), gpui::px(bar + 15.0)),
+        gpui::point(gpui::px(x + 20.0), gpui::px(y + 15.0)),
         gpui::Modifiers::default(),
     );
     wait_for(&view, cx, "fired bound bound new");

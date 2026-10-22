@@ -977,7 +977,7 @@ pub(crate) fn Chat(cx: Scope<NoEvent>) -> impl IntoElement {
         move || {
             scroll()
                 .horizontal()
-                .shows_indicator(false)
+                .scrollbar(false)
                 .keyboard_taps(KeyboardTaps::Handled)
                 .flex_grow(0.0)
                 .child(
@@ -1201,9 +1201,8 @@ pub(crate) fn Chat(cx: Scope<NoEvent>) -> impl IntoElement {
         chat.play(id);
     };
     let all = scenarios();
-    // TS: `bg-paper-border dark:bg-graphite-raised` when selected,
-    // `hover:bg-paper-card active:bg-paper-border dark:hover:bg-graphite-card
-    // dark:active:bg-graphite-raised` otherwise.
+    // TS: `bg-accent` when selected, `hover:bg-card active:bg-accent`
+    // otherwise (the gallery theme's tokens).
     let fill = AdaptiveColor::new(colors::BORDER.light, colors::RAISED.dark);
     let rows = conversations.iter().map(|&(id, label)| {
         let selected = move || current.get() == Some(id);
@@ -1470,7 +1469,7 @@ impl ChatState {
         .follow_end(px(40.0))
         .event_throttle(100.0)
         .element_ref(&list)
-        .on_scroll_begin_drag(move |_: &Point<Points>| {
+        .on_scroll_drag_start(move |_: &Point<Points>| {
             dragging.replace(true);
         })
         .on_scroll(move |e: &ScrollEvent| {
@@ -1478,7 +1477,7 @@ impl ChatState {
                 following.set(e.offset.y + e.size.height >= e.content_size.height - px(40.0));
             }
         })
-        .on_momentum_scroll_end(move |_: &Point<Points>| {
+        .on_momentum_end(move |_: &Point<Points>| {
             dragging.replace(false);
         })
         .on_scroll_end(move |_: &Point<Points>| {

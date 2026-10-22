@@ -120,7 +120,7 @@ NSH 的默认值与 Web 不同：
 
 ## 颜色
 
-在 Rust 中，颜色是类型化的值：`rgb(0x0099ff)`、`rgba(0x0099ffcc)`、`hsla(..)`、`white()`、`black()`，以及 `nsh_core::ui::palette` 中的 Tailwind 调色板（`BLUE.shade(500)`）。颜色方法接受 `AdaptiveColor`，即一个浅色值和一个深色值：`AdaptiveColor::rgb(0xffffff, 0x0d1117)` 以原生方式随系统外观切换，无需重新渲染。来自应用主题的颜色（`nsh_base` 的 `theme().primary()`）同样会自适应（[Rust](./rust.md#主题)）。
+在 Rust 中，颜色是类型化的值：`rgb(0x0099ff)`、`rgba(0x0099ffcc)`、`hsla(..)`、`white()`、`black()`，以及 `nsh_core::ui::palette` 中的 Tailwind 调色板（`BLUE.shade(500)`）。颜色方法接受 `AdaptiveColor`，即一个浅色值和一个深色值：`AdaptiveColor::rgb(0xffffff, 0x0d1117)` 以原生方式随系统外观切换，无需重新渲染。来自应用主题的颜色（`nsh_base` 的 `theme().primary`）同样会自适应（[Rust](./rust.md#主题)）。
 
 在 TSX 中，颜色属性接受 CSS 颜色字符串：
 
@@ -256,7 +256,7 @@ view()
 
 线性和径向渐变的色标位置可以是百分比或长度（`px`、`pt`、`rem`；纯数字表示点），锥形渐变的色标位置可以是百分比或角度（`deg`、`turn`、`rad`、`grad`）。带两个位置的色标（`#8250df 0 12px`）是一段纯色，位置相同的两个色标也是。长度沿视图当前尺寸下的渐变线计算，因此视图尺寸变化时，12px 的色带始终是 12px 宽。
 
-也接受 `experimental_backgroundImage`，它是 `backgroundImage` 的别名。在 iOS 上，文本元素不绘制渐变。
+在 iOS 上，文本元素不绘制渐变。
 
 ## 滤镜与混合
 

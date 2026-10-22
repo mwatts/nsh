@@ -2,6 +2,7 @@ package com.longbridge.nsh;
 
 import android.annotation.SuppressLint;
 import android.content.Context;
+import android.graphics.Canvas;
 import android.graphics.Rect;
 import android.view.MotionEvent;
 import android.view.ScaleGestureDetector;
@@ -63,6 +64,14 @@ final class ScrollBox extends FrameLayout implements Node {
     /** This touch only dismisses the keyboard (`keyboardShouldPersistTaps`); -1: it does not. */
     private int tapMode = -1;
     private boolean swallowing;
+    /**
+     * Frames the platform scroll view drew. It draws again each frame while
+     * its overscroll effect (Android 12's stretch) relaxes, which moves no
+     * view: the test agent counts the frames as movement
+     * ({@link TestAgent#animating}), since a touch caught then only stops
+     * the stretch, and presses nothing.
+     */
+    int frames;
 
     /** The scrolled content, sized by the core (`ScrollContent`). */
     static final class Content extends Box {
@@ -131,9 +140,9 @@ final class ScrollBox extends FrameLayout implements Node {
                 // The scroll view takes the touches from JS responders.
                 mounter.cancelTouches();
                 // Caught while gliding: the glide ended.
-                if (momentum) emit(Native.MOMENTUM_SCROLL_END);
+                if (momentum) emit(Native.MOMENTUM_END);
                 momentum = false;
-                emit(Native.SCROLL_BEGIN_DRAG);
+                emit(Native.SCROLL_DRAG_START);
             } else if (swallowing) {
                 dragging = true;
             }
@@ -316,7 +325,7 @@ final class ScrollBox extends FrameLayout implements Node {
         return target != null ? target : velocity > 0 ? max : 0;
     }
 
-    /** The platform scroll views, with `scrollEnabled` and snapping. */
+    /** The platform scroll views, with `scrollable` and snapping. */
     private final class VScroll extends ScrollView {
         VScroll(Context context) {
             super(context);
@@ -340,6 +349,12 @@ final class ScrollBox extends FrameLayout implements Node {
         @Override
         public void fling(int velocity) {
             if (!ScrollBox.this.fling(velocity)) super.fling(velocity);
+        }
+
+        @Override
+        public void draw(Canvas canvas) {
+            super.draw(canvas);
+            frames++;
         }
     }
 
@@ -367,6 +382,12 @@ final class ScrollBox extends FrameLayout implements Node {
         public void fling(int velocity) {
             if (!ScrollBox.this.fling(velocity)) super.fling(velocity);
         }
+
+        @Override
+        public void draw(Canvas canvas) {
+            super.draw(canvas);
+            frames++;
+        }
     }
 
     /** Before the scroll view sees {@code e}: whether it ends the touch. */
@@ -384,10 +405,10 @@ final class ScrollBox extends FrameLayout implements Node {
             snap(0);
             flung = true;
         }
-        emit(Native.SCROLL_END_DRAG);
+        emit(Native.SCROLL_DRAG_END);
         if (flung) {
             momentum = true;
-            emit(Native.MOMENTUM_SCROLL_BEGIN);
+            emit(Native.MOMENTUM_START);
         }
     }
 
@@ -461,7 +482,7 @@ final class ScrollBox extends FrameLayout implements Node {
         }
         if (momentum) {
             momentum = false;
-            emit(Native.MOMENTUM_SCROLL_END);
+            emit(Native.MOMENTUM_END);
         }
         float d = mounter.density;
         mounter.event(id, Native.SCROLL_END, null, 0, scroller.getScrollX() / d, scroller.getScrollY() / d);
