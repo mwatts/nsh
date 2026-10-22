@@ -368,13 +368,11 @@ impl RootView {
     }
 
     fn with_mounter(&self, f: impl FnOnce(&mut Mounter)) {
-        let Some(running) = self.ivars().running.borrow().as_ref() else {
-            return;
-        };
-        let Some(mounter) = running.mounter.get(self.mtm()).borrow_mut().as_mut() else {
-            return;
-        };
-        f(mounter);
+        if let Some(running) = self.ivars().running.borrow().as_ref()
+            && let Some(mounter) = running.mounter.get(self.mtm()).borrow_mut().as_mut()
+        {
+            f(mounter);
+        }
     }
 
     /// Queues hardware characters while no input is focused. True when one
@@ -504,7 +502,7 @@ impl RootView {
                 nsh_engine::FileStorage::open(dir) as Arc<dyn nsh_engine::StorageBackend>
             }),
             clock: Default::default(),
-            context: Default::default(),
+            context: self.ivars().options.context.clone(),
             pinned: Default::default(),
             clipboard: None,
         };
@@ -603,6 +601,10 @@ pub struct SurfaceOptions {
     pub storage: Option<std::path::PathBuf>,
     /// The native components the apps can use (`nsh/native`).
     pub components: crate::component::Components,
+    /// What the embedding app gives the engines of the views made with
+    /// these options ([`nsh_engine::EngineConfig::context`]): its UI sets'
+    /// functions read it with `nsh_core::ui::engine_context`.
+    pub context: nsh_engine::EngineContext,
 }
 
 impl Default for SurfaceOptions {
@@ -615,6 +617,7 @@ impl Default for SurfaceOptions {
             data_dir: data_dir(),
             storage: None,
             components: crate::component::Components::default(),
+            context: nsh_engine::EngineContext::default(),
         }
     }
 }
