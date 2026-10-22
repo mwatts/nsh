@@ -916,6 +916,15 @@ pub(crate) fn wheel(surface: &Rc<Surface>, event: WheelEvent) {
 /// A key from the window; true when handled. Only key downs (and their
 /// repeats) go to the modules; ups are not acted on.
 pub(crate) fn key(surface: &Rc<Surface>, event: KeyEvent) -> bool {
+    if event.down && crate::text_input::hold_key(surface, &event) {
+        return true;
+    }
+    key_now(surface, event)
+}
+
+/// A key from the window, or one that waited behind typed text for the
+/// next field ([`crate::text_input`]); true when handled.
+pub(crate) fn key_now(surface: &Rc<Surface>, event: KeyEvent) -> bool {
     let input = &surface.input;
     if !event.down {
         crate::keymap::released(surface, &event);

@@ -114,7 +114,7 @@ fn repeats(state: &KeymapState, event: &KeyEvent) -> bool {
 }
 
 /// A modifier key (which does not end another key's auto-repeat).
-fn modifier(vk: u16) -> bool {
+pub(crate) fn modifier(vk: u16) -> bool {
     matches!(
         vk,
         keys::VK_SHIFT | keys::VK_CONTROL | keys::VK_MENU | keys::VK_LWIN

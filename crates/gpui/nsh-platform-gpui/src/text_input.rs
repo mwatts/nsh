@@ -67,6 +67,7 @@ mod layout;
 
 use std::{
     cell::{Cell, RefCell},
+    collections::VecDeque,
     ops::Range,
     rc::Rc,
     sync::Arc,
@@ -585,6 +586,12 @@ fn xalign(config: &InputConfig) -> f32 {
 
 // --- Focus -------------------------------------------------------------------
 
+/// What waits for the next field.
+enum Held {
+    Text(String),
+    Key(KeyEvent),
+}
+
 /// A surface's focused field, and whether the surface has the window's
 /// focus.
 #[derive(Default)]
@@ -592,11 +599,16 @@ struct Focus {
     view: Option<NshView>,
     inactive: bool,
     /// Text typed after an action that can move focus, before a field
-    /// takes the keyboard. The next field takes it before its own later text.
-    pending: String,
+    /// takes the keyboard, and the keys typed after that text. The next
+    /// field takes them, in order, before its own later text.
+    pending: VecDeque<Held>,
     /// [`Surface::clock`] time after which `pending` is dropped. None when
     /// nothing armed the queue.
     until: Option<f64>,
+    /// The events sent up to the action that armed the queue
+    /// ([`Surface::events_sent`]). Until the engine has handled them, the
+    /// field with the keyboard may be about to lose it.
+    after: u64,
     /// `set_focus` is on the stack. Text typed now waits for the field it
     /// settles on.
     changing: bool,
@@ -688,6 +700,11 @@ fn set_focus(surface: &Rc<Surface>, view: Option<&NshView>) {
     set_changing(surface, true);
     if old.as_ref() != view {
         move_focus(surface, view, old.as_ref());
+        // The new field's value may still be on its way from the engine,
+        // after what the old one reported: text typed now waits for it.
+        if view.is_some() {
+            arm(surface);
+        }
     } else if view.is_some() {
         // The host can own the window's focus while this field keeps the surface's.
         surface.window_focus_requested.set(true);
@@ -772,9 +789,85 @@ pub(crate) fn typed_without_handler(surface: &Rc<Surface>, text: &str) {
 /// field that takes the keyboard.
 pub(crate) fn arm(surface: &Surface) {
     let until = surface.clock() + HOLD;
+    let after = surface.events_sent();
     FOCUS.with(|f| {
-        f.borrow_mut().entry(surface.key()).or_default().until = Some(until);
+        let mut map = f.borrow_mut();
+        let focus = map.entry(surface.key()).or_default();
+        focus.until = Some(until);
+        focus.after = after;
     });
+}
+
+/// The engine has not yet handled the action that armed the queue: the
+/// field with the keyboard may be about to lose it.
+fn behind(surface: &Surface) -> bool {
+    let after = FOCUS.with(|f| f.borrow().get(&surface.key()).map_or(0, |f| f.after));
+    surface.events_handled() < after
+}
+
+/// The engine handled more events ([`Surface::events_handled`]), and what
+/// they changed is applied: what waits goes to the field that now has the
+/// keyboard.
+pub(crate) fn engine_caught_up(surface: &Rc<Surface>) {
+    if armed(surface) && !behind(surface) {
+        flush_pending(surface);
+    }
+}
+
+/// Keeps a key down for the next field when text typed before it waits
+/// there: the key comes after that text. True when kept. A key that types
+/// a character is not kept: its text comes through the input method, and
+/// waits as text.
+pub(crate) fn hold_key(surface: &Surface, event: &KeyEvent) -> bool {
+    let m = event.modifiers;
+    let edits = matches!(
+        event.vk,
+        VK_RETURN
+            | VK_BACK
+            | VK_DELETE
+            | VK_TAB
+            | VK_LEFT
+            | VK_RIGHT
+            | VK_UP
+            | VK_DOWN
+            | VK_HOME
+            | VK_END
+            | VK_PRIOR
+            | VK_NEXT
+    );
+    let chord = (m.ctrl || m.alt || m.meta) && !crate::keymap::modifier(event.vk);
+    if !(edits || chord) || !armed(surface) {
+        return false;
+    }
+    FOCUS.with(|f| {
+        let mut map = f.borrow_mut();
+        let Some(focus) = map.get_mut(&surface.key()) else {
+            return false;
+        };
+        if focus.pending.is_empty() {
+            return false;
+        }
+        focus.pending.push_back(Held::Key(*event));
+        true
+    })
+}
+
+/// The app is taking `view` out. When the field with the keyboard is in
+/// it, text typed before the next field takes the keyboard waits for that
+/// field, as after an action that can move focus.
+pub(crate) fn removing(surface: &Surface, view: &NshView) {
+    let Some(field) = FOCUS.with(|f| f.borrow().get(&surface.key()).and_then(|f| f.view.clone()))
+    else {
+        return;
+    };
+    let mut at = Some(field);
+    while let Some(node) = at {
+        if node == *view {
+            arm(surface);
+            return;
+        }
+        at = node.parent_view();
+    }
 }
 
 /// Text still waiting for a field, and the wait ends. A save that runs
@@ -789,6 +882,12 @@ pub(crate) fn take_pending(surface: &Surface) -> String {
             .map(|focus| {
                 focus.until = None;
                 std::mem::take(&mut focus.pending)
+                    .into_iter()
+                    .filter_map(|held| match held {
+                        Held::Text(text) => Some(text),
+                        Held::Key(_) => None,
+                    })
+                    .collect()
             })
             .unwrap_or_default()
     })
@@ -848,12 +947,14 @@ fn queue_if_unsettled(surface: &Surface, text: &str) -> bool {
         return false;
     }
     if wants_text(surface) {
-        let changing = FOCUS.with(|f| {
+        let (changing, waits) = FOCUS.with(|f| {
             f.borrow()
                 .get(&surface.key())
-                .is_some_and(|focus| focus.changing)
+                .map_or((false, false), |focus| {
+                    (focus.changing, !focus.pending.is_empty())
+                })
         });
-        if !changing {
+        if !changing && !waits && !behind(surface) {
             // The field has the keyboard. Later text is its own.
             disarm(surface);
             return false;
@@ -863,44 +964,63 @@ fn queue_if_unsettled(surface: &Surface, text: &str) -> bool {
         return false;
     }
     FOCUS.with(|f| {
-        f.borrow_mut()
-            .entry(surface.key())
-            .or_default()
-            .pending
-            .push_str(&plain);
+        let mut map = f.borrow_mut();
+        let pending = &mut map.entry(surface.key()).or_default().pending;
+        match pending.back_mut() {
+            Some(Held::Text(text)) => text.push_str(&plain),
+            _ => pending.push_back(Held::Text(plain)),
+        }
     });
     true
 }
 
-/// Gives the queued text to the focused field. With no field yet, and the
-/// queue still armed, it stays queued. A field taking it ends the wait.
+/// Gives what waits to the focused field, in order: text is inserted, a
+/// key goes to the field as if typed now. It stops while the engine has not
+/// handled a key that armed the queue again (Return in the editor), and
+/// with no field yet, while the queue is armed. A field taking the last of
+/// it ends the wait.
 fn flush_pending(surface: &Rc<Surface>) {
     if !armed(surface) && !wants_text(surface) {
         disarm(surface);
     }
-    let text = FOCUS.with(|f| {
-        f.borrow_mut()
-            .get_mut(&surface.key())
-            .map(|focus| std::mem::take(&mut focus.pending))
-            .unwrap_or_default()
-    });
-    if text.is_empty() {
-        return;
-    }
-    let Some((view, input)) =
-        ime::field(surface).filter(|(_, input)| input.config.borrow().editable)
-    else {
-        if armed(surface) {
-            FOCUS.with(|f| {
-                let mut map = f.borrow_mut();
-                let focus = map.entry(surface.key()).or_default();
-                focus.pending.insert_str(0, &text);
-            });
+    let mut taken = false;
+    loop {
+        if behind(surface) {
+            return;
         }
-        return;
-    };
-    insert(surface, &view, &input, &text, true);
-    disarm(surface);
+        let next = FOCUS.with(|f| {
+            f.borrow_mut()
+                .get_mut(&surface.key())
+                .and_then(|focus| focus.pending.pop_front())
+        });
+        let Some(next) = next else {
+            break;
+        };
+        match next {
+            Held::Text(text) => {
+                let Some((view, input)) =
+                    ime::field(surface).filter(|(_, input)| input.config.borrow().editable)
+                else {
+                    if armed(surface) {
+                        FOCUS.with(|f| {
+                            let mut map = f.borrow_mut();
+                            let focus = map.entry(surface.key()).or_default();
+                            focus.pending.push_front(Held::Text(text));
+                        });
+                    }
+                    return;
+                };
+                insert(surface, &view, &input, &text, true);
+            }
+            Held::Key(event) => {
+                crate::input::key_now(surface, event);
+            }
+        }
+        taken = true;
+    }
+    if taken && !behind(surface) {
+        disarm(surface);
+    }
 }
 
 /// The surface's focus in its window (the window is active and the
@@ -1467,6 +1587,8 @@ fn submit(surface: &Rc<Surface>, view: &NshView, input: &InputState, blur: bool)
     send(surface, view, EventKind::SubmitEditing, || {
         EventPayload::Text { text, count }
     });
+    // A submit may move focus (Return in an editor splits the block).
+    arm(surface);
     if blur {
         set_focus(surface, None);
     }
