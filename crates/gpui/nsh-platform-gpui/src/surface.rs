@@ -135,6 +135,10 @@ pub(crate) struct Surface {
     /// The GPUI view drawing the surface ([`crate::app::AppView`]): notified
     /// when the surface changed.
     pub(crate) entity: Cell<Option<gpui::EntityId>>,
+    /// The window that view is in. A notify reaches GPUI's tracker only
+    /// while that view was read by the last frame; the handle still lets a
+    /// flush refresh the window.
+    window: Cell<Option<gpui::AnyWindowHandle>>,
     /// The GPUI text system (fonts the engine thread shapes with, and the
     /// main thread draws with).
     pub(crate) text_system: RefCell<Option<Arc<gpui::TextSystem>>>,
@@ -232,6 +236,7 @@ impl Surface {
             pending: RefCell::new(Arc::new(AtomicBool::new(false))),
             scale: Cell::new(1.0),
             entity: Cell::new(None),
+            window: Cell::new(None),
             text_system: RefCell::new(None),
             origin: Cell::new((0.0, 0.0)),
             invalid: Cell::new(false),
@@ -466,8 +471,13 @@ impl Surface {
         self.invalidate();
     }
 
+    /// The window the view was created in.
+    pub(crate) fn set_window(&self, window: gpui::AnyWindowHandle) {
+        self.window.set(Some(window));
+    }
+
     /// Asks for the surface to be drawn again (once, however often asked
-    /// before it is): [`flush_all`] notifies its view.
+    /// before it is): [`flush_all`] notifies its view and refreshes its window.
     pub(crate) fn invalidate(&self) {
         if !self.invalid.replace(true) {
             // Entry points flush when they end; a change made anywhere else
@@ -661,9 +671,17 @@ impl Drop for Surface {
     }
 }
 
-/// Notifies the views of this thread's surfaces that changed.
+/// Notifies the views of this thread's surfaces that changed, and asks each
+/// window for a frame.
+///
+/// `notify` dirties a window only while GPUI tracked the view on the last
+/// frame. A retained ancestor does not. And on Wayland `schedule_frame` does
+/// nothing while a compositor callback is already in flight, so the callback
+/// would draw the tree from before this batch and then park. Refreshing on
+/// that callback, before it decides whether to draw, puts the batch in the
+/// frame. No key has to arrive first.
 pub(crate) fn flush_all(cx: &mut gpui::App) {
-    let ids: Vec<gpui::EntityId> = SURFACES.with(|s| {
+    let pending: Vec<(gpui::EntityId, Option<gpui::AnyWindowHandle>)> = SURFACES.with(|s| {
         s.borrow()
             .values()
             .filter_map(Weak::upgrade)
@@ -672,12 +690,24 @@ pub(crate) fn flush_all(cx: &mut gpui::App) {
                 if let Some(stats) = surface.stats.borrow_mut().as_mut() {
                     stats.notified();
                 }
-                surface.entity.get()
+                surface.entity.get().map(|id| (id, surface.window.get()))
             })
             .collect()
     });
-    for id in ids {
+    for (id, window) in pending {
         cx.notify(id);
+        let Some(window) = window else {
+            continue;
+        };
+        // The window is borrowed while it draws. The job [`Surface::invalidate`]
+        // queued runs once that draw has returned. The callback runs before
+        // the frame decides to draw, so a callback already in flight (Wayland
+        // ignores `schedule_frame` then) still rebuilds this batch.
+        let _ = window.update(cx, |_, window, _| {
+            window.on_next_frame(|window, _| {
+                window.refresh();
+            });
+        });
     }
 }
 

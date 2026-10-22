@@ -280,6 +280,7 @@ fn windows(cx: &mut TestAppContext) {
     text_typed_with_no_action_does_not_reach_a_later_field(cx);
     text_typed_after_a_shortcut_reaches_a_field_mounted_later(cx);
     text_typed_after_a_shortcut_is_dropped_once_the_second_passes(cx);
+    an_engine_batch_focuses_a_new_field_without_another_input(cx);
 }
 
 /// Runs the window until the focused field's text satisfies `done`, and
@@ -1123,6 +1124,98 @@ fn type_key(cx: &mut VisualTestContext, key: &str) {
     });
 }
 
+/// A shell, then a field. The test asks the engine to mount the field
+/// after the window has drawn, with no GPUI input event after that.
+const FIELD_MOUNTED_BY_THE_ENGINE: &str = r#"
+import { Input, View, mount, signal } from "nsh";
+import { Window } from "nsh/desktop";
+
+function App() {
+  const shown = signal(false);
+  Window.setTitle("ready");
+  return (
+    <View
+      style={{ flex: 1 }}
+      onPress={() => {
+        shown.set(true);
+        Window.setTitle("mounted");
+      }}
+    >
+      <If when={shown()}>
+        <Input autoFocus value="hi" style={{ height: 30 }} />
+      </If>
+    </View>
+  );
+}
+mount(App);
+"#;
+
+/// An engine commit that mounts an autoFocus field, with no input event
+/// after it, still draws a frame and the field takes focus.
+///
+/// The test platform draws a dirty window inside `flush_effects`, so it
+/// cannot miss the Wayland `schedule_frame` that a compositor callback
+/// already in flight ignores. This is the same batch that stall drops.
+fn an_engine_batch_focuses_a_new_field_without_another_input(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", FIELD_MOUNTED_BY_THE_ENGINE, &[]).unwrap();
+    // No `window.focus`: nothing after the engine batch is a GPUI input.
+    let (framed, cx) = cx.add_window_view(|window, cx| {
+        use gpui::AppContext as _;
+        let view = cx.new(|cx| {
+            let view = AppView::new(AppOptions::default(), window, cx);
+            view.own_window(window, cx);
+            view
+        });
+        Framed(view)
+    });
+    let view = framed.read_with(cx, |framed, _| framed.0.clone());
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    wait_until_window(cx, "the shell is up", |cx| {
+        cx.window_title().as_deref() == Some("ready")
+    });
+    view.read_with(cx, |view, _| {
+        let surface = view.surface();
+        let mut ids = Vec::new();
+        press_targets(&surface.root, &mut ids);
+        assert!(!ids.is_empty(), "the shell has no press listener");
+        for id in ids {
+            surface.event(
+                id,
+                nsh_core::EventKind::Press,
+                nsh_core::EventPayload::Press(nsh_core::PressEvent {
+                    clicks: 1,
+                    ..Default::default()
+                }),
+            );
+        }
+    });
+    let mut text = None;
+    let mut drawn = false;
+    for _ in 0..32 {
+        cx.run_until_parked();
+        text = field_text(&view, cx);
+        drawn = view.read_with(cx, |view, _| !view.surface().invalidated());
+        if text.as_deref() == Some("hi") && drawn {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(text.as_deref(), Some("hi"), "the field never took focus");
+    assert!(drawn, "the engine batch never drew a frame");
+}
+
+fn press_targets(view: &crate::view::NshView, ids: &mut Vec<nsh_core::NodeId>) {
+    let listens = view.state().events.contains(nsh_core::EventKind::Press);
+    let id = view.id();
+    let children = view.child_views();
+    if listens {
+        ids.push(id);
+    }
+    for child in children {
+        press_targets(&child, ids);
+    }
+}
+
 /// No field yet. `n` mounts and focuses one on the next turn. `abc` is
 /// typed in that same turn, with no wait between the two.
 const FIELD_ON_THE_NEXT_TURN: &str = r#"
@@ -1606,7 +1699,7 @@ fn presses_carry_where_the_pointer_was(cx: &mut TestAppContext) {
     let (view, cx) =
         cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
     view.update(cx, |view, _| {
-        view.load(App::Rust(Root::of::<press_point::PressPoint>()))
+        view.load(App::Rust(crate::Root::of::<press_point::PressPoint>()))
     });
     cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
     wait_for(&view, cx, "none");

@@ -276,6 +276,7 @@ impl AppView {
             *surface.stats.borrow_mut() = Some(Default::default());
         }
         surface.entity.set(Some(cx.entity_id()));
+        surface.set_window(window.window_handle());
         *surface.text_system.borrow_mut() = Some(cx.text_system().clone());
         surface.native.set_components(options.components.clone());
         crate::system::watch_environment(&surface, window, cx);
