@@ -1113,6 +1113,17 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
                 obj.set(*key, payload_value(cx, value)?)?;
             }
         }
+        EventPayload::Press(nsh_core::PressEvent {
+            position,
+            page_position,
+            modifiers,
+            clicks,
+        }) => {
+            obj.set("position", point_object(cx, *position)?)?;
+            obj.set("pagePosition", point_object(cx, *page_position)?)?;
+            obj.set("modifiers", modifiers_object(cx, modifiers)?)?;
+            obj.set("clickCount", *clicks)?;
+        }
         EventPayload::Hover(nsh_core::HoverEvent {
             position,
             page_position,
@@ -1126,19 +1137,6 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             obj.set("position", point_object(cx, *position)?)?;
             obj.set("pagePosition", point_object(cx, *page_position)?)?;
             obj.set("modifiers", modifiers_object(cx, modifiers)?)?;
-        }
-        EventPayload::Press(e) => {
-            obj.set("altKey", e.modifiers.alt)?;
-            obj.set("ctrlKey", e.modifiers.ctrl)?;
-            obj.set("metaKey", e.modifiers.cmd)?;
-            obj.set("shiftKey", e.modifiers.shift)?;
-            obj.set("clickCount", e.clicks)?;
-            if let Some(at) = e.position {
-                obj.set("locationX", at.location.x.0)?;
-                obj.set("locationY", at.location.y.0)?;
-                obj.set("pageX", at.page.x.0)?;
-                obj.set("pageY", at.page.y.0)?;
-            }
         }
         EventPayload::Selection(e) => {
             obj.set("start", e.start)?;
@@ -1967,6 +1965,41 @@ const report = (v) => text(String(v));
     }
 
     #[test]
+    fn press_payload_has_both_positions() {
+        let host = Host::new().unwrap();
+        let event = nsh_core::PressEvent {
+            position: point(px(3.0), px(4.5)),
+            page_position: point(px(30.0), px(40.5)),
+            modifiers: nsh_core::keymap::Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            clicks: 2,
+        };
+        host.cx.with(|cx| {
+            let value = payload_object(&cx, &EventPayload::Press(event)).unwrap();
+            let obj = value.as_object().unwrap();
+            let num = |o: &str, k: &str| {
+                let o: rquickjs::Object = obj.get(o).unwrap();
+                o.get::<_, f64>(k).unwrap()
+            };
+            assert_eq!(
+                (
+                    num("position", "x"),
+                    num("position", "y"),
+                    num("pagePosition", "x"),
+                    num("pagePosition", "y")
+                ),
+                (3.0, 4.5, 30.0, 40.5)
+            );
+            let modifiers: rquickjs::Object = obj.get("modifiers").unwrap();
+            assert!(modifiers.get::<_, bool>("control").unwrap());
+            assert!(!modifiers.get::<_, bool>("shift").unwrap());
+            assert_eq!(obj.get::<_, u32>("clickCount").unwrap(), 2);
+        });
+    }
+
+    #[test]
     fn hover_payload_has_both_positions_and_the_modifiers() {
         let host = Host::new().unwrap();
         let event = nsh_core::HoverEvent {
@@ -2000,62 +2033,6 @@ const report = (v) => text(String(v));
             );
             assert!(flag("shift") && flag("platform"));
             assert!(!flag("alt") && !flag("control"));
-        });
-    }
-
-    #[test]
-    fn press_payload_has_the_modifiers() {
-        let host = Host::new().unwrap();
-        let event = nsh_core::PressEvent {
-            modifiers: nsh_core::keymap::Modifiers {
-                ctrl: true,
-                ..Default::default()
-            },
-            clicks: 2,
-            position: None,
-        };
-        host.cx.with(|cx| {
-            let value = payload_object(&cx, &EventPayload::Press(event)).unwrap();
-            let obj = value.as_object().unwrap();
-            let flag = |k: &str| obj.get::<_, bool>(k).unwrap();
-            assert_eq!(
-                (
-                    flag("ctrlKey"),
-                    flag("shiftKey"),
-                    flag("altKey"),
-                    flag("metaKey")
-                ),
-                (true, false, false, false)
-            );
-            assert_eq!(obj.get::<_, u32>("clickCount").unwrap(), 2);
-            assert!(!obj.contains_key("locationX").unwrap());
-        });
-    }
-
-    #[test]
-    fn press_payload_has_the_position() {
-        let host = Host::new().unwrap();
-        let mut position = nsh_core::PressPosition::default();
-        position.location = point(px(3.0), px(4.5));
-        position.page = point(px(30.0), px(40.5));
-        let event = nsh_core::PressEvent {
-            clicks: 1,
-            position: Some(position),
-            ..Default::default()
-        };
-        host.cx.with(|cx| {
-            let value = payload_object(&cx, &EventPayload::Press(event)).unwrap();
-            let obj = value.as_object().unwrap();
-            let num = |k: &str| obj.get::<_, f64>(k).unwrap();
-            assert_eq!(
-                (
-                    num("locationX"),
-                    num("locationY"),
-                    num("pageX"),
-                    num("pageY")
-                ),
-                (3.0, 4.5, 30.0, 40.5)
-            );
         });
     }
 

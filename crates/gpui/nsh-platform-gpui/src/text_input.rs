@@ -685,10 +685,13 @@ const HOLD: f64 = 3.0;
 /// up focused, ahead of text it receives later.
 fn set_focus(surface: &Rc<Surface>, view: Option<&NshView>) {
     let old = focused(surface);
-    let same = old.as_ref() == view;
     set_changing(surface, true);
-    if !same {
+    if old.as_ref() != view {
         move_focus(surface, view, old.as_ref());
+    } else if view.is_some() {
+        // The host can own the window's focus while this field keeps the surface's.
+        surface.window_focus_requested.set(true);
+        surface.invalidate();
     }
     set_changing(surface, false);
     flush_pending(surface);
@@ -720,7 +723,7 @@ fn move_focus(surface: &Rc<Surface>, view: Option<&NshView>, old: Option<&NshVie
         && let Some(input) = input_of(view)
     {
         FOCUS.with(|f| f.borrow_mut().entry(surface.key()).or_default().view = Some(view.clone()));
-        surface.wants_window_focus.set(true);
+        surface.window_focus_requested.set(true);
         input.focused.set(true);
         input.active.set(window_active(surface));
         input.wake_caret();

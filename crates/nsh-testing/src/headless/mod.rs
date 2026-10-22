@@ -49,8 +49,7 @@ use std::{
 use crossbeam_channel::{Receiver, Sender};
 use nsh_core::{
     ApproxTextEngine, Command, Dialog, DialogButtonStyle, EventKind, EventPayload, MountBatch,
-    MountItem, NodeId, PayloadValue, Point, Points, PressEvent, PressPosition, ROOT_ID, Size,
-    SubmitBehavior,
+    MountItem, NodeId, PayloadValue, Point, Points, PressEvent, ROOT_ID, Size, SubmitBehavior,
     geometry::{point, px},
     keymap::Modifiers,
 };
@@ -978,7 +977,7 @@ impl Headless {
 
     /// The step `pressAt(<selector>, <x>, <y>)`: [`Headless::press`] with
     /// the pointer at `at` in the view `selector` names (its top left
-    /// corner, as [`nsh_core::PressPosition::location`]): the events tell
+    /// corner, as [`PressEvent::position`]): the events tell
     /// the view that hears them where that is in it and in the surface.
     pub fn press_at(&mut self, selector: &str, at: Point<Points>) -> Result<(), String> {
         let step = format!("pressAt({selector}, {}, {})", at.x.0, at.y.0);
@@ -1009,11 +1008,7 @@ impl Headless {
             }
             .or_else(|| self.screen.bounds_in_root(id).map(|b| b.center())),
         };
-        let event = PressEvent {
-            modifiers,
-            clicks: 1,
-            position: self.press_position(id, page),
-        };
+        let payload = self.press_payload(id, page, modifiers, 1);
         // The finger, as platforms report it to the views around it that
         // listen to touches (an overlay's `onPressOutside` among them).
         let path = self.screen.touch_path(id);
@@ -1021,7 +1016,7 @@ impl Headless {
             self.send_touch(id, nsh_core::TouchPhase::Start, path.clone());
         }
         for kind in [EventKind::PressDown, EventKind::PressUp, EventKind::Press] {
-            self.send(id, kind, EventPayload::Press(event));
+            self.send(id, kind, payload.clone());
         }
         if !path.is_empty() {
             self.send_touch(id, nsh_core::TouchPhase::End, path);
@@ -1044,13 +1039,25 @@ impl Headless {
         self.done()
     }
 
-    /// The position of a press at `page` (surface coordinates) in `view`.
-    fn press_position(&self, view: NodeId, page: Option<Point<Points>>) -> Option<PressPosition> {
-        let page = page?;
-        let mut position = PressPosition::default();
-        position.location = page - self.screen.bounds_in_root(view)?.origin;
-        position.page = page;
-        Some(position)
+    /// A press at `page` (surface coordinates) in `view`, with `modifiers`
+    /// held and `clicks` its click count. `None` when the view has no
+    /// bounds or the pointer is not known.
+    fn press_payload(
+        &self,
+        view: NodeId,
+        page: Option<Point<Points>>,
+        modifiers: Modifiers,
+        clicks: u32,
+    ) -> EventPayload {
+        let (Some(page), Some(bounds)) = (page, self.screen.bounds_in_root(view)) else {
+            return EventPayload::None;
+        };
+        EventPayload::Press(PressEvent {
+            position: page - bounds.origin,
+            page_position: page,
+            modifiers,
+            clicks,
+        })
     }
 
     /// The step `pressSpan(<selector>)`: presses the characters of a text
@@ -1075,13 +1082,9 @@ impl Headless {
             Some(_) => id,
             None => span.view,
         };
-        let event = PressEvent {
-            clicks: 1,
-            position: self.press_position(holder, page),
-            ..PressEvent::default()
-        };
+        let payload = self.press_payload(holder, page, Modifiers::default(), 1);
         for kind in [EventKind::PressDown, EventKind::PressUp, EventKind::Press] {
-            self.send(id, kind, EventPayload::Press(event));
+            self.send(id, kind, payload.clone());
         }
         self.done()
     }
@@ -1098,19 +1101,15 @@ impl Headless {
         let id = self.picked(pick, selector, "pressable view")?;
         let delay = self.screen.long_press_delay(id).unwrap_or(500.0).max(0.0);
         let page = self.screen.bounds_in_root(id).map(|b| b.center());
-        let event = EventPayload::Press(PressEvent {
-            clicks: 1,
-            position: self.press_position(id, page),
-            ..PressEvent::default()
-        });
+        let payload = self.press_payload(id, page, Modifiers::default(), 1);
         let path = self.screen.touch_path(id);
         if !path.is_empty() {
             self.send_touch(id, nsh_core::TouchPhase::Start, path.clone());
         }
-        self.send(id, EventKind::PressDown, event.clone());
+        self.send(id, EventKind::PressDown, payload.clone());
         self.elapse(Duration::from_secs_f64(f64::from(delay) / 1000.0));
-        self.send(id, EventKind::LongPress, event.clone());
-        self.send(id, EventKind::PressUp, event);
+        self.send(id, EventKind::LongPress, payload.clone());
+        self.send(id, EventKind::PressUp, payload);
         if !path.is_empty() {
             self.send_touch(id, nsh_core::TouchPhase::End, path);
         }
@@ -1575,6 +1574,39 @@ mod tests {
             )
     }
 
+    /// A pad under a 10-point strip. A press reports where it was in the
+    /// pad and in the root.
+    #[component]
+    fn PressPoint() -> impl IntoElement {
+        let seen = signal(String::from("none"));
+        view()
+            .child(view().h(px(10.0)))
+            .child(view().test_id("pad").w(px(80.0)).h(px(40.0)).on(
+                EventKind::Press,
+                move |p: &EventPayload| {
+                    let EventPayload::Press(e) = p else {
+                        seen.set("no position".into());
+                        return;
+                    };
+                    seen.set(format!(
+                        "at {:.0} {:.0} in {:.0} {:.0}",
+                        e.position.x.0, e.position.y.0, e.page_position.x.0, e.page_position.y.0
+                    ));
+                },
+            ))
+            .child(text(move || format!("seen: {}", seen.get())))
+    }
+
+    #[test]
+    fn presses_carry_where_the_pointer_was() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<PressPoint>())).unwrap();
+        app.first_render().unwrap();
+        app.press_at("id:pad", point(px(10.0), px(12.0))).unwrap();
+        app.wait_for("seen: at 10 12 in 10 22").unwrap();
+        app.press("id:pad").unwrap();
+        app.wait_for("seen: at 40 20 in 40 30").unwrap();
+    }
+
     #[test]
     fn steps_press_what_a_text_is_in_and_wait_for_what_it_shows() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<Tally>())).unwrap();
@@ -1644,7 +1676,7 @@ mod tests {
     /// for its last press, where it was in the paragraph and in the
     /// surface, and the caret offset there.
     #[component]
-    fn PressPoint() -> impl IntoElement {
+    fn PressTextIndex() -> impl IntoElement {
         let seen = signal(String::from("none"));
         let paragraph = element_ref();
         view()
@@ -1657,15 +1689,16 @@ mod tests {
                     .element_ref(&paragraph)
                     .on(EventKind::Press, move |p: &EventPayload| {
                         let EventPayload::Press(PressEvent {
-                            position: Some(at), ..
+                            position: l,
+                            page_position: g,
+                            ..
                         }) = *p
                         else {
                             seen.set("no position".into());
                             return;
                         };
                         spawn(async move {
-                            let index = paragraph.text_index_at(at.location).await;
-                            let (l, g) = (at.location, at.page);
+                            let index = paragraph.text_index_at(l).await;
                             seen.set(format!(
                                 "{} {} in {} {} at {index:?}",
                                 l.x.0, l.y.0, g.x.0, g.y.0
@@ -1680,7 +1713,7 @@ mod tests {
     /// lines: the paragraph is two lines of five.
     #[test]
     fn presses_carry_the_point_and_text_index_at_reads_it() {
-        let mut app = Headless::start(EngineConfig::new(Root::of::<PressPoint>())).unwrap();
+        let mut app = Headless::start(EngineConfig::new(Root::of::<PressTextIndex>())).unwrap();
         app.first_render().unwrap();
         app.press_at("id:paragraph", point(px(16.0), px(5.0)))
             .unwrap();
@@ -1828,11 +1861,8 @@ mod tests {
                     .child(view().test_id("pad").absolute().size_full().on(
                         EventKind::Press,
                         move |p: &EventPayload| {
-                            if let EventPayload::Press(PressEvent {
-                                position: Some(at), ..
-                            }) = *p
-                            {
-                                pressed.set(format!("{} {}", at.location.x.0, at.location.y.0));
+                            if let EventPayload::Press(PressEvent { position: at, .. }) = *p {
+                                pressed.set(format!("{} {}", at.x.0, at.y.0));
                             }
                         },
                     ))

@@ -1397,8 +1397,9 @@ fn down(
                 generation,
                 SCROLL_PRESS_DELAY,
                 |surface, p| {
+                    let at = (p.x, p.y);
                     if let Some(press) = &mut p.press {
-                        press_in(surface, press, (p.x, p.y));
+                        press_in(surface, press, at);
                     }
                 },
             );
@@ -1408,10 +1409,11 @@ fn down(
         if press.events.contains(EventKind::LongPress) {
             let delay = press.long_delay.max(0.0) as u64;
             after(surface, key, generation, delay, |surface, p| {
+                let at = (p.x, p.y);
                 let Some(press) = &mut p.press else { return };
-                press_in(surface, press, (p.x, p.y));
+                press_in(surface, press, at);
                 press.long = true;
-                press_event(surface, press, EventKind::LongPress, (p.x, p.y));
+                press_event(surface, press, EventKind::LongPress, at);
             });
         }
     }
@@ -1729,7 +1731,7 @@ fn press_in(surface: &Rc<Surface>, press: &mut Press, at: (f32, f32)) {
 }
 
 /// Ends a press: `onPressUp`, then `onPress` if `fire` (released inside)
-/// and it was no long press, with the pointer at `at` (root coordinates).
+/// and it was no long press. `at` is the pointer in root coordinates.
 fn press_out(surface: &Rc<Surface>, press: &mut Press, fire: bool, at: (f32, f32)) {
     let kinds: Vec<_> = press.press_out(fire).collect();
     let pressed = kinds.contains(&EventKind::Press);
@@ -1744,18 +1746,15 @@ fn press_out(surface: &Rc<Surface>, press: &mut Press, fire: bool, at: (f32, f32
     }
 }
 
-/// Sends `kind` of `press` with the pointer at `(x, y)` (root
-/// coordinates), which its event gives in the press's view too.
+/// Sends `kind` of `press` with the pointer at `(x, y)` (root coordinates).
 fn press_event(surface: &Surface, press: &Press, kind: EventKind, (x, y): (f32, f32)) {
     log::debug!(target: "nsh::input", "{} on {}", kind.prop_name(), press.node);
     let (location_x, location_y) = local(&press.view, x, y);
-    let mut position = nsh_core::PressPosition::default();
-    position.location = nsh_core::geometry::point(Points(location_x), Points(location_y));
-    position.page = nsh_core::geometry::point(Points(x), Points(y));
     let event = nsh_core::PressEvent {
+        position: nsh_core::geometry::point(Points(location_x), Points(location_y)),
+        page_position: nsh_core::geometry::point(Points(x), Points(y)),
         modifiers: press.modifiers,
         clicks: press.clicks,
-        position: Some(position),
     };
     surface.event(press.node, kind, EventPayload::Press(event));
 }

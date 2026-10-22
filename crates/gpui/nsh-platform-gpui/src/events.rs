@@ -118,7 +118,7 @@ pub(crate) fn install(
     window: &mut Window,
     cx: &mut App,
 ) {
-    if surface.wants_window_focus.take() && !focus.is_focused(window) {
+    if surface.window_focus_requested.take() && !focus.is_focused(window) {
         let focus = focus.clone();
         // After this paint. Text already queued for the next field stays
         // queued: this only moves the window's focus handle.

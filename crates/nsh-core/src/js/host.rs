@@ -442,6 +442,17 @@ export interface PanEvent {
   valueY?: number;
 }
 
+/** Where the pointer was at a press, the modifier keys held when it began and its click count: the payload of `onPress`, `onLongPress`, `onPressDown` and `onPressUp` on backends that know it. */
+export interface PressEvent {
+  /** Position in the pressed view (its transforms undone; a pressed span's text view). */
+  position: Point;
+  /** Position in the root view the view is in (the surface or its modal), as touches' `pageX` / `pageY`. */
+  pagePosition: Point;
+  modifiers: Modifiers;
+  /** Consecutive clicks at the same place: 1 for a click, 2 for a double click. */
+  clickCount: number;
+}
+
 /** Where the mouse is over a hovered view: the payload of `onHoverMove` (GPUI's `MouseMoveEvent`). */
 export interface HoverEvent {
   /** Position in the view (its transforms undone). */
@@ -449,23 +460,6 @@ export interface HoverEvent {
   /** Position in the root view the view is in (the surface or its modal), as touches' `pageX` / `pageY`. */
   pagePosition: Point;
   modifiers: Modifiers;
-}
-
-/** The modifier keys held when a press began, its click count and where the pointer was: the payload of `onPress`, `onLongPress`, `onPressDown` and `onPressUp` on backends that know them (none otherwise). */
-export interface PressEvent {
-  altKey: boolean;
-  ctrlKey: boolean;
-  /** Command on Apple platforms, the Windows / Super key elsewhere. */
-  metaKey: boolean;
-  shiftKey: boolean;
-  /** Consecutive clicks at the same place: 1 for a click, 2 for a double click. */
-  clickCount: number;
-  /** Where the pointer was in the pressed view (points, its transforms undone; a pressed span's text view), on backends that know it. */
-  locationX?: number;
-  locationY?: number;
-  /** Where the pointer was in the root view the view is in (the surface or its modal), as touches' `pageX`. */
-  pageX?: number;
-  pageY?: number;
 }
 
 /** Where a context menu was asked for: the payload of `onContextMenu`. */
@@ -522,20 +516,30 @@ export interface WebViewNavigation {
 /// its documentation. An event whose payload differs between elements has
 /// a row per payload.
 pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
-    (EventKind::Press, on::ALL, "(e?: PressEvent) => void", ""),
+    (
+        EventKind::Press,
+        on::ALL,
+        "(e?: PressEvent) => void",
+        "A tap. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
+    ),
     (
         EventKind::LongPress,
         on::ALL,
         "(e?: PressEvent) => void",
-        "",
+        "A press held for about half a second. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
     ),
     (
         EventKind::PressDown,
         on::ALL,
         "(e?: PressEvent) => void",
-        "",
+        "A press went down. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
     ),
-    (EventKind::PressUp, on::ALL, "(e?: PressEvent) => void", ""),
+    (
+        EventKind::PressUp,
+        on::ALL,
+        "(e?: PressEvent) => void",
+        "The press ended. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
+    ),
     (
         EventKind::HoverIn,
         on::ALL,
