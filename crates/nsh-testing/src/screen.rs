@@ -736,7 +736,18 @@ impl Screen {
                 inner = if scroll.locked {
                     inner.within(bounds)
                 } else if inner.shows(&bounds) {
-                    Clip::All
+                    // Any of its content scrolls into view, nothing before
+                    // its start: lists park the cells they do not use there.
+                    let size =
+                        scroll
+                            .content
+                            .map_or(Size::new(Points(f32::MAX), Points(f32::MAX)), |c| {
+                                Size::new(
+                                    c.width.max(bounds.size.width),
+                                    c.height.max(bounds.size.height),
+                                )
+                            });
+                    Clip::Within(Bounds::new(content, size))
                 } else {
                     Clip::Within(Bounds::default())
                 };
@@ -1676,9 +1687,15 @@ mod tests {
             insert(10, 12),
             insert(2, 14),
             insert(14, 16),
+            // A cell a list parked before the start of its content.
+            create(18, ViewKind::Text),
+            text(18, "parked"),
+            frame(18, 0.0, -1.0e6, 100.0, 20.0),
+            insert(14, 18),
         ]));
         // Without `overflow: hidden` a view of no height shows what it
-        // holds; a row far down a scroll view scrolls into view.
+        // holds; a row far down a scroll view scrolls into view, nothing
+        // before its start does.
         assert_eq!(shown(&screen), "shown clipped row");
         screen.apply(&batch(vec![style(10, |s| s.overflow_hidden = true)]));
         assert_eq!(shown(&screen), "shown row");
