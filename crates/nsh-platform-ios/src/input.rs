@@ -101,15 +101,6 @@ define_class!(
             unsafe { msg_send![super(self), caretRectForPosition: position] }
         }
 
-        /// A hardware navigation key, reported before UIKit moves the caret.
-        #[unsafe(method(pressesBegan:withEvent:))]
-        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
-            report_navigation_keys(self.as_ref(), presses);
-            // SAFETY: calling the superclass implementation.
-            let _: () =
-                unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
-        }
-
         /// Where the caret is, drawn or not (`caret()`).
         #[unsafe(method(nshCaretRectForPosition:))]
         fn shown_caret_rect(&self, position: &objc2::runtime::AnyObject) -> CGRect {
@@ -151,9 +142,12 @@ define_class!(
 
         /// A hardware keyboard's keys go to the app's shortcuts first
         /// (`nsh/keymap`): a key a binding takes never reaches the input.
+        /// A navigation key no binding takes is reported before UIKit
+        /// moves the caret.
         #[unsafe(method(pressesBegan:withEvent:))]
-        fn presses_began(&self, presses: &AnyObject, event: Option<&AnyObject>) {
+        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
             if !crate::keymap::input_began(self.as_ref(), presses) {
+                report_navigation_keys(self.as_ref(), presses);
                 // SAFETY: calling the superclass implementation.
                 let _: () = unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
             }
@@ -245,15 +239,6 @@ define_class!(
             unsafe { msg_send![super(self), caretRectForPosition: position] }
         }
 
-        /// A hardware navigation key, reported before UIKit moves the caret.
-        #[unsafe(method(pressesBegan:withEvent:))]
-        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
-            report_navigation_keys(self.as_ref(), presses);
-            // SAFETY: calling the superclass implementation.
-            let _: () =
-                unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
-        }
-
         /// Where the caret is, drawn or not (`caret()`).
         #[unsafe(method(nshCaretRectForPosition:))]
         fn shown_caret_rect(&self, position: &objc2::runtime::AnyObject) -> CGRect {
@@ -312,9 +297,12 @@ define_class!(
 
         /// A hardware keyboard's keys go to the app's shortcuts first
         /// (`nsh/keymap`): a key a binding takes never reaches the input.
+        /// A navigation key no binding takes is reported before UIKit
+        /// moves the caret.
         #[unsafe(method(pressesBegan:withEvent:))]
-        fn presses_began(&self, presses: &AnyObject, event: Option<&AnyObject>) {
+        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
             if !crate::keymap::input_began(self.as_ref(), presses) {
+                report_navigation_keys(self.as_ref(), presses);
                 // SAFETY: calling the superclass implementation.
                 let _: () = unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
             }
