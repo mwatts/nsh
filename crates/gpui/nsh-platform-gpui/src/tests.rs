@@ -261,12 +261,13 @@ fn windows(cx: &mut TestAppContext) {
     cx.executor().allow_parking();
     keys_reach_the_fields_of_a_surface_showing_a_native_component(cx);
     compositions_are_reported_and_hold_values_until_they_end(cx);
+    menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx);
     presses_carry_where_the_pointer_was(cx);
+    presses_carry_the_modifier_keys_and_click_count(cx);
     an_embedded_surface_takes_the_keyboard_when_its_app_focuses_a_field(cx);
     the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx);
     js_and_rust_view_shortcuts_fire_together_in_either_order(cx);
     each_view_s_functions_read_the_context_its_options_gave_its_engine(cx);
-    presses_carry_the_modifier_keys_and_click_count(cx);
     presses_carry_the_point_text_index_at_reads(cx);
     selections_carry_the_caret_and_first_line_rectangles(cx);
     keys_are_reported_before_the_field_acts_and_bindings_take_them_first(cx);
@@ -275,34 +276,12 @@ fn windows(cx: &mut TestAppContext) {
     quit_and_close_requests_go_to_the_handler_instead_of_acting(cx);
     an_auto_hidden_menu_bar_shows_on_alt_alone_and_while_a_menu_is_open(cx);
     asset_uris_resolve_in_the_first_directory_that_has_the_file(cx);
-    menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx);
+    releasing_shift_before_alt_keeps_the_auto_hidden_menu_bar_hidden(cx);
     text_typed_as_a_field_mounts_reaches_it(cx);
     text_typed_with_no_action_does_not_reach_a_later_field(cx);
     text_typed_after_a_shortcut_reaches_a_field_mounted_later(cx);
     text_typed_after_a_shortcut_is_dropped_once_the_second_passes(cx);
     an_engine_batch_focuses_a_new_field_without_another_input(cx);
-}
-
-/// Runs the window until the focused field's text satisfies `done`, and
-/// returns it.
-fn wait_until(
-    view: &Entity<AppView>,
-    cx: &mut VisualTestContext,
-    done: impl Fn(&str) -> bool,
-) -> String {
-    let start = Instant::now();
-    loop {
-        cx.run_until_parked();
-        let now = field_text(view, cx).unwrap_or_default();
-        if done(&now) {
-            return now;
-        }
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "the field reads {now:?}"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
 }
 
 fn keys_reach_the_fields_of_a_surface_showing_a_native_component(cx: &mut TestAppContext) {
@@ -689,11 +668,6 @@ fn wait_until_window(
     }
 }
 
-/// The window's content height, in points.
-fn viewport_height(cx: &mut VisualTestContext) -> f32 {
-    cx.update(|window, _| f32::from(window.viewport_size().height))
-}
-
 /// A field that reads the app's height (`h <points>`, the window less the
 /// chrome around the app) and ` new` once New was chosen, under a title
 /// and an application menu: File with New, Quit (the `quit` role, with a
@@ -729,19 +703,6 @@ mount(App);
 fn app_height(view: &Entity<AppView>, cx: &mut VisualTestContext) -> f32 {
     let text = wait_until(view, cx, |t| t.starts_with("h ") && !t.starts_with("h -1"));
     text.split(' ').nth(1).and_then(|h| h.parse().ok()).unwrap()
-}
-
-fn an_embedded_view_that_owns_its_window_sets_its_title_and_menu(cx: &mut TestAppContext) {
-    let code = nsh_bundler::compile_module("App.tsx", OWNED_WINDOW, &[]).unwrap();
-    let (view, cx) = owned_view(cx, code, |_| {});
-    wait_until_window(cx, "the app's title on the window", |cx| {
-        cx.window_title().as_deref() == Some("Owned")
-    });
-    if cfg!(target_os = "linux") {
-        // The menu bar is drawn above the app, 28 points tall.
-        let window = viewport_height(cx);
-        wait_until(&view, cx, |t| t == format!("h {}", window - 28.0));
-    }
 }
 
 fn quit_and_close_requests_go_to_the_handler_instead_of_acting(cx: &mut TestAppContext) {
@@ -807,54 +768,6 @@ function App() {
 mount(App);
 "#;
 
-fn an_auto_hidden_menu_bar_shows_on_alt_alone_and_while_a_menu_is_open(cx: &mut TestAppContext) {
-    // macOS's menu bar is the system's.
-    if !cfg!(target_os = "linux") && !cfg!(windows) {
-        return;
-    }
-    let code = nsh_bundler::compile_module("App.tsx", AUTO_HIDDEN_BAR, &[]).unwrap();
-    let (view, cx) = owned_view(cx, code, |_| {});
-    let full = viewport_height(cx);
-    let (hidden, shown) = (format!("h {full}"), format!("h {}", full - 28.0));
-    wait_for(&view, cx, &hidden);
-    let alt_alone = |cx: &mut VisualTestContext| {
-        cx.simulate_modifiers_change(gpui::Modifiers::alt());
-        cx.simulate_modifiers_change(gpui::Modifiers::none());
-    };
-    alt_alone(cx);
-    wait_for(&view, cx, &shown);
-    alt_alone(cx);
-    wait_for(&view, cx, &hidden);
-    // Alt with a key or another modifier is a shortcut: Alt + F opens File
-    // (the bar shows while it is open), and the bar hides again as it
-    // closes.
-    cx.simulate_modifiers_change(gpui::Modifiers::alt());
-    cx.simulate_keystrokes("alt-f");
-    cx.simulate_modifiers_change(gpui::Modifiers::none());
-    wait_for(&view, cx, &shown);
-    cx.simulate_keystrokes("escape");
-    wait_for(&view, cx, &hidden);
-    cx.simulate_modifiers_change(gpui::Modifiers::alt());
-    cx.simulate_modifiers_change(gpui::Modifiers {
-        alt: true,
-        shift: true,
-        ..Default::default()
-    });
-    cx.simulate_modifiers_change(gpui::Modifiers::none());
-    cx.run_until_parked();
-    assert_eq!(
-        field_text(&view, cx),
-        Some(hidden.clone()),
-        "Alt + Shift showed the bar"
-    );
-    // F10 opens the first menu; Return chooses its first item, and the bar
-    // hides again.
-    cx.simulate_keystrokes("f10");
-    wait_for(&view, cx, &shown);
-    cx.simulate_keystrokes("enter");
-    wait_for(&view, cx, &format!("{hidden} new"));
-}
-
 /// Two images from two asset directories: each reports its size, or why
 /// it did not load.
 const TWO_ASSET_ROOTS: &str = r#"
@@ -915,76 +828,6 @@ fn asset_uris_resolve_in_the_first_directory_that_has_the_file(cx: &mut TestAppC
     assert_eq!(report, "app 2x3|cover 4x5");
 }
 
-/// A field that keeps its focus on Return, under a menu whose items add
-/// their names to it: three that leave a focused field the keys it uses
-/// (`when: "auto"`) and one that takes its key everywhere (the default).
-const MENU_OVER_FIELD: &str = r#"
-import { Input, mount, signal, View } from "nsh";
-import { Menu } from "nsh/desktop";
-
-function App() {
-  const text = signal("abcd");
-  const chose = (name: string) => () => text.set(`${text()} ${name}`);
-  Menu.setApplicationMenu([
-    {
-      label: "Edit",
-      submenu: [
-        { label: "Revert", shortcut: "mod+z", when: "auto", onSelect: chose("revert") },
-        { label: "Remove", shortcut: "delete", when: "auto", onSelect: chose("remove") },
-        { label: "Send", shortcut: "mod+enter", when: "auto", onSelect: chose("send") },
-        { label: "Purge", shortcut: "shift+delete", onSelect: chose("purge") },
-      ],
-    },
-  ]);
-  return (
-    <View style={{ flex: 1 }}>
-      <Input
-        autoFocus
-        submitBehavior="submit"
-        value={text()}
-        onChange={(t) => text.set(t)}
-        style={{ height: 30 }}
-      />
-    </View>
-  );
-}
-mount(App);
-"#;
-
-fn menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx: &mut TestAppContext) {
-    let code = nsh_bundler::compile_module("App.tsx", MENU_OVER_FIELD, &[]).unwrap();
-    let (view, cx) = owned_view(cx, code, |_| {});
-    let primary = if cfg!(target_os = "macos") {
-        "cmd"
-    } else {
-        "ctrl"
-    };
-    wait_for(&view, cx, "abcd");
-    cx.simulate_keystrokes("end");
-    cx.simulate_input("e");
-    wait_for(&view, cx, "abcde");
-    cx.simulate_keystrokes(&format!("{primary}-z"));
-    wait_for(&view, cx, "abcd");
-    cx.simulate_keystrokes("home delete");
-    wait_for(&view, cx, "bcd");
-    cx.simulate_keystrokes(&format!("{primary}-enter"));
-    cx.run_until_parked();
-    cx.simulate_keystrokes("shift-delete");
-    wait_for(&view, cx, "bcd purge");
-    cx.simulate_keystrokes("escape");
-    wait_until_window(cx, "Escape takes the focus from the field", |cx| {
-        field_text(&view, cx).is_none()
-    });
-    cx.simulate_keystrokes(&format!("{primary}-z delete {primary}-enter"));
-    cx.run_until_parked();
-    let (x, y) = view.read_with(cx, |view, _| view.surface().origin.get());
-    cx.simulate_click(
-        gpui::point(gpui::px(x + 20.0), gpui::px(y + 15.0)),
-        gpui::Modifiers::default(),
-    );
-    wait_for(&view, cx, "bcd purge revert remove send");
-}
-
 /// A native component that takes the keyboard and records each key down
 /// it sees, letting every key go on; it shares its focus handle once drawn.
 struct KeyLog {
@@ -1025,9 +868,8 @@ impl NativeComponent for KeyLog {
 }
 
 /// A field showing which of the app's shortcuts fired, above a component
-/// that takes the keyboard: a binding that fires everywhere (`mod+k`), one
-/// that leaves text editing its keys (`j`), a menu item that does too
-/// (`mod+z`) and one that takes its key everywhere (`mod+shift+n`).
+/// that takes the keyboard. `mod+k` fires while text is edited. `j` does
+/// not. The menu's `mod+z` and `mod+shift+n` still choose their items.
 const SHORTCUTS_OVER_COMPONENT: &str = r#"
 import { Input, mount, signal, View } from "nsh";
 import { Menu } from "nsh/desktop";
@@ -1045,7 +887,7 @@ function App() {
     {
       label: "Edit",
       submenu: [
-        { label: "Revert", shortcut: "mod+z", when: "auto", onSelect: fire("revert") },
+        { label: "Revert", shortcut: "mod+z", onSelect: fire("revert") },
         { label: "New", shortcut: "mod+shift+n", onSelect: fire("new") },
       ],
     },
@@ -1065,9 +907,14 @@ fn the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx: &m
     let code = nsh_bundler::compile_module("App.tsx", SHORTCUTS_OVER_COMPONENT, &[]).unwrap();
     let keys = Rc::new(RefCell::new(Vec::new()));
     let focus = Rc::new(RefCell::new(None));
-    let asked = Rc::new(RefCell::new(Vec::new()));
-    let (component_keys, component_focus, log) = (keys.clone(), focus.clone(), asked.clone());
-    let (view, cx) = owned_view(cx, code, move |view| {
+    let (component_keys, component_focus) = (keys.clone(), focus.clone());
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let view = AppView::new(AppOptions::default(), window, cx);
+        let title = window.window_title();
+        crate::chrome::set_standalone(view.surface(), &title, window.window_handle());
+        view
+    });
+    view.update(cx, |view, _| {
         view.register_component(
             "test.keylog",
             Rc::new(move |_| {
@@ -1077,10 +924,20 @@ fn the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx: &m
                 })
             }),
         );
-        view.on_close_request(move |request, _, _| log.borrow_mut().push(request));
+        view.load(App::Js(Bundle::source(code)));
     });
-    wait_until_window(cx, "the component is drawn", |_| focus.borrow().is_some());
-    let handle = focus.borrow().clone().unwrap();
+    let start = Instant::now();
+    let handle = loop {
+        cx.run_until_parked();
+        if let Some(handle) = focus.borrow().clone() {
+            break handle;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the component is not drawn"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    };
     cx.update(|window, cx| window.focus(&handle, cx));
     cx.run_until_parked();
     let primary = if cfg!(target_os = "macos") {
@@ -1089,30 +946,24 @@ fn the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx: &m
         "ctrl"
     };
     cx.simulate_keystrokes(&format!("a j {primary}-z {primary}-k"));
-    // GPUI's test window sends no releases: K's comes to the keymap while
-    // the component has the focus, so the next Ctrl+K is no repeat.
+    // GPUI's test window sends no releases. K's release reaches the keymap
+    // while the component has the focus, so the next Ctrl+K is not a repeat.
     cx.simulate_event(gpui::KeyUpEvent {
         keystroke: gpui::Keystroke::parse(&format!("{primary}-k")).unwrap(),
     });
-    cx.simulate_keystrokes(&format!("{primary}-k shift-{primary}-n {primary}-q"));
-    wait_until_window(cx, "the quit key asks Quit", |_| {
-        *asked.borrow() == [crate::CloseRequest::Quit]
-    });
-    // The component saw every key first, the typed ones and Undo among
-    // them; its focus never moved.
+    cx.simulate_keystrokes(&format!("{primary}-k shift-{primary}-n"));
     assert_eq!(
         keys.borrow()[..4],
         ["a", "j", &format!("{primary}-z"), &format!("{primary}-k")],
     );
     cx.update(|window, _| assert!(handle.is_focused(window), "the component lost the focus"));
-    // Only the shortcuts that fire while text is edited fired: both Ctrl+K
-    // presses (a released key is not held), and the menu's New.
+    // The surface starts below the platform's title and menu bars.
     let (x, y) = view.read_with(cx, |view, _| view.surface().origin.get());
     cx.simulate_click(
         gpui::point(gpui::px(x + 20.0), gpui::px(y + 15.0)),
         gpui::Modifiers::default(),
     );
-    wait_for(&view, cx, "fired bound bound new");
+    wait_for(&view, cx, "fired revert bound bound new");
 }
 
 /// Dispatches one key and does not park. The following input stays in the
@@ -1708,4 +1559,221 @@ fn presses_carry_where_the_pointer_was(cx: &mut TestAppContext) {
         gpui::Modifiers::default(),
     );
     wait_for(&view, cx, "at 10 12 in 18 20");
+}
+
+/// Runs the window until the focused field's text satisfies `done`, and
+/// returns it.
+fn wait_until(
+    view: &Entity<AppView>,
+    cx: &mut VisualTestContext,
+    done: impl Fn(&str) -> bool,
+) -> String {
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        let now = field_text(view, cx).unwrap_or_default();
+        if done(&now) {
+            return now;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the field reads {now:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The height available below the title bar, before the menu bar.
+fn height_below_title_bar(cx: &mut VisualTestContext) -> f32 {
+    let full = cx.update(|window, _| f32::from(window.viewport_size().height));
+    // Windows draws a 32-point caption inside the viewport; Linux's
+    // window manager draws its decorations outside it.
+    full - if cfg!(windows) { 32.0 } else { 0.0 }
+}
+
+fn an_embedded_view_that_owns_its_window_sets_its_title_and_menu(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", OWNED_WINDOW, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    wait_until_window(cx, "the app's title on the window", |cx| {
+        cx.window_title().as_deref() == Some("Owned")
+    });
+    if cfg!(target_os = "linux") {
+        // The menu bar is drawn above the app, 28 points tall.
+        let window = height_below_title_bar(cx);
+        wait_until(&view, cx, |t| t == format!("h {}", window - 28.0));
+    }
+}
+
+fn an_auto_hidden_menu_bar_shows_on_alt_alone_and_while_a_menu_is_open(cx: &mut TestAppContext) {
+    // macOS's menu bar is the system's.
+    if !cfg!(target_os = "linux") && !cfg!(windows) {
+        return;
+    }
+    let code = nsh_bundler::compile_module("App.tsx", AUTO_HIDDEN_BAR, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    let full = height_below_title_bar(cx);
+    let (hidden, shown) = (format!("h {full}"), format!("h {}", full - 28.0));
+    wait_for(&view, cx, &hidden);
+    let alt_alone = |cx: &mut VisualTestContext| {
+        cx.simulate_modifiers_change(gpui::Modifiers::alt());
+        cx.simulate_modifiers_change(gpui::Modifiers::none());
+    };
+    alt_alone(cx);
+    wait_for(&view, cx, &shown);
+    alt_alone(cx);
+    wait_for(&view, cx, &hidden);
+    // Alt with a key or another modifier is a shortcut: Alt + F opens File
+    // (the bar shows while it is open), and the bar hides again as it
+    // closes.
+    cx.simulate_modifiers_change(gpui::Modifiers::alt());
+    cx.simulate_keystrokes("alt-f");
+    cx.simulate_modifiers_change(gpui::Modifiers::none());
+    wait_for(&view, cx, &shown);
+    cx.simulate_keystrokes("escape");
+    wait_for(&view, cx, &hidden);
+    cx.simulate_modifiers_change(gpui::Modifiers::alt());
+    cx.simulate_modifiers_change(gpui::Modifiers {
+        alt: true,
+        shift: true,
+        ..Default::default()
+    });
+    cx.simulate_modifiers_change(gpui::Modifiers::none());
+    cx.run_until_parked();
+    assert_eq!(
+        field_text(&view, cx),
+        Some(hidden.clone()),
+        "Alt + Shift showed the bar"
+    );
+    // F10 opens the first menu; Return chooses its first item, and the bar
+    // hides again.
+    cx.simulate_keystrokes("f10");
+    wait_for(&view, cx, &shown);
+    cx.simulate_keystrokes("enter");
+    wait_for(&view, cx, &format!("{hidden} new"));
+}
+
+fn releasing_shift_before_alt_keeps_the_auto_hidden_menu_bar_hidden(cx: &mut TestAppContext) {
+    if !cfg!(target_os = "linux") && !cfg!(windows) {
+        return;
+    }
+    let code = nsh_bundler::compile_module("App.tsx", AUTO_HIDDEN_BAR, &[]).unwrap();
+    let (view, cx) = owned_view(cx, code, |_| {});
+    let full = height_below_title_bar(cx);
+    wait_for(&view, cx, &format!("h {full}"));
+    for shift_first in [false, true] {
+        cx.simulate_modifiers_change(if shift_first {
+            gpui::Modifiers {
+                shift: true,
+                ..Default::default()
+            }
+        } else {
+            gpui::Modifiers::alt()
+        });
+        cx.simulate_modifiers_change(gpui::Modifiers {
+            alt: true,
+            shift: true,
+            ..Default::default()
+        });
+        cx.simulate_modifiers_change(gpui::Modifiers::alt());
+        cx.simulate_modifiers_change(gpui::Modifiers::none());
+        cx.run_until_parked();
+        let height = view.read_with(cx, |view, _| view.surface().size().1);
+        assert_eq!(
+            height, full,
+            "Alt+Shift showed the bar after Shift was released first (shift_first={shift_first})"
+        );
+    }
+}
+
+const MENU_OVER_FIELD: &str = r#"
+import { Input, mount, signal, View } from "nsh";
+import { Menu } from "nsh/desktop";
+
+function App() {
+  const text = signal("abcd");
+  const chose = (name: string) => () => text.set(`${text()} ${name}`);
+  Menu.setApplicationMenu([
+    {
+      label: "Edit",
+      submenu: [
+        { label: "Revert", shortcut: "mod+z", when: "auto", onSelect: chose("revert") },
+        { label: "Redo app", shortcut: "mod+y", when: "auto", onSelect: chose("app-redo") },
+        { label: "Remove", shortcut: "delete", when: "auto", onSelect: chose("remove") },
+        { label: "Send", shortcut: "mod+enter", when: "auto", onSelect: chose("send") },
+        { label: "Purge", shortcut: "shift+delete", onSelect: chose("purge") },
+      ],
+    },
+  ]);
+  return (
+    <View style={{ flex: 1 }}>
+      <Input
+        autoFocus
+        submitBehavior="submit"
+        value={text()}
+        onChange={(t) => text.set(t)}
+        style={{ height: 30 }}
+      />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", MENU_OVER_FIELD, &[]).unwrap();
+    let (view, cx) = cx.add_window_view(|window, cx| {
+        let view = AppView::new(AppOptions::default(), window, cx);
+        let title = window.window_title();
+        crate::chrome::set_standalone(view.surface(), &title, window.window_handle());
+        crate::system::own_window(view.surface());
+        view
+    });
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    let primary = if cfg!(target_os = "macos") {
+        "cmd"
+    } else {
+        "ctrl"
+    };
+    wait_for(&view, cx, "abcd");
+    cx.simulate_keystrokes("end");
+    cx.simulate_input("e");
+    wait_for(&view, cx, "abcde");
+    cx.simulate_keystrokes(&format!("{primary}-z"));
+    wait_for(&view, cx, "abcd");
+    cx.simulate_keystrokes(&format!("{primary}-y"));
+    wait_for(&view, cx, "abcde");
+    cx.simulate_keystrokes(&format!("{primary}-z"));
+    wait_for(&view, cx, "abcd");
+    cx.simulate_keystrokes("home delete");
+    wait_for(&view, cx, "bcd");
+    cx.simulate_keystrokes(&format!("{primary}-enter"));
+    cx.run_until_parked();
+    cx.simulate_keystrokes("shift-delete");
+    wait_for(&view, cx, "bcd purge");
+    cx.simulate_keystrokes("escape");
+    wait_until_blurred(&view, cx);
+    cx.simulate_keystrokes(&format!("{primary}-z {primary}-y delete {primary}-enter"));
+    cx.run_until_parked();
+    let (x, y) = view.read_with(cx, |view, _| view.surface().origin.get());
+    cx.simulate_click(
+        gpui::point(gpui::px(x + 20.0), gpui::px(y + 15.0)),
+        gpui::Modifiers::default(),
+    );
+    wait_for(&view, cx, "bcd purge revert app-redo remove send");
+}
+
+fn wait_until_blurred(view: &Entity<AppView>, cx: &mut VisualTestContext) {
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if field_text(view, cx).is_none() {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the field still has focus"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

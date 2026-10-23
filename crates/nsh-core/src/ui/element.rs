@@ -236,6 +236,7 @@ impl Attrs {
                 uri: src.uri.to_arc(),
                 size: src.size.map(|(w, h)| crate::geometry::size_pt(w, h)),
                 scales: src.scales,
+                data: None,
             })));
         }
         if self.inset_padding != old.inset_padding {
@@ -383,6 +384,7 @@ pub struct ListConfig {
     pub(crate) scrollbar_visible: Option<bool>,
     pub(crate) content: Option<ListContentStyle>,
     pub(crate) follow_end: Option<f32>,
+    pub(crate) viewport: Option<crate::ListViewport>,
 }
 
 impl ListConfig {
@@ -410,6 +412,9 @@ impl ListConfig {
         }
         if self.follow_end != old.follow_end {
             out.push(Prop::FollowEnd(self.follow_end.map(Points)));
+        }
+        if self.viewport != old.viewport {
+            out.push(Prop::ListViewport(self.viewport.unwrap_or_default()));
         }
     }
 }
@@ -739,6 +744,19 @@ pub trait Element: IntoElement + Sized {
         self
     }
 
+    /// A sticky view ([`super::Styled::sticky`]) sticks this animated value
+    /// from the top of the scroll view's viewport, following it (below a
+    /// header that moves: `header.add(8.0)`; TS: `top` set to an animated
+    /// value).
+    fn bind_sticky_top(self, value: &impl super::Animated) -> Self {
+        self.bind(crate::animation::AnimationProp::StickyTop, value)
+    }
+
+    /// The same as [`Self::bind_sticky_top`] in a horizontal scroll view.
+    fn bind_sticky_left(self, value: &impl super::Animated) -> Self {
+        self.bind(crate::animation::AnimationProp::StickyLeft, value)
+    }
+
     /// Appends a transform step driven by an animated value, after the styles'
     /// transforms.
     fn bind_transform(mut self, kind: crate::TransformKind, value: &impl super::Animated) -> Self {
@@ -747,6 +765,28 @@ pub trait Element: IntoElement + Sized {
             self.node().attrs.animated.push((decl, node));
         }
         self
+    }
+
+    /// Binds a motion's channels: its opacity, and its transform after the
+    /// styles' transforms (translations, then rotations, then the scales,
+    /// `scale` folded into `scale_x` and `scale_y`: 7 steps of a view's 8).
+    fn bind_motion(self, motion: &super::Motion) -> Self {
+        use crate::animation::MotionChannel::*;
+        let mut this = self.bind_opacity(&motion.value(Opacity));
+        for channel in [TranslateX, TranslateY, Rotate, RotateX, RotateY] {
+            if let Some(kind) = channel.transform() {
+                this = this.bind_transform(kind, &motion.value(channel));
+            }
+        }
+        let scale = motion.value(Scale);
+        this.bind_transform(
+            crate::TransformKind::ScaleX,
+            &scale.mul(&motion.value(ScaleX)),
+        )
+        .bind_transform(
+            crate::TransformKind::ScaleY,
+            &scale.mul(&motion.value(ScaleY)),
+        )
     }
 
     /// Moves it right by an animated value (points).
@@ -1495,6 +1535,12 @@ pub trait Interactive: Element {
         self
     }
 
+    /// The system material of a backdrop blur (iOS).
+    fn backdrop_material(mut self, material: crate::BackdropMaterial) -> Self {
+        super::host::set(self.node(), Prop::BackdropMaterial(material));
+        self
+    }
+
     /// The id UI tests find it by.
     fn test_id(mut self, id: &str) -> Self {
         super::host::set(self.node(), Prop::TestId(Some(id.into())));
@@ -1822,6 +1868,7 @@ impl Image {
                 uri: src.uri.to_arc(),
                 size: src.size.map(|(w, h)| crate::geometry::size_pt(w, h)),
                 scales: src.scales,
+                data: None,
             })))
         });
         self

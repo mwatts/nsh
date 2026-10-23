@@ -61,7 +61,8 @@ build to the same file) and takes `nsh.js` from the crate.
   bytes: the engine reads fonts synchronously, `Assets::read`, to measure text with them). Fonts the entry or the UI
   sets register are fetched before the app starts; one only chunks register (`font("asset:/…")` in their code) comes
   with the first of them, through `createPlayer`'s `prepareChunk(id)`, which `nsh.js` awaits with the chunk's download
-  (`web::font_loads`). It runs the bundle with `run(code, { release: true, harden, capabilities, appId, chunks })`
+  (`web::font_loads`). With `nsh.json` `web.host` the page also imports `host.<digest>.js` and passes `createPlayer` a
+  `host` (Platform services). It runs the bundle with `run(code, { release: true, harden, capabilities, appId, chunks })`
   (`appId`: the `nsh.json` id, the page's `app.id`; a Rust app's root carries its own), without `limits`: a published
   app runs on its own, with none (`sandbox.md`); an app whose capabilities restrict `network`
   gets a CSP `connect-src` meta with `'self'` and explicit HTTP / WebSocket scheme, host and port sources
@@ -81,7 +82,10 @@ build to the same file) and takes `nsh.js` from the crate.
   `bytecode_version` (the server then sends JS source, without the warning a mismatched version gets), it runs
   each bundle with its message's `app_id` (the app's storage), applies patches with `player.hotUpdate` (`nsh_hot_update`; when it reports a failure, `nsh_hot_failed`, the bundle that
   follows loads from scratch), shows build errors and `CannotRun` over the app, sends the app's log lines back, and
-  reads fonts with a synchronous `XMLHttpRequest` from `/assets/`.
+  reads fonts with a synchronous `XMLHttpRequest` from `/assets/`. With `nsh.json` `web.host` it imports the module
+  (`web::with_page_host` serves it as `nsh-host.js`, read when the session starts, checked as `nsh package` checks it)
+  and runs its `createHost(player)` before the first bundle, as a published page does; `nsh test --target web` serves
+  each app's the same way (headless `nsh test` runs the module itself: `docs/dev/tooling.md` "Headless runs").
 - **Tests** (`nsh test --target web`, `docs/dev/tooling.md` "On a real platform"): the CLI opens the development host
   in a headless Chromium browser it drives over the DevTools protocol (`nsh-cli/src/cdp.rs`, `test_web.rs`). When the
   server's hello says `test`, the page calls `player.testStart()` (`nsh_test_start`): from the next bundle on, every
@@ -380,7 +384,16 @@ dropped.
 Text (`src/text.rs`) is broken into lines here, with widths and font metrics from the `measure_text`,
 `font_ascent` and `font_descent` imports (canvas `measureText`, cached per font and string); runs are drawn at the
 positions computed here with a line height equal to the font's ascent + descent, so the baseline lands where layout
-put it.
+put it. Canvas text has no numeric variants (its `font` takes only `small-caps`; there is no `fontVariantNumeric`),
+so text with one (`tabular-nums`, ...) is measured by `measure_numeric_text` instead: a hidden span with the run's
+`font` and `font-variant-numeric`, as the run is drawn. Measuring there lays the page out, so a figure (digits and the
+signs numbers are written with: `css::measured_by_char`) is the sum of its characters' widths, each measured once and
+cached, and a live value that changes every frame lays nothing out; text with letters is measured whole, kerning
+included (`web/text-browser.test.mjs` checks both against what Chrome draws). The CSS of runs (`src/text/css.rs`: the `font` shorthand,
+generic families such as `monospace` left unquoted,
+names the app quoted kept only when their quotes close them) and line breaking (`src/text/wrap.rs`: break opportunities, the
+line start and end rules of CJK punctuation, the filling of lines) depend on nothing of the browser and are tested on
+the host (`tests/text`).
 
 ## Styles as classes
 
@@ -565,7 +578,17 @@ range of travel, with no breadth across it, so it takes no pointer events, at `z
 list isolates that z-index (`nsh-sticky`): as natively, a sticky cell never covers the views after the list, such as a
 bar the content scrolls under. The next sticky cell's track starts where it pushes the cell out, the last one's ends
 with the content, and a cell no longer sticky goes back to its frame. Entering a track cancels any frame
-animation already running on the cell, so its content coordinates cannot override the sticky insets.
+animation already running on the cell, so its content coordinates cannot override the sticky insets. The cells of a
+list in the scroll view's viewport (`viewport="parent"`) are in that list: their tracks go there, the list isolates
+their z-index, and their insets add where the list is in the scroll view's content (`trackOrigin`, the frames
+between them); the core bounds their travel by the list's end. A cell's animated offset (an animated
+`stickyHeaderOffset` or sticky `top`) comes as the animator's `sticky-offset` output for the cell each frame
+(`op_a`): it is kept on the cell (`_stickyOffset`) and added to the track's inset. Views clip with `overflow: clip`, which, unlike
+`hidden`, makes no scroll container, so `position: sticky` reaches the scroll view through the list.
+
+A smooth scroll of the core's (`scrollTo` with `animated`) in flight moves with a `ScrollBy` (`op_sb` retargets it),
+as the native backends move theirs: setting `scrollTop` would stop the browser's smooth scroll. The user's wheel,
+pointer, touch or key takes it over.
 
 ## Platform services
 
@@ -601,9 +624,33 @@ animation already running on the cell, so its content coordinates cannot overrid
   deleted video is stopped (a detached media element plays on). Browsers only start a video with sound after a user
   gesture (a warning says so).
 - **Registered native components** are the native apps' own: their view stays empty, with a warning once per name.
+- **The host** (`nsh/host`): the page answers the app's calls with `createPlayer`'s `host` option, an object whose
+  `call(name, args)` returns the result or a promise of it. `Command::HostCall` is the command `hostCall` (`encode.rs`;
+  the id written whole, not rounded as `num` would), and `nsh.js` `hostCall` answers every one with `onHost`
+  `{ type: "reply", id, ok, value?, error? }` (`EventPayload::Json`, `nsh_event`): `ok: false` with the error's message when the page has no host, `call` throws or
+  its promise rejects, or the result is not JSON, since the app's call waits until it is answered. The page sends
+  events with `player.hostEvent(event, payload)` (`onHost` `{ type: "event", event, payload }`; one `EventKind` for
+  both keeps the kinds within `EventMask`'s 64 bits): the payload is serialized at once (a payload that is
+  not JSON throws to the page, not inside a deferred engine call where it would drop the calls queued after it), and
+  events sent before the app runs are queued and delivered in order right after `begin` starts it, so its top-level
+  `host.on` listeners get them (no replay to listeners registered later); every `begin` queues again until the new app
+  has started, and a start that throws (a trap) drops the queue and the events sent after it. `web/nsh.test.mjs`
+  tests `hostCall` and this queue on a fake engine (`node --test crates/nsh-platform-web/web/nsh.test.mjs`).
+  `Environment::host` is set when the player has a `host` (`nsh_environment`'s `host`, read at start only).
+  `nsh package --target web` copies `nsh.json` `web.host` (a JS module relative to `nsh.json`, `package::WebConfig`; `package::web_host_module` requires it inside the app's
+  directory once symbolic links are resolved, as `nsh test` does) as `host.<digest>.js`; the page imports it alongside the
+  runtime and runs its `createHost(player)` once the player exists, before `run`, and its `host` option forwards to
+  what that returns (no callable `call`: the page's "could not be loaded" error). The host module shares the page's
+  CSP: an app restricting `network` gets a `connect-src` of `'self'`, its `capabilities.network` and `web.connect`
+  (`package::WebConfig::connect`, host patterns checked as `HostPattern`s, which keeps any CSP syntax out:
+  `web::page_connect`). `web.connect` is the page's alone: the core checks the app's requests against its
+  capabilities before `fetch` sees them, so only the redirect hops CSP guards widen with it. The module is copied as it
+  is: its own imports are absolute URLs.
+  Headless `nsh test` runs the same module for each app a test opens (`nsh_testing` `page_host.rs`,
+  `docs/dev/tooling.md` "Headless runs").
 
 ## Not implemented
 
-Platform services other than the theme color, toasts, dialogs and the clipboard; image download progress; a web
+Platform services other than the theme color, toasts, dialogs, the clipboard and the host; image download progress; a web
 view's events and commands for pages of other sites (beyond `postMessage` and loads), user agents. A published app
 ships no source map.

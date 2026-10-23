@@ -31,6 +31,7 @@ pub const NATIVE_MODULES: &[&str] = &[
     "nsh/canvas",
     "nsh/list",
     "nsh/image",
+    "nsh/host",
     "nsh/keymap",
 ];
 
@@ -110,10 +111,14 @@ mod tests {
             ("gridTemplateColumns", "string"),
             ("transform", "TransformStep[]"),
             ("tintColor", "ColorValue"),
-            ("display", "\"flex\" | \"grid\" | \"block\" | \"none\""),
+            (
+                "display",
+                "\"flex\" | \"grid\" | \"block\" | \"flow-root\" | \"none\"",
+            ),
         ] {
             assert!(style.contains(&format!("  {name}?: {ts};")), "{name}");
         }
+        assert!(!style.contains("backdropMaterial"));
         let text = style.find("export interface TextStyle").unwrap();
         assert!(style[text..].contains("  textDecorationStyle?:"));
         // Each host prop and event in the interface of the elements it is for.
@@ -126,6 +131,7 @@ mod tests {
             ("HostProps", "  onPressUp?: (e?: PressEvent) => void;"),
             ("HostProps", "  onLayout?: (bounds: Bounds) => void;"),
             ("AndroidHostProps", "  elevation?: number;"),
+            ("IOSHostProps", "  backdropMaterial?: BackdropMaterial;"),
             ("InputHostProps", "  keyboardType?: KeyboardType;"),
             ("InputHostProps", "  onChange?: (text: string) => void;"),
             (
@@ -144,6 +150,7 @@ mod tests {
                 "VideoHostProps",
                 "  onLoad?: (e: { duration: number; size: Size }) => void;",
             ),
+            ("VideoHostProps", "  audioSession?: AudioSession;"),
             (
                 "ScrollingHostProps",
                 "  decelerationRate?: \"normal\" | \"fast\" | number;",

@@ -32,6 +32,8 @@ pub(crate) struct TargetIvars {
     /// Scrolls the core asked for that each scroll view applied, reported
     /// with its offsets (`EngineControl::scroll`).
     scrolls_applied: std::cell::RefCell<rustc_hash::FxHashMap<NodeId, u32>>,
+    /// The app's keyboard shortcuts, matched as keys are pressed.
+    keymap: crate::keymap::KeymapState,
 }
 
 define_class!(
@@ -298,6 +300,10 @@ define_class!(
                 .control
                 .scroll(id, point(px(offset.x as f32), px(offset.y as f32)), applied);
             self.with_mounter(move |m| m.scrolled(id, offset));
+            // A text area scrolling moves its caret.
+            if scroll.downcast_ref::<input::Area>().is_some() {
+                self.caret_moved(scroll);
+            }
         }
 
         /// Zoomable scroll views zoom their zoom view.
@@ -456,6 +462,7 @@ impl EventTarget {
             control,
             mounter,
             scrolls_applied: Default::default(),
+            keymap: Default::default(),
         });
         // SAFETY: NSObject's designated initializer.
         unsafe { msg_send![super(this), init] }
@@ -477,7 +484,12 @@ impl EventTarget {
         self.ivars().scrolls_applied.borrow_mut().remove(&id);
     }
 
-    fn dispatch(&self, id: NodeId, event: EventKind, payload: EventPayload) {
+    /// The app's keyboard shortcuts.
+    pub(crate) fn keymap(&self) -> &crate::keymap::KeymapState {
+        &self.ivars().keymap
+    }
+
+    pub(crate) fn dispatch(&self, id: NodeId, event: EventKind, payload: EventPayload) {
         self.ivars().control.dispatch_event(id, event, payload);
     }
 
@@ -565,6 +577,33 @@ impl EventTarget {
                 None => EventPayload::Selection(nsh_core::SelectionEvent::new(start, end)),
             };
             m.input_event(id, EventKind::SelectionChange, payload);
+        });
+        self.caret_moved(view);
+    }
+
+    /// `onPaste` of input `id`: what the user pasted.
+    pub(crate) fn pasted(&self, id: NodeId, paste: nsh_core::PasteEvent) {
+        self.with_mounter(move |m| {
+            m.input_event(id, EventKind::Paste, EventPayload::Paste(Box::new(paste)))
+        });
+    }
+
+    /// `onCaretMove` of the input `view` belongs to if its caret moved:
+    /// with the selection, or as a text area scrolled or the input was laid
+    /// out again, while it edits.
+    pub(crate) fn caret_moved(&self, view: &UIView) {
+        if !view.isFirstResponder() {
+            return;
+        }
+        let Some(caret) = input::caret(view) else {
+            return;
+        };
+        if !input::caret_changed(view, caret) {
+            return;
+        }
+        let id = view.tag() as NodeId;
+        self.with_mounter(move |m| {
+            m.input_event(id, EventKind::CaretMove, EventPayload::caret(caret))
         });
     }
 

@@ -939,7 +939,7 @@ pub(crate) fn key_now(surface: &Rc<Surface>, event: KeyEvent) -> bool {
     let handled = shortcut
         || crate::system::key(surface, &event)
         || crate::keymap::key(surface, &event, editing)
-        || crate::chrome::shortcut(surface, &event, editing)
+        || crate::chrome::shortcut(surface, &event)
         || crate::text_input::key(surface, &event)
         || crate::text::key(surface, &event)
         || crate::selection_area::key(surface, &event)
@@ -970,7 +970,7 @@ pub(crate) fn component_key(surface: &Rc<Surface>, event: KeyEvent) -> bool {
     }
     let handled = surface.shortcuts.borrow().iter().any(|f| f(&event))
         || crate::keymap::key(surface, &event, true)
-        || crate::chrome::shortcut(surface, &event, true);
+        || crate::chrome::shortcut(surface, &event);
     if handled && event.modifiers.alt {
         surface.input.alt_combo.set(true);
     }

@@ -110,6 +110,14 @@ pub struct Screen {
     clipboard_reads: Vec<(u32, bool)>,
     /// The `Image.getSize` / `Image.prefetch` requests to answer.
     image_infos: Vec<u32>,
+    /// The picks asked (`Picker.pickImages`), in order, and how many were
+    /// answered.
+    picks: Vec<(u32, nsh_core::picker::PickRequest)>,
+    picks_answered: usize,
+    /// The URLs the app had the system open (`openUrl`), in order.
+    opened_urls: Vec<String>,
+    /// The `openUrl` requests to answer.
+    url_opens: Vec<u32>,
     /// What the app asked that only a real platform answers, since the
     /// last call.
     unsupported: Vec<&'static str>,
@@ -257,6 +265,9 @@ pub(crate) struct Input {
     /// The edits reported so far ([`nsh_core::EventPayload::Text`]).
     pub(crate) count: u32,
     pub(crate) config: Box<InputConfig>,
+    /// Where its text goes in the view (inside padding and border); the
+    /// whole view until the core says.
+    pub(crate) content: Option<Bounds<Points>>,
 }
 
 impl Input {
@@ -425,6 +436,11 @@ impl Screen {
                     input.config = config.clone();
                 }
             }
+            MountItem::InputContent { id, content } => {
+                if let Some(input) = self.input_mut(*id) {
+                    input.content = Some(*content);
+                }
+            }
             MountItem::InputValue { id, text, count } => {
                 // A value based on fewer edits than the user made is stale.
                 if let Some(input) = self.input_mut(*id)
@@ -527,6 +543,12 @@ impl Screen {
             // Headless runs load no images: the size is answered as a
             // failed load (a `TextView` asks for its images' sizes).
             Command::ImageInfo { id, .. } => self.image_infos.push(*id),
+            Command::PickImages { id, request } => self.picks.push((*id, *request)),
+            // Recorded, never opened: a test's machine opens nothing.
+            Command::OpenUrl { id, url } => {
+                self.opened_urls.push(url.clone());
+                self.url_opens.push(*id);
+            }
             Command::Back => self.back_asked = true,
             Command::SetSelection { start, end } => {
                 if let Some(input) = self.input_mut(id) {
@@ -737,17 +759,19 @@ impl Screen {
                     inner.within(bounds)
                 } else if inner.shows(&bounds) {
                     // Any of its content scrolls into view, nothing before
-                    // its start: lists park the cells they do not use there.
-                    let size =
-                        scroll
-                            .content
-                            .map_or(Size::new(Points(f32::MAX), Points(f32::MAX)), |c| {
-                                Size::new(
-                                    c.width.max(bounds.size.width),
-                                    c.height.max(bounds.size.height),
-                                )
-                            });
-                    Clip::Within(Bounds::new(content, size))
+                    // its start along its axis: lists park the cells they do
+                    // not use there. Across it nothing is clipped (the
+                    // headless text engine puts inline views on one line).
+                    let far = Points(f32::MAX / 4.0);
+                    let start = if scroll.horizontal {
+                        Point::new(content.x, -far)
+                    } else {
+                        Point::new(-far, content.y)
+                    };
+                    Clip::Within(Bounds::new(
+                        start,
+                        Size::new(Points(f32::MAX), Points(f32::MAX)),
+                    ))
                 } else {
                     Clip::Within(Bounds::default())
                 };
@@ -872,6 +896,22 @@ impl Screen {
         self.answered = (self.answered + 1).min(self.dialogs.len());
     }
 
+    /// The picks the app asked for so far, in order (`Picker.pickImages`).
+    pub fn picks(&self) -> Vec<nsh_core::picker::PickRequest> {
+        self.picks.iter().map(|(_, request)| *request).collect()
+    }
+
+    /// The oldest pick not answered yet: its request's id and what it
+    /// asks.
+    pub(crate) fn pending_pick(&self) -> Option<(u32, nsh_core::picker::PickRequest)> {
+        self.picks.get(self.picks_answered).copied()
+    }
+
+    /// The oldest pick was answered.
+    pub(crate) fn picked(&mut self) {
+        self.picks_answered = (self.picks_answered + 1).min(self.picks.len());
+    }
+
     /// The clipboard's text.
     pub fn clipboard(&self) -> Option<&str> {
         self.clipboard.as_deref()
@@ -890,6 +930,18 @@ impl Screen {
     /// last call.
     pub(crate) fn take_image_infos(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.image_infos)
+    }
+
+    /// The URLs the app had the system open (`openUrl`, a `TextView`'s
+    /// links), in order: what reached the platform, past the URL check,
+    /// the `openUrl` capability and the embedding app's URL handler.
+    pub fn opened_urls(&self) -> &[String] {
+        &self.opened_urls
+    }
+
+    /// The `openUrl` requests to answer since the last call.
+    pub(crate) fn take_url_opens(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.url_opens)
     }
 
     pub(crate) fn take_unsupported(&mut self) -> Vec<&'static str> {
@@ -1131,6 +1183,62 @@ impl Screen {
             [one] => Pick::One(one),
             ref all => Pick::Many(all.len()),
         }
+    }
+
+    /// The center of canvas node `id` in the root; `None` for a view.
+    pub(crate) fn canvas_node_center(&self, id: NodeId) -> Option<Point<Points>> {
+        if !self.nodes.get(&id)?.canvas_node {
+            return None;
+        }
+        Some(self.bounds_in_root(id)?.center())
+    }
+
+    /// The canvas containing the one node `selector` names, and its
+    /// center in that canvas's coordinates; `None` for ordinary views.
+    pub(crate) fn canvas_node(&self, selector: &Selector) -> Option<(NodeId, Point<Points>)> {
+        let [id] = self.resolve(selector)[..] else {
+            return None;
+        };
+        let view = self.nodes.get(&id)?;
+        view.canvas_node
+            .then_some((view.parent?, view.frame.center()))
+    }
+
+    /// The view a pointer at `at` (in the root) reaches: the topmost,
+    /// innermost one there that receives touches. Canvas nodes are not views.
+    fn hit_pointer(&self, at: Point<Points>) -> NodeId {
+        let attached: HashSet<NodeId> = self.attached().into_iter().collect();
+        self.hit_in(ROOT, at, &attached).unwrap_or(ROOT)
+    }
+
+    fn hit_in(&self, id: NodeId, at: Point<Points>, attached: &HashSet<NodeId>) -> Option<NodeId> {
+        let view = self.nodes.get(&id);
+        let receives = view.map_or(PointerEvents::Auto, |v| v.pointer_events);
+        if receives == PointerEvents::None || view.is_some_and(|v| v.hidden) {
+            return None;
+        }
+        let inside = id == ROOT || self.bounds_in_root(id).is_some_and(|b| b.contains(&at));
+        // Unclipped children can receive a pointer outside their parent's box.
+        if !inside
+            && (receives == PointerEvents::BoxOnly
+                || view.is_some_and(|v| v.clips || v.scroll.is_some()))
+        {
+            return None;
+        }
+        if receives != PointerEvents::BoxOnly
+            && let Some(children) = self.children.get(&id)
+        {
+            for &child in children.iter().rev() {
+                let node = self.nodes.get(&child).is_some_and(|v| v.canvas_node);
+                if node || !attached.contains(&child) {
+                    continue;
+                }
+                if let Some(hit) = self.hit_in(child, at, attached) {
+                    return Some(hit);
+                }
+            }
+        }
+        (inside && receives != PointerEvents::BoxNone).then_some(id)
     }
 
     /// The view a press on the selector's match goes to: it, or its nearest
@@ -1377,53 +1485,6 @@ impl Screen {
         Some(Bounds::new(origin, view.frame.size))
     }
 
-    /// The center of canvas node `id` in the root's points; `None` for a
-    /// view.
-    pub(crate) fn canvas_node_center(&self, id: NodeId) -> Option<Point<Points>> {
-        if !self.nodes.get(&id)?.canvas_node {
-            return None;
-        }
-        Some(self.bounds_in_root(id)?.center())
-    }
-
-    /// The view a pointer at `at` (in the root's points) reaches: the
-    /// topmost, innermost one on screen there that receives touches
-    /// (`pointerEvents`), as platforms hit-test; canvas nodes and text
-    /// spans are not views.
-    fn hit_pointer(&self, at: Point<Points>) -> NodeId {
-        let shown: HashSet<NodeId> = self.shown().into_iter().collect();
-        self.hit_in(ROOT, at, &shown).unwrap_or(ROOT)
-    }
-
-    fn hit_in(&self, id: NodeId, at: Point<Points>, shown: &HashSet<NodeId>) -> Option<NodeId> {
-        let receives = self
-            .nodes
-            .get(&id)
-            .map_or(PointerEvents::Auto, |v| v.pointer_events);
-        if receives == PointerEvents::None
-            || id != ROOT && !self.bounds_in_root(id).is_some_and(|b| b.contains(&at))
-        {
-            return None;
-        }
-        if receives != PointerEvents::BoxOnly
-            && let Some(children) = self.children.get(&id)
-        {
-            for &child in children.iter().rev() {
-                let drawn = self
-                    .nodes
-                    .get(&child)
-                    .is_some_and(|v| v.canvas_node || v.span.is_some());
-                if drawn || !shown.contains(&child) {
-                    continue;
-                }
-                if let Some(hit) = self.hit_in(child, at, shown) {
-                    return Some(hit);
-                }
-            }
-        }
-        (receives != PointerEvents::BoxNone).then_some(id)
-    }
-
     /// The views of `chain` (innermost first) that hovering matters to:
     /// their `hover:` styles or hover events (`input::hoverable`).
     #[cfg(not(target_arch = "wasm32"))]
@@ -1516,6 +1577,48 @@ impl Screen {
         self.nodes.get(&id)?.input.as_ref()
     }
 
+    /// Input `id`'s caret at the end of its text, in the view, as
+    /// [`nsh_core::ApproxTextEngine`] lays the text out: characters `0.55 ×`
+    /// the font size wide, lines `1.2 ×` it tall, wrapped at the content
+    /// box's width when multiline; a single line is centered in the box and
+    /// keeps the caret inside it.
+    pub(crate) fn input_caret(&self, id: NodeId) -> Option<Bounds<Points>> {
+        let view = self.nodes.get(&id)?;
+        let input = view.input.as_ref()?;
+        let content = input
+            .content
+            .unwrap_or_else(|| Bounds::new(Point::default(), view.frame.size));
+        let font = input.config.style.font_size.0;
+        let (advance, line) = (font * 0.55, font * 1.2);
+        let (column, row) = if input.config.multiline {
+            let per_line = ((content.size.width.0 / advance).floor() as usize).max(1);
+            let mut row = 0;
+            let mut column = 0;
+            for (i, part) in input.text.split('\n').enumerate() {
+                let chars = part.chars().count();
+                if i > 0 {
+                    row += 1;
+                }
+                row += chars / per_line;
+                column = chars % per_line;
+            }
+            (column, row)
+        } else {
+            (input.text.chars().count(), 0)
+        };
+        let mut x = content.origin.x.0 + column as f32 * advance;
+        let y = if input.config.multiline {
+            content.origin.y.0 + row as f32 * line
+        } else {
+            x = x.min(content.origin.x.0 + (content.size.width.0 - 1.0).max(0.0));
+            content.origin.y.0 + (content.size.height.0 - line) / 2.0
+        };
+        Some(Bounds::new(
+            nsh_core::geometry::point(Points(x), Points(y)),
+            nsh_core::geometry::size(Points(1.0), Points(line)),
+        ))
+    }
+
     pub(crate) fn input_mut(&mut self, id: NodeId) -> Option<&mut Input> {
         self.nodes.get_mut(&id)?.input.as_mut()
     }
@@ -1565,6 +1668,81 @@ impl Screen {
 mod tests {
     use super::*;
 
+    /// A canvas over a pressable pad, both inside a plain container.
+    fn canvas_screen() -> Screen {
+        let mut screen = Screen::default();
+        screen.apply(&batch(vec![
+            create(2, ViewKind::View),
+            create(4, ViewKind::Canvas),
+            create(6, ViewKind::View),
+            frame(2, 0.0, 0.0, 200.0, 40.0),
+            frame(4, 0.0, 0.0, 200.0, 40.0),
+            frame(6, 0.0, 0.0, 200.0, 40.0),
+            insert(1, 2),
+            insert(2, 6),
+            insert(2, 4),
+        ]));
+        screen.nodes.get_mut(&4).unwrap().pointer_events = PointerEvents::None;
+        screen
+            .nodes
+            .get_mut(&6)
+            .unwrap()
+            .events
+            .set(EventKind::Press, true);
+        screen.canvas(
+            4,
+            &[nsh_core::canvas::CanvasNode::new(
+                Bounds::new(Point::default(), Size::new(Points(100.0), Points(40.0))),
+                AccessibilityRole::Text,
+                "cell",
+            )
+            .test_id("cell")],
+        );
+        screen
+    }
+
+    #[test]
+    fn canvas_presses_skip_hidden_subtrees() {
+        let mut screen = canvas_screen();
+        screen.apply(&batch(vec![
+            create(8, ViewKind::View),
+            create(10, ViewKind::View),
+            frame(8, 0.0, 0.0, 200.0, 40.0),
+            frame(10, 0.0, 0.0, 200.0, 40.0),
+            insert(2, 8),
+            insert(8, 10),
+            style(8, |s| s.hidden = true),
+        ]));
+        screen
+            .nodes
+            .get_mut(&10)
+            .unwrap()
+            .events
+            .set(EventKind::Press, true);
+        assert_eq!(
+            screen.pressable(&Selector::parse("id:cell").unwrap()),
+            Pick::One(6)
+        );
+    }
+
+    #[test]
+    fn canvas_presses_reach_visible_overflow_but_respect_clipping() {
+        let mut screen = canvas_screen();
+        screen.apply(&batch(vec![
+            frame(2, 0.0, 0.0, 100.0, 40.0),
+            frame(4, 100.0, 0.0, 100.0, 40.0),
+            frame(6, 100.0, 0.0, 100.0, 40.0),
+        ]));
+        let selector = Selector::parse("id:cell").unwrap();
+        assert_eq!(screen.count("id:cell"), Ok(1));
+        assert_eq!(screen.pressable(&selector), Pick::One(6));
+        screen.nodes.get_mut(&2).unwrap().clips = true;
+        assert_eq!(screen.pressable(&selector), Pick::None);
+        screen.nodes.get_mut(&2).unwrap().clips = false;
+        screen.nodes.get_mut(&2).unwrap().pointer_events = PointerEvents::BoxOnly;
+        assert_eq!(screen.pressable(&selector), Pick::None);
+    }
+
     fn batch(items: Vec<MountItem>) -> MountBatch {
         MountBatch { items }
     }
@@ -1610,6 +1788,42 @@ mod tests {
             layout: nsh_core::TextLayout(Arc::new(())),
             content: Bounds::default(),
         }
+    }
+
+    #[test]
+    fn an_input_caret_follows_its_text_as_the_approximate_engine_lays_it_out() {
+        let mut screen = Screen::default();
+        let mut config = nsh_core::InputConfig::default();
+        config.style.font_size = Points(10.0);
+        config.multiline = true;
+        screen.apply(&batch(vec![
+            create(2, ViewKind::Input),
+            frame(2, 0.0, 0.0, 60.0, 100.0),
+            MountItem::Input {
+                id: 2,
+                config: Box::new(config),
+            },
+            MountItem::InputContent {
+                id: 2,
+                content: Bounds::new(
+                    Point::new(Points(4.0), Points(6.0)),
+                    Size::new(Points(55.0), Points(88.0)),
+                ),
+            },
+            insert(1, 2),
+        ]));
+        let caret = |screen: &Screen| {
+            let b = screen.input_caret(2).unwrap();
+            (b.origin.x.0, b.origin.y.0, b.size.height.0)
+        };
+        assert_eq!(caret(&screen), (4.0, 6.0, 12.0));
+        // Ten characters fit a line of 55 points (5.5 each): the twelfth is
+        // the second of the next line.
+        screen.input_mut(2).unwrap().text = "abcdefghijkl".into();
+        assert_eq!(caret(&screen), (4.0 + 2.0 * 5.5, 18.0, 12.0));
+        // A line break starts a line.
+        screen.input_mut(2).unwrap().text = "ab\nc".into();
+        assert_eq!(caret(&screen), (4.0 + 5.5, 18.0, 12.0));
     }
 
     #[test]

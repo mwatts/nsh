@@ -29,6 +29,7 @@ final class ScrollBox extends FrameLayout implements Node {
     final Mounter mounter;
     final int id;
     final Decor decor = new Decor();
+    /** The events it listens to, kinds below 64 ({@link Mounter#wants} has all). */
     long events;
     boolean horizontal;
     int dismissMode; // 0 none, 1 on drag, 2 interactive
@@ -192,6 +193,16 @@ final class ScrollBox extends FrameLayout implements Node {
             if (!kept && v != null) {
                 if (horizontal) v.setTranslationX(0); else v.setTranslationY(0);
             }
+            if (!kept && mounter.stickyHosts.get(old) == this) mounter.stickyHosts.remove(old);
+            mounter.forgetStickyOffset(old);
+        }
+        // A cell may be in a list in this scroll view's viewport: its
+        // animated offset finds this scroll view. Its offset is forgotten:
+        // the outputs after the batch bring back the ones still animated,
+        // so a cell whose offset became a number no longer adds the old one.
+        for (int c : cells) {
+            mounter.stickyHosts.put(c, this);
+            mounter.forgetStickyOffset(c);
         }
         stickyCells = cells;
         stickyStart = start;
@@ -214,13 +225,14 @@ final class ScrollBox extends FrameLayout implements Node {
         return stickyCells.length > 0;
     }
 
-    /** Moves the sticky cells with the scroll offset. */
-    private void pinSticky() {
+    /** Moves the sticky cells with the scroll offset (and their animated offsets). */
+    void pinSticky() {
         float offset = horizontal ? scroller.getScrollX() : scroller.getScrollY();
         for (int i = 0; i < stickyCells.length; i++) {
             View v = mounter.view(stickyCells[i]);
             if (v == null) continue;
-            float t = Math.max(0, Math.min(offset - stickyStart[i], stickyEnd[i] - stickyStart[i]));
+            float extra = mounter.stickyOffset(stickyCells[i]);
+            float t = Math.max(0, Math.min(offset + extra - stickyStart[i], stickyEnd[i] - stickyStart[i]));
             if (horizontal) v.setTranslationX(t); else v.setTranslationY(t);
         }
     }

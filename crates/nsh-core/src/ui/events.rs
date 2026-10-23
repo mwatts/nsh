@@ -95,6 +95,21 @@ pub struct KeyPress {
     pub modifiers: crate::keymap::Modifiers,
 }
 
+/// Where an input's caret is (`on_caret_move`): what opens at it (an `@`
+/// mention's suggestions) is placed with it.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+#[non_exhaustive]
+pub struct CaretEvent {
+    /// The caret in the input's coordinates (its border box), its own
+    /// scrolling applied: as wide as the platform draws it, as tall as its
+    /// line. Empty when the platform could not place it.
+    pub bounds: Bounds<Points>,
+    /// The caret in its root view's coordinates (the surface, or the dialog
+    /// around the input), as of the event:
+    /// [`crate::overlay::OverlayAnchor::Bounds`] places an overlay against it.
+    pub page_bounds: Bounds<Points>,
+}
+
 /// An input method's composition in an input (`on_composition_change`):
 /// the text being composed (pinyin before a character is chosen, kana
 /// before conversion), not yet the input's text.
@@ -346,6 +361,20 @@ pub(crate) fn text_layout(p: &EventPayload) -> Option<Cow<'_, [crate::TextLine]>
         EventPayload::TextLayout(lines) => Some(Cow::Borrowed(lines)),
         _ => None,
     }
+}
+
+pub(crate) fn paste(p: &EventPayload) -> Option<Cow<'_, crate::PasteEvent>> {
+    match p {
+        EventPayload::Paste(paste) => Some(Cow::Borrowed(paste)),
+        _ => None,
+    }
+}
+
+pub(crate) fn caret(p: &EventPayload) -> Option<Cow<'_, CaretEvent>> {
+    Some(Cow::Owned(CaretEvent {
+        bounds: bounds_field(p, "bounds"),
+        page_bounds: bounds_field(p, "pageBounds"),
+    }))
 }
 
 pub(crate) fn composition(p: &EventPayload) -> Option<Cow<'_, Composition>> {

@@ -195,16 +195,20 @@ impl ResolvedTextStyle {
         let font_size = style.font_size.unwrap_or(self.font_size);
         // A multiple follows each nested font size (unitless CSS
         // line-height); points stay points.
-        let (line_height, line_height_multiple) =
-            match (style.line_height_multiple, style.line_height) {
-                (Some(m), _) => (m * font_size, m),
-                (None, Some(points)) => (points, 0.0),
-                (None, None) if self.line_height_multiple > 0.0 => (
-                    self.line_height_multiple * font_size,
-                    self.line_height_multiple,
-                ),
-                (None, None) => (self.line_height, 0.0),
-            };
+        let (line_height, line_height_multiple) = match (
+            style.line_height_multiple,
+            style.line_height,
+            style.line_height_em,
+        ) {
+            (_, _, Some(em)) => (em * font_size, 0.0),
+            (Some(m), _, _) => (m * font_size, m),
+            (None, Some(points), _) => (points, 0.0),
+            (None, None, _) if self.line_height_multiple > 0.0 => (
+                self.line_height_multiple * font_size,
+                self.line_height_multiple,
+            ),
+            (None, None, _) => (self.line_height, 0.0),
+        };
         Self {
             color: style.color.unwrap_or(self.color),
             font_size,
@@ -814,6 +818,8 @@ impl TextEngine for ApproxTextEngine {
         let (_, count) = approx_lines(chars, font, *max_lines, Some(size.width));
         let count = count as usize;
         let per = chars.div_ceil(count.max(1)).max(1);
+        // Baseline at the bottom of each line: the ascent is the line and
+        // the descent is 0, the same extent attachments are placed against.
         let lines = (0..count)
             .map(|k| {
                 let (from, to) = ((k * per).min(chars), ((k + 1) * per).min(chars));
@@ -825,10 +831,9 @@ impl TextEngine for ApproxTextEngine {
                     y: line * k as f32,
                     width: advance * (to - from) as f32,
                     height: line,
-                    ascender: font,
-                    descender: font * 0.2,
-                    cap_height: font * 0.7,
+                    ascender: line,
                     x_height: font * 0.5,
+                    ..TextLine::default()
                 }
             })
             .collect();
