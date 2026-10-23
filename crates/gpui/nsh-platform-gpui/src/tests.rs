@@ -717,7 +717,7 @@ function App() {
     },
   ]);
   return (
-    <View style={{ flex: 1 }} onLayout={(e) => height.set(Math.round(e.height))}>
+    <View style={{ flex: 1 }} onLayout={(e) => height.set(Math.round(e.size.height))}>
       <Input autoFocus value={`h ${height()}${chosen()}`} style={{ height: 30 }} />
     </View>
   );
@@ -799,7 +799,7 @@ function App() {
     { label: "File", submenu: [{ label: "New", onSelect: () => chosen.set(" new") }] },
   ]);
   return (
-    <View style={{ flex: 1 }} onLayout={(e) => height.set(Math.round(e.height))}>
+    <View style={{ flex: 1 }} onLayout={(e) => height.set(Math.round(e.size.height))}>
       <Input autoFocus value={`h ${height()}${chosen()}`} style={{ height: 30 }} />
     </View>
   );

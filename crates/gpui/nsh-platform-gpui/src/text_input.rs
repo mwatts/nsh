@@ -697,6 +697,9 @@ const HOLD: f64 = 3.0;
 /// up focused, ahead of text it receives later.
 fn set_focus(surface: &Rc<Surface>, view: Option<&NshView>) {
     let old = focused(surface);
+    // Drop a queue whose wait already ended. The `arm` below starts a new
+    // wait, and `armed` skips the deadline while `changing` is set.
+    armed(surface);
     set_changing(surface, true);
     if old.as_ref() != view {
         move_focus(surface, view, old.as_ref());
