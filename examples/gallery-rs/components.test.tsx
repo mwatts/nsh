@@ -34,8 +34,8 @@ test("shows its cards and the platform's figures", () => {
     "platform.os",
     "ios",
     "platform.version",
-    "platform.idiom / catalyst",
-    "phone / false",
+    "platform.idiom / desktop / catalyst",
+    "phone / false / false",
     "ios branch",
     "pixelRatio()",
     "10.3 on whole pixels",
@@ -91,11 +91,11 @@ test("opens the modal and the sheet, and closes them", async () => {
   await app.waitFor("A sheet", { state: "gone" });
 });
 
-test("pushes the keyboard avoiding view and switches its behavior", async () => {
-  await app.press("KeyboardAvoidingView");
-  await app.waitFor('behavior="padding"');
+test("pushes the keyboard inset page and switches padding and margin", async () => {
+  await app.press("Keyboard inset");
+  await app.waitFor("text:padding-bottom: env(keyboard-inset-height)");
   expect(app.texts()).toContain("The bottom pads: the tinted background stays under the keyboard.");
-  await app.press("height");
-  await app.waitFor('behavior="height"');
+  await app.press("margin");
+  await app.waitFor("text:margin-bottom: env(keyboard-inset-height)");
   expect(app.texts()).toContain("The view shrinks: its background ends at the keyboard.");
 });

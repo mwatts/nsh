@@ -1,7 +1,6 @@
 ---
 title: Progress
 description: Progress 组件：线性进度条，负责屏幕阅读器读到的角色、范围和数值，以及指示条随数值变化的宽度，轨道和指示条由应用设置样式。
-order: 20.8
 group: base
 demo: el-progress
 ---
@@ -12,7 +11,7 @@ demo: el-progress
 
 ```rust tabs
 use nsh_base::{progress, theme};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn upload(sent: Signal<f32>) -> impl IntoElement {
     progress()

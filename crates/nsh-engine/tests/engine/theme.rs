@@ -6,10 +6,7 @@ use std::{collections::BTreeMap, time::Duration};
 
 use crossbeam_channel::Receiver;
 use nsh_base::{Theme, theme};
-use nsh_core::{
-    ApproxTextEngine, Color, MountBatch, MountItem, Size,
-    ui::{Root, prelude::*},
-};
+use nsh_core::{ApproxTextEngine, Color, MountBatch, MountItem, Size, element::Root, prelude::*};
 use nsh_engine::{App, ColorScheme, Engine, EngineConfig, Environment};
 
 use crate::ChannelSink;
@@ -44,6 +41,7 @@ fn start(app_theme: Option<Theme>, host_theme: Option<Theme>) -> (Engine, Receiv
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Environment::default(),
@@ -60,6 +58,7 @@ fn start(app_theme: Option<Theme>, host_theme: Option<Theme>) -> (Engine, Receiv
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     let engine = Engine::start_with(
         config,
@@ -144,6 +143,7 @@ fn a_tsx_apps_token_classes_follow_the_host_theme() {
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Environment::default(),
@@ -160,6 +160,7 @@ fn a_tsx_apps_token_classes_follow_the_host_theme() {
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     assert_eq!(backgrounds(&rx), vec![default_primary()]);
@@ -227,6 +228,7 @@ fn a_hosts_theme_overrides_win_over_the_apps_tokens_they_set_and_keep_the_rest()
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Environment::default(),
@@ -242,6 +244,7 @@ fn a_hosts_theme_overrides_win_over_the_apps_tokens_they_set_and_keep_the_rest()
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
         cache: Default::default(),
     };
     // A brand's primary, light and dark, set before the app runs.
@@ -277,4 +280,128 @@ fn a_hosts_theme_overrides_win_over_the_apps_tokens_they_set_and_keep_the_rest()
     engine.control().set_tokens(None);
     assert!(colors(backgrounds_by_id(&rx)).contains(&Color(0x0000ffff)));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The texts of a batch.
+fn texts(batch: &MountBatch) -> Vec<String> {
+    batch
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            MountItem::Text { text, .. } => Some(text.text.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The last text the batches within a moment show.
+fn last_text(rx: &Receiver<MountBatch>) -> Option<String> {
+    let mut last = None;
+    while let Ok(batch) = rx.recv_timeout(Duration::from_millis(300)) {
+        if let Some(text) = texts(&batch).pop() {
+            last = Some(text);
+        }
+    }
+    last
+}
+
+/// A TSX app whose theme (`nsh.json`) adds a token, `brand`, which it reads
+/// once as its entry evaluates and again where it renders, started with
+/// the embedding app's tokens `host` sent before the start.
+fn start_branded(
+    name: &str,
+    host: Option<nsh_core::element::Tokens>,
+) -> (Engine, Receiver<MountBatch>) {
+    let dir = crate::temporary_root().join(format!("nsh-theme-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("nsh.json"),
+        r##"{ "theme": { "cssVars": { "light": { "brand": "#123456" } } } }"##,
+    )
+    .unwrap();
+    let entry = dir.join("App.tsx");
+    std::fs::write(
+        &entry,
+        "import { mount, Text, token } from \"nsh\";\n\
+         const atStart = token(\"brand\");\n\
+         mount(() => <Text>{`${atStart} ${token(\"brand\")}`}</Text>);\n",
+    )
+    .unwrap();
+    let bundle = nsh_bundler::bundle(&nsh_bundler::BundleOptions {
+        entry,
+        minify: false,
+        split: false,
+        ui_sets: Vec::new(),
+    })
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    let bytecode = nsh_js::compile_bytecode(&bundle.code, false).unwrap();
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let config = EngineConfig {
+        // SAFETY: compiled just now by this runtime.
+        app: App::Js(unsafe { nsh_engine::Bundle::bytecode(bytecode) }),
+        viewport: Size::new(px(390.0), px(844.0)),
+        trace: false,
+        network: None,
+        websocket: None,
+        refuse_connections: None,
+        filesystem: None,
+        assets: None,
+        environment: Environment::default(),
+        header_heights: (nsh_core::Points(44.0), nsh_core::Points(96.0)),
+        limits: nsh_engine::Limits::default(),
+        ui_sets: vec![nsh_base::registry()],
+        runtime: None,
+        data_dir: None,
+        storage: None,
+        clock: Default::default(),
+        context: Default::default(),
+        pinned: Default::default(),
+        clipboard: None,
+        host: Default::default(),
+        picker: None,
+        speech: None,
+        cache: Default::default(),
+    };
+    let engine = Engine::start_with(
+        config,
+        || ApproxTextEngine,
+        ChannelSink(tx),
+        |control| {
+            if host.is_some() {
+                control.set_tokens(host);
+            }
+        },
+    )
+    .unwrap();
+    (engine, rx)
+}
+
+/// The app's theme reaches the core after the turn of the first render;
+/// `token()` has it from the entry's first statement on, so the first
+/// render (and what the entry reads once) shows it, in a single pass.
+#[test]
+fn the_apps_theme_tokens_are_read_in_the_first_render() {
+    let (_engine, rx) = start_branded("first-render", None);
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(texts(&first), vec!["#123456ff #123456ff".to_owned()]);
+}
+
+/// The embedding app's tokens sent before the start win in the first
+/// render too; changed later, what read them reactively follows.
+#[test]
+fn the_host_tokens_win_in_the_first_render_and_reads_follow_their_changes() {
+    let overrides = |hex: &str| {
+        nsh_base::theme_overrides(&format!(
+            r#"{{ "cssVars": {{ "light": {{ "brand": "{hex}" }} }} }}"#
+        ))
+        .unwrap()
+    };
+    let (engine, rx) = start_branded("host-first-render", Some(overrides("#abcdef")));
+    let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(texts(&first), vec!["#abcdefff #abcdefff".to_owned()]);
+    engine.control().set_tokens(Some(overrides("#00ff00")));
+    assert_eq!(last_text(&rx).as_deref(), Some("#abcdefff #00ff00ff"));
+    engine.control().set_tokens(None);
+    assert_eq!(last_text(&rx).as_deref(), Some("#abcdefff #123456ff"));
 }

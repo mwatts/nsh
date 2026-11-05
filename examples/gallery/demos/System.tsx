@@ -1,38 +1,17 @@
 import { cleanup, resource, signal, Text, View } from "nsh";
-import { createAnimatedValue, Easing } from "nsh/animated";
-import { Toast } from "nsh/android";
-import { colorScheme, fontScale, windowSize } from "nsh/device";
-import { AlertDialog, Dialog, keyboardFrame, safeArea, type StatusBarForeground } from "nsh/base";
+import { createAnimatedValue, Easing } from "nsh";
+import { colorScheme, fontScale, windowSize } from "nsh";
+import { AlertDialog, type AlertDialogAction, Dialog, type StatusBarForeground } from "nsh/base";
+import { keyboardFrame, safeArea } from "nsh";
 import { Menu } from "nsh/desktop";
-import { keymap } from "nsh/keymap";
-import { Icon, type IconName } from "../icons";
-import {
-  Appear,
-  Badge,
-  Button,
-  Caption,
-  Card,
-  colors,
-  DemoPage,
-  Figure,
-  finish,
-  IconTile,
-  isDark,
-  Inset,
-  Legend,
-  Meter,
-  mono,
-  Press,
-  Row,
-  Segmented,
-  Stat,
-  tints,
-  Toggle,
-  type Tone,
-  toneColor,
-} from "../ui";
+import { keymap, platform } from "nsh";
+import { Icon, type IconName, lucideSvg } from "../icons";
+import { toast } from "../toast";
+import { Appear, Badge, Button, Caption, Card, colors, DemoPage, Figure, finish, IconTile, isDark, Inset, Legend, Meter, mono, Press, Row, Segmented, Stat, tints, Toggle, type Tone, toneColor } from "../ui";
 
 /** The window drawn to scale, with the safe area insets shaded. */
+const terminal = platform.idiom === "terminal";
+
 function SafeAreaDiagram() {
   const width = 76;
   const scale = () => width / Math.max(1, windowSize().width);
@@ -81,19 +60,28 @@ function Environment() {
             <Stat label="Font scale" value={`${fontScale().toFixed(2)}×`} width="50%" />
           </View>
         </View>
-        <SafeAreaDiagram />
+        {/* A drawing the terminal's Cells would not hold; its figures are below. */}
+        <If when={!terminal}>
+          <SafeAreaDiagram />
+        </If>
       </View>
       <View style={{ height: 1, backgroundColor: colors.line }} />
       <View style={{ gap: 4 }}>
-        <Caption label="Safe area insets" note="pt" />
+        {/* The terminal's figures carry their unit, as the keyboard's does. */}
+        <Caption label="Safe area insets" note={terminal ? undefined : "pt"} />
         <View style={{ flexDirection: "row" }}>
-          <Each of={insets()}>{(inset) => <Stat label={inset().label} value={String(Math.round(inset().value))} width="25%" />}</Each>
+          <Each of={insets()}>
+            {(inset) => <Stat label={inset().label} value={`${Math.round(inset().value)}${terminal ? " pt" : ""}`} width="25%" />}
+          </Each>
         </View>
       </View>
       <View style={{ height: 1, backgroundColor: colors.line }} />
       <View style={{ flexDirection: "row", alignItems: "center", gap: 16 }}>
-        <Legend color={colors.info} label="Safe area" />
-        <Legend color={colors.warn} label="Keyboard" />
+        {/* The legend is the drawing's, which the terminal leaves out. */}
+        <If when={!terminal}>
+          <Legend color={colors.info} label="Safe area" />
+          <Legend color={colors.warn} label="Keyboard" />
+        </If>
         <View style={{ flex: 1 }} />
         <Badge label={colorScheme() === "dark" ? "Dark scheme" : "Light scheme"} tone={colorScheme() === "dark" ? "info" : "warn"} outline />
       </View>
@@ -132,7 +120,7 @@ function StatusBarCard() {
         open={open()}
         animation="fade"
         statusBar={{ foreground: foreground(), hidden: barHidden(), animated: true }}
-        onOpenChange={(o) => open.set(o)}
+        onOpenChange={({ open: o }) => open.set(o)}
         style={{ flex: 1 }}
       >
         <View style={{ flex: 1, alignItems: "center", justifyContent: "center", gap: 16, backgroundColor: backdrop() }}>
@@ -162,6 +150,11 @@ function ActionRow(props: { first?: boolean; icon: IconName; tint: string; title
   );
 }
 
+/** What the gallery shows for the action `AlertDialog.show` reported: its label (none: dismissed). */
+function labelOf(actions: AlertDialogAction[], id?: string | null): string {
+  return actions.find((a) => a.id === id)?.label ?? "dismissed";
+}
+
 function Dialogs() {
   const answer = signal<{ text: string; tone: Tone } | null>(null);
   // The answer pops in each time it changes.
@@ -181,7 +174,7 @@ function Dialogs() {
           title="Alert"
           detail="One button"
           onPress={async () => {
-            await AlertDialog.show({ title: "Saved", description: "Your changes were saved.", actions: [{ label: "OK" }] });
+            await AlertDialog.show({ title: "Saved", description: "Your changes were saved.", actions: [{ label: "OK", id: "ok" }] });
             show("OK", "up");
           }}
         />
@@ -191,32 +184,33 @@ function Dialogs() {
           title="Confirm"
           detail="Cancel and destructive buttons"
           onPress={async () => {
-            const action = await AlertDialog.show({
+            const actions: AlertDialogAction[] = [
+              { label: "Cancel", role: "cancel", id: "cancel" },
+              { label: "Delete", role: "destructive", id: "delete" },
+            ];
+            const { action } = await AlertDialog.show({
               title: "Delete the photo?",
               description: "This cannot be undone.",
-              actions: [
-                { label: "Cancel", role: "cancel" },
-                { label: "Delete", role: "destructive" },
-              ],
+              actions,
               closeOnEscape: true,
               closeOnBackdropPress: true,
             });
-            const text = action ?? "dismissed";
-            show(text, text === "Delete" ? "danger" : "neutral");
+            show(labelOf(actions, action), action === "delete" ? "danger" : "neutral");
           }}
         />
         <ActionRow
           icon="star"
           tint={colors.info}
           title="Three buttons"
-          detail="Resolves to the id of the action pressed"
+          detail="Shows the label of the action pressed"
           onPress={async () => {
-            const action = await AlertDialog.show({
-              title: "Update available",
-              description: "Install it now?",
-              actions: [{ label: "Later" }, { label: "Never", role: "cancel" }, { label: "Install", id: "install" }],
-            });
-            show(action === "install" ? "Install" : (action ?? "dismissed"), action === "install" ? "info" : "neutral");
+            const actions: AlertDialogAction[] = [
+              { label: "Later", id: "later" },
+              { label: "Never", role: "cancel", id: "never" },
+              { label: "Install", id: "install" },
+            ];
+            const { action } = await AlertDialog.show({ title: "Update available", description: "Install it now?", actions });
+            show(labelOf(actions, action), action === "install" ? "info" : "neutral");
           }}
         />
         <ActionRow
@@ -225,21 +219,22 @@ function Dialogs() {
           title="Action sheet"
           detail="Title, cancel and destructive options"
           onPress={async () => {
-            const action = await AlertDialog.show({
-              title: "Share the photo",
-              presentation: "actionSheet",
-              actions: [{ label: "Cancel", role: "cancel" }, { label: "Copy link" }, { label: "Save" }, { label: "Delete", role: "destructive" }],
-            });
-            const text = action ?? "dismissed";
-            show(text, text === "Delete" ? "danger" : "accent");
+            const actions: AlertDialogAction[] = [
+              { label: "Cancel", role: "cancel", id: "cancel" },
+              { label: "Copy link", id: "copy" },
+              { label: "Save", id: "save" },
+              { label: "Delete", role: "destructive", id: "delete" },
+            ];
+            const { action } = await AlertDialog.show({ title: "Share the photo", presentation: "actionSheet", actions });
+            show(labelOf(actions, action), action === "delete" ? "danger" : "accent");
           }}
         />
-        <ActionRow icon="spark" tint={colors.warn} title="Toast" detail="Android only" onPress={() => Toast.show("Hello from a toast", "long")} />
+        <ActionRow icon="spark" tint={colors.warn} title="Toast" detail="nsh/base, every platform" onPress={() => void toast({ title: "Hello from a toast", description: "nsh/base's ToastManager, styled by the gallery" })} />
       </Inset>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 10, paddingHorizontal: 11, paddingTop: 12, paddingBottom: 11, minHeight: 44 }}>
         <Text style={{ flex: 1, fontSize: 13, color: colors.muted }}>Answer</Text>
         <If when={answer()} else={<Text style={{ fontSize: 13, color: colors.faint }}>None yet</Text>}>
-          <View style={{ transform: [{ scale: pop }] }}>
+          <View style={{ scale: pop }}>
             <Badge label={answer()!.text} tone={answer()!.tone} />
           </View>
         </If>
@@ -305,7 +300,7 @@ function FramesAndTimers() {
                 borderRadius: 3.5,
                 backgroundColor: colors.accent,
                 opacity: beat.interpolate({ inputRange: [0, 1], outputRange: [0.25, 1] }),
-                transform: [{ scale: beat.interpolate({ inputRange: [0, 1], outputRange: [1, 1.6] }) }],
+                scale: beat.interpolate({ inputRange: [0, 1], outputRange: [1, 1.6] }),
               }}
             />
           </View>
@@ -327,18 +322,18 @@ function Shortcuts() {
   const on = signal(false);
   const last = signal("");
   keymap.bind({
-    "mod+k": (k) => {
+    "mod+k": ({ keystroke }) => {
       count.set(count() + 1);
-      last.set(k);
+      last.set(keystroke);
     },
-    "mod+shift+l": (k) => {
+    "mod+shift+l": ({ keystroke }) => {
       on.set(!on());
-      last.set(k);
+      last.set(keystroke);
     },
   });
-  keymap.bind("mod+backspace", (k) => {
+  keymap.bind("mod+backspace", ({ keystroke }) => {
     count.set(0);
-    last.set(k);
+    last.set(keystroke);
   }, { when: "notEditing" });
   const keys: [string, string][] = [
     [keymap.label("mod+k"), "Counts"],
@@ -357,7 +352,8 @@ function Shortcuts() {
           )}
         </Each>
       </View>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+      {/* A terminal's badge is its text: a wider gap keeps it apart from the count. */}
+      <View style={{ flexDirection: "row", alignItems: "center", gap: terminal ? 24 : 8 }}>
         <Badge label={on() ? "Light on" : "Light off"} tone={on() ? "up" : "neutral"} />
         <View style={{ flex: 1 }}>
           <Caption label={`Counted ${count()}`} note={last() || "–"} />
@@ -372,9 +368,13 @@ function ContextMenu() {
   const chosen = signal("");
   const menu = () =>
     Menu.popup([
-      { label: "Copy", onSelect: () => chosen.set("Copy") },
-      { label: "Paste", disabled: true },
-      { label: "Share", submenu: [{ label: "Mail", onSelect: () => chosen.set("Share > Mail") }] },
+      { label: "Copy", icon: lucideSvg("copy"), onSelect: () => chosen.set("Copy") },
+      { label: "Paste", icon: lucideSvg("clipboard-paste"), disabled: true },
+      {
+        label: "Share",
+        icon: lucideSvg("share-2"),
+        submenu: [{ label: "Mail", icon: lucideSvg("mail"), onSelect: () => chosen.set("Share > Mail") }],
+      },
     ]);
   return (
     <Card icon="bell" title="Context menu" subtitle="nsh/desktop · right click">
@@ -419,7 +419,7 @@ function Network() {
               <Appear index={i()}>
                 <Row first={i() === 0}>
                   <Text style={{ width: 28, fontSize: 13, color: colors.accent, fontVariant: ["tabular-nums"] }}>{`#${post().id}`}</Text>
-                  <Text numberOfLines={1} style={{ flex: 1, fontSize: 15, color: colors.text }}>
+                  <Text style={{ numberOfLines: 1, flex: 1, fontSize: 15, color: colors.text }}>
                     {post().title}
                   </Text>
                 </Row>
@@ -431,7 +431,7 @@ function Network() {
       <If when={status()}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
           <View style={{ width: 7, height: 7, borderRadius: 3.5, backgroundColor: toneColor(status()!.tone) }} />
-          <Text numberOfLines={2} style={{ flex: 1, fontSize: 13, color: toneColor(status()!.tone), fontVariant: ["tabular-nums"] }}>
+          <Text style={{ numberOfLines: 2, flex: 1, fontSize: 13, color: toneColor(status()!.tone), fontVariant: ["tabular-nums"] }}>
             {status()!.text}
           </Text>
         </View>

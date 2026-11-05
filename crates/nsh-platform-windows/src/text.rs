@@ -34,9 +34,9 @@ use std::{
 };
 
 use nsh_core::{
-    ATTACHMENT_CHAR, AttributedText, Bounds, Color, DecorationStyle, EllipsizeMode, EventKind,
-    FontFamily, Points, ResolvedTextStyle, Size, TextAlign, TextEngine, TextLayout, TextLine,
-    TextSpan, geometry::px,
+    ATTACHMENT_CHAR, Affinity, AttributedText, Bounds, Color, DecorationStyle, EllipsizeMode,
+    EventKind, FontFamily, Points, ResolvedTextStyle, Size, TextAlign, TextEngine, TextLayout,
+    TextLine, TextPosition, TextSpan, geometry::px,
 };
 use rustc_hash::FxHashMap;
 use windows::{
@@ -68,17 +68,18 @@ use windows::{
                 DWRITE_TEXT_ALIGNMENT_JUSTIFIED, DWRITE_TEXT_ALIGNMENT_LEADING,
                 DWRITE_TEXT_ALIGNMENT_TRAILING, DWRITE_TEXT_METRICS, DWRITE_TEXT_RANGE,
                 DWRITE_TRIMMING, DWRITE_TRIMMING_GRANULARITY_CHARACTER,
-                DWRITE_TRIMMING_GRANULARITY_NONE, DWRITE_UNDERLINE, DWRITE_WORD_WRAPPING_NO_WRAP,
-                DWRITE_WORD_WRAPPING_WRAP, IDWriteFactory2, IDWriteFactory5, IDWriteFontCollection,
-                IDWriteFontCollection1, IDWriteFontFace, IDWriteFontFace2, IDWriteFontFile,
+                DWRITE_TRIMMING_GRANULARITY_NONE, DWRITE_UNDERLINE, DWRITE_UNICODE_RANGE,
+                DWRITE_WORD_WRAPPING_NO_WRAP, DWRITE_WORD_WRAPPING_WRAP, IDWriteFactory2,
+                IDWriteFactory5, IDWriteFontCollection, IDWriteFontCollection1, IDWriteFontFace,
+                IDWriteFontFace2, IDWriteFontFallback, IDWriteFontFile,
                 IDWriteInMemoryFontFileLoader, IDWriteInlineObject, IDWriteInlineObject_Impl,
-                IDWritePixelSnapping_Impl, IDWriteTextFormat, IDWriteTextLayout,
-                IDWriteTextLayout1, IDWriteTextRenderer, IDWriteTextRenderer_Impl,
-                IDWriteTypography,
+                IDWritePixelSnapping_Impl, IDWriteTextFormat, IDWriteTextFormat1,
+                IDWriteTextLayout, IDWriteTextLayout1, IDWriteTextRenderer,
+                IDWriteTextRenderer_Impl, IDWriteTypography,
             },
         },
     },
-    core::{BOOL, HSTRING, IUnknown, Interface, Ref, implement},
+    core::{BOOL, HSTRING, IUnknown, Interface, PCWSTR, Ref, implement},
 };
 use windows_core::ComObjectInterface;
 use windows_numerics::Vector2;
@@ -250,17 +251,15 @@ pub(crate) fn ui_family() -> Arc<str> {
 /// list (DirectWrite takes one family: the first installed one is used).
 fn family_names(name: &str, ui: &str) -> Vec<String> {
     let mut out = Vec::new();
-    for family in name.split(',') {
-        let family = family.trim().trim_matches(|c| c == '"' || c == '\'');
+    use nsh_core::FamilyName;
+    for family in nsh_core::font_families(name) {
         let family = match family {
-            "" => continue,
-            "system-ui" | "-apple-system" | "BlinkMacSystemFont" | "ui-sans-serif"
-            | "ui-rounded" | "sans-serif" => ui,
-            "ui-monospace" | "monospace" => "Consolas",
-            "ui-serif" | "serif" => "Times New Roman",
-            "cursive" => "Comic Sans MS",
-            "fantasy" => "Impact",
-            f => f,
+            FamilyName::Monospace => "Consolas",
+            FamilyName::Serif => "Times New Roman",
+            FamilyName::Named("cursive") => "Comic Sans MS",
+            FamilyName::Named("fantasy") => "Impact",
+            FamilyName::Named(f) => f,
+            _ => ui,
         };
         out.push(family.to_owned());
     }
@@ -354,6 +353,10 @@ struct Face {
     custom: bool,
     /// Its primary font's metrics.
     metrics: Metrics,
+    /// The other families of its `fontFamily` list the system has, which
+    /// characters the first lacks are taken from before the system's
+    /// fallback (`None`: the system's alone).
+    fallback: Option<IDWriteFontFallback>,
 }
 
 /// Metrics of a font a run is set in.
@@ -413,6 +416,9 @@ struct Run {
     indices: Box<[u32]>,
     /// The color layers when the run has color glyphs.
     layers: Option<Box<[Layer]>>,
+    /// Whether it is the ellipsis DirectWrite trimmed the text with: drawn,
+    /// but not text a selection covers.
+    sign: bool,
 }
 
 impl Run {
@@ -455,12 +461,37 @@ struct Line {
     runs: std::ops::Range<usize>,
 }
 
+/// An attachment as placed in a final layout.
+struct Inline {
+    /// Its placeholder (UTF-16 offset).
+    index: u32,
+    /// Left edge (content coordinates).
+    x: f32,
+    width: f32,
+}
+
+/// A box on a line a caret sits next to: a glyph, or an attachment.
+struct Stop {
+    /// Left edge (content coordinates).
+    x: f32,
+    width: f32,
+    /// UTF-16 offset of the cluster (or the placeholder) it shows.
+    index: u32,
+    /// Whether it is right to left: its cluster starts at its right edge.
+    rtl: bool,
+    /// Whether it is a glyph of the trimming ellipsis.
+    sign: bool,
+}
+
 /// A final layout: plain data, drawn on the main thread.
 #[derive(Default)]
 pub(crate) struct WinLayout {
     runs: Vec<Run>,
     lines: Vec<Line>,
     attachments: Vec<Option<(f32, f32)>>,
+    /// The attachments placed, to hit test lines that hold them (the text
+    /// is not at hand there).
+    inline: Vec<Inline>,
 }
 
 // --- Recording ------------------------------------------------------------------------------
@@ -952,6 +983,7 @@ impl DWriteTextEngine {
                     name: name.into(),
                     custom: true,
                     metrics,
+                    fallback: None,
                 });
             }
             let metrics = find_font(self.system.as_ref()?, name, weight, italic)?;
@@ -959,9 +991,10 @@ impl DWriteTextEngine {
                 name: name.into(),
                 custom: false,
                 metrics,
+                fallback: None,
             })
         };
-        let face = names
+        let mut face = names
             .iter()
             .find_map(|n| find(n))
             .or_else(|| names.iter().find_map(|n| alias(n).and_then(find)))
@@ -977,11 +1010,62 @@ impl DWriteTextEngine {
                     name: names[0].as_str().into(),
                     custom: false,
                     metrics,
+                    fallback: None,
                 }
             });
+        // The list's other families the system has, in order.
+        let mut others: Vec<(HSTRING, bool)> = Vec::new();
+        for found in names
+            .iter()
+            .filter_map(|n| find(n).or_else(|| alias(n).and_then(find)))
+        {
+            if found.name != face.name && !others.iter().any(|(n, _)| *n == found.name) {
+                others.push((found.name, found.custom));
+            }
+        }
+        face.fallback = self.fallback(&others, custom.as_ref());
         let face = Rc::new(face);
         self.faces.borrow_mut().insert(key, face.clone());
         face
+    }
+
+    /// A fallback that takes a character from the first of `families` (a
+    /// name, and whether it is registered) that has it, then from the
+    /// system's fallback; `None` without families.
+    fn fallback(
+        &self,
+        families: &[(HSTRING, bool)],
+        custom: Option<&IDWriteFontCollection>,
+    ) -> Option<IDWriteFontFallback> {
+        if families.is_empty() {
+            return None;
+        }
+        let everything = [DWRITE_UNICODE_RANGE {
+            first: 0,
+            last: 0x10_FFFF,
+        }];
+        // SAFETY: COM calls on live objects; the names outlive the calls.
+        unsafe {
+            let builder = self.factory.CreateFontFallbackBuilder().ok()?;
+            for (name, registered) in families {
+                let names = [name.as_ptr()];
+                let collection = if *registered { custom } else { None };
+                builder
+                    .AddMapping(
+                        &everything,
+                        &names,
+                        collection,
+                        PCWSTR::null(),
+                        PCWSTR::null(),
+                        1.0,
+                    )
+                    .ok()?;
+            }
+            if let Ok(system) = self.factory.GetSystemFontFallback() {
+                let _ = builder.AddMappings(&system);
+            }
+            builder.CreateFontFallback().ok()
+        }
     }
 
     fn typography(&self, variant: nsh_core::FontVariant) -> Option<IDWriteTypography> {
@@ -1029,6 +1113,11 @@ impl DWriteTextEngine {
                     &HSTRING::new(),
                 )
                 .ok()?;
+            if let Some(fallback) = &face.fallback
+                && let Ok(format1) = format.cast::<IDWriteTextFormat1>()
+            {
+                let _ = format1.SetFontFallback(fallback);
+            }
             let (left, right) = if rtl {
                 (
                     DWRITE_TEXT_ALIGNMENT_TRAILING,
@@ -1810,6 +1899,7 @@ impl TextEngine for DWriteTextEngine {
                     offsets: raw.offsets.into(),
                     indices,
                     layers,
+                    sign: raw.sign,
                 },
                 ink,
             ));
@@ -1829,6 +1919,11 @@ impl TextEngine for DWriteTextEngine {
             let line = line_of(oy + a.height);
             if let Some(&(_, _, top, ascent, _)) = tops.get(line) {
                 out.attachments[n] = Some((x, top + ascent - a.top));
+                out.inline.push(Inline {
+                    index: a.index,
+                    x,
+                    width: a.width,
+                });
                 objects[n] = Some((line, x));
             }
         }
@@ -1904,6 +1999,33 @@ impl TextEngine for DWriteTextEngine {
         })
     }
 
+    fn hit_test(&self, layout: &TextLayout, point: nsh_core::Point<Points>) -> TextPosition {
+        layout
+            .downcast::<WinLayout>()
+            .map_or_else(TextPosition::default, |l| l.hit_test(point.x.0, point.y.0))
+    }
+
+    fn caret_rect(&self, layout: &TextLayout, position: TextPosition) -> Option<Bounds<Points>> {
+        layout.downcast::<WinLayout>()?.caret_rect(position)
+    }
+
+    fn range_rects(
+        &self,
+        layout: &TextLayout,
+        range: std::ops::Range<u32>,
+        out: &mut Vec<Bounds<Points>>,
+    ) {
+        let Some(layout) = layout.downcast::<WinLayout>() else {
+            return;
+        };
+        layout.range_rects((range.start, range.end), |x, y, w, h| {
+            out.push(Bounds::new(
+                nsh_core::geometry::point(Points(x), Points(y)),
+                nsh_core::geometry::size(Points(w), Points(h)),
+            ));
+        });
+    }
+
     fn register_font(&self, data: &[u8]) -> Result<(), String> {
         let face = ttf_parser::Face::parse(data, 0).map_err(|e| e.to_string())?;
         let has_family = face.names().into_iter().any(|n| {
@@ -1930,10 +2052,10 @@ pub(crate) struct DrawnText {
     pub(crate) layout: TextLayout,
     /// Where the layout goes inside the view.
     pub(crate) content: Bounds<Points>,
-    /// The selection of `selectable` text, kept across new content.
+    /// The selection of selectable text, kept across new content.
     selection: Option<Rc<Selection>>,
-    /// The part of a selection area's selection in this text (UTF-16,
-    /// `start < end`), which [`crate::selection_area`] sets.
+    /// The part of a selectable view's selection in this text (UTF-16,
+    /// `start < end`), which [`crate::selectable_view`] sets.
     pub(crate) area_range: Cell<Option<(u32, u32)>>,
     /// The text shadow's effect, made on first draw (and again on a new
     /// device).
@@ -2317,7 +2439,7 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
     let range = drawn.selection.as_ref().and_then(|s| s.range.get());
     if let Some(range) = range.or_else(|| drawn.area_range.get()) {
         let brush = cx.solid(selection_tint(&drawn.text));
-        layout.selection_rects(&drawn.text, range, |x, y, w, h| {
+        layout.range_rects(range, |x, y, w, h| {
             // SAFETY: a COM call between BeginDraw and EndDraw.
             unsafe { cx.dc.FillRectangle(&rect_f(ox + x, oy + y, w, h), brush) };
         });
@@ -2348,7 +2470,13 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
             draw_shadow(cx, &res, drawn, layout, shadow);
         }
     }
-    painter.paint(&drawn.text, layout, ox, oy, state.anim.color);
+    // An animated color, or a transition of the text's color, over the
+    // runs' own.
+    let color = state
+        .anim
+        .color
+        .or_else(|| state.live.as_ref()?.text_color());
+    painter.paint(&drawn.text, layout, ox, oy, color);
 }
 
 /// Draws a blurred text shadow: the glyphs recorded into a command list
@@ -2446,7 +2574,7 @@ pub(crate) fn range_rect(state: &ViewState, start: u32, end: u32) -> Option<(f32
     let layout = drawn.layout.downcast::<WinLayout>()?;
     let (cx, cy) = (drawn.content.origin.x.0, drawn.content.origin.y.0);
     let mut first = None;
-    layout.selection_rects(&drawn.text, (start, end), |x, y, w, h| {
+    layout.range_rects((start, end), |x, y, w, h| {
         first.get_or_insert((cx + x, cy + y, w, h));
     });
     first
@@ -2461,11 +2589,12 @@ pub(crate) fn char_at(state: &ViewState, x: f32, y: f32) -> Option<u32> {
 }
 
 /// The caret position (UTF-16 offset) nearest `(x, y)` (view
-/// coordinates) in a text view's layout (selection areas).
+/// coordinates) in a text view's layout (selectable views).
 pub(crate) fn caret_at(state: &ViewState, x: f32, y: f32) -> Option<u32> {
     let drawn = state.text.as_ref()?;
     let layout = drawn.layout.downcast::<WinLayout>()?;
-    Some(layout.caret_at(x - drawn.content.origin.x.0, y - drawn.content.origin.y.0))
+    let (x, y) = (x - drawn.content.origin.x.0, y - drawn.content.origin.y.0);
+    Some(layout.hit_test(x, y).offset)
 }
 
 // --- Selection ----------------------------------------------------------------------
@@ -2486,7 +2615,7 @@ enum Unit {
     Paragraph,
 }
 
-/// The range selection of a `selectable` text view, desktop style: a mouse
+/// The range selection of a selectable text view, desktop style: a mouse
 /// drag selects characters, a double click words and a triple click the
 /// paragraph (and drags on by them), Shift+click extends, Ctrl+C copies,
 /// Ctrl+A selects all, Escape or a press anywhere else clears. Offsets are
@@ -2538,8 +2667,8 @@ fn select(surface: u64, view: &NshView, range: Option<(u32, u32)>) {
     }
     view.changed();
     if range.is_some() {
-        // One selection at a time, a selection area's too.
-        crate::selection_area::clear();
+        // One selection at a time, a selectable view's too.
+        crate::selectable_view::clear();
     }
     let previous = SELECTED.with_borrow_mut(|selected| match range {
         Some(_) => selected.replace((surface, view.clone())),
@@ -2560,7 +2689,7 @@ fn select(surface: u64, view: &NshView, range: Option<(u32, u32)>) {
     }
 }
 
-/// Clears the selection of a single text, if any (a selection area
+/// Clears the selection of a single text, if any (a selectable view
 /// selects).
 pub(crate) fn clear_selected() {
     let selected = SELECTED.with_borrow(|s| s.clone());
@@ -2654,7 +2783,7 @@ fn pressed(key: u64, view: &NshView, s: &Selection, clicks: u32, x: f32, y: f32,
                 .and_then(|i| drawn.text.link_at(i))
                 .is_some_and(|l| press.iter().any(|&k| l.events.contains(k)));
         (
-            layout.caret_at(lx, ly),
+            layout.hit_test(lx, ly).offset,
             char_index,
             drawn.text.clone(),
             over_press,
@@ -2715,7 +2844,9 @@ fn dragged(key: u64, view: &NshView, s: &Selection, dx: f32, dy: f32, x: f32, y:
         let Some(layout) = drawn.layout.downcast::<WinLayout>() else {
             return;
         };
-        let caret = layout.caret_at(x - drawn.content.origin.x.0, y - drawn.content.origin.y.0);
+        let caret = layout
+            .hit_test(x - drawn.content.origin.x.0, y - drawn.content.origin.y.0)
+            .offset;
         extend(&drawn.text.text, s.anchor.get(), caret, s.unit.get())
     };
     select(key, view, Some(range));
@@ -2893,11 +3024,38 @@ impl WinLayout {
     /// The glyphs of `line` with their left edge and advance (content
     /// coordinates), cluster offset and whether their run is right to
     /// left.
-    fn line_glyphs<'a>(&'a self, line: &Line) -> impl Iterator<Item = (f32, f32, u32, bool)> + 'a {
-        self.runs[line.runs.clone()].iter().flat_map(|run| {
-            let rtl = run.rtl();
-            run.boxes().map(move |(x, w, index)| (x, w, index, rtl))
-        })
+    fn line_glyphs<'a>(&'a self, line: &Line) -> impl Iterator<Item = Stop> + 'a {
+        self.runs
+            .get(line.runs.clone())
+            .unwrap_or_default()
+            .iter()
+            .flat_map(|run| {
+                let (rtl, sign) = (run.rtl(), run.sign);
+                run.boxes().map(move |(x, width, index)| Stop {
+                    x,
+                    width,
+                    index,
+                    rtl,
+                    sign,
+                })
+            })
+    }
+
+    /// The glyphs and the attachments of `line`: what a caret sits next to.
+    fn line_stops<'a>(&'a self, line: &Line) -> impl Iterator<Item = Stop> + 'a {
+        let (start, end) = (line.info.start, line.info.end);
+        let objects = self
+            .inline
+            .iter()
+            .filter(move |o| o.index >= start && o.index < end)
+            .map(|o| Stop {
+                x: o.x,
+                width: o.width,
+                index: o.index,
+                rtl: false,
+                sign: false,
+            });
+        self.line_glyphs(line).chain(objects)
     }
 
     /// The line at height `y`, if any.
@@ -2912,42 +3070,100 @@ impl WinLayout {
     fn char_at(&self, x: f32, y: f32) -> Option<u32> {
         let line = self.line_at(y)?;
         self.line_glyphs(line)
-            .find(|&(gx, w, _, _)| x >= gx && x < gx + w)
-            .map(|(_, _, index, _)| index)
+            .find(|s| x >= s.x && x < s.x + s.width)
+            .map(|s| s.index)
     }
 
     /// The caret position (UTF-16 offset) nearest `(x, y)` in content
     /// coordinates: on the line at that height (the first above the text,
-    /// the last below it), at the glyph edge nearest x.
-    fn caret_at(&self, x: f32, y: f32) -> u32 {
-        let Some(line) = self
+    /// the last below it), at the cluster edge nearest x. A hit that ends
+    /// a soft-wrapped line is its end, [`Affinity::Upstream`].
+    fn hit_test(&self, x: f32, y: f32) -> TextPosition {
+        let Some(k) = self
             .lines
             .iter()
-            .find(|l| y < (l.info.y + l.info.height).0)
-            .or(self.lines.last())
+            .position(|l| y < (l.info.y + l.info.height).0)
+            .or_else(|| self.lines.len().checked_sub(1))
         else {
-            return 0;
+            return TextPosition::default();
         };
-        // Distance, the glyph's cluster, the caret goes after it.
+        let Some(line) = self.lines.get(k) else {
+            return TextPosition::default();
+        };
+        // Distance, the cluster, the caret goes after it.
         let mut best: Option<(f32, u32, bool)> = None;
-        for (gx, w, index, rtl) in self.line_glyphs(line) {
-            for (edge, right) in [(gx, false), (gx + w, true)] {
+        for s in self.line_stops(line) {
+            for (edge, right) in [(s.x, false), (s.x + s.width, true)] {
                 let d = (x - edge).abs();
                 if best.is_none_or(|b| d < b.0) {
-                    best = Some((d, index, right != rtl));
+                    best = Some((d, s.index, right != s.rtl));
                 }
             }
         }
-        match best {
+        let offset = match best {
             None => line.info.start,
             Some((_, index, false)) => index,
             Some((_, index, true)) => self
-                .line_glyphs(line)
-                .map(|(_, _, i, _)| i)
+                .line_stops(line)
+                .map(|s| s.index)
                 .filter(|&i| i > index)
                 .min()
                 .unwrap_or(line.info.end),
+        };
+        // A hard break leaves a gap before the next line's start: only a
+        // soft wrap has the offset on both lines.
+        let wrapped = offset == line.info.end
+            && self
+                .lines
+                .get(k.saturating_add(1))
+                .is_some_and(|next| next.info.start == offset);
+        let affinity = if wrapped {
+            Affinity::Upstream
+        } else {
+            Affinity::Downstream
+        };
+        TextPosition::new(offset, affinity)
+    }
+
+    /// The line a caret at `position` is on (the rule of
+    /// [`TextPosition::line`], without copying the lines out).
+    fn line_of(&self, position: TextPosition) -> Option<&Line> {
+        let i = position.line_in(self.lines.iter().map(|l| l.info.start..l.info.end))?;
+        self.lines.get(i)
+    }
+
+    /// The x (content coordinates) of the caret at `offset` on `line`: the
+    /// leading edge of the cluster that starts there (the one it is in,
+    /// when inside one), the trailing edge of the last one at the line's end.
+    fn caret_x(&self, line: &Line, offset: u32) -> f32 {
+        let cluster = self
+            .line_stops(line)
+            .map(|s| s.index)
+            .filter(|&i| i <= offset)
+            .max()
+            .or_else(|| self.line_stops(line).map(|s| s.index).min());
+        let Some(cluster) = cluster else {
+            return line.info.x.0;
+        };
+        let trailing = cluster < offset && offset >= line.info.end;
+        let mut edge: Option<f32> = None;
+        // A cluster can have several glyphs: the outermost edge of them.
+        for s in self.line_stops(line).filter(|s| s.index == cluster) {
+            let right = trailing != s.rtl;
+            let e = if right { s.x + s.width } else { s.x };
+            edge = Some(edge.map_or(e, |p| if right { p.max(e) } else { p.min(e) }));
         }
+        edge.unwrap_or(line.info.x.0)
+    }
+
+    /// The caret at `position` (content coordinates): zero wide, as high as
+    /// its line. `None` when there are no lines.
+    fn caret_rect(&self, position: TextPosition) -> Option<Bounds<Points>> {
+        let line = self.line_of(position)?;
+        Some(Bounds::new(
+            nsh_core::geometry::point(Points(self.caret_x(line, position.offset)), line.info.y),
+            nsh_core::geometry::size(Points(0.0), line.info.height),
+        ))
     }
 
     /// Calls `f(x, y, width, height, radius, color)` with the boxes
@@ -2991,30 +3207,16 @@ impl WinLayout {
 
     /// Calls `f(x, y, width, height)` with the rectangles (content
     /// coordinates) that highlight the characters of `range`: per line,
-    /// the spans of selected glyphs and attachments, line high.
-    fn selection_rects(
-        &self,
-        text: &AttributedText,
-        (a, b): (u32, u32),
-        mut f: impl FnMut(f32, f32, f32, f32),
-    ) {
+    /// the spans of selected glyphs and attachments, line high. The
+    /// trimming ellipsis is never selected.
+    fn range_rects(&self, (a, b): (u32, u32), mut f: impl FnMut(f32, f32, f32, f32)) {
         let mut spans: Vec<(f32, f32)> = Vec::new();
         for line in &self.lines {
             let (y, h) = (line.info.y.0, line.info.height.0);
             spans.clear();
-            for (gx, w, index, _) in self.line_glyphs(line) {
-                if index >= a && index < b {
-                    spans.push((gx, gx + w));
-                }
-            }
-            for (attachment, at) in text.attachments.iter().zip(&self.attachments) {
-                if let Some((x, _)) = at
-                    && attachment.index >= a
-                    && attachment.index < b
-                    && attachment.index >= line.info.start
-                    && attachment.index < line.info.end
-                {
-                    spans.push((*x, *x + attachment.width.0));
+            for s in self.line_stops(line) {
+                if !s.sign && s.index >= a && s.index < b {
+                    spans.push((s.x, s.x + s.width));
                 }
             }
             spans.sort_by(|p, q| p.0.total_cmp(&q.0));
@@ -3097,6 +3299,10 @@ mod tests {
             ["Fira Code", "Consolas", "Consolas"]
         );
         assert_eq!(family_names(" , ", "X"), ["X"]);
+        assert_eq!(
+            family_names("'ACME, Inc', \"serif\"", "X"),
+            ["ACME, Inc", "serif"]
+        );
         assert_eq!(alias("Menlo"), Some("Consolas"));
     }
 
@@ -3471,6 +3677,31 @@ mod tests {
         assert!(x(&hebrew) < 1.0);
     }
 
+    /// A `fontFamily` list sets text in its first family the system has,
+    /// the others it has its fallback. (Registered families take part too:
+    /// `registered_fonts_lay_out`, as registering is process-wide.)
+    #[test]
+    fn a_family_list_falls_back_to_its_other_families() {
+        let engine = engine();
+        let style = |family: &str| ResolvedTextStyle {
+            font_family: Some(nsh_core::FontFamily::new(family)),
+            font_size: px(20.0),
+            ..Default::default()
+        };
+        let face = engine.face(&style("No Such Family, Consolas, Segoe UI"));
+        assert_eq!(face.name.to_string(), "Consolas");
+        assert!(!face.custom);
+        assert!(face.fallback.is_some());
+        assert!(engine.face(&style("Consolas")).fallback.is_none());
+        // Laid out with the fallback.
+        let t = text(&[(
+            "Consolas → 中文",
+            style("Consolas, Segoe UI, Microsoft YaHei"),
+        )]);
+        let size = engine.measure(&engine.prepare(&t), None);
+        assert!(size.width.0 > 0.0);
+    }
+
     #[test]
     fn registered_fonts_lay_out() {
         let engine = engine();
@@ -3490,6 +3721,17 @@ mod tests {
         assert!(engine.face(&style).custom);
         // Pacifico is tall: its lines are more than 1.5 ems.
         assert!(after.height > px(30.0), "{after:?}");
+        // A registered family in a list, with installed ones as its fallback.
+        let listed = ResolvedTextStyle {
+            font_family: Some(nsh_core::FontFamily::new(
+                "No Such Family, Pacifico, Consolas",
+            )),
+            ..style
+        };
+        let face = engine.face(&listed);
+        assert_eq!(face.name.to_string(), "Pacifico");
+        assert!(face.custom);
+        assert!(face.fallback.is_some());
     }
 
     #[test]
@@ -3620,23 +3862,24 @@ mod tests {
         let (size, layout) = layout_of(&engine, &t, None);
         let l = layout.downcast::<WinLayout>().unwrap();
         assert_eq!(l.lines.len(), 2);
-        assert_eq!(l.caret_at(-5.0, 2.0), 0);
-        assert_eq!(l.caret_at((size.width + px(20.0)).0, 2.0), 15);
+        let at = |x: f32, y: f32| l.hit_test(x, y).offset;
+        assert_eq!(at(-5.0, 2.0), 0);
+        assert_eq!(at((size.width + px(20.0)).0, 2.0), 15);
         // Below the text: the last line.
         assert_eq!(
-            l.caret_at((size.width + px(20.0)).0, (size.height + px(50.0)).0),
+            at((size.width + px(20.0)).0, (size.height + px(50.0)).0),
             22
         );
-        let mid = l.caret_at((size.width / 2.0).0, 2.0);
+        let mid = at((size.width / 2.0).0, 2.0);
         assert!(mid > 3 && mid < 12, "{mid}");
         // Nearest glyph edge: just right of a glyph's start is before it.
-        let (gx, w, index, _) = l.line_glyphs(&l.lines[0]).nth(2).unwrap();
-        assert_eq!(l.caret_at(gx + w * 0.2, 2.0), index);
-        assert_eq!(l.caret_at(gx + w * 0.8, 2.0), index + 1);
-        assert_eq!(l.char_at(gx + w * 0.5, 2.0), Some(index));
+        let g = l.line_glyphs(&l.lines[0]).nth(2).unwrap();
+        assert_eq!(at(g.x + g.width * 0.2, 2.0), g.index);
+        assert_eq!(at(g.x + g.width * 0.8, 2.0), g.index + 1);
+        assert_eq!(l.char_at(g.x + g.width * 0.5, 2.0), Some(g.index));
 
         let mut rects = Vec::new();
-        l.selection_rects(&t, (6, 19), |x, y, w, h| rects.push((x, y, w, h)));
+        l.range_rects((6, 19), |x, y, w, h| rects.push((x, y, w, h)));
         // "line here" on the first line, "sec" on the second.
         assert_eq!(rects.len(), 2, "{rects:?}");
         assert!(rects[0].0 > 0.0 && rects[0].1 == 0.0);
@@ -3648,7 +3891,70 @@ mod tests {
         let (size, layout) = layout_of(&engine, &rtl, None);
         let l = layout.downcast::<WinLayout>().unwrap();
         // Right to left: the right edge is the start.
-        assert_eq!(l.caret_at((size.width + px(5.0)).0, 2.0), 0);
-        assert_eq!(l.caret_at(-5.0, 2.0), 9);
+        assert_eq!(l.hit_test((size.width + px(5.0)).0, 2.0).offset, 0);
+        assert_eq!(l.hit_test(-5.0, 2.0).offset, 9);
+    }
+
+    #[test]
+    fn hit_testing_through_the_engine() {
+        let engine = engine();
+        let t = text(&[("The quick brown fox jumps over the lazy dog", plain(15.0))]);
+        let (size, layout) = layout_of(&engine, &t, Some(90.0));
+        let lines = engine.lines(&layout);
+        assert!(lines.len() > 2);
+        let far = size.width.0 + 50.0;
+        // Past the end of a wrapped line: its end, upstream; the caret
+        // box is on that line.
+        let p = engine.hit_test(&layout, nsh_core::geometry::point(Points(far), lines[0].y));
+        assert_eq!(p.offset, lines[0].end);
+        assert_eq!(p.affinity, Affinity::Upstream);
+        let caret = engine.caret_rect(&layout, p).unwrap();
+        assert_eq!(caret.origin.y, lines[0].y);
+        assert_eq!(caret.size.height, lines[0].height);
+        assert_eq!(caret.size.width, Points(0.0));
+        // The same offset downstream is the start of the next line.
+        let next = engine
+            .caret_rect(
+                &layout,
+                TextPosition::new(lines[1].start, Affinity::Downstream),
+            )
+            .unwrap();
+        assert_eq!(next.origin.y, lines[1].y);
+        // The last line ends the text, downstream.
+        let last = lines.last().unwrap();
+        let p = engine.hit_test(&layout, nsh_core::geometry::point(Points(far), last.y));
+        assert_eq!(p.offset, last.end);
+        assert_eq!(p.affinity, Affinity::Downstream);
+        // A range across lines appends one box per line, through the
+        // first line's end, and an empty one nothing.
+        let origin = nsh_core::geometry::point(Points(0.0), Points(0.0));
+        let mut out = vec![Bounds::new(origin, Size::new(Points(0.0), Points(0.0)))];
+        engine.range_rects(&layout, 2..lines[1].end - 1, &mut out);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].origin.y, lines[0].y);
+        assert_eq!(out[2].origin.y, lines[1].y);
+        engine.range_rects(&layout, 4..4, &mut out);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn hard_breaks_keep_the_caret_before_them() {
+        let engine = engine();
+        let t = text(&[("ab\ncd", plain(15.0))]);
+        let (size, layout) = layout_of(&engine, &t, None);
+        let lines = engine.lines(&layout);
+        assert_eq!(lines.len(), 2);
+        let far = nsh_core::geometry::point(size.width + px(30.0), px(1.0));
+        let p = engine.hit_test(&layout, far);
+        assert_eq!(p, TextPosition::new(2, Affinity::Downstream));
+        let c = engine.caret_rect(&layout, p).unwrap();
+        assert_eq!(c.origin.y, lines[0].y);
+        // Another layout type: nothing.
+        let other = TextLayout(Arc::new(0u8));
+        assert_eq!(
+            engine.hit_test(&other, nsh_core::geometry::point(px(0.0), px(0.0))),
+            TextPosition::default()
+        );
+        assert!(engine.caret_rect(&other, p).is_none());
     }
 }

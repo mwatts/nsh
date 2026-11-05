@@ -2,13 +2,14 @@ use std::{
     any::Any,
     fmt,
     hash::{Hash, Hasher},
+    ops::Range,
     sync::Arc,
 };
 
 use rustc_hash::FxHashMap;
 
 use crate::{
-    geometry::{Point, Points, Size, point, px, size},
+    geometry::{Bounds, Point, Points, Size, point, px, size},
     ops::{EventMask, NodeId},
     style::{
         Color, DecorationStyle, EllipsizeMode, FontFamily, FontVariant, TextAlign, TextDecoration,
@@ -282,8 +283,8 @@ pub struct AttributedText {
     pub shadow: Option<TextShadow>,
     /// Nested `<text>` spans that take presses (they may nest).
     pub links: Vec<TextLink>,
-    /// Nested `<text>` spans with a `testID` (they may nest), for tests
-    /// that name a span; platforms draw nothing of them.
+    /// Nested `<Text>` spans with a `testID` (they may nest). Platforms
+    /// draw nothing from them. Tests name a span by its id.
     pub test_ids: Vec<SpanTestId>,
     /// `writingDirection`: right to left (`Some(true)`), left to right, or
     /// from the content (`None`).
@@ -291,7 +292,7 @@ pub struct AttributedText {
     /// The block is laid out right to left: `auto` alignment is the right
     /// side.
     pub rtl: bool,
-    /// A long press copies the text (`selectable` or `select-text`;
+    /// A long press copies the text (`userSelect: "text"` or `select-text`;
     /// drawing only): `Some(false)` when set off, `None` when not set, which
     /// is not selectable except where text is by default (desktop
     /// browsers). [`is_selectable`](Self::is_selectable) is whether it is asked for.
@@ -437,11 +438,33 @@ impl AttachmentAlignments {
     }
 }
 
+/// Whether the grapheme cluster `c` is drawn as a color emoji: a character
+/// of emoji presentation or one asked for with U+FE0F, unless U+FE0E asks
+/// for text.
+fn is_emoji_presentation(c: &str) -> bool {
+    use unicode_properties::{EmojiStatus, UnicodeEmoji};
+    !c.contains('\u{FE0E}')
+        && c.chars().any(|ch| {
+            ch == '\u{FE0F}'
+                || matches!(
+                    ch.emoji_status(),
+                    EmojiStatus::EmojiPresentation
+                        | EmojiStatus::EmojiPresentationAndModifierBase
+                        | EmojiStatus::EmojiPresentationAndEmojiComponent
+                        | EmojiStatus::EmojiPresentationAndModifierAndEmojiComponent
+                )
+        })
+}
+
 /// The character standing for an attachment.
 pub const ATTACHMENT_CHAR: char = '\u{FFFC}';
 
 /// A nested `<text>` span with press listeners: presses on its characters
-/// go to it rather than to the block.
+/// go to it rather than to the block. It is a stop of the keyboard focus
+/// of its own ([`Self::focus_stop`]): Tab reaches it after its text view,
+/// in text order, the platform reports `FOCUSED` (`focus:`) and `Focus` /
+/// `Blur` for the span's node and presses it on Return, as a view that
+/// takes presses.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TextLink {
     /// Start offset (UTF-16 units, inclusive).
@@ -452,11 +475,14 @@ pub struct TextLink {
     pub node: NodeId,
     /// Its listeners.
     pub events: EventMask,
+    /// A stop of Tab (`ViewProps::focus_stop` of the span: unless
+    /// `focusable={false}` or disabled).
+    pub focus_stop: bool,
 }
 
-/// A nested `<text>` span with a `testID` (see
-/// [`AttributedText::test_ids`]).
-#[derive(Debug, Clone, PartialEq)]
+/// A nested `<Text>` span with a `testID` ([`AttributedText::test_ids`]).
+#[derive(Debug, Clone, PartialEq, Default)]
+#[non_exhaustive]
 pub struct SpanTestId {
     /// Start offset (UTF-16 units, inclusive).
     pub start: u32,
@@ -467,7 +493,7 @@ pub struct SpanTestId {
 }
 
 impl AttributedText {
-    /// Whether the text was made selectable (`selectable`, `select-text`).
+    /// Whether the text was made selectable (`userSelect: "text"`, `select-text`).
     pub fn is_selectable(&self) -> bool {
         self.selectable == Some(true)
     }
@@ -475,6 +501,21 @@ impl AttributedText {
     /// Whether a span has a background ([`TextBackground`]).
     pub fn has_backgrounds(&self) -> bool {
         self.spans.iter().any(|s| s.style.background.is_some())
+    }
+
+    /// The color every character is drawn in, decoration lines included,
+    /// if there is one (`None` for several, or no text): what a transition
+    /// of the text's color animates ([`crate::transition::recolor`]).
+    pub fn uniform_color(&self) -> Option<Color> {
+        let color = self.spans.first()?.style.color;
+        self.spans
+            .iter()
+            .all(|s| {
+                s.style.color == color
+                    && (s.style.decoration.is_none()
+                        || s.style.decoration_color.is_none_or(|c| c == color))
+            })
+            .then_some(color)
     }
 
     /// The span containing the UTF-16 offset `index` (the last one past the
@@ -514,12 +555,40 @@ impl AttributedText {
     }
 
     /// Appends `s` with `style`, merging with the previous run when the
-    /// style is identical.
+    /// style is identical. Italic text keeps its color emoji upright, in
+    /// runs of their own.
     pub fn push(&mut self, s: &str, style: ResolvedTextStyle) {
         if s.is_empty() {
             return;
         }
         let s = &*style.transform.apply(s);
+        if !style.italic || s.is_ascii() {
+            self.push_run(s, style);
+            return;
+        }
+        // Emoji fonts have no italic face: Chrome and Android slant them,
+        // WebKit and CoreText keep them upright, as every platform does here.
+        let upright = ResolvedTextStyle {
+            italic: false,
+            ..style
+        };
+        let (mut run, mut at) = (0, 0);
+        while at < s.len() {
+            let end = crate::text_edit::next_cluster(s, at);
+            if is_emoji_presentation(&s[at..end]) {
+                self.push_run(&s[run..at], style);
+                self.push_run(&s[at..end], upright);
+                run = end;
+            }
+            at = end;
+        }
+        self.push_run(&s[run..], style);
+    }
+
+    fn push_run(&mut self, s: &str, style: ResolvedTextStyle) {
+        if s.is_empty() {
+            return;
+        }
         let len = s.encode_utf16().count() as u32;
         self.text.push_str(s);
         match self.spans.last_mut() {
@@ -533,6 +602,40 @@ impl AttributedText {
                 });
             }
         }
+    }
+
+    /// Equality of the content the platform draws, excluding test metadata.
+    pub(crate) fn rendering_eq(&self, other: &Self) -> bool {
+        // Enumerating the fields makes additions revisit this comparison.
+        let Self {
+            text,
+            spans,
+            align,
+            max_lines,
+            ellipsize,
+            no_wrap,
+            shadow,
+            links,
+            writing_direction,
+            rtl,
+            selectable,
+            selection_color,
+            attachments,
+            test_ids: _,
+        } = self;
+        text == &other.text
+            && spans == &other.spans
+            && align == &other.align
+            && max_lines == &other.max_lines
+            && ellipsize == &other.ellipsize
+            && no_wrap == &other.no_wrap
+            && shadow == &other.shadow
+            && links == &other.links
+            && writing_direction == &other.writing_direction
+            && rtl == &other.rtl
+            && selectable == &other.selectable
+            && selection_color == &other.selection_color
+            && attachments == &other.attachments
     }
 
     /// True if both texts lay out identically: same characters, runs,
@@ -640,15 +743,40 @@ pub trait TextEngine {
         Vec::new()
     }
 
-    /// The caret position (UTF-16 offset) nearest `at` (content box, y
-    /// down) in a final layout: on the line at that height (the first
-    /// above the text, the last below it), at the character edge nearest
-    /// `at.x`, as `CTLineGetStringIndexForPosition` and Android's
-    /// `Layout.getOffsetForHorizontal` answer. `None` when the engine
-    /// cannot tell.
-    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
-        let _ = (layout, at);
-        None
+    /// The caret position nearest `point` (content box, y down) in a final
+    /// layout: on the line at that height (the first line above the text,
+    /// the last below it), at the character edge nearest its x. A point
+    /// past the end of a wrapped line gives the line's end with
+    /// [`Affinity::Upstream`], so the caret stays on that line.
+    ///
+    /// The default estimates it from [`TextEngine::lines`], each line's
+    /// characters spread evenly over its width; engines that know where
+    /// their glyphs are override it.
+    fn hit_test(&self, layout: &TextLayout, point: Point<Points>) -> TextPosition {
+        estimate::hit_test(&self.lines(layout), point)
+    }
+
+    /// The caret at `position` in a final layout: a box of no width as high
+    /// as its line (content box, y down), at the edge of the characters
+    /// `position` stands between; `None` when the layout has no lines.
+    ///
+    /// The default estimates it from [`TextEngine::lines`], as
+    /// [`TextEngine::hit_test`] does.
+    fn caret_rect(&self, layout: &TextLayout, position: TextPosition) -> Option<Bounds<Points>> {
+        estimate::caret_rect(&self.lines(layout), position)
+    }
+
+    /// Appends to `out` the boxes (content box, y down) that cover the
+    /// characters of `range` (UTF-16 offsets), line high: per line, one box
+    /// per stretch of adjacent characters (several where bidirectional text
+    /// splits the range), and through the line's end where the range goes
+    /// on past it. `out` is the caller's, so a selection drawn every frame
+    /// reuses one buffer.
+    ///
+    /// The default estimates them from [`TextEngine::lines`], as
+    /// [`TextEngine::hit_test`] does.
+    fn range_rects(&self, layout: &TextLayout, range: Range<u32>, out: &mut Vec<Bounds<Points>>) {
+        estimate::range_rects(&self.lines(layout), range, out);
     }
 
     /// Makes the font in `data` (TrueType / OpenType) available by its
@@ -693,8 +821,16 @@ impl<T: TextEngine> TextEngine for std::rc::Rc<T> {
         (**self).attachments(layout)
     }
 
-    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
-        (**self).index_at(layout, at)
+    fn hit_test(&self, layout: &TextLayout, point: Point<Points>) -> TextPosition {
+        (**self).hit_test(layout, point)
+    }
+
+    fn caret_rect(&self, layout: &TextLayout, position: TextPosition) -> Option<Bounds<Points>> {
+        (**self).caret_rect(layout, position)
+    }
+
+    fn range_rects(&self, layout: &TextLayout, range: Range<u32>, out: &mut Vec<Bounds<Points>>) {
+        (**self).range_rects(layout, range, out);
     }
 
     fn register_font(&self, data: &[u8]) -> Result<(), String> {
@@ -730,31 +866,154 @@ pub struct TextLine {
     pub x_height: Points,
 }
 
+/// Which side a caret offset is on where one offset is two places on
+/// screen: the end of a wrapped line and the start of the next.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Affinity {
+    /// With the character before the offset: at the end of the earlier
+    /// line.
+    Upstream,
+    /// With the character after the offset: at the start of the later
+    /// line.
+    #[default]
+    Downstream,
+}
+
+/// A caret position in a text: a UTF-16 offset and the side it is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub struct TextPosition {
+    /// The offset (UTF-16 units).
+    pub offset: u32,
+    /// Which line it is on where it ends one and starts the next.
+    pub affinity: Affinity,
+}
+
+impl TextPosition {
+    /// The position at `offset` on the side `affinity` says.
+    pub const fn new(offset: u32, affinity: Affinity) -> Self {
+        Self { offset, affinity }
+    }
+
+    /// The index of the line of `lines` (a final layout's, in order) the
+    /// caret at this position is on: the line holding the offset, the
+    /// earlier of two for [`Affinity::Upstream`] at a line's end; past every
+    /// line (the text's end, an empty last line), the last line starting at
+    /// or before it. `None` when there are no lines.
+    pub fn line(self, lines: &[TextLine]) -> Option<usize> {
+        self.line_in(lines.iter().map(|l| l.start..l.end))
+    }
+
+    /// [`TextPosition::line`] over the UTF-16 ranges of the lines, for
+    /// engines that keep their lines in a type of their own.
+    pub fn line_in<I>(self, ranges: I) -> Option<usize>
+    where
+        I: IntoIterator<Item = Range<u32>>,
+        I::IntoIter: Clone,
+    {
+        let ranges = ranges.into_iter();
+        let o = self.offset;
+        let holds = |r: &Range<u32>| match self.affinity {
+            Affinity::Upstream => r.start < o && o <= r.end,
+            Affinity::Downstream => r.start <= o && o < r.end,
+        };
+        ranges
+            .clone()
+            .position(|r| holds(&r))
+            .or_else(|| {
+                let starts = ranges.clone().enumerate();
+                starts.filter(|(_, r)| r.start <= o).last().map(|(i, _)| i)
+            })
+            .or_else(|| ranges.clone().next().map(|_| 0))
+    }
+}
+
+/// The hit testing of engines that only report their lines: each line's
+/// characters spread evenly over its width, left to right.
+mod estimate {
+    use super::*;
+
+    /// The line a point at height `y` lands on: the one at that height, the
+    /// first above the text, the last below it.
+    pub(super) fn line_at(lines: &[TextLine], y: Points) -> Option<&TextLine> {
+        lines.iter().find(|l| y < l.y + l.height).or(lines.last())
+    }
+
+    /// The x of offset `o` (clamped to the line).
+    fn x_of(l: &TextLine, o: u32) -> Points {
+        let count = l.end.saturating_sub(l.start);
+        if count == 0 {
+            return l.x;
+        }
+        let done = o.clamp(l.start, l.end) - l.start;
+        l.x + l.width * (done as f32 / count as f32)
+    }
+
+    pub(super) fn hit_test(lines: &[TextLine], p: Point<Points>) -> TextPosition {
+        let Some(l) = line_at(lines, p.y) else {
+            return TextPosition::default();
+        };
+        let count = l.end.saturating_sub(l.start);
+        let fraction = if l.width > Points::ZERO {
+            ((p.x - l.x) / l.width).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        // At most `count`: the cast cannot truncate.
+        let offset = l.start + (fraction * count as f32).round() as u32;
+        let affinity = if offset == l.end && count > 0 {
+            Affinity::Upstream
+        } else {
+            Affinity::Downstream
+        };
+        TextPosition::new(offset, affinity)
+    }
+
+    pub(super) fn caret_rect(lines: &[TextLine], position: TextPosition) -> Option<Bounds<Points>> {
+        let l = lines.get(position.line(lines)?)?;
+        Some(Bounds::new(
+            point(x_of(l, position.offset), l.y),
+            size(Points::ZERO, l.height),
+        ))
+    }
+
+    pub(super) fn range_rects(lines: &[TextLine], r: Range<u32>, out: &mut Vec<Bounds<Points>>) {
+        if r.start >= r.end {
+            return;
+        }
+        for l in lines.iter().filter(|l| l.start < r.end && r.start < l.end) {
+            let x1 = x_of(l, r.start);
+            let x2 = if r.end > l.end {
+                l.x + l.width
+            } else {
+                x_of(l, r.end)
+            };
+            out.push(Bounds::new(point(x1, l.y), size(x2 - x1, l.height)));
+        }
+    }
+}
+
 /// A deterministic, platform-free [`TextEngine`] for headless runs and
 /// tests: every character is `0.55 × font size` wide and lines are
-/// `1.2 × font size` tall, their baseline at the bottom (the font's ascent
+/// `1.2 × font size` tall; a text with line breaks measures as wide as its
+/// widest line and as tall as its lines (each wrapped on its own), their baseline at the bottom (the font's ascent
 /// is the line, its descent 0, its x height `0.5 × font size`), where
 /// attachments are placed by [`TextAttachment::ascent`] on the first line.
-/// Text wider than its box breaks into as many lines as
-/// [`TextEngine::measure`] counts, each holding an equal share of the
-/// characters (the last the rest), wherever that falls.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct ApproxTextEngine;
 
-/// [`ApproxTextEngine`]'s final layout.
-struct ApproxLayout {
-    attachments: Vec<Option<Point<Points>>>,
-    lines: Vec<TextLine>,
-    /// A character's width.
-    advance: Points,
-    /// The UTF-16 offset of each character, and of the end.
-    offsets: Arc<[u32]>,
-}
-
 impl TextEngine for ApproxTextEngine {
-    /// `(character count, font size, max lines, attachments, the UTF-16
-    /// offset of each character and of the end)`.
-    type Prepared = (usize, Points, u32, Vec<TextAttachment>, Arc<[u32]>);
+    /// `(character count, font size, max lines, attachments, the indices of
+    /// the characters two UTF-16 units long, each line's character count
+    /// when the text has line breaks)`.
+    type Prepared = (
+        usize,
+        Points,
+        u32,
+        Vec<TextAttachment>,
+        Vec<u32>,
+        Vec<usize>,
+    );
 
     fn prepare(&self, text: &AttributedText) -> Self::Prepared {
         self.prepare_aligned(text, &AttachmentAlignments::default())
@@ -766,13 +1025,19 @@ impl TextEngine for ApproxTextEngine {
         alignments: &AttachmentAlignments,
     ) -> Self::Prepared {
         let size = text.spans.first().map_or(px(14.0), |s| s.style.font_size);
-        let mut offsets = Vec::with_capacity(text.text.len() + 1);
-        let mut at = 0;
-        for c in text.text.chars() {
-            offsets.push(at);
-            at += c.len_utf16() as u32;
-        }
-        offsets.push(at);
+        // Empty (no allocation) for text in the Basic Multilingual Plane.
+        let astral = text
+            .text
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| c.len_utf16() == 2)
+            .filter_map(|(i, _)| u32::try_from(i).ok())
+            .collect();
+        // Empty (no allocation) for a text of one line.
+        let lines = match text.text.contains('\n') {
+            true => text.text.split('\n').map(|l| l.chars().count()).collect(),
+            false => Vec::new(),
+        };
         (
             text.text.chars().count(),
             size,
@@ -787,61 +1052,107 @@ impl TextEngine for ApproxTextEngine {
                     }
                 })
                 .collect(),
-            offsets.into(),
+            astral,
+            lines,
         )
     }
 
     fn measure(
         &self,
-        &(chars, font, max_lines, _, _): &Self::Prepared,
+        &(chars, font, max_lines, _, _, ref breaks): &Self::Prepared,
         max_width: Option<Points>,
     ) -> Size<Points> {
-        let (width, lines) = approx_lines(chars, font, max_lines, max_width);
-        size(width, font * 1.2 * lines)
+        // The order of the products is kept: it decides the last bit.
+        let wrap = |chars: usize| {
+            let width = Points(chars as f32 * font.0 * 0.55);
+            match max_width {
+                Some(max) if width > max && max > Points::ZERO => (max, (width / max).ceil()),
+                _ => (width, 1.0),
+            }
+        };
+        let line = font * 1.2;
+        let (width, mut lines) = match breaks.is_empty() {
+            true => wrap(chars),
+            false => breaks.iter().fold((Points::ZERO, 0.0), |(w, n), &c| {
+                let (lw, ln) = wrap(c);
+                (w.max(lw), n + ln)
+            }),
+        };
+        if max_lines > 0 {
+            lines = lines.min(max_lines as f32);
+        }
+        size(width, line * lines)
     }
 
     fn layout(&self, prepared: &Self::Prepared, size: Size<Points>) -> TextLayout {
-        let (chars, font, max_lines, attachments, offsets) = prepared;
-        let (chars, font) = (*chars, *font);
-        let line = font * 1.2;
-        let advance = Points(font.0 * 0.55);
-        // Attachments as on one line, each character as wide as the others.
-        let points: Vec<Option<Point<Points>>> = attachments
+        // Each character is as wide as the others. A text with no hard
+        // break that is wider than its box splits into the line count
+        // `measure` reports, each line an equal share of the characters
+        // (the last the rest). A hard break stays one run: its measured
+        // height already counts the breaks.
+        let (chars, font, max_lines, attachments, astral, breaks) = prepared;
+        let line_h = *font * 1.2;
+        let advance = *font * 0.55;
+        let attachments = attachments
             .iter()
             .map(|a| {
                 Some(point(
                     Points(a.index as f32 * font.0 * 0.55),
-                    (line - a.height).max(Points::ZERO),
+                    (line_h - a.height).max(Points::ZERO),
                 ))
             })
             .collect();
-        let (_, count) = approx_lines(chars, font, *max_lines, Some(size.width));
-        let count = count as usize;
-        let per = chars.div_ceil(count.max(1)).max(1);
-        // Baseline at the bottom of each line: the ascent is the line and
+        // Baseline at the bottom of the line: the ascent is the line and
         // the descent is 0, the same extent attachments are placed against.
-        let lines = (0..count)
-            .map(|k| {
-                let (from, to) = ((k * per).min(chars), ((k + 1) * per).min(chars));
-                TextLine {
-                    text: String::new(),
-                    start: offsets[from],
-                    end: offsets[to],
-                    x: Points::ZERO,
-                    y: line * k as f32,
-                    width: advance * (to - from) as f32,
-                    height: line,
-                    ascender: line,
-                    x_height: font * 0.5,
-                    ..TextLine::default()
-                }
-            })
-            .collect();
+        let chars_n = *chars;
+        let units = chars_n.saturating_add(astral.len());
+        let unit_of = |k: usize| -> u32 {
+            let before = astral.partition_point(|&i| (i as usize) < k);
+            u32::try_from(k.saturating_add(before)).unwrap_or(u32::MAX)
+        };
+        let natural = Points(chars_n as f32 * font.0 * 0.55);
+        let mut count = match size.width {
+            w if breaks.is_empty() && natural > w && w > Points::ZERO => (natural.0 / w.0).ceil(),
+            _ => 1.0,
+        };
+        if *max_lines > 0 {
+            count = count.min(*max_lines as f32);
+        }
+        let count = (count as usize).max(1).min(chars_n.max(1));
+        let lines = if count <= 1 {
+            vec![TextLine {
+                end: u32::try_from(units).unwrap_or(u32::MAX),
+                width: size.width,
+                height: line_h,
+                ascender: line_h,
+                x_height: *font * 0.5,
+                ..TextLine::default()
+            }]
+        } else {
+            let per = chars_n.div_ceil(count).max(1);
+            (0..count)
+                .map(|k| {
+                    let from = (k * per).min(chars_n);
+                    let to = ((k + 1) * per).min(chars_n);
+                    TextLine {
+                        start: unit_of(from),
+                        end: unit_of(to),
+                        y: line_h * k as f32,
+                        width: advance * (to - from) as f32,
+                        height: line_h,
+                        ascender: line_h,
+                        x_height: *font * 0.5,
+                        ..TextLine::default()
+                    }
+                })
+                .collect()
+        };
         TextLayout(Arc::new(ApproxLayout {
-            attachments: points,
+            attachments,
             lines,
             advance,
-            offsets: offsets.clone(),
+            chars: u32::try_from(chars_n).unwrap_or(u32::MAX),
+            astral: astral.clone(),
         }))
     }
 
@@ -857,17 +1168,67 @@ impl TextEngine for ApproxTextEngine {
             .map_or_else(Vec::new, |l| l.attachments.clone())
     }
 
-    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
-        let l = layout.downcast::<ApproxLayout>()?;
+    fn hit_test(&self, layout: &TextLayout, p: Point<Points>) -> TextPosition {
+        let Some(l) = layout.downcast::<ApproxLayout>() else {
+            return TextPosition::default();
+        };
+        // One line: x only, the same edges the single-line layout reports.
+        if l.lines.len() <= 1 {
+            let k = if l.advance > Points::ZERO {
+                // Clamped to `0..=chars` first: the cast cannot truncate.
+                (p.x / l.advance).round().clamp(0.0, l.chars as f32) as u32
+            } else {
+                0
+            };
+            return TextPosition::new(l.unit_of(k), Affinity::Downstream);
+        }
         let line = l
             .lines
             .iter()
-            .find(|line| at.y < line.y + line.height)
-            .or(l.lines.last())?;
-        let first = l.offsets.partition_point(|&o| o < line.start);
-        let last = l.offsets.partition_point(|&o| o < line.end);
-        let column = ((at.x - line.x) / l.advance).round().max(0.0) as usize;
-        Some(l.offsets[(first + column).min(last)])
+            .find(|line| p.y < line.y + line.height)
+            .unwrap_or(l.lines.last().expect("more than one line"));
+        let first = l.char_at(line.start);
+        let last = l.char_at(line.end);
+        let column = if l.advance > Points::ZERO {
+            ((p.x - line.x) / l.advance).round().max(0.0) as u32
+        } else {
+            0
+        };
+        let k = first.saturating_add(column).min(last).min(l.chars);
+        TextPosition::new(l.unit_of(k), Affinity::Downstream)
+    }
+
+    fn caret_rect(&self, layout: &TextLayout, position: TextPosition) -> Option<Bounds<Points>> {
+        let l = layout.downcast::<ApproxLayout>()?;
+        let line = l.line_at(position.offset)?;
+        let column = l
+            .char_at(position.offset)
+            .saturating_sub(l.char_at(line.start));
+        Some(Bounds::new(
+            point(line.x + l.advance * column as f32, line.y),
+            size(Points::ZERO, line.height),
+        ))
+    }
+
+    fn range_rects(&self, layout: &TextLayout, range: Range<u32>, out: &mut Vec<Bounds<Points>>) {
+        let Some(l) = layout.downcast::<ApproxLayout>() else {
+            return;
+        };
+        if range.start >= range.end {
+            return;
+        }
+        for line in &l.lines {
+            if range.start >= line.end || range.end <= line.start {
+                continue;
+            }
+            let from = range.start.max(line.start);
+            let to = range.end.min(line.end);
+            let x1 =
+                line.x + l.advance * l.char_at(from).saturating_sub(l.char_at(line.start)) as f32;
+            let x2 =
+                line.x + l.advance * l.char_at(to).saturating_sub(l.char_at(line.start)) as f32;
+            out.push(Bounds::new(point(x1, line.y), size(x2 - x1, line.height)));
+        }
     }
 
     fn register_font(&self, _: &[u8]) -> Result<(), String> {
@@ -875,25 +1236,51 @@ impl TextEngine for ApproxTextEngine {
     }
 }
 
-/// The width and the line count of `chars` characters at `font` within
-/// `max_width`: one line while they fit, else as many full-width lines as
-/// they fill (at most `max_lines`, 0: no limit).
-fn approx_lines(
-    chars: usize,
-    font: Points,
-    max_lines: u32,
-    max_width: Option<Points>,
-) -> (Points, f32) {
-    // The order of the products is kept: it decides the last bit.
-    let width = Points(chars as f32 * font.0 * 0.55);
-    let (width, mut lines) = match max_width {
-        Some(max) if width > max && max > Points::ZERO => (max, (width / max).ceil()),
-        _ => (width, 1.0),
-    };
-    if max_lines > 0 {
-        lines = lines.min(max_lines as f32);
+/// [`ApproxTextEngine`]'s final layout. One line when the text fits or has
+/// a hard break; otherwise one line per equal share of the characters.
+struct ApproxLayout {
+    attachments: Vec<Option<Point<Points>>>,
+    lines: Vec<TextLine>,
+    /// The width of every character.
+    advance: Points,
+    chars: u32,
+    /// The indices of the characters two UTF-16 units long, in order.
+    astral: Vec<u32>,
+}
+
+impl ApproxLayout {
+    /// The UTF-16 offset of character `k`.
+    fn unit_of(&self, k: u32) -> u32 {
+        let before = self.astral.partition_point(|&i| i < k);
+        k.saturating_add(u32::try_from(before).unwrap_or(u32::MAX))
     }
-    (width, lines)
+
+    /// The character at UTF-16 offset `o`: the one it starts, or the one
+    /// it is inside (between the two units of a surrogate pair).
+    fn char_at(&self, o: u32) -> u32 {
+        let mut k = o;
+        for (j, &i) in self.astral.iter().enumerate() {
+            let start = i.saturating_add(u32::try_from(j).unwrap_or(u32::MAX));
+            if start >= o {
+                break;
+            }
+            k = if start.saturating_add(1) == o {
+                i
+            } else {
+                k.saturating_sub(1)
+            };
+        }
+        k.min(self.chars)
+    }
+
+    /// The line whose range holds `o`, else the last line when `o` is at
+    /// or past the end.
+    fn line_at(&self, o: u32) -> Option<&TextLine> {
+        self.lines
+            .iter()
+            .find(|line| o < line.end)
+            .or(self.lines.last())
+    }
 }
 
 /// Content-addressed text measurements shared by all nodes of a surface,
@@ -903,14 +1290,83 @@ fn approx_lines(
 /// promote from the previous one; when the current generation is full it
 /// becomes the previous one. O(1), and never more than `2 * GENERATION`
 /// entries.
-#[derive(Default)]
+///
+/// It also holds the surface's pixel ratio: measurements are rounded up to
+/// its device pixels ([`MeasureCache::pixel_ratio`]), so they are only
+/// valid for one ratio and go when it changes. On a grid surface (a
+/// terminal) they are rounded up to its whole Cells instead
+/// ([`MeasureCache::set_cell`]).
 pub(crate) struct MeasureCache {
     current: FxHashMap<(u64, u32), Size<Points>>,
     previous: FxHashMap<(u64, u32), Size<Points>>,
+    pixel_ratio: f32,
+    cell: Option<Size<Points>>,
+}
+
+impl Default for MeasureCache {
+    fn default() -> Self {
+        Self {
+            current: FxHashMap::default(),
+            previous: FxHashMap::default(),
+            pixel_ratio: 1.0,
+            cell: None,
+        }
+    }
 }
 
 impl MeasureCache {
     const GENERATION: usize = 512;
+
+    /// The device pixels per point the measurements are rounded to.
+    pub(crate) fn pixel_ratio(&self) -> f32 {
+        self.pixel_ratio
+    }
+
+    /// Measures for `ratio` from now on; returns whether it changed (the
+    /// measurements cached for the previous ratio are dropped).
+    pub(crate) fn set_pixel_ratio(&mut self, ratio: f32) -> bool {
+        let ratio = if ratio.is_finite() && ratio > 0.0 {
+            ratio
+        } else {
+            1.0
+        };
+        if ratio == self.pixel_ratio {
+            return false;
+        }
+        self.pixel_ratio = ratio;
+        self.clear();
+        true
+    }
+
+    /// Measures on a grid of `cell` (a terminal's Cells) from now on, or to
+    /// device pixels with `None`; returns whether it changed (the
+    /// measurements cached before are dropped).
+    pub(crate) fn set_cell(&mut self, cell: Option<Size<Points>>) -> bool {
+        if cell == self.cell {
+            return false;
+        }
+        self.cell = cell;
+        self.clear();
+        true
+    }
+
+    /// `size` rounded up to whole Cells on a grid surface: a text is never
+    /// shorter or narrower than the Cells it takes, so the frames rounded
+    /// to Cells never cut its last line or glyph. `None` off a grid.
+    pub(crate) fn on_cells(&self, size: Size<Points>) -> Option<Size<Points>> {
+        let cell = self.cell?;
+        let up = |v: Points, c: Points| Points(((v.0 / c.0) - 1.0e-3).ceil().max(0.0) * c.0);
+        Some(Size::new(
+            up(size.width, cell.width),
+            up(size.height, cell.height),
+        ))
+    }
+
+    /// Drops every measurement (the fonts changed), keeping the ratio.
+    pub(crate) fn clear(&mut self) {
+        self.current.clear();
+        self.previous.clear();
+    }
 
     #[inline]
     fn key(layout_hash: u64, max_width: Option<Points>) -> (u64, u32) {
@@ -955,6 +1411,64 @@ impl MeasureCache {
     }
 }
 
+/// The most a WOFF file's tables may declare they hold: what `wuff` lets a
+/// WOFF2 file hold, which it checks itself before it decompresses.
+const MAX_WOFF_TABLES: u64 = 128 * 1024 * 1024;
+
+/// The TrueType or OpenType data of a font file, which the text engines
+/// register: `data` itself, or what a WOFF or WOFF2 file holds,
+/// decompressed (WOFF2's transformed glyph tables rebuilt).
+pub fn font_data(data: &[u8]) -> Result<std::borrow::Cow<'_, [u8]>, String> {
+    let unwrapped = match data.get(..4) {
+        Some(b"wOFF") => {
+            // `wuff` reserves the size each table declares before inflating
+            // it, so a few bytes could otherwise ask for gigabytes; and it
+            // copies a table that is not smaller compressed at its compressed
+            // size, so tables sharing one block of data could copy it past
+            // what their sizes add up to.
+            if let Some(size) = woff_tables_size(data)?.filter(|&size| size > MAX_WOFF_TABLES) {
+                return Err(format!(
+                    "the WOFF font's tables declare {size} bytes, more than a font may hold \
+                     ({MAX_WOFF_TABLES})"
+                ));
+            }
+            wuff::decompress_woff1(data)
+        }
+        Some(b"wOF2") => wuff::decompress_woff2(data),
+        _ => return Ok(std::borrow::Cow::Borrowed(data)),
+    };
+    unwrapped
+        .map(std::borrow::Cow::Owned)
+        .map_err(|e| format!("the WOFF font does not decompress: {e:?}"))
+}
+
+/// The sizes a WOFF file's table directory declares, summed (`None` for a
+/// directory cut short, which `wuff` rejects): after the 44-byte header,
+/// 20 bytes a table, its `compLength` at 8 and `origLength` at 12. A table
+/// larger compressed than it is, which the format does not allow, is an
+/// error.
+fn woff_tables_size(data: &[u8]) -> Result<Option<u64>, String> {
+    let field = |at: usize| Some(u32::from_be_bytes(data.get(at..at + 4)?.try_into().ok()?));
+    let Some(tables) = data.get(12..14) else {
+        return Ok(None);
+    };
+    let mut size = 0;
+    for table in 0..usize::from(u16::from_be_bytes([tables[0], tables[1]])) {
+        let at = 44 + table * 20;
+        let (Some(compressed), Some(length)) = (field(at + 8), field(at + 12)) else {
+            return Ok(None);
+        };
+        if compressed > length {
+            return Err(format!(
+                "the WOFF font's table {table} is larger compressed ({compressed} bytes) than it is \
+                 ({length})"
+            ));
+        }
+        size += u64::from(length);
+    }
+    Ok(Some(size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -975,6 +1489,48 @@ mod tests {
         assert_eq!(t.spans.len(), 2);
         assert_eq!((t.spans[0].start, t.spans[0].end), (0, 4));
         assert_eq!((t.spans[1].start, t.spans[1].end), (4, 5));
+    }
+
+    #[test]
+    fn italic_text_keeps_color_emoji_upright() {
+        let italic = ResolvedTextStyle {
+            italic: true,
+            ..Default::default()
+        };
+        let runs = |s: &str| {
+            let mut t = AttributedText::default();
+            t.push(s, italic);
+            let units: Vec<u16> = t.text.encode_utf16().collect();
+            t.spans
+                .iter()
+                .map(|s| {
+                    let text = String::from_utf16(&units[s.start as usize..s.end as usize]);
+                    (text.unwrap(), s.style.italic)
+                })
+                .collect::<Vec<_>>()
+        };
+        let run = |s: &str, italic: bool| (s.to_owned(), italic);
+        assert_eq!(
+            runs("斜体 abc 😀😀 end"),
+            [
+                run("斜体 abc ", true),
+                run("😀😀", false),
+                run(" end", true)
+            ]
+        );
+        // Sequences stay whole: ZWJ, skin tone, flag, keycap, U+FE0F.
+        assert_eq!(runs("👩‍💻👍🏽🇨🇳#️⃣❤️"), [run("👩‍💻👍🏽🇨🇳#️⃣❤️", false)]);
+        // Text presentation by default, or asked for with U+FE0E.
+        assert_eq!(runs("© ❤ ☺ 😀\u{FE0E}"), [run("© ❤ ☺ 😀\u{FE0E}", true)]);
+
+        // Upright text is one run, and pushes merge across the emoji.
+        let mut t = AttributedText::default();
+        t.push("a😀", ResolvedTextStyle::default());
+        assert_eq!(t.spans.len(), 1);
+        t.push("😀", italic);
+        t.push("b", italic);
+        assert_eq!(t.spans.len(), 2);
+        assert_eq!((t.spans[0].end, t.spans[1].start), (5, 5));
     }
 
     #[test]
@@ -1088,5 +1644,231 @@ mod tests {
         assert_eq!(y(VerticalAlign::TextTop), Some((px(11.0), px(0.0))));
         assert_eq!(y(VerticalAlign::TextBottom), Some((px(11.0), px(6.0))));
         assert_eq!(y(VerticalAlign::Middle), Some((px(11.0), px(6.5))));
+    }
+
+    fn line(start: u32, end: u32, y: f32) -> TextLine {
+        TextLine {
+            start,
+            end,
+            x: px(0.0),
+            y: px(y),
+            width: px((end - start) as f32 * 10.0),
+            height: px(20.0),
+            ..TextLine::default()
+        }
+    }
+
+    #[test]
+    fn caret_positions_take_their_line_by_affinity() {
+        // "abcd" wrapped after its 4th character, then a hard break and an
+        // empty last line.
+        let lines = [line(0, 4, 0.0), line(4, 9, 20.0), line(9, 9, 40.0)];
+        let at = |o, a| TextPosition::new(o, a).line(&lines);
+        assert_eq!(at(4, Affinity::Upstream), Some(0));
+        assert_eq!(at(4, Affinity::Downstream), Some(1));
+        assert_eq!(at(0, Affinity::Upstream), Some(0));
+        assert_eq!(at(9, Affinity::Upstream), Some(1));
+        assert_eq!(at(9, Affinity::Downstream), Some(2));
+        assert_eq!(at(50, Affinity::Downstream), Some(2));
+        assert_eq!(TextPosition::default().line(&[]), None);
+    }
+
+    /// An engine that only reports its lines (the defaults' hit testing).
+    struct LinesOnly(Vec<TextLine>);
+
+    impl TextEngine for LinesOnly {
+        type Prepared = ();
+
+        fn prepare(&self, _: &AttributedText) {}
+
+        fn measure(&self, (): &(), _: Option<Points>) -> Size<Points> {
+            Size::default()
+        }
+
+        fn layout(&self, (): &(), _: Size<Points>) -> TextLayout {
+            TextLayout(Arc::new(()))
+        }
+
+        fn lines(&self, _: &TextLayout) -> Vec<TextLine> {
+            self.0.clone()
+        }
+    }
+
+    #[test]
+    fn line_only_engines_estimate_hits_carets_and_ranges() {
+        let engine = LinesOnly(vec![line(0, 4, 0.0), line(4, 8, 20.0)]);
+        let layout = engine.layout(&(), Size::default());
+        // Past the end of the wrapped first line: its end, on that line.
+        let end = engine.hit_test(&layout, point(px(70.0), px(5.0)));
+        assert_eq!(end, TextPosition::new(4, Affinity::Upstream));
+        assert_eq!(
+            engine.caret_rect(&layout, end),
+            Some(Bounds::new(
+                point(px(40.0), px(0.0)),
+                size(px(0.0), px(20.0))
+            ))
+        );
+        assert_eq!(
+            engine.caret_rect(&layout, TextPosition::new(4, Affinity::Downstream)),
+            Some(Bounds::new(
+                point(px(0.0), px(20.0)),
+                size(px(0.0), px(20.0))
+            ))
+        );
+        // Below the text: the last line, the nearest character edge.
+        let below = engine.hit_test(&layout, point(px(16.0), px(90.0)));
+        assert_eq!(below, TextPosition::new(6, Affinity::Downstream));
+        let mut rects = Vec::new();
+        engine.range_rects(&layout, 2..6, &mut rects);
+        assert_eq!(
+            rects,
+            [
+                Bounds::new(point(px(20.0), px(0.0)), size(px(20.0), px(20.0))),
+                Bounds::new(point(px(0.0), px(20.0)), size(px(20.0), px(20.0))),
+            ]
+        );
+        rects.clear();
+        engine.range_rects(&layout, 3..3, &mut rects);
+        assert!(rects.is_empty());
+    }
+
+    #[test]
+    fn approx_engine_hit_tests_whole_characters() {
+        let engine = ApproxTextEngine;
+        let mut t = AttributedText::default();
+        // Characters 5.5 wide; the emoji is two UTF-16 units (1..3).
+        t.push(
+            "a😀b",
+            ResolvedTextStyle {
+                font_size: px(10.0),
+                ..ResolvedTextStyle::default()
+            },
+        );
+        let layout = engine.layout(&engine.prepare(&t), size(px(100.0), px(12.0)));
+        assert_eq!(engine.lines(&layout)[0].end, 4);
+        let hit = |x| engine.hit_test(&layout, point(px(x), px(6.0))).offset;
+        assert_eq!([hit(-3.0), hit(5.0), hit(11.5), hit(99.0)], [0, 1, 3, 4]);
+        let caret_x = |o| {
+            engine
+                .caret_rect(&layout, TextPosition::new(o, Affinity::Downstream))
+                .map(|b| b.origin.x)
+        };
+        // Inside the surrogate pair: at the emoji's start.
+        assert_eq!(caret_x(2), Some(px(5.5)));
+        assert_eq!(caret_x(3), Some(px(11.0)));
+        assert_eq!(caret_x(9), Some(px(16.5)));
+        let mut rects = Vec::new();
+        engine.range_rects(&layout, 1..3, &mut rects);
+        assert_eq!(
+            rects,
+            [Bounds::new(
+                point(px(5.5), px(0.0)),
+                size(px(5.5), px(12.0))
+            )]
+        );
+    }
+
+    #[test]
+    fn woff_and_woff2_fonts_decompress_to_the_font_they_hold() {
+        let ttf: &[u8] =
+            include_bytes!("../../../tests/compat/cases/layout/fonts/Pacifico-Regular.ttf");
+        let face = |data: &[u8]| {
+            let face = ttf_parser::Face::parse(data, 0).expect("a font");
+            let family = face
+                .names()
+                .into_iter()
+                .find(|n| n.name_id == ttf_parser::name_id::FAMILY && n.is_unicode())
+                .and_then(|n| n.to_string());
+            (family, face.number_of_glyphs(), face.glyph_index('P'))
+        };
+        let original = face(ttf);
+        assert_eq!(original.0.as_deref(), Some("Pacifico"));
+        // TrueType comes back as it is.
+        assert!(matches!(font_data(ttf), Ok(std::borrow::Cow::Borrowed(_))));
+        for wrapped in [
+            &include_bytes!("../../../tests/compat/cases/layout/fonts/Pacifico-Regular.woff")[..],
+            &include_bytes!("../../../tests/compat/cases/layout/fonts/Pacifico-Regular.woff2")[..],
+        ] {
+            let data = font_data(wrapped).expect("decompressed");
+            assert_eq!(face(&data), original);
+        }
+        assert!(font_data(b"wOF2 and nothing else").is_err());
+    }
+
+    /// A WOFF file of 68 bytes whose one table declares `length` bytes.
+    fn forged_woff(length: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend(b"wOFF\0\x01\0\0");
+        data.extend(68u32.to_be_bytes()); // length
+        data.extend(1u16.to_be_bytes()); // numTables
+        data.extend([0; 2]); // reserved
+        data.extend(length.saturating_add(28).to_be_bytes()); // totalSfntSize
+        data.extend([0; 24]); // versions, metadata, private data
+        data.extend(b"glyf");
+        data.extend(64u32.to_be_bytes()); // offset
+        data.extend(4u32.to_be_bytes()); // compLength
+        data.extend(length.to_be_bytes()); // origLength
+        data.extend([0; 4]); // origChecksum
+        data.extend([0x78, 0x9c, 0x03, 0x00]); // zlib
+        data
+    }
+
+    #[test]
+    fn a_woff_font_declaring_more_than_a_font_holds_is_refused_before_it_decompresses() {
+        let forged = forged_woff(u32::MAX);
+        let error = font_data(&forged).expect_err("refused");
+        assert!(error.contains("declare"), "{error}");
+        // A size a font may have goes on to `wuff`, which finds the table
+        // does not hold it.
+        let error = font_data(&forged_woff(1024)).expect_err("refused");
+        assert!(error.contains("does not decompress"), "{error}");
+        // So does a directory cut short, for `wuff` to report.
+        assert!(matches!(woff_tables_size(&forged[..56]), Ok(None)));
+        assert!(font_data(&forged[..56]).is_err());
+    }
+
+    #[test]
+    fn a_woff_font_whose_tables_share_data_larger_than_they_are_is_refused() {
+        // Two tables of 4 bytes, each taking the same 8 bytes as stored as
+        // they are: `wuff` would copy those 8 bytes for each, however many
+        // tables there were.
+        let mut forged = Vec::new();
+        forged.extend(b"wOFF\0\x01\0\0");
+        forged.extend(92u32.to_be_bytes()); // length
+        forged.extend(2u16.to_be_bytes()); // numTables
+        forged.extend([0; 2]); // reserved
+        forged.extend(44u32.to_be_bytes()); // totalSfntSize
+        forged.extend([0; 24]); // versions, metadata, private data
+        for tag in [b"cmap", b"glyf"] {
+            forged.extend(tag);
+            forged.extend(84u32.to_be_bytes()); // offset, the same block
+            forged.extend(8u32.to_be_bytes()); // compLength
+            forged.extend(4u32.to_be_bytes()); // origLength
+            forged.extend([0; 4]); // origChecksum
+        }
+        forged.extend([0; 8]);
+        assert_eq!(forged.len(), 92);
+        let error = font_data(&forged).expect_err("refused");
+        assert!(error.contains("larger compressed"), "{error}");
+    }
+
+    #[test]
+    fn a_woff2_font_declaring_more_than_its_size_allows_is_refused() {
+        // One `cmap` table declaring 4 GiB from a brotli stream of 4 bytes
+        // (`wuff` holds what a WOFF2 file decompresses to at most 100 times
+        // the file's size, and 128 MiB).
+        let mut forged = Vec::new();
+        forged.extend(b"wOF2\0\x01\0\0");
+        forged.extend(60u32.to_be_bytes()); // length
+        forged.extend(1u16.to_be_bytes()); // numTables
+        forged.extend([0; 2]); // reserved
+        forged.extend(u32::MAX.to_be_bytes()); // totalSfntSize
+        forged.extend(4u32.to_be_bytes()); // totalCompressedSize
+        forged.extend([0; 24]); // versions, metadata, private data
+        forged.push(0); // cmap, untransformed
+        forged.extend([0x8f, 0xff, 0xff, 0xff, 0x7f]); // origLength, UIntBase128
+        forged.extend([0; 6]); // the stream, padded to 4 bytes
+        assert_eq!(forged.len(), 60);
+        assert!(font_data(&forged).is_err());
     }
 }

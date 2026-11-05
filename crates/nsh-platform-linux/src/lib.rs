@@ -26,14 +26,21 @@ mod decor;
 #[cfg(feature = "dev")]
 pub mod dev;
 mod file_drop;
+mod file_requests;
+mod fps;
+#[cfg(test)]
+mod gtk_test;
 mod image;
 mod input;
 mod keymap;
+mod menu_style;
 mod mount;
 mod native;
 mod navigation;
+mod notifications;
 mod scroll;
-mod selection_area;
+mod selectable_view;
+mod shader;
 mod surface;
 #[cfg(feature = "dev")]
 mod synth;
@@ -52,7 +59,7 @@ pub use nsh_engine::{
 #[cfg(feature = "dev")]
 pub use crate::app::set_root;
 pub use crate::{
-    app::{AppOptions, AppSource, AppView, run_app, set_ui_sets},
+    app::{AppOptions, AppSource, AppView, run_app, set_components, set_ui_sets},
     image::AssetBase,
     native::{ComponentContext, ComponentFactory, Components, NativeComponent},
 };

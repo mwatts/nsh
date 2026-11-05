@@ -4,20 +4,19 @@
 //! The cheap path is the view's own layer: `cornerRadius` + `maskedCorners`
 //! covers every shape whose rounded corners share one radius. Only corners
 //! with different radii need shape layers, and only a view that both clips
-//! its children and casts a shadow needs an extra content view (clipping a
-//! layer also clips its shadow).
+//! its children and draws outside its bounds (an outer box shadow, an
+//! outline) needs an extra content view (clipping a layer also clips what it
+//! draws outside).
 //!
-//! With a background a shadow gets a `shadowPath` (no offscreen pass); with a
-//! transparent background it follows the content (text shadows). Known
-//! limits: scroll views and lists take one radius (the largest) and clip
-//! their shadow; a `<text>` with different radii is masked, which clips its
-//! shadow too.
+//! A `drop-shadow()` filter is the layer's own shadow: it follows the
+//! content. Known limits: scroll views and lists take one radius (the
+//! largest); a `<text>` with different radii is masked.
 
 use nsh_core::{
     BorderStyle, Borders, Color, CornerRadii, ObjectPosition, ResizeMode, ViewStyle,
     geometry::{px, size},
 };
-use objc2::{MainThreadMarker, rc::Retained, runtime::AnyObject};
+use objc2::{MainThreadMarker, MainThreadOnly, rc::Retained, runtime::AnyObject};
 use objc2_core_foundation::{CFRetained, CGFloat, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{CGColor, CGImage, CGMutablePath};
 use objc2_foundation::{NSArray, NSNumber};
@@ -25,7 +24,7 @@ use objc2_quartz_core::{
     CACornerMask, CALayer, CAMediaTiming, CAShapeLayer, CATransaction, kCACornerCurveCircular,
     kCACornerCurveContinuous, kCAFillRuleEvenOdd, kCAGravityResize, kCALineCapRound,
 };
-use objc2_ui_kit::{UIColor, UIImage, UIView};
+use objc2_ui_kit::{UIColor, UIImage, UIView, UIViewAutoresizing};
 
 /// Fills sit behind the children. Borders too (CSS), except where the
 /// children are clipped: there the layer's own border, which Core Animation
@@ -58,6 +57,9 @@ pub(crate) struct Decor {
     mask: Option<Retained<CAShapeLayer>>,
     /// Holds the children while the view both clips them and casts a shadow.
     content: Option<Retained<UIView>>,
+    /// Holds the children while a shader effect or transition draws them
+    /// ([`crate::shader`]), inside [`Decor::content`] when there is one.
+    effect: Option<Retained<UIView>>,
     /// Image content (image views only): clips the picture to the view's
     /// shape.
     image: Option<Retained<CALayer>>,
@@ -102,7 +104,47 @@ impl Decor {
 
     /// The view children are added to.
     pub(crate) fn container<'a>(&'a self, view: &'a UIView) -> &'a UIView {
-        self.content.as_deref().unwrap_or(view)
+        self.effect
+            .as_deref()
+            .or(self.content.as_deref())
+            .unwrap_or(view)
+    }
+
+    /// Moves the children of `view` into a view of their own, which a
+    /// shader that draws them masks while its frames show instead (`on`),
+    /// or back out of it; that view.
+    pub(crate) fn set_effect(&mut self, view: &UIView, on: bool) -> Option<Retained<UIView>> {
+        let parent = self.content.as_deref().unwrap_or(view);
+        match (on, &self.effect) {
+            (true, None) => {
+                let effect = UIView::new(view.mtm());
+                effect.setFrame(parent.bounds());
+                effect.setAutoresizingMask(
+                    UIViewAutoresizing::FlexibleWidth | UIViewAutoresizing::FlexibleHeight,
+                );
+                let children = parent.subviews();
+                parent.addSubview(&effect);
+                // The backdrop blur is the view's own, below its background,
+                // not a child the shader draws: masked with the children, it
+                // would show nowhere.
+                let backdrop = self.visual.backdrop_view();
+                for child in children.iter() {
+                    if !backdrop.is_some_and(|b| std::ptr::eq(b, &*child)) {
+                        effect.addSubview(&child);
+                    }
+                }
+                self.effect = Some(effect);
+            }
+            (false, Some(effect)) => {
+                for child in effect.subviews().iter() {
+                    parent.insertSubview_belowSubview(&child, effect);
+                }
+                effect.removeFromSuperview();
+                self.effect = None;
+            }
+            _ => {}
+        }
+        self.effect.clone()
     }
 
     /// True if [`Decor::apply`] must run again when the view is resized.
@@ -190,7 +232,7 @@ impl Decor {
         self.mode
     }
 
-    /// How an image view fits its image (`resizeMode`) and where it places
+    /// How an image view fits its image (`objectFit`) and where it places
     /// it (`objectPosition`).
     pub(crate) fn set_fit(&mut self, mode: ResizeMode, position: ObjectPosition) {
         if self.mode != mode || self.position != position {
@@ -300,27 +342,17 @@ impl Decor {
         });
     }
 
-    /// Sets the shadow's color, opacity and radius (animated ones).
-    pub(crate) fn set_shadow(&self, view: &UIView, color: Color, opacity: f32, radius: f32) {
-        let layer = view.layer();
-        layer.setShadowColor(cg_color(color).as_deref());
-        layer.setShadowOpacity(opacity.clamp(0.0, 1.0));
-        layer.setShadowRadius(radius.max(0.0) as CGFloat);
-    }
-
     /// Shapes `view` after `style` at its current size. `background` is the
-    /// current (possibly animated) background; `animated_background` tells
-    /// whether it may change without a new style.
+    /// current (possibly animated) background.
     pub(crate) fn apply(
         &mut self,
         view: &UIView,
         kind: Kind,
         style: &ViewStyle,
         background: Color,
-        animated_background: bool,
         mtm: MainThreadMarker,
     ) {
-        quiet(|| self.apply_quietly(view, kind, style, background, animated_background, mtm));
+        quiet(|| self.apply_quietly(view, kind, style, background, mtm));
     }
 
     /// Like [`Decor::apply`], letting the current transaction animate the
@@ -331,10 +363,9 @@ impl Decor {
         kind: Kind,
         style: &ViewStyle,
         background: Color,
-        animated_background: bool,
         mtm: MainThreadMarker,
     ) {
-        self.apply_quietly(view, kind, style, background, animated_background, mtm);
+        self.apply_quietly(view, kind, style, background, mtm);
     }
 
     fn apply_quietly(
@@ -343,7 +374,6 @@ impl Decor {
         kind: Kind,
         style: &ViewStyle,
         background: Color,
-        animated_background: bool,
         mtm: MainThreadMarker,
     ) {
         let layer = view.layer();
@@ -355,7 +385,6 @@ impl Decor {
         // paths are not reshaped on resize.
         let raw = style.radii();
         let radii = raw.fit(size(px(w), px(h)));
-        let shadow = style.shadow.is_visible();
         let borders = &style.borders;
         // Sides that differ are drawn as colored rings; equal sides by the
         // layer's border or a stroke.
@@ -374,7 +403,7 @@ impl Decor {
             (kind == Kind::Scroll).then(|| raw.to_array().into_iter().fold(0.0, |m, r| r.0.max(m)))
         });
         let corners = corner_mask(&raw);
-        let outside = shadow || crate::visual::draws_outside(style);
+        let outside = crate::visual::draws_outside(style);
         let content = kind == Kind::View && style.overflow_hidden && outside;
 
         // Text draws into the layer's own contents, below every sublayer: it
@@ -384,11 +413,14 @@ impl Decor {
         // Core Animation's continuous corners differ slightly from the
         // shared outline (`nsh_core::shape`): a stroke drawn along the latter
         // gets its background from the same outline, so none shows outside.
-        let fill = (shared.is_none() || (raw.continuous && stroke)) && kind != Kind::Text;
+        // A backdrop blur is a subview, above the layer's own background:
+        // the background moves to a fill layer above the blur.
+        let fill =
+            (shared.is_none() || (raw.continuous && stroke) || crate::visual::has_backdrop(style))
+                && kind != Kind::Text;
         let mask = shared.is_none() && (style.overflow_hidden || kind == Kind::Text) && !content;
 
         self.sized = kind == Kind::Image
-            || shadow
             || shared.is_none()
             || content
             || stroke
@@ -500,7 +532,7 @@ impl Decor {
             (0.0, None)
         };
 
-        // Children in a content view: it clips, the view casts the shadow.
+        // Children in a content view: it clips, the view draws outside.
         self.set_content(view, content, mtm);
         let border_layer = match &self.content {
             Some(c) => {
@@ -568,21 +600,7 @@ impl Decor {
             }
         }
 
-        // Shadow. With a background the shape is known and passed as a path,
-        // which spares Core Animation an offscreen pass over the content.
-        if shadow {
-            let s = style.shadow;
-            layer.setShadowColor(cg_color(s.color).as_deref());
-            layer.setShadowOpacity(s.opacity);
-            layer.setShadowOffset(CGSize::new(
-                s.offset_x.0 as CGFloat,
-                s.offset_y.0 as CGFloat,
-            ));
-            layer.setShadowRadius(s.radius.0 as CGFloat);
-            let solid = !style.background_color.is_transparent() || animated_background;
-            let path = solid.then(|| rounded(local, radii));
-            layer.setShadowPath(path.as_deref().map(|p| &**p));
-        } else if let Some((x, y, blur, color)) = crate::visual::drop_shadow(style) {
+        if let Some((x, y, blur, color)) = crate::visual::drop_shadow(style) {
             // `drop-shadow()`: follows the content's shape (no path).
             layer.setShadowColor(cg_color(Color(color.0 | 0xff)).as_deref());
             layer.setShadowOpacity((color.0 & 0xff) as f32 / 255.0);
@@ -678,8 +696,13 @@ impl Decor {
                 let content = UIView::new(mtm);
                 let children = view.subviews();
                 view.addSubview(&content);
+                // The backdrop blur is the view's own, below its background:
+                // in the content view it would cover the background.
+                let backdrop = self.visual.backdrop_view();
                 for child in children.iter() {
-                    content.addSubview(&child);
+                    if !backdrop.is_some_and(|b| std::ptr::eq(b, &*child)) {
+                        content.addSubview(&child);
+                    }
                 }
                 self.content = Some(content);
             }

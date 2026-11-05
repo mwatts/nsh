@@ -48,9 +48,10 @@ use gpui::{
     TextSystem, WindowTextSystem, px,
 };
 use nsh_core::{
-    ATTACHMENT_CHAR, AttributedText, Color, DecorationStyle, EllipsizeMode, EventKind, FontFamily,
-    Point, Points, ResolvedTextStyle, Size, TextAlign, TextEngine, TextLayout, TextLine, TextSpan,
-    geometry::point,
+    ATTACHMENT_CHAR, Affinity, AttributedText, Bounds, Color, DecorationStyle, EllipsizeMode,
+    EventKind, FontFamily, Point, Points, ResolvedTextStyle, Size, TextAlign, TextEngine,
+    TextLayout, TextLine, TextPosition, TextSpan,
+    geometry::{point, size},
 };
 use rustc_hash::FxHashMap;
 use unicode_bidi::{Level, ParagraphBidiInfo};
@@ -200,18 +201,15 @@ const FANTASY: &[&str] = &["Impact", "Papyrus"];
 /// comma-separated stack, CSS generic names and Apple's font names as fonts
 /// this platform has; `""` is the UI font.
 fn family_candidates(name: &str) -> Vec<&str> {
+    use nsh_core::FamilyName;
     let mut out = Vec::new();
-    for family in name.split(',') {
-        let family = family.trim().trim_matches(|c| c == '"' || c == '\'');
+    for family in nsh_core::font_families(name) {
         match family {
-            "" => {}
-            "system-ui" | "-apple-system" | "BlinkMacSystemFont" | "ui-sans-serif"
-            | "ui-rounded" | "sans-serif" => out.push(""),
-            "ui-monospace" | "monospace" => out.extend_from_slice(MONOSPACE),
-            "ui-serif" | "serif" => out.extend_from_slice(SERIF),
-            "cursive" => out.extend_from_slice(CURSIVE),
-            "fantasy" => out.extend_from_slice(FANTASY),
-            f => {
+            FamilyName::Monospace => out.extend_from_slice(MONOSPACE),
+            FamilyName::Serif => out.extend_from_slice(SERIF),
+            FamilyName::Named("cursive") => out.extend_from_slice(CURSIVE),
+            FamilyName::Named("fantasy") => out.extend_from_slice(FANTASY),
+            FamilyName::Named(f) => {
                 out.push(f);
                 // What apps written for Apple platforms name, as what
                 // this platform has (when it lacks the font itself).
@@ -222,6 +220,8 @@ fn family_candidates(name: &str) -> Vec<&str> {
                     _ => &[],
                 });
             }
+            // The system font, and its rounded design (which GPUI lacks).
+            _ => out.push(""),
         }
     }
     if out.is_empty() {
@@ -455,25 +455,39 @@ impl GpuiTextEngine {
         if let Some(face) = fonts.faces.get(&key) {
             return face.clone();
         }
-        let family = match style.font_family {
-            Some(f) => {
-                let name = f.name();
-                family_candidates(&name)
-                    .into_iter()
-                    .find_map(|c| {
-                        if c.is_empty() {
-                            Some(fonts.ui.clone())
-                        } else {
-                            fonts
-                                .installed
-                                .get(&c.to_lowercase())
-                                .map(|n| SharedString::from(n.clone()))
-                        }
-                    })
-                    // Not installed: lines take the UI font.
-                    .unwrap_or_else(|| fonts.ui.clone())
+        // The families of the list this system has, in order: text is set
+        // in the first, and the others are its fallbacks, before the
+        // platform's.
+        let listed: Vec<SharedString> = match style.font_family {
+            Some(f) => family_candidates(&f.name())
+                .into_iter()
+                .filter_map(|c| {
+                    if c.is_empty() {
+                        Some(fonts.ui.clone())
+                    } else {
+                        fonts
+                            .installed
+                            .get(&c.to_lowercase())
+                            .map(|n| SharedString::from(n.clone()))
+                    }
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        // Not installed: lines take the UI font.
+        let family = listed.first().cloned().unwrap_or_else(|| fonts.ui.clone());
+        let mut fallbacks: Vec<String> = Vec::new();
+        for f in listed.iter().skip(1).filter(|f| **f != family) {
+            if !fallbacks.iter().any(|n| n == f.as_ref()) {
+                fallbacks.push(f.to_string());
             }
-            None => fonts.ui.clone(),
+        }
+        let fallbacks = if fallbacks.is_empty() {
+            fonts.fallbacks.clone()
+        } else {
+            let platform = fonts.fallbacks.as_ref().map(|f| f.fallback_list().to_vec());
+            fallbacks.extend(platform.into_iter().flatten());
+            Some(gpui::FontFallbacks::from_fonts(fallbacks))
         };
         let features: Vec<(String, u32)> = style
             .font_variant
@@ -483,7 +497,7 @@ impl GpuiTextEngine {
         let font = Font {
             family,
             features: FontFeatures(Arc::new(features)),
-            fallbacks: fonts.fallbacks.clone(),
+            fallbacks,
             weight: FontWeight(f32::from(style.font_weight)),
             style: if style.italic {
                 FontStyle::Italic
@@ -1498,9 +1512,26 @@ impl TextEngine for GpuiTextEngine {
         })
     }
 
-    fn index_at(&self, layout: &TextLayout, at: Point<Points>) -> Option<u32> {
-        let l = layout.downcast::<GpuiLayout>()?;
-        Some(l.caret_at(at.x.0, at.y.0))
+    fn hit_test(&self, layout: &TextLayout, p: Point<Points>) -> TextPosition {
+        layout
+            .downcast::<GpuiLayout>()
+            .map_or_else(TextPosition::default, |l| l.hit_test(p.x.0, p.y.0))
+    }
+
+    fn caret_rect(&self, layout: &TextLayout, position: TextPosition) -> Option<Bounds<Points>> {
+        layout.downcast::<GpuiLayout>()?.caret_rect(position)
+    }
+
+    fn range_rects(&self, layout: &TextLayout, range: Range<u32>, out: &mut Vec<Bounds<Points>>) {
+        let Some(l) = layout.downcast::<GpuiLayout>() else {
+            return;
+        };
+        l.selection_rects((range.start, range.end), |x, y, w, h| {
+            out.push(Bounds::new(
+                point(Points(x), Points(y)),
+                size(Points(w), Points(h)),
+            ));
+        });
     }
 
     fn register_font(&self, data: &[u8]) -> Result<(), String> {
@@ -1951,19 +1982,42 @@ impl GpuiLayout {
             .map(|b| b.at)
     }
 
-    /// The caret position (UTF-16 offset) nearest `(x, y)` in content
-    /// coordinates: on the line at that height (the first above the text,
-    /// the last below it), at the box edge nearest x.
-    fn caret_at(&self, x: f32, y: f32) -> u32 {
-        let Some(line) = self
+    /// The boxes of `line`.
+    fn line_boxes(&self, line: &Line) -> &[CBox] {
+        self.boxes.get(line.boxes.clone()).unwrap_or_default()
+    }
+
+    /// Whether line `i` was cut by wrapping rather than by a break
+    /// character: the next line then starts where it ends (a break
+    /// character sits between the lines of a hard break).
+    fn wraps(&self, i: usize) -> bool {
+        match (self.lines.get(i), self.lines.get(i + 1)) {
+            (Some(line), Some(next)) => next.info.start == line.info.end,
+            _ => false,
+        }
+    }
+
+    /// The index of the line the caret at `position` is on (the rules of
+    /// [`nsh_core::TextPosition::line`], without copying the lines).
+    fn line_of(&self, position: TextPosition) -> Option<usize> {
+        position.line_in(self.lines.iter().map(|l| l.info.start..l.info.end))
+    }
+
+    /// The caret position nearest `(x, y)` in content coordinates: on the
+    /// line at that height (the first above the text, the last below it),
+    /// at the box edge nearest x. At a wrapped line's end it is
+    /// [`Affinity::Upstream`], so the caret stays on that line.
+    fn hit_test(&self, x: f32, y: f32) -> TextPosition {
+        let Some((i, line)) = self
             .lines
             .iter()
-            .find(|l| y < (l.info.y + l.info.height).0)
-            .or(self.lines.last())
+            .position(|l| y < (l.info.y + l.info.height).0)
+            .or(self.lines.len().checked_sub(1))
+            .and_then(|i| Some((i, self.lines.get(i)?)))
         else {
-            return 0;
+            return TextPosition::default();
         };
-        let boxes = &self.boxes[line.boxes.clone()];
+        let boxes = self.line_boxes(line);
         // Distance, the box's offset, the caret goes after it.
         let mut best: Option<(f32, u32, bool)> = None;
         for b in boxes {
@@ -1974,7 +2028,7 @@ impl GpuiLayout {
                 }
             }
         }
-        match best {
+        let offset = match best {
             None => line.info.start,
             Some((_, at, false)) => at,
             Some((_, at, true)) => boxes
@@ -1983,7 +2037,35 @@ impl GpuiLayout {
                 .filter(|&i| i > at)
                 .min()
                 .unwrap_or(line.info.end),
-        }
+        };
+        let affinity = if offset == line.info.end && self.wraps(i) {
+            Affinity::Upstream
+        } else {
+            Affinity::Downstream
+        };
+        TextPosition::new(offset, affinity)
+    }
+
+    /// The caret at `position` (content coordinates): no width, as high as
+    /// its line, at the edge of the box that starts at the offset or, past
+    /// the last character of the line, at the end of the last box before it.
+    fn caret_rect(&self, position: TextPosition) -> Option<Bounds<Points>> {
+        let line = self.lines.get(self.line_of(position)?)?;
+        let o = position.offset.max(line.info.start).min(line.info.end);
+        let boxes = self.line_boxes(line);
+        let x = if let Some(b) = boxes.iter().find(|b| b.at == o) {
+            // The edge the characters start at.
+            if b.rtl { b.x + b.w } else { b.x }
+        } else if let Some(b) = boxes.iter().filter(|b| b.at < o).max_by_key(|b| b.at) {
+            // The edge they end at.
+            if b.rtl { b.x } else { b.x + b.w }
+        } else {
+            line.info.x.0
+        };
+        Some(Bounds::new(
+            point(Points(x), line.info.y),
+            size(Points::ZERO, line.info.height),
+        ))
     }
 
     /// Calls `f(x, y, width, height, radius, color)` with the boxes
@@ -2063,10 +2145,10 @@ pub(crate) struct DrawnText {
     pub(crate) layout: TextLayout,
     /// Where the layout goes inside the view.
     pub(crate) content: nsh_core::Bounds<Points>,
-    /// The selection of `selectable` text, kept across new content.
+    /// The selection of selectable text, kept across new content.
     selection: Option<Rc<Selection>>,
-    /// The part of the selection of the selection area around it that is
-    /// this text's ([`crate::selection_area`]).
+    /// The part of the selection of the selectable view around it that is
+    /// this text's ([`crate::selectable_view`]).
     pub(crate) area_range: Option<(u32, u32)>,
 }
 
@@ -2080,7 +2162,7 @@ pub(crate) fn set(
     let old = view.state_mut().text.take();
     let was = old.as_ref().is_some_and(|o| o.text.is_selectable());
     // The area's selection is checked against the new content once the
-    // batch is applied (`selection_area::batch_applied`).
+    // batch is applied (`selectable_view::batch_applied`).
     let area_range = old
         .as_ref()
         .filter(|o| o.text.text == text.text)
@@ -2251,7 +2333,12 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
             .get(span_at(&text.spans, index))
             .map_or(&default, |s| &s.style)
     };
-    let animated = state.anim.color;
+    // An animated color, or a transition of the text's color, over the
+    // runs' own.
+    let animated = state
+        .anim
+        .color
+        .or_else(|| state.live.as_ref()?.text_color());
     let mut glyphs = Vec::with_capacity(layout.glyphs.len());
     for g in &layout.glyphs {
         let o = cx.map(ox + g.x, oy + g.y);
@@ -2480,7 +2567,11 @@ pub(crate) fn char_at(state: &ViewState, x: f32, y: f32) -> Option<u32> {
 pub(crate) fn caret_at(state: &ViewState, x: f32, y: f32) -> Option<u32> {
     let drawn = state.text.as_ref()?;
     let layout = drawn.layout.downcast::<GpuiLayout>()?;
-    Some(layout.caret_at(x - drawn.content.origin.x.0, y - drawn.content.origin.y.0))
+    Some(
+        layout
+            .hit_test(x - drawn.content.origin.x.0, y - drawn.content.origin.y.0)
+            .offset,
+    )
 }
 
 // --- Selection ----------------------------------------------------------------------
@@ -2501,7 +2592,7 @@ enum Unit {
     Paragraph,
 }
 
-/// The range selection of a `selectable` text view, desktop style: a mouse
+/// The range selection of a selectable text view, desktop style: a mouse
 /// drag selects characters, a double click words and a triple click the
 /// paragraph (and drags on by them), Shift+click extends, Ctrl+C (Cmd+C on
 /// macOS) copies, Ctrl+A selects all, Escape or a press anywhere else
@@ -2553,7 +2644,7 @@ fn select(surface: u64, view: &NshView, range: Option<(u32, u32)>) {
     }
     view.changed();
     if range.is_some() {
-        crate::selection_area::clear_all();
+        crate::selectable_view::clear_all();
     }
     let previous = SELECTED.with_borrow_mut(|selected| match range {
         Some(_) => selected.replace((surface, view.clone())),
@@ -2676,7 +2767,7 @@ fn pressed(key: u64, view: &NshView, s: &Selection, clicks: u32, x: f32, y: f32,
                 .and_then(|i| drawn.text.link_at(i))
                 .is_some_and(|l| press.iter().any(|&k| l.events.contains(k)));
         (
-            layout.caret_at(lx, ly),
+            layout.hit_test(lx, ly).offset,
             char_index,
             drawn.text.clone(),
             over_press,
@@ -2737,7 +2828,9 @@ fn dragged(key: u64, view: &NshView, s: &Selection, dx: f32, dy: f32, x: f32, y:
         let Some(layout) = drawn.layout.downcast::<GpuiLayout>() else {
             return;
         };
-        let caret = layout.caret_at(x - drawn.content.origin.x.0, y - drawn.content.origin.y.0);
+        let caret = layout
+            .hit_test(x - drawn.content.origin.x.0, y - drawn.content.origin.y.0)
+            .offset;
         extend(&drawn.text.text, s.anchor.get(), caret, s.unit.get())
     };
     select(key, view, Some(range));
@@ -3077,6 +3170,12 @@ mod tests {
         assert_eq!(stack[0], "Fira Code");
         assert_eq!(&stack[1..], MONOSPACE);
         assert_eq!(&family_candidates("Menlo")[1..], MONOSPACE);
+        // A quoted name runs to its closing quote, commas and all, and is
+        // never a generic family.
+        assert_eq!(
+            family_candidates("'ACME, Inc', \"serif\""),
+            ["ACME, Inc", "serif"]
+        );
     }
 
     #[test]
@@ -3541,17 +3640,17 @@ mod tests {
         let (_, layout) = layout_of(&engine, &t, None);
         let lines = engine.lines(&layout);
         let (first, second) = (&lines[0], &lines[1]);
-        let at = |x: f32, y: f32| engine.index_at(&layout, point(Points(x), Points(y)));
+        let at = |x: f32, y: f32| engine.hit_test(&layout, point(Points(x), Points(y))).offset;
         let middle = |l: &TextLine| (l.y + l.height / 2.0).0;
-        assert_eq!(at(0.0, middle(first)), Some(0));
-        assert_eq!(at(first.width.0 + 50.0, middle(first)), Some(2));
-        assert_eq!(at(0.0, middle(second)), Some(3));
-        assert_eq!(at(second.width.0 + 50.0, middle(second)), Some(14));
-        assert_eq!(at(-10.0, -10.0), Some(0));
-        assert_eq!(at(1.0e4, 1.0e4), Some(14));
+        assert_eq!(at(0.0, middle(first)), 0);
+        assert_eq!(at(first.width.0 + 50.0, middle(first)), 2);
+        assert_eq!(at(0.0, middle(second)), 3);
+        assert_eq!(at(second.width.0 + 50.0, middle(second)), 14);
+        assert_eq!(at(-10.0, -10.0), 0);
+        assert_eq!(at(1.0e4, 1.0e4), 14);
         // Inside "H" near its left edge, inside "x" near its right one.
-        assert_eq!(at(1.0, middle(first)), Some(0));
-        assert_eq!(at(first.width.0 - 1.0, middle(first)), Some(2));
+        assert_eq!(at(1.0, middle(first)), 0);
+        assert_eq!(at(first.width.0 - 1.0, middle(first)), 2);
     }
 
     #[test]
@@ -3757,16 +3856,23 @@ mod tests {
         let (size, layout) = layout_of(&engine, &t, None);
         let l = layout.downcast::<GpuiLayout>().unwrap();
         assert_eq!(l.lines.len(), 2);
-        assert_eq!(l.caret_at(-5.0, 2.0), 0);
-        assert_eq!(l.caret_at(size.width.0 + 20.0, 2.0), 15);
+        assert_eq!(l.hit_test(-5.0, 2.0).offset, 0);
+        // A hard break: the caret goes before it, on that line.
+        assert_eq!(
+            l.hit_test(size.width.0 + 20.0, 2.0),
+            TextPosition::new(15, Affinity::Downstream)
+        );
         // Below the text: the last line.
-        assert_eq!(l.caret_at(size.width.0 + 20.0, size.height.0 + 50.0), 22);
-        let mid = l.caret_at((size.width / 2.0).0, 2.0);
+        assert_eq!(
+            l.hit_test(size.width.0 + 20.0, size.height.0 + 50.0).offset,
+            22
+        );
+        let mid = l.hit_test((size.width / 2.0).0, 2.0).offset;
         assert!(mid > 3 && mid < 12, "{mid}");
         // Nearest edge: just right of a box's start is before it.
         let b = l.boxes[l.lines[0].boxes.clone()][2];
-        assert_eq!(l.caret_at(b.x + b.w * 0.2, 2.0), b.at);
-        assert_eq!(l.caret_at(b.x + b.w * 0.8, 2.0), b.at + 1);
+        assert_eq!(l.hit_test(b.x + b.w * 0.2, 2.0).offset, b.at);
+        assert_eq!(l.hit_test(b.x + b.w * 0.8, 2.0).offset, b.at + 1);
         assert_eq!(l.char_at(b.x + b.w * 0.5, 2.0), Some(b.at));
 
         let mut rects = Vec::new();
@@ -3782,8 +3888,61 @@ mod tests {
         let (size, layout) = layout_of(&engine, &rtl, None);
         let l = layout.downcast::<GpuiLayout>().unwrap();
         // Right to left: the right edge is the start.
-        assert_eq!(l.caret_at(size.width.0 + 5.0, 2.0), 0);
-        assert_eq!(l.caret_at(-5.0, 2.0), 9);
+        assert_eq!(l.hit_test(size.width.0 + 5.0, 2.0).offset, 0);
+        assert_eq!(l.hit_test(-5.0, 2.0).offset, 9);
+    }
+
+    /// The engine's hit testing: the end of a wrapped line is `Upstream`
+    /// and its caret stays on that line, carets sit on box edges, and
+    /// ranges append a line-high box per line.
+    #[test]
+    fn engine_hit_testing() {
+        let Some(engine) = engine() else {
+            return;
+        };
+        let t = text(&[("alpha beta gamma delta epsilon", plain(15.0))]);
+        let (_, layout) = layout_of(&engine, &t, Some(90.0));
+        let lines = engine.lines(&layout);
+        assert!(lines.len() > 2, "{lines:?}");
+        let first = &lines[0];
+        assert_eq!(first.end, lines[1].start);
+
+        let past = point(Points(500.0), first.y + first.height / 2.0);
+        let end = engine.hit_test(&layout, past);
+        assert_eq!(end, TextPosition::new(first.end, Affinity::Upstream));
+        let up = engine.caret_rect(&layout, end).unwrap();
+        let down = engine
+            .caret_rect(&layout, TextPosition::new(first.end, Affinity::Downstream))
+            .unwrap();
+        assert_eq!((up.origin.y, up.size.width), (first.y, Points::ZERO));
+        assert_eq!(up.size.height, first.height);
+        assert_eq!(down.origin.y, lines[1].y);
+        assert!(up.origin.x.0 > down.origin.x.0 + 20.0, "{up:?} {down:?}");
+        // The start of the text and a point above it.
+        let start = engine.hit_test(&layout, point(Points(-5.0), Points(-5.0)));
+        assert_eq!(start, TextPosition::default());
+        assert_eq!(engine.caret_rect(&layout, start).unwrap().origin.x, first.x);
+
+        // A range over two lines appends to what `out` holds.
+        let mut out = vec![Bounds::new(
+            point(Points(1.0), Points(2.0)),
+            size(Points(3.0), Points(4.0)),
+        )];
+        engine.range_rects(&layout, 2..lines[1].start + 2, &mut out);
+        assert_eq!(out.len(), 3, "{out:?}");
+        assert_eq!(out[1].origin.y, first.y);
+        assert_eq!(out[2].origin.y, lines[1].y);
+        assert_eq!(out[1].size.height, first.height);
+        engine.range_rects(&layout, 4..4, &mut out);
+        assert_eq!(out.len(), 3);
+
+        // Not this engine's layout.
+        let other = nsh_core::ApproxTextEngine;
+        let foreign = other.layout(&other.prepare(&t), Size::new(Points(90.0), Points(40.0)));
+        assert_eq!(engine.hit_test(&foreign, past), TextPosition::default());
+        assert!(engine.caret_rect(&foreign, end).is_none());
+        engine.range_rects(&foreign, 0..5, &mut out);
+        assert_eq!(out.len(), 3);
     }
 
     #[test]
@@ -3819,6 +3978,39 @@ mod tests {
         assert_eq!(&*engine.face(&style).font.family, "Pacifico");
         // Pacifico is tall: its lines are more than 1.5 ems.
         assert!(after.height.0 > 30.0, "{after:?}");
+
+        // A `fontFamily` list sets text in its first family the system has
+        // (a registered one here: registering is process-wide, so this is
+        // the test that registers), the others it has first among the
+        // fallbacks.
+        let listed = ResolvedTextStyle {
+            font_family: Some(nsh_core::FontFamily::new(
+                "No Such Family, Pacifico, 'Pacifico', monospace",
+            )),
+            ..style
+        };
+        let font = engine.font(&listed);
+        assert_eq!(&*font.family, "Pacifico");
+        let fallbacks = font.fallbacks.expect("fallbacks");
+        let list = fallbacks.fallback_list();
+        assert!(!list.iter().any(|f| f == "Pacifico"), "{list:?}");
+        assert!(!list.is_empty());
+
+        // The list's second installed family is the first fallback.
+        let names = system().all_font_names();
+        let Some(other) = names.iter().find(|n| *n != "Pacifico" && !n.contains(',')) else {
+            return;
+        };
+        let listed = ResolvedTextStyle {
+            font_family: Some(nsh_core::FontFamily::new(&format!(
+                "No Such Family, Pacifico, \"{other}\", monospace"
+            ))),
+            ..style
+        };
+        let font = engine.font(&listed);
+        assert_eq!(&*font.family, "Pacifico");
+        let list = font.fallbacks.expect("fallbacks").fallback_list().to_vec();
+        assert_eq!(list.first(), Some(other), "{list:?}");
     }
 
     #[test]

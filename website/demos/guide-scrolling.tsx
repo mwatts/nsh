@@ -1,6 +1,6 @@
-import { mount, Scroll, signal, Text, View, type YNode } from "nsh";
-import { createAnimatedValue } from "nsh/animated";
-import { desktop, size, tint, ui, wide } from "./palette";
+import { mount, Scroll, type ScrollRef, signal, Text, View } from "nsh";
+import { createAnimatedValue } from "nsh";
+import { button, buttonText, desktop, size, tint, ui, wide } from "./palette";
 
 // Tints of the info, violet, danger, warn and up colours under the text colour.
 const hues = ["info", "violet", "down", "warn", "up", "faint"] as const;
@@ -17,9 +17,9 @@ function Pager() {
         pagingEnabled
         scrollbar={false}
         style={{ height: 110, borderRadius: 12 }}
-        onLayout={(e) => width.set(e.size.width)}
-        onMomentumEnd={(e) => page.set(Math.round(e.x / width()))}
-        onScrollEnd={(e) => page.set(Math.round(e.x / width()))}
+        onLayout={({ bounds }) => width.set(bounds.size.width)}
+        onMomentumEnd={({ offset }) => page.set(Math.round(offset.x / width()))}
+        onScrollEnd={({ offset }) => page.set(Math.round(offset.x / width()))}
       >
         <View style={{ flexDirection: "row" }}>
           <Each of={[0, 1, 2, 3]}>
@@ -73,7 +73,7 @@ function App() {
   const y = signal(0);
   const refreshing = signal(false);
   const refreshed = signal(0);
-  let scroll!: YNode;
+  let scroll!: ScrollRef;
   const refresh = () => {
     refreshing.set(true);
     setTimeout(() => {
@@ -100,7 +100,7 @@ function App() {
             fontWeight: "700",
             color: ui().text,
             transformOrigin: "left center",
-            transform: [{ scale: offset.interpolate({ inputRange: [0, 80], outputRange: [1, 0.8] }) }],
+            scale: offset.interpolate({ inputRange: [0, 80], outputRange: [1, 0.8] }),
           }}
         >
           Scrolling
@@ -141,19 +141,9 @@ function App() {
           </View>
           <View
             onPress={() => scroll.scrollTo({ y: 0 })}
-            activeStyle={{ opacity: 0.6 }}
-            style={
-              desktop
-                ? { alignSelf: "flex-start", height: size.control, justifyContent: "center", paddingHorizontal: 12, borderRadius: 8, ...ui().primary }
-                : {
-                    padding: 14,
-                    borderRadius: 10,
-                    ...ui().primary,
-                    alignItems: "center",
-                  }
-            }
+            {...button("primary")}
           >
-            <Text style={{ color: ui().onPrimary, fontWeight: "600", fontSize: desktop ? 13 : undefined }}>Back to the top (ref.scrollTo)</Text>
+            <Text style={buttonText("primary")}>Back to the top (ref.scrollTo)</Text>
           </View>
         </View>
       </Scroll>

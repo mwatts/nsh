@@ -23,7 +23,7 @@ use std::{
 
 use nsh_core::{
     decl,
-    ui::{ComponentSpec, DECLARATIONS, ModuleSpec, Registry, description::SetDescription},
+    element::{ComponentSpec, DECLARATIONS, ModuleSpec, Registry, description::SetDescription},
 };
 use rquickjs::{Ctx, JsLifetime, Module, qjs};
 
@@ -62,7 +62,7 @@ pub(crate) enum Ts {
 
 impl Ts {
     // Constructors for the tables: the text is left out of builds without
-    // declarations (`nsh_core::ui::DECLARATIONS`).
+    // declarations (`nsh_core::element::DECLARATIONS`).
 
     /// [`Ts::Function`].
     pub(crate) const fn function(doc: &'static str, signatures: &'static [&'static str]) -> Ts {
@@ -99,12 +99,12 @@ pub(crate) type Item = (&'static str, Export, Ts);
 pub(crate) struct NativeModule {
     pub(crate) name: &'static str,
     pub(crate) exports: &'static [Item],
-    /// The modules whose exports this one serves too, the same values (one
-    /// per VM): `nsh` serves the primitives `nsh/image`, `nsh/list`, ...
-    /// exported first.
+    /// The sources whose exports this one serves too (`moved_to`), kept by
+    /// area: `nsh` serves the primitives (`nsh/list`, `nsh/image`, ...), the
+    /// environment (`nsh/device`), ...; no app imports a source.
     pub(crate) also: &'static [&'static str],
-    /// The module apps import this one's exports from now (`nsh`): they
-    /// stay, declared `@deprecated`.
+    /// The module that serves this one's exports (`nsh`): it is no module
+    /// apps import, only the source of those exports and their types.
     pub(crate) moved_to: Option<&'static str>,
     /// The module's own TypeScript types (interfaces, type aliases), next to
     /// the declarations of its exports.
@@ -208,7 +208,7 @@ const NSH: &[Item] = &[
         "ErrorBoundary",
         Export::Function(dom::error_boundary, 1),
         Ts::function(
-            "Its children, or `fallback` once something under them threw (a component's body, a\nbinding, an effect, a listener): what failed goes, and `fallback(error, reset)` shows the\nthrown value; `reset()` renders the children again. A fallback that takes no arguments\nis shown as is. What throws in the fallback goes to the boundary above.",
+            "Its children, or `fallback` once something under them threw (a component's body, a\nbinding, an effect, a listener): what failed goes, and `fallback(error, reset)` shows the\nthrown value; `reset()` renders the children again. A function fallback is always\ncalled so; an element is shown as is. What throws in the fallback goes to\nthe boundary above.",
             &[
                 "(props: { fallback: JSX.Element | ((error: unknown, reset: () => void) => JSX.Element); children?: JSX.Element }): JSX.Element",
             ],
@@ -219,7 +219,7 @@ const NSH: &[Item] = &[
         Export::Value(|cx| dom::host_component(cx, "view", true)),
         Ts::function(
             "A view: the box layout, styles, touches and accessibility work on\n(UIView / ViewGroup).",
-            &["(props: ViewProps): YNode"],
+            &["(props: ViewProps): JSX.Element"],
         ),
     ),
     (
@@ -227,7 +227,7 @@ const NSH: &[Item] = &[
         Export::Value(|cx| dom::host_component(cx, "text", true)),
         Ts::function(
             "A paragraph of text; a `<Text>` in it is a span of the same paragraph, other\nelements are inline attachments.",
-            &["(props: TextProps): YNode"],
+            &["(props: TextProps): JSX.Element"],
         ),
     ),
     (
@@ -235,15 +235,7 @@ const NSH: &[Item] = &[
         Export::Value(|cx| dom::host_component(cx, "scroll", true)),
         Ts::function(
             "A native scroll view (UIScrollView / ScrollView), zoomable; for long\nlists, `List`.",
-            &["(props: ScrollProps): YNode"],
-        ),
-    ),
-    (
-        "Input",
-        Export::Value(|cx| dom::host_component(cx, "input", true)),
-        Ts::function(
-            "A native text input (UITextField / UITextView, EditText); `ref` has\n`focus()`, `blur()` and `setSelection(start, end)`.",
-            &["(props: InputProps): YNode"],
+            &["(props: ScrollProps): JSX.Element"],
         ),
     ),
     (
@@ -251,7 +243,47 @@ const NSH: &[Item] = &[
         Export::Value(|cx| dom::host_component(cx, "overlay", true)),
         Ts::function(
             "Its children on top of the root view it is in (the surface, or the dialog\naround it), outside its parent's layout and clipping, while it stays its\nparent's child for everything else (context, events, lifetime): popovers,\nmenus, tooltips. Without `anchor` it is a `position: fixed` box of that\nroot view; with one it goes on the `placement` side of the anchor, on the\nother when only that one has room, kept inside the safe area, and follows\nthe anchor as it moves. `onPressOutside` and `onCancel` (Escape, Android\nback) report what closes it; closing is the app's.",
-            &["(props: OverlayProps): YNode"],
+            &["(props: OverlayProps): JSX.Element"],
+        ),
+    ),
+    (
+        "Shader",
+        Export::Value(|cx| dom::host_component(cx, "shader", true)),
+        Ts::function(
+            "A view whose box a GPU shader draws, under its children: `source` is WGSL\ndefining `fn shade(uv: vec2f) -> vec4f`, the straight sRGB color of each\npoint (`uv` 0..1 from the top left), which reads `nsh.size` (points),\n`nsh.time` (seconds; reading it animates the shader, unless `paused`),\n`nsh.scale` and the members of its `struct Uniforms` as `uniforms.name`, set by\n`uniforms={{ name: value }}`: numbers, colors, lists and animated values,\nwhich move it natively. It takes every prop of a `View`.",
+            &["(props: ShaderProps): JSX.Element"],
+        ),
+    ),
+    (
+        "ShaderEffect",
+        Export::Value(|cx| dom::host_component(cx, "shadereffect", true)),
+        Ts::function(
+            "A view whose children draw through a GPU shader: its WGSL `shade` reads\nwhat they draw with `sample_content(uv)` (and what is behind the view with\n`sample_backdrop(uv)`), `nsh.progress` from `progress` (a number or an\nanimated value), and draws `maxSampleOffset` points beyond the box. The\nchildren keep their presses. Without `source` they draw as they are.",
+            &["(props: ShaderEffectProps): JSX.Element"],
+        ),
+    ),
+    (
+        "ShaderTransition",
+        Export::Value(|cx| dom::host_component(cx, "shadertransition", true)),
+        Ts::function(
+            "A view whose children change through a GPU shader: when `value` changes\n(not the first one) its WGSL `shade` draws, for `duration` ms (300),\n`sample_from(uv)` (a picture of what they drew) changing into\n`sample_to(uv)` (what they draw now) as `nsh.progress` goes from 0 to 1.\nWithout `source` it runs `fallback`: `\"fade\"` (a cross-fade) or `\"none\"`.",
+            &["(props: ShaderTransitionProps): JSX.Element"],
+        ),
+    ),
+    (
+        "ScreenEffect",
+        Export::Value(|cx| dom::host_component(cx, "screeneffect", false)),
+        Ts::function(
+            "The whole surface (its pages, dialogs and overlays) drawn through a GPU\nshader, which reads it with `sample_content(uv)`. It takes no space and\nhas no children; the last one mounted with a `source` draws.",
+            &["(props: ScreenEffectProps): JSX.Element"],
+        ),
+    ),
+    (
+        "ScreenTransition",
+        Export::Value(|cx| dom::host_component(cx, "screentransition", false)),
+        Ts::function(
+            "The whole surface changing through a GPU shader when `value` changes,\nas `ShaderTransition` does for its children.",
+            &["(props: ScreenTransitionProps): JSX.Element"],
         ),
     ),
 ];
@@ -329,21 +361,31 @@ export type Component<P = {}> = (props: P) => JSX.Element;
 export interface Tokens {}
 "#;
 
-/// The modules that exported primitives before `nsh` did: `nsh` serves
-/// their exports, and they keep serving them (deprecated).
-const PRIMITIVE_MODULES: &[&str] = &[
+/// The sources of what `nsh` serves (`NativeModule::moved_to`), kept by
+/// area.
+const NSH_SOURCES: &[&str] = &[
     "nsh/image",
     "nsh/list",
     "nsh/canvas",
     "nsh/webview",
     "nsh/video",
+    "nsh/device",
+    "nsh/accessibility",
+    "nsh/native",
+    "nsh/gesture",
+    "nsh/animated",
+    "nsh/host",
+    "nsh/keymap",
 ];
+
+/// The sources of what `nsh/mobile` serves, by platform.
+const MOBILE_SOURCES: &[&str] = &["nsh/ios", "nsh/android"];
 
 pub(crate) const MODULES: &[NativeModule] = &[
     NativeModule {
         name: "nsh",
         exports: NSH,
-        also: PRIMITIVE_MODULES,
+        also: NSH_SOURCES,
         moved_to: None,
         types: decl!(NSH_TYPES),
     },
@@ -358,28 +400,28 @@ pub(crate) const MODULES: &[NativeModule] = &[
         name: "nsh/device",
         exports: env::DEVICE_EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh"),
         types: decl!(env::DEVICE_TYPES),
     },
     NativeModule {
         name: "nsh/accessibility",
         exports: env::ACCESSIBILITY_EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh"),
         types: "",
     },
     NativeModule {
         name: "nsh/android",
         exports: platform_modules::ANDROID_EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh/mobile"),
         types: decl!(platform_modules::ANDROID_TYPES),
     },
     NativeModule {
         name: "nsh/ios",
         exports: platform_modules::IOS_EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh/mobile"),
         types: decl!(platform_modules::IOS_TYPES),
     },
     NativeModule {
@@ -388,6 +430,13 @@ pub(crate) const MODULES: &[NativeModule] = &[
         also: &[],
         moved_to: None,
         types: decl!(desktop::TYPES),
+    },
+    NativeModule {
+        name: "nsh/mobile",
+        exports: platform_modules::MOBILE_EXPORTS,
+        also: MOBILE_SOURCES,
+        moved_to: None,
+        types: "",
     },
     NativeModule {
         name: "nsh/webview",
@@ -407,21 +456,21 @@ pub(crate) const MODULES: &[NativeModule] = &[
         name: "nsh/native",
         exports: platform_modules::NATIVE_EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh"),
         types: decl!(platform_modules::NATIVE_TYPES),
     },
     NativeModule {
         name: "nsh/gesture",
         exports: touch::GESTURE_EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh"),
         types: decl!(touch::GESTURE_TYPES),
     },
     NativeModule {
         name: "nsh/animated",
         exports: animated::EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh"),
         types: decl!(animated::TYPES),
     },
     NativeModule {
@@ -449,39 +498,39 @@ pub(crate) const MODULES: &[NativeModule] = &[
         name: "nsh/host",
         exports: platform_modules::HOST_EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh"),
         types: decl!(crate::host_channel::TYPES),
     },
     NativeModule {
         name: "nsh/keymap",
         exports: keymap::EXPORTS,
         also: &[],
-        moved_to: None,
+        moved_to: Some("nsh"),
         types: decl!(keymap::TYPES),
     },
 ];
 
-/// `nsh/image`: `Image`, the image element as a component carrying the
+/// `nsh`'s `Image`: the image element as a component carrying the
 /// functions of the runtime's module (`getSize`, `prefetch`).
 const IMAGE_EXPORTS: &[Item] = &[(
     "Image",
     Export::Value(|cx| {
         let image = dom::host_component(cx, "image", true);
-        components::add_runtime_functions(cx, image, "nsh/image", "Image");
+        components::add_runtime_functions(cx, image, "nsh", "Image");
         image
     }),
     Ts::value(
         "An image (a URL or `import logo from \"./logo.png\"`), decoded and cached\nnatively; `Image.getSize(src)` and `Image.prefetch(src)` ask about one\nwithout showing it.",
-        "((props: ImageProps) => YNode) & ImageModule",
+        "((props: ImageProps) => JSX.Element) & ImageModule",
     ),
 )];
 
 /// One export of a module, as it is made.
 enum Made {
     Own(Export),
-    /// An export of nsh's module `.0` that another serves too (`nsh`'s
-    /// `Image` is `nsh/image`'s): one value per VM, whichever module is
-    /// imported first making it.
+    /// An export of source `.0` a module serves (`nsh`'s `Image` is the
+    /// source `nsh/image`'s): one value per VM, whichever module serving it
+    /// is imported first making it.
     Shared(&'static str, Export),
     /// A Rust component, with the functions of a module of the same name.
     Component(Arc<ComponentSpec>, Option<Arc<ModuleSpec>>),
@@ -495,7 +544,7 @@ enum Made {
     /// The generated module object itself.
     Default(Arc<ModuleSpec>),
     /// A Rust class (`#[class]`).
-    Class(&'static nsh_core::ui::ClassDef),
+    Class(&'static nsh_core::element::ClassDef),
     /// A runtime value a registry exports as it is (`safeArea`).
     Reexport(&'static str),
 }
@@ -713,7 +762,10 @@ impl ModuleTable {
             let own = crate::hot::EXPORTS.iter();
             return Some(own.map(|&(n, e, _)| (n.to_owned(), Made::Own(e))).collect());
         }
-        if let Some(m) = MODULES.iter().find(|m| m.name == name) {
+        if let Some(m) = MODULES
+            .iter()
+            .find(|m| m.name == name && m.moved_to.is_none())
+        {
             found = true;
             let shared = m.moved_to.is_some();
             out.extend(m.exports.iter().map(|&(n, e, _)| {
@@ -910,7 +962,6 @@ impl rquickjs::loader::Loader for Loader {
 
 /// Resolve an already-canonical native specifier through the same provider
 /// selection used by the runtime loader (also used by type discovery).
-#[cfg(not(feature = "bytecode-only"))]
 pub(crate) fn load_module<'js>(cx: &Ctx<'js>, name: &str) -> rquickjs::Result<Module<'js>> {
     rquickjs::loader::Loader::load(&mut Loader, cx, name, None)
 }
@@ -1166,46 +1217,40 @@ pub(crate) fn host_module(cx: *mut JsContext, specifier: &str) -> Option<JsValue
 mod tests {
     #[test]
     fn nshs_own_modules_are_the_ones_the_bundler_knows() {
-        let names: Vec<&str> = super::MODULES.iter().map(|m| m.name).collect();
+        let names: Vec<&str> = super::MODULES
+            .iter()
+            .filter(|m| m.moved_to.is_none())
+            .map(|m| m.name)
+            .collect();
         assert_eq!(names, nsh_core::js::NATIVE_MODULES);
     }
 
-    /// `nsh` exports the primitives the modules before it exported, the
-    /// same values, whichever module is imported first; those modules
-    /// keep exporting them.
+    /// `Image` carries its functions; the sources the primitives come from
+    /// are no modules apps import (bundles never import them: the bundler
+    /// refuses them).
     #[test]
-    fn nsh_and_the_older_modules_export_the_same_primitives() {
+    fn nsh_serves_the_primitives() {
         let source = r#"
-            import * as old from "nsh/canvas";
-            import { Image as OldImage } from "nsh/image";
             import * as nsh from "nsh";
-            import { List as OldList } from "nsh/list";
-            import { WebView as OldWebView } from "nsh/webview";
-            import { Video as OldVideo } from "nsh/video";
-            const same = [
-                [nsh.Canvas, old.Canvas],
-                [nsh.Path2D, old.Path2D],
-                [nsh.CanvasGradient, old.CanvasGradient],
-                [nsh.CanvasRenderingContext2D, old.CanvasRenderingContext2D],
-                [nsh.Image, OldImage],
-                [nsh.List, OldList],
-                [nsh.WebView, OldWebView],
-                [nsh.Video, OldVideo],
-            ];
-            for (const [a, b] of same) {
-                if (typeof a !== "function" || a !== b) throw Error(`not the same: ${a && a.name}`);
-            }
             if (typeof nsh.Image.getSize !== "function" || typeof nsh.Image.prefetch !== "function") {
                 throw Error("Image carries its functions");
             }
-            if (!(new nsh.Path2D("M0 0 L1 1") instanceof old.Path2D)) throw Error("one Path2D");
+            if (!(new nsh.Path2D("M0 0 L1 1") instanceof nsh.Path2D)) throw Error("Path2D");
         "#;
         crate::Host::new().unwrap().eval_source(source).unwrap();
-        let bytecode = crate::compile_bytecode(source, false).unwrap();
-        crate::Host::new()
-            .unwrap()
-            .eval_bytecode(&bytecode)
-            .unwrap();
+        for old in [
+            "nsh/image",
+            "nsh/list",
+            "nsh/canvas",
+            "nsh/webview",
+            "nsh/video",
+        ] {
+            let source = format!("import * as old from \"{old}\";");
+            assert!(
+                crate::Host::new().unwrap().eval_source(&source).is_err(),
+                "{old}"
+            );
+        }
     }
 
     /// The bytecode compiler, which knows a UI set by its description,

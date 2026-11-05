@@ -1,6 +1,6 @@
 //! The surface's environment: one signal per part
 //! (window, safe area, keyboard, color scheme, font scale, screen reader,
-//! reduced motion, pixel ratio, locale) written when the platform reports a
+//! reduced motion, pixel ratio, locale, lifecycle) written when the platform reports a
 //! change, read through read-only accessors; `nsh/device` (`platform`) and
 //! `nsh/accessibility`; the layout direction, which follows the user's
 //! language; the insets
@@ -15,8 +15,8 @@ use std::{
 };
 
 use nsh_core::{
+    element::{ThemeTokens, Token, Tokens},
     platform::{Appearance, ColorScheme, Environment, Idiom, Os},
-    ui::{Token, Tokens},
 };
 use rquickjs::qjs;
 
@@ -43,9 +43,10 @@ enum Part {
     PixelRatio,
     TitleBar,
     Locale,
+    Lifecycle,
 }
 
-const PARTS: usize = 10;
+const PARTS: usize = 11;
 
 /// The environment's part of a context's state.
 pub(crate) struct Env {
@@ -65,6 +66,9 @@ pub(crate) struct Env {
     /// a token follows a new theme.
     tokens_signal: Cell<JsValue>,
     tokens_version: Cell<u32>,
+    /// The tokens the app's theme file gives ([`set_theme_tokens`]), taken
+    /// in when the entry hands the theme to the renderer ([`take_theme`]).
+    theme: RefCell<ThemeTokens>,
 }
 
 impl Default for Env {
@@ -78,6 +82,7 @@ impl Default for Env {
             tokens: RefCell::new(Arc::default()),
             tokens_signal: Cell::new(UNDEFINED),
             tokens_version: Cell::new(0),
+            theme: RefCell::new(ThemeTokens::default()),
         }
     }
 }
@@ -134,6 +139,23 @@ pub(crate) fn set_tokens(cx: *mut JsContext, tokens: Arc<Tokens>) {
     let version = e.tokens_version.get().wrapping_add(1);
     e.tokens_version.set(version);
     reactive::set_signal(cx, e.tokens_signal.get(), number(version as f32));
+}
+
+/// Sets how the app's theme file makes the tokens it is drawn with
+/// ([`nsh_core::Core::theme_tokens`]).
+pub(crate) fn set_theme_tokens(cx: *mut JsContext, theme: ThemeTokens) {
+    env(cx).theme.replace(theme);
+}
+
+/// Takes in the tokens of the app's theme file `json` (`nsh:rt`'s `setup`,
+/// the entry's first statement): the core has them only once the theme's
+/// op reaches it, after the turn of the first render, which reads them
+/// already.
+pub(crate) fn take_theme(cx: *mut JsContext, json: &str) {
+    let tokens = env(cx).theme.borrow().of(json);
+    if let Some(tokens) = tokens {
+        set_tokens(cx, Arc::new(tokens));
+    }
 }
 
 /// `token(name)`: the design token `name` in the appearance shown (a
@@ -355,6 +377,9 @@ pub(crate) fn set_environment(cx: *mut JsContext, next: &Environment) -> Result<
     if changed(&|p| p.pixel_ratio == next.pixel_ratio) {
         writes.push((Part::PixelRatio, number(next.pixel_ratio)));
     }
+    if changed(&|p| p.lifecycle == next.lifecycle) {
+        writes.push((Part::Lifecycle, string(cx, next.lifecycle.name())));
+    }
     // The layout direction follows the user's language.
     // SAFETY: the state's renderer, by shared reference.
     unsafe { &(*crate::state::state(cx)).dom }.set_direction(next.rtl);
@@ -425,7 +450,7 @@ pub(crate) const REEXPORTS: &[Item] = &[
         "keyboardFrame",
         Export::Value(|cx| accessor(cx, Part::Keyboard)),
         Ts::value(
-            "Height of the software keyboard over the surface (0 when hidden) and the\nduration of its animation in seconds (reactive).",
+            "Height of the software keyboard over the surface (0 when hidden) and the\nduration of its animation in milliseconds (reactive).",
             "Accessor<{ height: number; duration: number }>",
         ),
     ),
@@ -447,11 +472,24 @@ pub(crate) const REEXPORTS: &[Item] = &[
     ),
 ];
 
+/// The host elements a UI set exports (`Registry::native_values`):
+/// `nsh/base`'s `Input`, a base component the platforms make natively.
+pub(crate) const ELEMENTS: &[Item] = &[(
+    "Input",
+    Export::Value(|cx| crate::dom::host_component(cx, "input", true)),
+    Ts::function(
+        "A native text input (UITextField / UITextView, EditText); `ref` has\n`focus()`, `blur()` and `setSelection(start, end)`.",
+        &["(props: InputProps): JSX.Element"],
+    ),
+)];
+
 /// Value `name` a registry re-exports or names as native
-/// (`Registry::native_values`): [`REEXPORTS`] and navigation's.
+/// (`Registry::native_values`): [`REEXPORTS`], [`ELEMENTS`] and
+/// navigation's.
 pub(crate) fn reexport(cx: *mut JsContext, name: &str) -> JsValue {
     let item = REEXPORTS
         .iter()
+        .chain(ELEMENTS)
         .chain(crate::navigation::EXPORTS)
         .find(|(n, ..)| *n == name);
     match item {
@@ -483,13 +521,17 @@ fn os_version(env: &Environment) -> String {
     }
 }
 
+/// `platform.idiom`: `"terminal"` in a terminal, else `"desktop"` exactly
+/// where desktop behavior applies
+/// ([`nsh_core::platform::Idiom::reported_on`]).
 fn idiom(env: &Environment) -> &'static str {
-    match env.idiom {
+    match env.reported_idiom() {
         Idiom::Phone => "phone",
         Idiom::Pad => "pad",
         Idiom::Mac => "mac",
         Idiom::Tv => "tv",
         Idiom::Desktop => "desktop",
+        Idiom::Terminal => "terminal",
     }
 }
 
@@ -503,7 +545,8 @@ fn platform(cx: *mut JsContext) -> JsValue {
             (c"os", string(cx, e.os.name())),
             (c"version", string(cx, &os_version(&e))),
             (c"idiom", string(cx, idiom(&e))),
-            (c"catalyst", boolean(e.idiom == Idiom::Mac)),
+            (c"desktop", boolean(e.desktop())),
+            (c"catalyst", boolean(e.os.is_catalyst())),
             (c"select", select),
         ],
     )
@@ -589,6 +632,14 @@ pub(crate) const DEVICE_EXPORTS: &[Item] = &[
         ),
     ),
     (
+        "lifecycle",
+        Export::Value(|cx| accessor(cx, Part::Lifecycle)),
+        Ts::value(
+            "Whether the app is in use (reactive): `\"active\"` in the foreground,\n`\"inactive\"` while visible without the focus (another app or window has\nit, or the system shows something over it), `\"background\"` while not\nvisible (in the background, minimized or hidden). An embedded app\nfollows the embedding app's.",
+            "Accessor<\"active\" | \"inactive\" | \"background\">",
+        ),
+    ),
+    (
         "platform",
         Export::Value(platform),
         Ts::value(
@@ -606,9 +657,11 @@ pub(crate) const DEVICE_TYPES: &str = r#"export interface PlatformSelectSpec<T> 
   windows?: T;
   linux?: T;
   web?: T;
-  /** iOS, Android, and phone and tablet browsers. */
+  /** Where `platform.desktop` is false: iOS (Mac Catalyst included),
+   * Android, and browsers in the phone or tablet idiom. */
   mobile?: T;
-  /** macOS, Windows, Linux, and desktop browsers. */
+  /** Where `platform.desktop` is true: macOS, Windows, Linux, browsers in
+   * the desktop idiom, and terminals. */
   desktop?: T;
   /** Every platform but the web. */
   native?: T;
@@ -622,15 +675,25 @@ export interface PlatformInfo {
   /** iOS and desktops: the OS version (`"17.5"`); Android: the API level
    * (`"35"`); the web: `"0.0"`. */
   readonly version: string;
-  /** The kind of device. `"desktop"`: desktop behavior applies (macOS,
-   * Windows, Linux, and browsers with a mouse and a wide viewport); Mac
-   * Catalyst in the Mac idiom is `"mac"`. */
-  readonly idiom: "phone" | "pad" | "mac" | "tv" | "desktop";
-  /** Mac Catalyst in the Mac idiom. */
+  /** The kind of device. `"terminal"` in a terminal: drawn on a grid of
+   * character cells, with desktop behavior (`desktop` true; `os` is still
+   * the machine's). Elsewhere `"desktop"` exactly where `desktop` is true,
+   * else the idiom the system reports: `"phone"`, `"pad"`, `"tv"`, and
+   * `"mac"`, UIKit's Mac idiom under Mac Catalyst (a mobile idiom). */
+  readonly idiom: "phone" | "pad" | "mac" | "tv" | "desktop" | "terminal";
+  /** Desktop behavior applies, NSH's one definition of desktop: macOS,
+   * Windows, Linux, browsers in the desktop idiom (a mouse and a wide
+   * viewport), and terminals. `desktop={{…}}` props and `select({ desktop })`
+   * follow it. Mac Catalyst runs the iOS backend and is mobile.
+   * `nsh/desktop`'s `isAvailable` is narrower: its window and menu APIs work
+   * on the desktop OSes, not in browsers. */
+  readonly desktop: boolean;
+  /** The app runs under Mac Catalyst, in the Mac or the iPad idiom
+   * (`os` is `"ios"`, `desktop` false). */
   readonly catalyst: boolean;
   /** The value for this platform: its OS (`ios`, `macos`, `web`, ...),
-   * else `mobile` / `desktop`, else `native` (not on the web), else
-   * `default`. */
+   * else `desktop` / `mobile` (by `platform.desktop`), else `native` (not
+   * on the web), else `default`. */
   select<T>(spec: PlatformSelectSpec<T>): T | undefined;
 }
 "#;

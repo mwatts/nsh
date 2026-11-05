@@ -88,7 +88,7 @@ fn texts_within(rx: &Receiver<MountBatch>, time: Duration) -> Vec<String> {
 }
 
 const APP: &str = r#"import { mount, signal, Text } from "nsh";
-import { host } from "nsh/host";
+import { host } from "nsh";
 
 const log = signal<string[]>([]);
 const say = (s: string) => log.set([...log(), s]);
@@ -103,9 +103,9 @@ const off = host.on("ping", (d) => say(`ping ${d}`));
 host.on("stop", () => off());
 
 host.call("echo", { n: 1 }).then((v: any) => say(`echo ${v.got.n}`));
-host.call("fail").catch((e) => say(`fail ${e instanceof Error} ${e.message}`));
-host.call("missing").catch((e) => say(`missing ${e.message}`));
-host.call("dropped").catch((e) => say(`dropped ${e.message}`));
+host.call("fail").catch((e) => say(`fail ${e instanceof Error} ${e.code} ${e.message}`));
+host.call("missing").catch((e) => say(`missing ${e.code} ${e.message}`));
+host.call("dropped").catch((e) => say(`dropped ${e.code} ${e.message}`));
 host.call("later", 21).then((v) => say(`later ${v}`));
 host.post("analytics", { screen: "home", f: () => 1 });
 try {
@@ -153,9 +153,9 @@ fn the_app_and_its_host_talk() {
             "params c-42 object",
             "early 1",
             "echo 1",
-            "fail true nope",
-            "missing host.call(\"missing\"): the embedding app handles no \"missing\"",
-            "dropped host.call(\"dropped\"): the embedding app did not answer",
+            "fail true ERR_NSH_HOST_ERROR nope",
+            "missing ERR_NSH_HOST_ERROR host.call(\"missing\"): the embedding app handles no \"missing\"",
+            "dropped ERR_NSH_HOST_ERROR host.call(\"dropped\"): the embedding app did not answer",
             "later 42",
             "bad TypeError",
             "not a name TypeError",
@@ -179,7 +179,7 @@ fn the_app_and_its_host_talk() {
 }
 
 const LISTENER: &str = r#"import { mount, signal, Text } from "nsh";
-import { host } from "nsh/host";
+import { host } from "nsh";
 
 const seen = signal<string[]>([]);
 host.on("open", (d: any) => seen.set([...seen(), d.id]));
@@ -203,7 +203,7 @@ fn events_wait_for_the_next_app() {
 }
 
 const PARAMS: &str = r#"import { mount, Text } from "nsh";
-import { host } from "nsh/host";
+import { host } from "nsh";
 
 mount(() => <Text>{`keys ${Object.keys(host.params).length}`}</Text>);
 "#;

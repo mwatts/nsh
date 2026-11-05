@@ -3,8 +3,12 @@
 //! truncation, Chinese and Japanese, right-to-left text and alignment, each
 //! on a card (as the TSX gallery's `demos/TextDemo.tsx`).
 
-use nsh_core::ui::{EllipsizeMode, WritingDirection, prelude::*};
+use nsh_core::{
+    element::{EllipsizeMode, WritingDirection},
+    prelude::*,
+};
 
+use super::spacex;
 use crate::{
     assets::{LOGO, PACIFICO},
     ui::{
@@ -239,45 +243,63 @@ fn fonts() -> Card {
             false,
             view()
                 .flex_row()
-                .items_center()
                 .gap_3()
-                .child(
-                    text("Glow")
-                        .text_size(px(26.0))
-                        .font_weight(FontWeight::EXTRA_BOLD)
-                        .text_color(colors::ACCENT)
-                        .text_shadow_color(AdaptiveColor::new(
-                            colors::ACCENT.light.opacity(0.3),
-                            colors::ACCENT.dark.opacity(0.6),
-                        ))
-                        .text_shadow_offset(point(px(0.0), px(0.0)))
-                        .text_shadow_radius(px(10.0)),
-                )
-                .child(
-                    view()
-                        .h(px(48.0))
-                        .px(px(14.0))
-                        .justify_center()
-                        .rounded(px(radius::CONTROL))
-                        .border_curve(BorderCurve::Continuous)
-                        .bg(colors::RAISED)
-                        .finish(Finish::Raised)
-                        .border_1()
-                        .border_color(colors::BORDER)
-                        .child(
-                            text("Drop shadow")
-                                .text_size(px(26.0))
-                                .font_weight(FontWeight::EXTRA_BOLD)
-                                .text_color(colors::INFO)
-                                .text_shadow_color(AdaptiveColor::new(
-                                    rgb_a(0x14140a, 0.22),
-                                    rgb_a(0x000000, 0.9),
-                                ))
-                                .text_shadow_offset(point(px(2.0), px(3.0)))
-                                .text_shadow_radius(px(3.0)),
-                        ),
-                ),
+                .child(shadow_photo(
+                    spacex::BOOSTER,
+                    "Glow",
+                    rgb(0xffe9c7),
+                    TextShadow {
+                        radius: px(12.0),
+                        ..TextShadow::default()
+                    },
+                    rgb_a(0xff963c, 1.0),
+                ))
+                .child(shadow_photo(
+                    spacex::DAY,
+                    "Drop shadow",
+                    rgb(0xffffff),
+                    TextShadow {
+                        offset_y: px(1.0),
+                        radius: px(8.0),
+                        ..TextShadow::default()
+                    },
+                    rgb_a(0x05192d, 0.75),
+                )),
         ))
+}
+
+/// A line of text over a photo, where a text shadow does its work.
+fn shadow_photo(
+    photo: &str,
+    label: &'static str,
+    ink: Rgba,
+    shadow: TextShadow,
+    color: Rgba,
+) -> impl IntoElement {
+    view()
+        .flex_1()
+        .h(px(96.0))
+        .rounded(px(radius::CONTROL))
+        .border_curve(BorderCurve::Continuous)
+        .overflow_hidden()
+        .bg(colors::RAISED)
+        .child(
+            image(spacex::url(photo, "small"))
+                .absolute()
+                .inset_0()
+                .object_fit(ResizeMode::Cover),
+        )
+        // The padding keeps the shadow inside the text's own box.
+        .child(
+            text(label)
+                .number_of_lines(1)
+                .p(px(14.0))
+                .text_size(px(19.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(ink)
+                .text_shadow([shadow])
+                .text_shadow_color(color),
+        )
 }
 
 /// The system text size and its limits.
@@ -316,32 +338,32 @@ fn scaling() -> Card {
 
 /// Lines and ellipsis modes.
 fn truncation() -> Card {
-    let lorem = |mode: EllipsizeMode| body(LOREM).number_of_lines(1).ellipsize_mode(mode);
+    let lorem = |mode: EllipsizeMode| body(LOREM).number_of_lines(1).text_overflow(mode);
     Card::new()
         .icon(IconName::Lists)
         .title("Truncation")
-        .subtitle("numberOfLines and ellipsizeMode")
+        .subtitle("numberOfLines and textOverflow")
         .child(specimen(
             "Two lines, tail",
-            Some("numberOfLines={2}"),
+            Some("numberOfLines: 2"),
             true,
             body(LOREM).number_of_lines(2),
         ))
         .child(specimen(
             "One line, head",
-            Some("ellipsizeMode=\"head\""),
+            Some("textOverflow: \"ellipsis-start\""),
             false,
             lorem(EllipsizeMode::Head),
         ))
         .child(specimen(
             "One line, middle",
-            Some("ellipsizeMode=\"middle\""),
+            Some("textOverflow: \"ellipsis-middle\""),
             false,
             lorem(EllipsizeMode::Middle),
         ))
         .child(specimen(
             "One line, clip",
-            Some("ellipsizeMode=\"clip\""),
+            Some("textOverflow: \"clip\""),
             false,
             lorem(EllipsizeMode::Clip),
         ))
@@ -372,17 +394,17 @@ fn cjk() -> Card {
         ))
         .child(specimen(
             "Two lines, tail",
-            Some("numberOfLines={2}"),
+            Some("numberOfLines: 2"),
             false,
             body(CHINESE).number_of_lines(2),
         ))
         .child(specimen(
             "One line, middle",
-            Some("ellipsizeMode=\"middle\""),
+            Some("textOverflow: \"ellipsis-middle\""),
             false,
             body(JAPANESE)
                 .number_of_lines(1)
-                .ellipsize_mode(EllipsizeMode::Middle),
+                .text_overflow(EllipsizeMode::Middle),
         ))
 }
 
@@ -412,7 +434,7 @@ fn right_to_left() -> Card {
         ))
         .child(specimen(
             "One line, tail",
-            Some("numberOfLines={1}"),
+            Some("numberOfLines: 1"),
             false,
             body(ARABIC).number_of_lines(1),
         ))

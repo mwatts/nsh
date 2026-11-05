@@ -1,20 +1,23 @@
-import { computed, Input, List, Scroll, signal, Text, View, type YNode } from "nsh";
-import { createAnimatedValue, LayoutAnimation } from "nsh/animated";
-import { platform } from "nsh/device";
-import { keyboardFrame, KeyboardAvoidingView, safeAreaInsets, Tab, Tabs } from "nsh/base";
+import { cleanup, computed, effect, List, type ListRef, Scroll, signal, Text, View } from "nsh";
+import { reduceMotion } from "nsh";
+import { Animated, type AnimatedNode, createAnimatedValue, Easing, LayoutAnimation } from "nsh";
+import { Tab, Tabs, Input } from "nsh/base";
+import { platform } from "nsh";
+import { keyboardFrame, safeAreaInsets } from "nsh";
 import { Icon, type IconName } from "../icons";
-import { Appear, Badge, bindRefresh, Button, colors, columnsFor, desktop, finish, hint, IconTile, Meter, mono, Press, radius, RoundButton, Section, Segmented, tabPress, type Tone, toneColor, toneTint } from "../ui";
+import { alpha, Appear, Badge, bindRefresh, Button, colors, columnsFor, desktop, finish, hint, IconTile, Meter, mono, Press, radius, RoundButton, Section, Segmented, tabPress, terminal, TERMINAL_COLUMN, TERMINAL_GAP, TERMINAL_ROW, type Tone, toneColor, toneTint } from "../ui";
 
 const tones: Tone[] = ["accent", "info", "warn", "up", "danger", "neutral"];
 
-/** A small pill action for list headers (36 pt, 44 pt with its hit slop). */
+/** A small pill action for list headers (36 pt, 44 pt with its hit slop; a
+ * row of text in the terminal). */
 function Action(props: { label: string; icon?: IconName; onPress: () => void }) {
   return (
     <Press onPress={props.onPress} accessibilityLabel={props.label} hitSlop={4}>
       <View
         style={{
-          height: 36,
-          paddingHorizontal: 14,
+          height: terminal ? TERMINAL_ROW : 36,
+          paddingHorizontal: terminal ? TERMINAL_COLUMN : 14,
           borderRadius: 18,
           flexDirection: "row",
           alignItems: "center",
@@ -25,7 +28,7 @@ function Action(props: { label: string; icon?: IconName; onPress: () => void }) 
           ...finish.raised,
         }}
       >
-        {props.icon ? <Icon name={props.icon} size={14} tint={colors.text} /> : null}
+        {props.icon && !terminal ? <Icon name={props.icon} size={14} tint={colors.text} /> : null}
         <Text style={{ fontSize: 13, fontWeight: "600", color: colors.text }}>{props.label}</Text>
       </View>
     </Press>
@@ -38,37 +41,41 @@ function Grid() {
   const items = Array.from({ length: 90 }, (_, i) => ({ id: i, height: 84 + (i % 4) * 22, tone: tones[i % tones.length] }));
   const first = signal(-1);
   const last = signal(-1);
-  let list!: YNode;
+  let list!: ListRef;
   const wide = desktop();
-  const grid = (columns: number) => (
+  // Changed in place when a resize fits more or fewer: the list keeps its
+  // scroll and its items.
+  const columns = wide ? computed(() => columnsFor(130, 10, undefined, 12)) : () => 3;
+  return (
     <List
       ref={list}
       each={items}
-      numColumns={columns}
+      numColumns={columns()}
       estimatedItemSize={110}
       style={{ flex: 1 }}
-      contentStyle={wide ? { padding: 24, gap: 12 } : { padding: 16, gap: 8 }}
-      viewabilityConfig={{ itemVisiblePercentThreshold: 50 }}
+      contentStyle={terminal ? { paddingHorizontal: TERMINAL_COLUMN, paddingBottom: TERMINAL_ROW, gap: TERMINAL_ROW } : wide ? { padding: 24, gap: 12 } : { padding: 16, gap: 8 }}
+      viewabilityConfig={{ itemVisibleThreshold: 0.5 }}
       onViewableItemsChange={({ viewableItems }) => {
         first.set(viewableItems.length ? viewableItems[0].index : -1);
         last.set(viewableItems.length ? viewableItems[viewableItems.length - 1].index : -1);
       }}
       header={
         <View
-          style={{
-            backgroundColor: colors.surface,
-            borderRadius: radius.card,
-            borderCurve: "continuous",
-            borderWidth: 1,
-            borderColor: colors.border,
-            padding: 16,
-            gap: 12,
-            marginBottom: 4,
-            ...finish.card,
-          }}
+          style={[
+            {
+              backgroundColor: colors.surface,
+              borderRadius: radius.card,
+              borderCurve: "continuous",
+              borderWidth: 1,
+              borderColor: colors.border,
+              ...finish.card,
+            },
+            // The terminal's border takes a row and a column on each side: the rest of them is padding.
+            terminal ? { paddingVertical: TERMINAL_ROW - 1, paddingHorizontal: 2 * TERMINAL_COLUMN - 1 } : { padding: 16, gap: 12, marginBottom: 4 },
+          ]}
         >
           <View style={{ flexDirection: "row", alignItems: "flex-end", gap: 8 }}>
-            <View style={{ flex: 1, gap: 2 }}>
+            <View style={{ flex: 1, gap: terminal ? 0 : 2 }}>
               <Text style={{ fontSize: 13, color: colors.muted }}>Viewable items (at least half shown)</Text>
               <Text style={{ fontSize: 30, fontWeight: "600", color: colors.text, fontVariant: ["tabular-nums"], letterSpacing: -0.5 }}>
                 {first() < 0 ? "—" : `${first()}–${last()}`}
@@ -77,10 +84,10 @@ function Grid() {
                 </Text>
               </Text>
             </View>
-            <Text style={{ fontSize: 13, color: colors.faint, paddingBottom: 6 }}>{`90 items, ${columns} columns`}</Text>
+            <Text style={{ fontSize: 13, color: colors.faint, paddingBottom: terminal ? 0 : 6 }}>{`90 items, ${columns()} columns`}</Text>
           </View>
           <Meter value={last() < 0 ? 0 : (last() + 1) / items.length} />
-          <View style={{ flexDirection: "row", gap: 8 }}>
+          <View style={{ flexDirection: "row", gap: 8, marginTop: terminal ? TERMINAL_ROW : 0 }}>
             <Action label="Jump to 60" icon="arrow-down" onPress={() => list.scrollToIndex({ index: 60, viewPosition: 0.5 })} />
             <Action label="End" onPress={() => list.scrollToEnd()} />
           </View>
@@ -100,11 +107,11 @@ function Grid() {
             borderColor: item().id === 60 ? toneColor("accent") : colors.border,
             backgroundColor: colors.raised,
             ...finish.raised,
-            padding: 12,
+            ...(terminal ? { paddingVertical: TERMINAL_ROW - 1, paddingHorizontal: 2 * TERMINAL_COLUMN - 1 } : { padding: 12 }),
             justifyContent: "space-between",
           }}
         >
-          <View style={{ width: 18, height: 4, borderRadius: 2, backgroundColor: toneColor(item().tone) }} />
+          <View style={{ width: 18, height: 4, borderRadius: 2, backgroundColor: toneColor(item().tone), opacity: terminal ? 0 : 1 }} />
           <View>
             <Text style={{ fontSize: 22, fontWeight: "600", color: colors.text, fontVariant: ["tabular-nums"] }}>{item().id}</Text>
             <Text style={{ fontSize: 12, color: colors.faint, fontVariant: ["tabular-nums"] }}>{item().height} pt</Text>
@@ -113,10 +120,6 @@ function Grid() {
       )}
     </List>
   );
-  if (!wide) return grid(3);
-  // Rebuilt when the number of columns changes.
-  const columns = computed(() => columnsFor(130, 10, undefined, 12));
-  return <View style={{ flex: 1 }}>{(() => grid(columns()))()}</View>;
 }
 
 const people = [
@@ -163,12 +166,12 @@ function Contacts() {
               <View
                 onPress={() => {}}
                 activeStyle={{ backgroundColor: colors.raised }}
-                style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingLeft: 16, height: 60 }}
+                style={{ flexDirection: "row", alignItems: "center", gap: terminal ? TERMINAL_GAP : 12, paddingLeft: terminal ? TERMINAL_COLUMN : 16, height: terminal ? TERMINAL_ROW : 60 }}
               >
                 <View
                   style={{
-                    width: 38,
-                    height: 38,
+                    width: terminal ? 2 * TERMINAL_COLUMN : 38,
+                    height: terminal ? TERMINAL_ROW : 38,
                     borderRadius: 19,
                     backgroundColor: toneTint(person().tone),
                     alignItems: "center",
@@ -180,21 +183,23 @@ function Contacts() {
                     {person().last[0]}
                   </Text>
                 </View>
+                {/* Name and note on one row in the terminal, which keeps no rules between rows. */}
                 <View
                   style={{
                     flex: 1,
                     alignSelf: "stretch",
                     justifyContent: "center",
-                    gap: 2,
-                    paddingRight: 16,
-                    borderBottomWidth: person().end ? 0 : 1,
+                    gap: terminal ? TERMINAL_GAP : 2,
+                    paddingRight: terminal ? TERMINAL_COLUMN : 16,
+                    ...(terminal ? { flexDirection: "row", alignItems: "center", justifyContent: "flex-start" } : {}),
+                    borderBottomWidth: person().end || terminal ? 0 : 1,
                     borderBottomColor: colors.line,
                   }}
                 >
-                  <Text style={{ fontSize: 15, color: colors.text }}>
+                  <Text style={{ width: terminal ? 20 * TERMINAL_COLUMN : undefined, fontSize: 15, color: colors.text }}>
                     {person().first} <Text style={{ fontWeight: "600" }}>{person().last}</Text>
                   </Text>
-                  <Text numberOfLines={1} style={{ fontSize: 13, color: colors.muted }}>
+                  <Text style={{ numberOfLines: 1, flexShrink: 1, fontSize: 13, color: colors.muted }}>
                     {person().note}
                   </Text>
                 </View>
@@ -205,12 +210,12 @@ function Contacts() {
               style={{
                 flexDirection: "row",
                 alignItems: "center",
-                height: 34,
-                paddingHorizontal: 16,
+                height: terminal ? TERMINAL_ROW : 34,
+                paddingHorizontal: terminal ? TERMINAL_COLUMN : 16,
                 gap: 10,
                 // Opaque: rows scroll under it while it sticks.
                 backgroundColor: colors.background,
-                borderBottomWidth: 1,
+                borderBottomWidth: terminal ? 0 : 1,
                 borderBottomColor: colors.border,
               }}
             >
@@ -258,7 +263,7 @@ function Chat() {
     messages.update((m) => [...m, ...Array.from({ length: 20 }, (_, i) => message(`Older message ${count + i + 1}`, i % 4 === 0))]);
   };
   return (
-    <KeyboardAvoidingView style={{ flex: 1 }}>
+    <View style={{ flex: 1, paddingBottom: "env(keyboard-inset-height)" }}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingHorizontal: 16, paddingBottom: 8 }}>
         <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: colors.up }} />
         <Text style={{ flex: 1, fontSize: 13, color: colors.muted }}>Release room</Text>
@@ -313,13 +318,14 @@ function Chat() {
       >
         <Input
           value={draft()}
-          onChange={(v) => draft.set(v)}
+          onChange={({ value }) => draft.set(value)}
           onSubmit={send}
           submitBehavior="submit"
           placeholder="Message"
           returnKeyType="send"
           style={{
             placeholderColor: colors.faint,
+            caretColor: colors.accent,
             selectionColor: colors.accent,
             flex: 1,
             height: 44,
@@ -335,16 +341,94 @@ function Chat() {
         />
         <RoundButton icon="arrow-up" label="Send" onPress={send} />
       </View>
-    </KeyboardAvoidingView>
+    </View>
   );
 }
 
 const ranges = ["Today", "Yesterday", "This week", "This month", "This year", "All time", "Custom"];
 
-/** Horizontal scrolling, pull to refresh on a plain scroll view, and an empty list. */
+const indicators = [
+  { value: "system", label: "System spinner" },
+  { value: "custom", label: "Custom indicator" },
+] as const;
+
+/** How tall the custom indicator is: where a pull refreshes, and the room it keeps while refreshing. */
+const INDICATOR = 72;
+
+/**
+ * A pull-to-refresh indicator drawn by the app, in the gallery's look, over the top of a scroll view: a round chip
+ * that travels in with the pull (`pull`, its `pullValue`), grows and fades in, turns its arrow over once the pull
+ * reaches the height where it refreshes, and spins while it refreshes. The pull drives all of it on the UI thread.
+ */
+function CustomIndicator(props: { pull: AnimatedNode; refreshing: boolean }) {
+  const turn = createAnimatedValue(0);
+  const spin = Animated.loop(Animated.timing(turn, { toValue: 1, duration: 900, easing: Easing.linear }));
+  effect(() => {
+    if (props.refreshing && !reduceMotion()) {
+      turn.set(0);
+      spin.start();
+    } else {
+      spin.stop();
+    }
+  });
+  cleanup(() => spin.stop());
+  const pull = props.pull;
+  return (
+    <View
+      style={{ pointerEvents: "none", position: "absolute", top: 0, left: 0, right: 0, height: INDICATOR, alignItems: "center", justifyContent: "center" }}
+    >
+      <View
+        style={{
+          width: 40,
+          height: 40,
+          borderRadius: 20,
+          borderWidth: 1,
+          borderColor: colors.border,
+          backgroundColor: colors.raised,
+          ...finish.raised,
+          alignItems: "center",
+          justifyContent: "center",
+          opacity: pull.interpolate({ inputRange: [0, 24], outputRange: [0, 1] }),
+          transform: [
+            { translateY: pull.interpolate({ inputRange: [0, INDICATOR], outputRange: [-28, 0] }) },
+            { scale: pull.interpolate({ inputRange: [0, INDICATOR], outputRange: [0.6, 1] }) },
+          ],
+        }}
+      >
+        {/* The arrow points down while pulling and turns up once releasing refreshes. */}
+        <View
+          style={{
+            position: "absolute",
+            opacity: props.refreshing ? 0 : 1,
+            transform: [{ rotate: pull.interpolate({ inputRange: [INDICATOR * 0.5, INDICATOR], outputRange: ["0deg", "180deg"] }) }],
+          }}
+        >
+          <Icon name="arrow-down" size={18} tint={colors.accent} />
+        </View>
+        <View
+          style={{
+            position: "absolute",
+            width: 20,
+            height: 20,
+            borderRadius: 10,
+            borderWidth: 2,
+            borderColor: alpha(colors.accent, 0.25),
+            borderTopColor: colors.accent,
+            opacity: props.refreshing ? 1 : 0,
+            transform: [{ rotate: turn.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "360deg"] }) }],
+          }}
+        />
+      </View>
+    </View>
+  );
+}
+
+/** Horizontal scrolling, pull to refresh on a plain scroll view (the system spinner or a custom indicator), and an empty list. */
 function More() {
   const refreshing = signal(false);
   const refreshed = signal(0);
+  const indicator = signal<"system" | "custom">("system");
+  const pull = createAnimatedValue(0);
   const range = signal("This week");
   const items = signal<{ n: number; tone: Tone }[]>([]);
   const refresh = () => {
@@ -360,8 +444,15 @@ function More() {
     change();
   };
   const cards = Array.from({ length: 1000 }, (_, i) => i);
-  return (
-    <Scroll style={{ flex: 1 }} refreshing={refreshing()} onRefresh={refresh}>
+  const custom = () => indicator() === "custom";
+  const page = (
+    <Scroll
+      style={{ flex: 1 }}
+      refreshing={refreshing()}
+      onRefresh={refresh}
+      pullValue={pull}
+      refreshIndicator={custom() ? { height: INDICATOR } : undefined}
+    >
       <View style={{ padding: 16, gap: 16 }}>
         {/* `position: sticky`: in the flow, then at the top while the page scrolls under it. */}
         <View
@@ -388,15 +479,16 @@ function More() {
             <IconTile name="arrow-down" tint={refreshing() ? colors.accent : colors.text} />
             <View style={{ flex: 1, gap: 2 }}>
               <Text style={{ fontSize: 15, color: colors.text }}>{refreshing() ? "Refreshing…" : hint("Pull the page down", refreshKey ? `Refresh or ${refreshKey}` : "Refresh below")}</Text>
-              <Text style={{ fontSize: 13, color: colors.muted }}>The system spinner on a plain scroll view</Text>
+              <Text style={{ fontSize: 13, color: colors.muted }}>{custom() ? "An indicator the app draws, from pullValue" : "The system spinner on a plain scroll view"}</Text>
             </View>
             <View style={{ alignItems: "flex-end" }}>
               <Text style={{ fontSize: 28, fontWeight: "600", color: colors.text, fontVariant: ["tabular-nums"] }}>{refreshed()}</Text>
               <Text style={{ fontSize: 12, color: colors.faint }}>refreshes</Text>
             </View>
           </View>
+          <Segmented options={indicators} value={indicator()} onChange={(v) => indicator.set(v)} />
           {/* The mouse does not pull scroll views down: desktops refresh here. */}
-          <If when={platform.idiom === "desktop"}>
+          <If when={platform.desktop}>
             <Button label="Refresh" variant="secondary" disabled={refreshing()} onPress={refresh} />
           </If>
         </Section>
@@ -507,6 +599,14 @@ function More() {
       </View>
     </Scroll>
   );
+  return (
+    <View style={{ flex: 1 }}>
+      {page}
+      <If when={custom()}>
+        <CustomIndicator pull={pull} refreshing={refreshing()} />
+      </If>
+    </View>
+  );
 }
 
 type Entry = { id: number; tone: Tone };
@@ -584,7 +684,7 @@ function Page() {
   const weeks = recent.flatMap((row, i) => ("week" in row ? [i] : []));
   const indexOf = (id: number) => recent.findIndex((row) => "id" in row && row.id === id);
   const archive = signal(entries(0, 100));
-  let list!: YNode;
+  let list!: ListRef;
   const loadMore = () => {
     if (archive().length < 500) archive.update((a) => [...a, ...entries(a.length, 100)]);
   };
@@ -655,7 +755,7 @@ function Page() {
           backgroundColor: colors.background,
           borderBottomWidth: 1,
           borderBottomColor: colors.border,
-          transform: [{ translateY: hidden.mul(-1) }],
+          translate: [0, hidden.mul(-1)],
         }}
       >
         <Text style={{ flex: 1, fontSize: 15, fontWeight: "600", color: colors.text }}>Recent and archived</Text>
@@ -679,7 +779,15 @@ export function Lists() {
   const tab = signal<ListTab>("grid");
   return (
     <View style={{ flex: 1, backgroundColor: colors.background }}>
-      <View style={desktop() ? { paddingHorizontal: 24, paddingTop: 16, paddingBottom: 4, width: "100%", maxWidth: 600 } : { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 8 }}>
+      <View
+        style={
+          terminal
+            ? { paddingHorizontal: TERMINAL_COLUMN, paddingVertical: TERMINAL_ROW, width: "100%", maxWidth: 600 }
+            : desktop()
+              ? { paddingHorizontal: 24, paddingTop: 16, paddingBottom: 4, width: "100%", maxWidth: 600 }
+              : { paddingHorizontal: 16, paddingTop: 8, paddingBottom: 8 }
+        }
+      >
         <Segmented options={tabs} value={tab()} onChange={(v) => tab.set(v)} />
       </View>
       {(() => {

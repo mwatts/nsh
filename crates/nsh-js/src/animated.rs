@@ -70,8 +70,21 @@ struct End {
     callback: JsValue,
     /// The composite's key (0: none).
     composite: u32,
-    /// Resolves with the value read rather than with `finished`.
-    read: bool,
+    /// What it resolves with.
+    settles: Settles,
+}
+
+/// What a promise of [`End`] resolves with: one object, as every result
+/// that may need a second field (`docs/dev/api-naming.md` "Shapes that can
+/// grow"), or the value a read asks for.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Settles {
+    /// An animation: `{ finished }`.
+    Finished,
+    /// `stop()`: `{ value }`, where it stopped.
+    Stopped,
+    /// `getValue()`: the value itself.
+    Value,
 }
 
 #[derive(Clone, Copy)]
@@ -277,7 +290,7 @@ fn classes(cx: *mut JsContext) -> Classes {
         methods(
             composite_proto,
             &[
-                (c"start", composite_start, 1),
+                (c"start", composite_start_js, 1),
                 (c"stop", composite_stop, 0),
                 (c"reset", composite_reset, 0),
             ],
@@ -467,12 +480,17 @@ fn derived_hash(op: &AnimationOp) -> u64 {
             }
         }
         AnimationOp::CreateDiffClamp {
-            input, min, max, ..
+            input,
+            min,
+            max,
+            snap,
+            ..
         } => {
             kind = 1;
             ids[0] = *input;
             f(*min);
             f(*max);
+            snap.hash(&mut h);
         }
         AnimationOp::CreateMath { a, b, .. } => {
             kind = 2;
@@ -547,6 +565,9 @@ unsafe extern "C" fn node_diff_clamp(
         int(input),
         dup(cx, arg(argc, argv, 0)),
         dup(cx, arg(argc, argv, 1)),
+        // `{ snap }`: settles at the nearer bound when its scroll view
+        // rests (undefined without options).
+        get(cx, arg(argc, argv, 2), c"snap"),
     ];
     derived(cx, vec![dup(cx, this)], ANIMATION_DIFF_CLAMP, args)
 }
@@ -682,12 +703,12 @@ unsafe extern "C" fn value_stop(
 ) -> JsValue {
     let id = match this_node(cx, this) {
         Ok(id) => id,
-        Err(e) => return e,
+        Err(e) => return crate::web::js::rejecting(cx, e),
     };
     if let Err(e) = send(cx, vec![int(ANIMATION_STOP), int(id)]) {
-        return e;
+        return crate::web::js::rejecting(cx, e);
     }
-    read(cx, id)
+    crate::web::js::rejecting(cx, read(cx, id, Settles::Stopped))
 }
 
 /// `getValue()`: a promise of the node's current value, read on the UI
@@ -698,15 +719,18 @@ unsafe extern "C" fn value_get(
     _argc: c_int,
     _argv: *mut JsValue,
 ) -> JsValue {
-    match this_node(cx, this) {
-        Ok(id) => read(cx, id),
-        Err(e) => e,
-    }
+    crate::web::js::rejecting(
+        cx,
+        match this_node(cx, this) {
+            Ok(id) => read(cx, id, Settles::Value),
+            Err(e) => e,
+        },
+    )
 }
 
 /// A promise of node `node`'s value, answered by the graph
 /// (`AnimationOp::Read`, reported as a `Finished` with the value).
-fn read(cx: *mut JsContext, node: u32) -> JsValue {
+fn read(cx: *mut JsContext, node: u32, settles: Settles) -> JsValue {
     let request = next_animation(cx);
     if let Err(e) = send(cx, vec![int(ANIMATION_READ), int(node), int(request)]) {
         return e;
@@ -718,7 +742,7 @@ fn read(cx: *mut JsContext, node: u32) -> JsValue {
             resolve,
             callback: UNDEFINED,
             composite: 0,
-            read: true,
+            settles,
         },
     );
     p
@@ -800,7 +824,7 @@ fn start(cx: *mut JsContext, this: JsValue, config: JsValue) -> JsValue {
             resolve,
             callback: UNDEFINED,
             composite: 0,
-            read: false,
+            settles: Settles::Finished,
         },
     );
     p
@@ -827,7 +851,7 @@ unsafe extern "C" fn value_timing(
     argv: *mut JsValue,
 ) -> JsValue {
     let config = driver_config(cx, "timing", Some(arg(argc, argv, 0)), arg(argc, argv, 1));
-    start(cx, this, config)
+    crate::web::js::rejecting(cx, start(cx, this, config))
 }
 
 unsafe extern "C" fn value_spring(
@@ -837,7 +861,7 @@ unsafe extern "C" fn value_spring(
     argv: *mut JsValue,
 ) -> JsValue {
     let config = driver_config(cx, "spring", Some(arg(argc, argv, 0)), arg(argc, argv, 1));
-    start(cx, this, config)
+    crate::web::js::rejecting(cx, start(cx, this, config))
 }
 
 unsafe extern "C" fn value_decay(
@@ -847,7 +871,7 @@ unsafe extern "C" fn value_decay(
     argv: *mut JsValue,
 ) -> JsValue {
     let config = driver_config(cx, "decay", None, arg(argc, argv, 0));
-    start(cx, this, config)
+    crate::web::js::rejecting(cx, start(cx, this, config))
 }
 
 /// Settles the promise of animation (or value read) `f.animation`
@@ -862,7 +886,7 @@ pub(crate) fn finished(
         resolve,
         callback,
         composite,
-        read,
+        settles,
     }) = a.ends.borrow_mut().remove(&id)
     else {
         return Ok(false);
@@ -896,13 +920,28 @@ pub(crate) fn finished(
                 qjs::JS_FreeValue(cx, v);
             }
         }
-        let mut args = [match (read, done) {
-            (true, _) => qjs::JS_NewFloat64(f.value.unwrap_or(0.0) as f64),
-            (false, true) => qjs::JS_TRUE,
-            (false, false) => qjs::JS_FALSE,
+        let value = || qjs::JS_NewFloat64(f.value.unwrap_or(0.0) as f64);
+        let mut args = [match settles {
+            Settles::Value => value(),
+            Settles::Stopped => {
+                let r = qjs::JS_NewObject(cx);
+                qjs::JS_SetPropertyStr(cx, r, c"value".as_ptr(), value());
+                r
+            }
+            Settles::Finished => {
+                let r = qjs::JS_NewObject(cx);
+                qjs::JS_SetPropertyStr(
+                    cx,
+                    r,
+                    c"finished".as_ptr(),
+                    if done { qjs::JS_TRUE } else { qjs::JS_FALSE },
+                );
+                r
+            }
         }];
         let v = qjs::JS_Call(cx, resolve, UNDEFINED, 1, args.as_mut_ptr());
         qjs::JS_FreeValue(cx, v);
+        qjs::JS_FreeValue(cx, args[0]);
         for x in [resolve, callback] {
             qjs::JS_FreeValue(cx, x);
         }
@@ -975,6 +1014,18 @@ unsafe extern "C" fn composite_reset(
 
 /// `start(callback)`: runs the composite (stopping a run of it first); a
 /// promise of whether it finished.
+/// `composite.start(callback?)`: [`composite_start`], whose failure
+/// rejects its promise.
+unsafe extern "C" fn composite_start_js(
+    cx: *mut JsContext,
+    this: JsValue,
+    argc: c_int,
+    argv: *mut JsValue,
+) -> JsValue {
+    // SAFETY: QuickJS's arguments, passed on.
+    crate::web::js::rejecting(cx, unsafe { composite_start(cx, this, argc, argv) })
+}
+
 unsafe extern "C" fn composite_start(
     cx: *mut JsContext,
     this: JsValue,
@@ -1012,7 +1063,7 @@ unsafe extern "C" fn composite_start(
             resolve,
             callback: dup(cx, arg(argc, argv, 0)),
             composite: key,
-            read: false,
+            settles: Settles::Finished,
         },
     );
     promise
@@ -1357,7 +1408,7 @@ unsafe extern "C" fn value_keyframes(
     }
     let c = keyframes(cx, this, config);
     free(cx, config);
-    start_composite(cx, c)
+    crate::web::js::rejecting(cx, start_composite(cx, c))
 }
 
 /// Whether field `key` of `obj` is truthy.
@@ -1466,7 +1517,12 @@ unsafe extern "C" fn motion_method(
     // SAFETY: one data value: the motion object.
     let object = unsafe { *data };
     match magic {
-        0 => return play(cx, object, arg(argc, argv, 0), arg(argc, argv, 1)),
+        0 => {
+            return crate::web::js::rejecting(
+                cx,
+                play(cx, object, arg(argc, argv, 0), arg(argc, argv, 1)),
+            );
+        }
         3 => return motion_composite(cx, object, arg(argc, argv, 0), arg(argc, argv, 1)),
         _ => {}
     }
@@ -1489,8 +1545,8 @@ unsafe extern "C" fn motion_method(
 
 /// A motion's transform steps (owned) over its channels' `values`: the
 /// translations and rotations, then the scales with `scale` folded into
-/// `scaleX` and `scaleY` (multiplied natively), so a motion takes 7 of a
-/// view's 8 transform steps and leaves one for the app (a `perspective`).
+/// `scaleX` and `scaleY` (multiplied natively): a `transform` list, which
+/// an app's own steps (a `perspective` first) may join.
 fn motion_transform(cx: *mut JsContext, values: &[JsValue]) -> Vec<JsValue> {
     use MotionChannel::*;
     let at = |c: MotionChannel| values[c.index()];
@@ -2089,8 +2145,12 @@ pub(crate) const EXPORTS: &[Item] = &[
     easing?: Easing;
   }): AnimatedNode;
   /** Follows this node's changes, kept within `min..max` (a header that
-   * hides while content scrolls up and comes back as it scrolls down). */
-  diffClamp(min: number, max: number): AnimatedNode;
+   * hides while content scrolls up and comes back as it scrolls down).
+   * `snap`: when the scroll view it follows comes to rest between the
+   * bounds, it settles at the nearer one in 200 ms, easing out (a floating
+   * bar shows or hides fully); at `max` only once this node reached
+   * `max`, so a page scrolled less than the bar's height shows all of it. */
+  diffClamp(min: number, max: number, options?: { snap?: boolean }): AnimatedNode;
   add(b: AnimatedNode | number): AnimatedNode;
   sub(b: AnimatedNode | number): AnimatedNode;
   mul(b: AnimatedNode | number): AnimatedNode;
@@ -2109,9 +2169,9 @@ pub(crate) const EXPORTS: &[Item] = &[
   constructor(value: number);
   /** Jumps to `value`, stopping any animation. */
   set(value: number): void;
-  /** Stops the running animation where it is; resolves with the value
-   * there. */
-  stop(): Promise<number>;
+  /** Stops the running animation where it is; resolves with `{ value }`,
+   * the value there. */
+  stop(): Promise<{ value: number }>;
   /** The current value (with its offset), read where it moves (the UI
    * thread): settles within a frame. */
   getValue(): Promise<number>;
@@ -2123,18 +2183,18 @@ pub(crate) const EXPORTS: &[Item] = &[
   /** Moves the value into the offset and makes the value 0 (a drag then
    * starts from where the last one left it). */
   extractOffset(): void;
-  /** Animates to `to` over `duration` ms. Resolves with `finished`. */
-  timing(to: number, options?: { duration?: number; easing?: Easing; delay?: number }): Promise<boolean>;
-  /** Springs to `to`. Resolves with `finished`. */
-  spring(to: number, options?: { stiffness?: number; damping?: number; mass?: number; velocity?: number }): Promise<boolean>;
+  /** Animates to `to` over `duration` ms. Resolves with `{ finished }`. */
+  timing(to: number, options?: { duration?: number; easing?: Easing; delay?: number }): Promise<{ finished: boolean }>;
+  /** Springs to `to`. Resolves with `{ finished }`. */
+  spring(to: number, options?: { stiffness?: number; damping?: number; mass?: number; velocity?: number }): Promise<{ finished: boolean }>;
   /** Coasts from `velocity` (units per second) and slows down; within
    * `clamp` it stops at a bound, or bounces back keeping `bounce` (0..1) of
    * its speed. */
-  decay(options?: DecayConfig): Promise<boolean>;
+  decay(options?: DecayConfig): Promise<{ finished: boolean }>;
   /** Plays `keyframes` (numbers spread evenly, or `{ offset, value, easing }`)
    * as CSS keyframes play: each segment with its easing (CSS `ease` by
-   * default), `iterations` times in `direction`. Resolves with `finished`. */
-  keyframes(keyframes: KeyframeValue[], options?: KeyframeTiming): Promise<boolean>;
+   * default), `iterations` times in `direction`. Resolves with `{ finished }`. */
+  keyframes(keyframes: KeyframeValue[], options?: KeyframeTiming): Promise<{ finished: boolean }>;
 }"#,
         ),
     ),
@@ -2142,7 +2202,7 @@ pub(crate) const EXPORTS: &[Item] = &[
         "createAnimatedValue",
         Export::Function(animated_value, 1),
         Ts::function(
-            "Creates an animated value. Bind it (or nodes derived from it) to style\nproperties (`opacity`, `transform`, `backgroundColor`, `borderColor`, a\ntext's `color`, `shadowColor` / `shadowOpacity` / `shadowRadius`), to a\nscroll position (`scrollValue`) or to drags (`pan`).",
+            "Creates an animated value. Bind it (or nodes derived from it) to style\nproperties (`opacity`, `translate` / `rotate` / `scale`, a `transform` list,\n`backgroundColor`, `borderColor`, a text's `color`), to a scroll position (`scrollValue`) or to drags (`pan`).",
             &["(value?: number): AnimatedValue"],
         ),
     ),
@@ -2301,8 +2361,8 @@ export interface MotionOptions extends MotionPlayOptions {
 }
 
 /** A motion's transform: its channels in the order they apply, `scale`
- * folded into `scaleX` and `scaleY` (7 steps; a view takes 8, so one is left
- * for yours, such as a `perspective` before them for 3D flips). */
+ * folded into `scaleX` and `scaleY`; spread it into a list with steps of
+ * your own (`[{ perspective: 800 }, ...motion.transform]` for 3D flips). */
 export type MotionTransform = [
   { translateX: AnimatedValue },
   { translateY: AnimatedValue },
@@ -2329,11 +2389,11 @@ export interface Motion {
   /** `{ opacity, transform }`: bind it with `style={motion.style}`, or
    * spread it into a style. */
   readonly style: { opacity: AnimatedValue; transform: MotionTransform };
-  /** The transform alone, to spread into one with steps of your own. */
+  /** The transform alone, to spread into a list with steps of your own. */
   readonly transform: MotionTransform;
   /** Plays a preset or a motion of your own; a new one interrupts the one
-   * playing. Resolves with whether it finished. */
-  play(motion: MotionName | MotionSpec, options?: MotionPlayOptions): Promise<boolean>;
+   * playing. Resolves with `{ finished }`: whether it finished. */
+  play(motion: MotionName | MotionSpec, options?: MotionPlayOptions): Promise<{ finished: boolean }>;
   /** The same motion as an animation to compose, not started:
    * `Animated.stagger(60, cards.map((m) => m.animation("fadeInUp")), { from:
    * "center" })`. */
@@ -2348,7 +2408,7 @@ export interface Motion {
 export interface CompositeAnimation {
   /** Runs it (again). Resolves (and calls `callback`) with whether it
    * finished rather than being stopped. */
-  start(callback?: (result: { finished: boolean }) => void): Promise<boolean>;
+  start(callback?: (result: { finished: boolean }) => void): Promise<{ finished: boolean }>;
   /** Stops it where it is. */
   stop(): void;
   /** Stops it and puts its values back where they were when it started. */
@@ -2374,7 +2434,7 @@ export interface AnimatedModule {
   multiply(a: AnimatedNode, b: AnimatedNode | number): AnimatedNode;
   divide(a: AnimatedNode, b: AnimatedNode | number): AnimatedNode;
   modulo(a: AnimatedNode, b: AnimatedNode | number): AnimatedNode;
-  diffClamp(a: AnimatedNode, min: number, max: number): AnimatedNode;
+  diffClamp(a: AnimatedNode, min: number, max: number, options?: { snap?: boolean }): AnimatedNode;
   /** The values a spring moves through from `from` (0), one per frame at
    * `fps` (60) until it rests: the exact curve the native driver runs. */
   sampleSpring(config: SpringConfig & { from?: number }, fps?: number): number[];
@@ -2408,14 +2468,14 @@ mod tests {
         let host = Host::new().unwrap();
         host.eval_source(
             r#"
-            import { Animated, AnimatedValue } from "nsh/animated";
+            import { Animated, AnimatedValue } from "nsh";
             import { text } from "nsh:rt";
             const v = new AnimatedValue(0);
             globalThis.log = [];
-            v.timing(1, { duration: 10 }).then((f) => log.push(`timing ${f}`));
+            v.timing(1, { duration: 10 }).then(({ finished }) => log.push(`timing ${finished}`));
             Animated.sequence([Animated.delay(5), Animated.timing(v, { toValue: 0 })])
                 .start((r) => log.push(`callback ${r.finished}`))
-                .then((f) => log.push(`sequence ${f}`));
+                .then(({ finished }) => log.push(`sequence ${finished}`));
             globalThis.report = () => text(log.join("|"));
             globalThis.keep = v;
             "#,
@@ -2483,7 +2543,7 @@ mod tests {
         let host = Host::new().unwrap();
         host.eval_source(
             r#"
-            import { AnimatedValue } from "nsh/animated";
+            import { AnimatedValue } from "nsh";
             import { text } from "nsh:rt";
             const v = new AnimatedValue(1);
             globalThis.log = [];
@@ -2491,7 +2551,7 @@ mod tests {
             v.extractOffset();
             v.flattenOffset();
             v.getValue().then((x) => log.push(`value ${x}`));
-            v.stop().then((x) => log.push(`stopped ${x}`));
+            v.stop().then(({ value }) => log.push(`stopped ${value}`));
             globalThis.report = () => text(log.join("|"));
             globalThis.keep = v;
             "#,
@@ -2542,7 +2602,7 @@ mod tests {
         let host = Host::new().unwrap();
         host.eval_source(
             r#"
-            import { AnimatedValue } from "nsh/animated";
+            import { AnimatedValue } from "nsh";
             import { text } from "nsh:rt";
             const v = new AnimatedValue(0);
             const config = { inputRange: [0, 1], outputRange: ["red", "blue"] };
@@ -2602,7 +2662,7 @@ mod tests {
         let host = Host::new().unwrap();
         host.eval_source(
             r#"
-            import { Animated, AnimatedValue } from "nsh/animated";
+            import { Animated, AnimatedValue } from "nsh";
             globalThis.v = new AnimatedValue(0);
             Animated.loop(Animated.timing(v, { toValue: 1 })).start();
             "#,
@@ -2626,11 +2686,44 @@ mod tests {
     }
 
     #[test]
+    fn a_diff_clamp_asks_to_snap() {
+        use nsh_core::animation::AnimationOp as A;
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"
+            import { Animated, AnimatedValue } from "nsh";
+            import { text } from "nsh:rt";
+            const scroll = new AnimatedValue(0);
+            const plain = scroll.diffClamp(0, 56);
+            const snapping = scroll.diffClamp(0, 56, { snap: true });
+            globalThis.report = () =>
+                text([
+                    plain === snapping,
+                    Animated.diffClamp(scroll, 0, 56, { snap: true }) === snapping,
+                    scroll.diffClamp(0, 56, { snap: false }) === plain,
+                ].join(","));
+            globalThis.keep = [scroll, plain, snapping];
+            "#,
+        )
+        .unwrap();
+        let snaps: Vec<bool> = animation_ops(&host)
+            .into_iter()
+            .filter_map(|o| match o {
+                A::CreateDiffClamp { snap, .. } => Some(snap),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(snaps, [false, true]);
+        // Equal ones share a node; a snapping one is not a plain one.
+        assert_eq!(report(&host).as_deref(), Some("false,true,true"));
+    }
+
+    #[test]
     fn curves_are_sampled_natively() {
         let host = Host::new().unwrap();
         host.eval_source(
             r#"
-            import { Animated, Easing } from "nsh/animated";
+            import { Animated, Easing } from "nsh";
             import { text } from "nsh:rt";
             const quad = Easing.sample(Easing.quad, 3);
             const spring = Animated.sampleSpring({ toValue: 1, from: 0, damping: 40 });
@@ -2657,7 +2750,7 @@ mod tests {
         let host = Host::new().unwrap();
         host.eval_source(
             r#"
-            import { Animated, AnimatedValue, Easing, createMotion, motions } from "nsh/animated";
+            import { Animated, AnimatedValue, Easing, createMotion, motions } from "nsh";
             import { text } from "nsh:rt";
             const v = new AnimatedValue(0);
             v.keyframes([0, { value: 10, offset: 0.25, easing: Easing.steps(2) }, 0], { duration: 400 });

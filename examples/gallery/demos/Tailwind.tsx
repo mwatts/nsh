@@ -1,4 +1,5 @@
-import { Image, Input, type JSX, signal, Text, View } from "nsh";
+import { Image, type JSX, platform, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
 import logo from "../logo@2x.png";
 import { Icon, type IconName } from "../icons";
 import { colors, DemoPage } from "../ui";
@@ -10,7 +11,7 @@ import { colors, DemoPage } from "../ui";
  * and depth (`finish` in ui.tsx) are gradients and arbitrary shadows with
  * `dark:` variants, everything else is stock Tailwind.
  */
-const photo = "https://picsum.photos/seed/nsh-tailwind/600/400";
+const photo = "https://pbs.twimg.com/media/HS6UGjvXkAAyHtp?format=jpg&name=small";
 
 /** The finishes of ui.tsx as classes: a top-lit gradient, a highlight along the top edge, a soft shadow. */
 const finish = {
@@ -39,7 +40,7 @@ function Card(props: { icon: IconName; title: string; subtitle: string; children
         </View>
         <View class="flex-1 gap-0.5">
           <Text class="text-[17px] font-semibold text-zinc-900 dark:text-zinc-100">{props.title}</Text>
-          <Text numberOfLines={2} class="font-mono text-xs leading-4 text-zinc-500 dark:text-zinc-400">
+          <Text style={{ numberOfLines: 2 }} class="font-mono text-xs leading-4 text-zinc-500 dark:text-zinc-400">
             {props.subtitle}
           </Text>
         </View>
@@ -98,7 +99,7 @@ function Stats() {
             <View class="gap-1 rounded-[10px] border border-line bg-linear-to-b from-white to-[#fafaf8] p-3 inset-shadow-[0_1px_0_#ffffff] dark:from-[#1d1e22] dark:to-[#17181b] dark:inset-shadow-[0_1px_0_rgba(255,255,255,0.05)]">
               <Text class="text-xs text-zinc-500">{s().label}</Text>
               <Text class="text-[26px] font-semibold tracking-tight text-zinc-900 dark:text-zinc-100 tabular-nums">{s().value}</Text>
-              <Text numberOfLines={1} class={`text-xs tabular-nums ${s().tone}`}>
+              <Text style={{ numberOfLines: 1 }} class={`text-xs tabular-nums ${s().tone}`}>
                 {s().note}
               </Text>
             </View>
@@ -404,7 +405,12 @@ function Inputs() {
   );
 }
 
-const sections: (() => JSX.Element)[] = [Hero, Stats, Buttons, Cards, Layout, Shadows, Gradients, Typography, Effects, Motion, Lists, Inputs, Colors];
+// A terminal's Cells draw no shadows or filters: those cards are left out there. Gradients
+// fill each Cell with their color at it.
+const sections: (() => JSX.Element)[] =
+  platform.idiom === "terminal"
+    ? [Hero, Stats, Buttons, Cards, Layout, Gradients, Typography, Motion, Lists, Inputs, Colors]
+    : [Hero, Stats, Buttons, Cards, Layout, Shadows, Gradients, Typography, Effects, Motion, Lists, Inputs, Colors];
 
 export function Tailwind() {
   return <DemoPage cards={sections} />;

@@ -1,18 +1,27 @@
-import { Canvas, cleanup, type GestureResponderEvent, Image, signal, Text, View } from "nsh";
-import { Animated, createAnimatedValue, Easing } from "nsh/animated";
-import { PanResponder } from "nsh/gesture";
-import { Icon, type IconName } from "../icons";
-import { alpha, Badge, Button, Caption, Card, colors, DemoPage, finish, hint, IconTile, isDark, mono, Press, radius, Row, Stat, tints } from "../ui";
+import { Canvas, cleanup, type GestureResponderEvent, Image, type MouseButton, platform, signal, Text, View } from "nsh";
 
-/** A dot matrix behind a stage, drawn once. */
+const pointer = platform.desktop;
+import { Animated, createAnimatedValue, Easing } from "nsh";
+import { PanResponder } from "nsh";
+import { Icon, type IconName } from "../icons";
+import { alpha, Badge, Button, Caption, Card, colors, DemoPage, density, finish, hint, IconTile, isDark, mono, Press, radius, Row, Stat, terminal, tints } from "../ui";
+
+/** The dots of a matrix `step` apart along `length`, centered: as far from either end, at least 8. */
+function along(length: number, step: number): number[] {
+  const gaps = Math.max(0, Math.floor((length - 16) / step));
+  const first = (length - gaps * step) / 2;
+  return Array.from({ length: gaps + 1 }, (_, i) => first + i * step);
+}
+
+/** A dot matrix behind a stage, drawn once. In a terminal its dots are two Cells across and two rows down apart:
+ * at 14 points, under two Cells and one row, they would dot nearly every Cell. */
 function Dots() {
   return (
     <Canvas
-      pointerEvents="none"
-      style={{ position: "absolute", left: 0, top: 0, right: 0, bottom: 0 }}
+      style={{ pointerEvents: "none", position: "absolute", left: 0, top: 0, right: 0, bottom: 0 }}
       draw={(cx, { width, height }) => {
         cx.fillStyle = colors.line;
-        for (let x = 8; x < width; x += 14) for (let y = 8; y < height; y += 14) cx.fillRect(x, y, 1.5, 1.5);
+        for (const x of along(width, terminal ? 16 : 14)) for (const y of along(height, terminal ? 32 : 14)) cx.fillRect(x - 0.75, y - 0.75, 1.5, 1.5);
       }}
     />
   );
@@ -62,15 +71,14 @@ function Transformable() {
       <View style={{ ...stage(), height: 260, alignItems: "center", justifyContent: "center" }}>
         <Dots />
         <View
-          pointerEvents="none"
-          style={{ position: "absolute", width: 200, height: 150, borderRadius: 18, borderWidth: 1, borderColor: colors.faint, borderStyle: "dashed" }}
+          style={{ pointerEvents: "none", position: "absolute", width: 200, height: 150, borderRadius: 18, borderWidth: 1, borderColor: colors.faint, borderStyle: "dashed" }}
         />
         <View
           testID="photo"
           pan={{ x, y }}
           pinch={{ scale }}
           rotation={{ angle }}
-          onPanEnd={(e) => last.set({ ...last(), drag: Math.round(Math.hypot(e.translationX, e.translationY)) })}
+          onPanEnd={(e) => last.set({ ...last(), drag: Math.round(Math.hypot(e.translation.x, e.translation.y)) })}
           onPinchEnd={(e) => last.set({ ...last(), scale: e.scale })}
           onRotationEnd={(e) => last.set({ ...last(), angle: e.rotation })}
           style={{
@@ -85,7 +93,7 @@ function Transformable() {
             transform: [{ translateX: x }, { translateY: y }, { scale }, { rotate: angle }],
           }}
         >
-          <Image src="https://picsum.photos/seed/nsh-card/400/300" style={{ flex: 1 }} />
+          <Image src="https://pbs.twimg.com/media/HS7_82eXsAAa-Hx?format=jpg&name=small" style={{ flex: 1 }} />
         </View>
       </View>
       <View style={{ flexDirection: "row" }}>
@@ -118,7 +126,7 @@ function Ball() {
     onPanResponderMove: (_, g) => pos.set({ x: start.x + g.dx, y: start.y + g.dy }),
     onPanResponderRelease: (_, g) => {
       grab.spring(0, { stiffness: 300, damping: 20 });
-      state.set({ label: `${g.vx.toFixed(2)}, ${g.vy.toFixed(2)} pt/ms`, tone: "info" });
+      state.set({ label: `${g.vx.toFixed(0)}, ${g.vy.toFixed(0)} pt/s`, tone: "info" });
     },
     onPanResponderTerminate: () => {
       grab.spring(0);
@@ -144,7 +152,8 @@ function Ball() {
             justifyContent: "center",
             backgroundColor: grab.interpolate({ inputRange: [0, 1], outputRange: [colors.info, colors.accentFill] }),
             ...knob(),
-            transform: [{ translateX: pos().x }, { translateY: pos().y }, { scale: grab.interpolate({ inputRange: [0, 1], outputRange: [1, 1.15] }) }],
+            translate: [pos().x, pos().y],
+            scale: grab.interpolate({ inputRange: [0, 1], outputRange: [1, 1.15] }),
           }}
         >
           <View style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: "rgba(19,22,12,0.35)" }} />
@@ -188,8 +197,8 @@ function TouchPad() {
         <Each of={fingers()} key={(f) => f.id}>
           {(f) => (
             <View
-              pointerEvents="none"
               style={{
+                pointerEvents: "none",
                 position: "absolute",
                 left: f().x - 26,
                 top: f().y - 26,
@@ -210,7 +219,7 @@ function TouchPad() {
             {(entry, i) => (
               <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
                 <Text style={{ width: 52, fontSize: 12, fontFamily: mono, color: i() === 0 ? colors.accent : colors.faint }}>{entry().name}</Text>
-                <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, color: i() === 0 ? colors.text : colors.faint, fontVariant: ["tabular-nums"] }}>
+                <Text style={{ numberOfLines: 1, flex: 1, fontSize: 13, color: i() === 0 ? colors.text : colors.faint, fontVariant: ["tabular-nums"] }}>
                   {entry().text}
                 </Text>
               </View>
@@ -244,80 +253,105 @@ function PressEvents() {
         onPressUp={() => fire("pressOut")}
         onPress={() => fire("press")}
         onLongPress={() => fire("longPress")}
-        activeStyle={{ opacity: 0.55 }}
+        hoverStyle={{ opacity: 0.94 }}
+        activeStyle={{ opacity: 0.7, transform: [{ scale: 0.99 }] }}
         role="button"
         style={{
-          height: 64,
+          height: pointer ? 44 : 56,
           borderRadius: radius.control,
           borderCurve: "continuous",
+          borderWidth: 1,
           backgroundColor: colors.light,
           ...finish.light,
           alignItems: "center",
           justifyContent: "center",
+          transitionProperty: "opacity, transform",
+          transitionDuration: 120,
         }}
       >
-        <Text style={{ fontSize: 15, fontWeight: "600", color: colors.onLight }}>{hint("Tap, hold, or slide off", "Click, hold, or slide off")}</Text>
+        <Text style={{ fontSize: pointer ? 13 : 15, fontWeight: "600", color: colors.onLight }}>{hint("Tap, hold, or slide off", "Click, hold, or slide off")}</Text>
       </View>
-      <View style={{ flexDirection: "row", gap: 6 }}>
+      {/* The events as lights in one sunk track, the latest ones under it. */}
+      <View style={{ ...stage(), padding: 3, gap: 3, flexDirection: "row" }}>
         <Each of={[...names]}>
           {(name, i) => (
             <View
               style={{
                 flex: 1,
-                height: 30,
-                borderRadius: 15,
+                height: pointer ? 22 : 28,
+                borderRadius: 5,
+                borderCurve: "continuous",
                 alignItems: "center",
                 justifyContent: "center",
-                borderWidth: 1,
-                borderColor: colors.border,
-                backgroundColor: flashes[i()].interpolate({ inputRange: [0, 1], outputRange: [colors.raised, colors.accentFill] }),
-                boxShadow: finish.raised.boxShadow,
+                backgroundColor: flashes[i()].interpolate({ inputRange: [0, 1], outputRange: [alpha(colors.text, 0), colors.accentFill] }),
               }}
             >
-              <Text style={{ fontSize: 11, fontFamily: mono, color: colors.text }}>{name()}</Text>
+              <Text style={{ fontSize: 11, fontFamily: mono, color: colors.muted }}>{name()}</Text>
             </View>
           )}
         </Each>
       </View>
-      <Text numberOfLines={1} style={{ fontSize: 12, fontFamily: mono, color: colors.faint }}>
+      <Text style={{ numberOfLines: 1, fontSize: 11, fontFamily: mono, color: colors.faint, paddingHorizontal: 2 }}>
         {log().join(" · ") || "No events yet"}
       </Text>
-      <View style={{ flexDirection: "row", gap: 10 }}>
+      <View style={{ flexDirection: "row", gap: 8 }}>
         <View
           onPress={() => fire("ripple")}
           onLongPress={() => fire("fast long press")}
           delayLongPress={250}
-          activeStyle={{ backgroundColor: colors.border }}
+          hoverStyle={finish.hover}
+          activeStyle={finish.pressed}
           android={{ ripple: { color: alpha(colors.accentFill, 0.25) } }}
+          role="button"
           style={{
             flex: 1,
-            height: 56,
+            height: pointer ? 44 : 56,
             borderRadius: radius.control,
             borderCurve: "continuous",
+            borderWidth: 1,
             backgroundColor: colors.raised,
             ...finish.raised,
-            borderWidth: 1,
-            borderColor: colors.border,
+            flexDirection: "row",
             alignItems: "center",
-            justifyContent: "center",
-            gap: 2,
+            paddingHorizontal: 12,
+            gap: 8,
+            transitionProperty: "background-color, border-color, box-shadow",
+            transitionDuration: 120,
           }}
         >
-          <Text style={{ fontSize: 14, color: colors.text }}>Ripple</Text>
-          <Text style={{ fontSize: 12, color: colors.faint }}>Long press after 250 ms</Text>
+          <Text style={{ fontSize: pointer ? 13 : 15, fontWeight: "500", color: colors.text }}>Ripple</Text>
+          <Text style={{ flex: 1, textAlign: "right", fontSize: 12, color: colors.faint }}>Long press after 250 ms</Text>
         </View>
         <View
           onPress={() => fire("borderless")}
           android={{ ripple: { borderless: true, radius: 40 } }}
-          activeStyle={{ opacity: 0.4 }}
+          hoverStyle={finish.hover}
+          activeStyle={finish.pressed}
           role="button"
           accessibilityLabel="Star"
-          style={{ width: 56, height: 56, alignItems: "center", justifyContent: "center" }}
+          style={{
+            width: pointer ? 44 : 56,
+            height: pointer ? 44 : 56,
+            borderRadius: radius.control,
+            borderCurve: "continuous",
+            borderWidth: 1,
+            backgroundColor: colors.raised,
+            ...finish.raised,
+            alignItems: "center",
+            justifyContent: "center",
+            transitionProperty: "background-color, border-color, box-shadow",
+            transitionDuration: 120,
+          }}
         >
-          <Icon name="star" size={24} tint={colors.warn} />
+          <Icon name="star" size={18} tint={colors.warn} />
         </View>
       </View>
-      <Text onPress={() => fire("text")} activeStyle={{ opacity: 0.3 }} style={{ alignSelf: "flex-start", fontSize: 15, color: colors.accent, paddingVertical: 12 }}>
+      <Text
+        onPress={() => fire("text")}
+        hoverStyle={{ textDecorationLine: "underline" }}
+        activeStyle={{ opacity: 0.4 }}
+        style={{ alignSelf: "flex-start", fontSize: density.body, fontWeight: "500", color: colors.accent, paddingVertical: 2 }}
+      >
         Pressable text, dimmed while pressed
       </Text>
     </Card>
@@ -341,8 +375,8 @@ function HitSlop() {
       <View style={{ ...stage(), height: 140, alignItems: "center", justifyContent: "center" }}>
         <Dots />
         <View
-          pointerEvents="none"
           style={{
+            pointerEvents: "none",
             position: "absolute",
             width: 72,
             height: 72,
@@ -352,7 +386,7 @@ function HitSlop() {
             borderColor: colors.danger,
             backgroundColor: tints.danger,
             opacity: ring.interpolate({ inputRange: [0, 1], outputRange: [0.45, 1] }),
-            transform: [{ scale: ring.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1.04] }) }],
+            scale: ring.interpolate({ inputRange: [0, 1], outputRange: [0.96, 1.04] }),
           }}
         />
         <Press hitSlop={30} scale={0.8} onPress={() => taps.set(taps() + 1)} accessibilityLabel="Tiny dot">
@@ -387,8 +421,7 @@ function PointerEvents() {
           </View>
         </Press>
         <Canvas
-          pointerEvents="none"
-          style={{ position: "absolute", left: 0, top: 0, right: 0, bottom: 0 }}
+          style={{ pointerEvents: "none", position: "absolute", left: 0, top: 0, right: 0, bottom: 0 }}
           draw={(cx, { width, height }) => {
             // A hatched band across the middle, framed with dashes.
             cx.save();
@@ -412,28 +445,28 @@ function PointerEvents() {
           }}
         />
       </View>
-      <Api label={hint("Taps on the hatched band reach the button", "Clicks on the hatched band reach the button")} api={'pointerEvents="none"'} />
+      <Api label={hint("Taps on the hatched band reach the button", "Clicks on the hatched band reach the button")} api={'pointerEvents: "none"'} />
     </Card>
   );
 }
 
-/** The mouse over a view: it comes in, moves and leaves (desktops). */
+/** The mouse over a view: it comes in, moves (a button down too) and leaves (desktops). */
 function Hover() {
   const over = signal(false);
-  const at = signal({ x: 0, y: 0 });
+  const at = signal<{ x: number; y: number; button: MouseButton | null }>({ x: 0, y: 0, button: null });
   return (
     <Card icon="gestures" title="Hover" subtitle={hint("A pointer over a view: iPad, desktops", "The mouse over a view")} right={<Badge label={over() ? "Over" : "Away"} tone={over() ? "accent" : "neutral"} />}>
       <View
         testID="hover-pad"
-        onHoverIn={() => over.set(true)}
-        onHoverOut={() => over.set(false)}
-        onHoverMove={(e) => at.set({ x: Math.round(e.position.x), y: Math.round(e.position.y) })}
+        onMouseEnter={() => over.set(true)}
+        onMouseLeave={() => over.set(false)}
+        onMouseMove={(e) => at.set({ x: Math.round(e.position.x), y: Math.round(e.position.y), button: e.pressedButton })}
         class="hover:bg-card"
         style={{ ...stage(), height: 100, alignItems: "center", justifyContent: "center" }}
       >
-        <Text style={{ fontSize: 14, color: colors.muted }}>{over() ? `Pointer at ${at().x}, ${at().y}` : "Pointer away"}</Text>
+        <Text style={{ fontSize: 14, color: colors.muted }}>{over() ? `Pointer at ${at().x}, ${at().y}${at().button ? `, ${at().button} button down` : ""}` : "Pointer away"}</Text>
       </View>
-      <Api label="In, move and out" api="onHoverIn · onHoverMove · onHoverOut" />
+      <Api label="Enter, move and leave" api="onMouseEnter · onMouseMove · onMouseLeave" />
     </Card>
   );
 }
@@ -458,10 +491,10 @@ function Accessibility() {
             onPress={() => last.set(item().label)}
           >
             <Row first={i() === 0}>
-              <IconTile name={item().icon} size={34} tint={last() === item().label ? colors.accent : colors.text} />
+              <IconTile name={item().icon} size={pointer ? 28 : 36} tint={last() === item().label ? colors.accent : colors.text} />
               <View style={{ flex: 1, gap: 1 }}>
-                <Text style={{ fontSize: 15, color: colors.text }}>{item().label}</Text>
-                <Text style={{ fontSize: 12, color: colors.muted }}>{item().hint}</Text>
+                <Text style={{ fontSize: density.body, fontWeight: "500", color: colors.text }}>{item().label}</Text>
+                <Text style={{ fontSize: density.note, color: colors.muted }}>{item().hint}</Text>
               </View>
               <Text style={{ fontSize: 11, fontFamily: mono, color: colors.faint }}>button</Text>
             </Row>

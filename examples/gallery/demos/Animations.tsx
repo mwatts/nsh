@@ -1,24 +1,18 @@
-import { type Bounds, Canvas, type CanvasRenderingContext2D, cleanup, Scroll, signal, Text, View } from "nsh";
-import {
-  Animated,
-  type AnimatedNode,
-  type CompositeAnimation,
-  createAnimatedValue,
-  createMotion,
-  Easing,
-  LayoutAnimation,
-  type LayoutAnimationConfig,
-  type MotionName,
-  type MotionPreset,
-  type MotionSpec,
-  motions,
-} from "nsh/animated";
+import { type Bounds, Canvas, type CanvasRenderingContext2D, cleanup, type JSX, Scroll, signal, Text, View } from "nsh";
+import { Animated, type AnimatedNode, type CompositeAnimation, createAnimatedValue, createMotion, Easing, LayoutAnimation, type LayoutAnimationConfig, type MotionName, type MotionPreset, type MotionSpec, motions } from "nsh";
 import { Button as BaseButton, Tab, Tabs } from "nsh/base";
 import { Icon } from "../icons";
-import { alpha, Badge, Button, Caption, Card, colors, DemoPage, finish, isDark, Legend, mono, type Palette, radius, Segmented, tabPress, tints } from "../ui";
+import { alpha, Badge, Button, Caption, Card, colors, DemoPage, finish, isDark, Legend, mono, type Palette, radius, Segmented, tabPress, TERMINAL_GAP, terminal, tints } from "../ui";
 
 /** The tones of the demos' dots and tiles (call in a reactive scope). */
 const tones = () => [colors.accent, colors.info, colors.warn, colors.danger, colors.up];
+/** A tone's raised fill: its color under a soft top light and the knob's
+ * drop (the knob's own finish would paint it white). */
+const toneFill = (color: string) => ({
+  backgroundColor: color,
+  backgroundImage: "linear-gradient(180deg, rgba(255,255,255,0.22) 0%, rgba(255,255,255,0) 100%)",
+  boxShadow: finish.knob.boxShadow,
+});
 /** Text on a tone's fill. */
 const onTone = () => (isDark() ? colors.onAccent : "#ffffff");
 
@@ -35,7 +29,7 @@ function Api(props: { label: string; api: string }) {
 /** The width of a track, measured once laid out (the dots move by it). */
 function useWidth() {
   const width = signal(0);
-  return [width, (bounds: Bounds) => width.set(bounds.size.width)] as const;
+  return [width, ({ bounds }: { bounds: Bounds }) => width.set(bounds.size.width)] as const;
 }
 
 // --- Hero -------------------------------------------------------------------
@@ -64,8 +58,8 @@ function Hero() {
   const S = 188;
   const orbit = (size: number, angle: AnimatedNode, color: string, dot: number) => (
     <View
-      pointerEvents="none"
       style={{
+        pointerEvents: "none",
         position: "absolute",
         left: (S - size) / 2,
         top: (S - size) / 2,
@@ -74,10 +68,10 @@ function Hero() {
         borderRadius: size / 2,
         borderWidth: 1,
         borderColor: colors.line,
-        transform: [{ rotate: angle }],
+        rotate: angle,
       }}
     >
-      <View style={{ position: "absolute", left: size / 2 - dot / 2, top: -dot / 2, width: dot, height: dot, borderRadius: dot / 2, backgroundColor: color, ...finish.knob }} />
+      <View style={{ position: "absolute", left: size / 2 - dot / 2, top: -dot / 2, width: dot, height: dot, borderRadius: dot / 2, ...toneFill(color) }} />
     </View>
   );
   return (
@@ -91,8 +85,8 @@ function Hero() {
           <Each of={rings}>
             {(r) => (
               <View
-                pointerEvents="none"
                 style={{
+                  pointerEvents: "none",
                   position: "absolute",
                   left: 34,
                   top: 34,
@@ -102,7 +96,7 @@ function Hero() {
                   borderWidth: 1.5,
                   borderColor: colors.accent,
                   opacity: r().interpolate({ inputRange: [0, 0.15, 1], outputRange: [0, 0.6, 0] }),
-                  transform: [{ scale: r().interpolate({ inputRange: [0, 1], outputRange: [0.35, 1.45] }) }],
+                  scale: r().interpolate({ inputRange: [0, 1], outputRange: [0.35, 1.45] }),
                 }}
               />
             )}
@@ -121,7 +115,7 @@ function Hero() {
               justifyContent: "center",
               backgroundColor: breathe.interpolate({ inputRange: [0, 1], outputRange: [colors.accentFill, colors.up] }),
               boxShadow: finish.accent.boxShadow,
-              transform: [{ scale: breathe.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1.08] }) }],
+              scale: breathe.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1.08] }),
             }}
           >
             <Icon name="animation" size={22} tint={colors.onAccent} />
@@ -173,7 +167,7 @@ function PresetTile(props: { name: MotionName; tone: string; onPlay: (status: st
       return;
     }
     props.onPlay(props.name);
-    const finished = await m.play(props.name);
+    const { finished } = await m.play(props.name);
     if (kind !== "exit" || !finished) return;
     await pause(450);
     if (mine !== turn) return;
@@ -184,21 +178,29 @@ function PresetTile(props: { name: MotionName; tone: string; onPlay: (status: st
     <BaseButton
       onPress={press}
       accessibilityLabel={props.name}
-      style={{ flexBasis: "30%", flexGrow: 1, borderRadius: 14 }}
-      activeStyle={{ transform: [{ scale: 0.97 }] }}
+      // In a terminal a tile is its name in a column of names, not grown,
+      // so the rows line up: no card or icon to center it in.
+      style={{
+        flexBasis: "30%",
+        flexGrow: terminal ? 0 : 1,
+        borderRadius: 14,
+        borderCurve: "continuous",
+        backgroundColor: colors.raised,
+        ...finish.raised,
+        borderWidth: 1,
+        borderColor: looping() ? props.tone : colors.border,
+        transitionProperty: "background-color, transform",
+        transitionDuration: 120,
+      }}
+      hoverStyle={{ ...finish.hover, borderColor: looping() ? props.tone : finish.hover.borderColor }}
+      activeStyle={{ transform: "scale(0.97)" }}
     >
       <View
         style={{
           height: 92,
-          borderRadius: 14,
-          borderCurve: "continuous",
-          alignItems: "center",
+          alignItems: terminal ? "flex-start" : "center",
           justifyContent: "center",
           gap: 12,
-          backgroundColor: colors.raised,
-          ...finish.raised,
-          borderWidth: 1,
-          borderColor: looping() ? props.tone : colors.border,
         }}
       >
         <View
@@ -209,15 +211,14 @@ function PresetTile(props: { name: MotionName; tone: string; onPlay: (status: st
             borderCurve: "continuous",
             alignItems: "center",
             justifyContent: "center",
-            backgroundColor: props.tone,
-            ...finish.knob,
+            ...toneFill(props.tone),
             opacity: m.opacity,
             transform: [{ perspective: 300 }, ...m.transform],
           }}
         >
           <View style={{ width: 10, height: 10, borderRadius: 5, backgroundColor: onTone(), opacity: 0.85 }} />
         </View>
-        <Text numberOfLines={1} style={{ fontSize: 12, fontFamily: mono, color: looping() ? colors.text : colors.muted }}>
+        <Text style={{ numberOfLines: 1, fontSize: 12, fontFamily: mono, color: looping() ? colors.text : colors.muted }}>
           {props.name}
         </Text>
       </View>
@@ -232,8 +233,7 @@ function MotionPresets() {
   const names = () => presetNames.filter((n) => motions[n].kind === kind());
   return (
     <Card icon="spark" title="Motion presets" subtitle={`${presetNames.length} ready-made motions, played natively`} right={<Badge label={status()} tone="accent" />}>
-      <Scroll horizontal scrollbar={false}>
-        <Tabs style={{ flexDirection: "row", gap: 8 }}>
+      <ChipRow>
           <Each of={kinds}>
             {(k) => (
               <Chip
@@ -246,8 +246,7 @@ function MotionPresets() {
               />
             )}
           </Each>
-        </Tabs>
-      </Scroll>
+      </ChipRow>
       <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
         <Each of={names()}>{(name, i) => <PresetTile name={name()} tone={tones()[i() % tones().length]} onPlay={(s) => status.set(s)} />}</Each>
       </View>
@@ -363,7 +362,7 @@ function Keyframes() {
       duration: 900,
       easing: Easing.out(Easing.quad),
     });
-    if (await heart.play("popIn", { duration: 360 })) heart.play("heartbeat");
+    if ((await heart.play("popIn", { duration: 360 })).finished) heart.play("heartbeat");
   };
 
   const charge = createAnimatedValue(0);
@@ -384,7 +383,7 @@ function Keyframes() {
       <View style={{ flexDirection: "row", alignItems: "flex-start", justifyContent: "space-around" }}>
         <View style={{ alignItems: "center", gap: 8 }}>
           <View style={{ width: MOON, height: MOON, borderRadius: MOON / 2, overflow: "hidden", backgroundColor: colors.raised }}>
-            <View style={{ flexDirection: "row", width: MOON * PHASES, transform: [{ translateX: sprite }] }}>
+            <View style={{ flexDirection: "row", width: MOON * PHASES, translate: [sprite, 0] }}>
               <Each of={Array.from({ length: PHASES }, (_, k) => k)}>
                 {(k) => (
                   <View style={{ width: MOON, height: MOON, borderRadius: MOON / 2, overflow: "hidden", backgroundColor: colors.warn }}>
@@ -411,16 +410,14 @@ function Keyframes() {
             <Each of={Array.from({ length: 12 }, (_, k) => k)}>
               {(k) => (
                 <View
-                  pointerEvents="none"
-                  style={{ position: "absolute", left: MOON / 2 - 2.25, top: 2, width: 1.5, height: MOON - 7, transform: [{ rotate: `${k() * 30}deg` }] }}
+                  style={{ pointerEvents: "none", position: "absolute", left: MOON / 2 - 2.25, top: 2, width: 1.5, height: MOON - 7, rotate: `${k() * 30}deg` }}
                 >
                   <View style={{ height: k() % 3 === 0 ? 6 : 3, backgroundColor: colors.faint }} />
                 </View>
               )}
             </Each>
             <View
-              pointerEvents="none"
-              style={{ position: "absolute", left: MOON / 2 - 2.75, top: 7, width: 2.5, height: MOON - 17, transform: [{ rotate: tick }] }}
+              style={{ pointerEvents: "none", position: "absolute", left: MOON / 2 - 2.75, top: 7, width: 2.5, height: MOON - 17, rotate: tick }}
             >
               <View style={{ height: (MOON - 17) / 2, borderRadius: 1.25, backgroundColor: colors.accent }} />
             </View>
@@ -446,7 +443,7 @@ function Keyframes() {
               </View>
             </View>
           </BaseButton>
-          <View pointerEvents="none" style={{ position: "absolute", top: -4, right: -10, ...bubble.style }}>
+          <View style={{ pointerEvents: "none", position: "absolute", top: -4, right: -10, ...bubble.style }}>
             <Text style={{ fontSize: 13, fontWeight: "700", color: colors.warn }}>+1</Text>
           </View>
           <Text style={{ fontSize: 11, fontFamily: mono, color: colors.faint, fontVariant: ["tabular-nums"] }}>{count()} likes</Text>
@@ -462,10 +459,10 @@ function Keyframes() {
               bottom: 0,
               width: width(),
               backgroundImage: `linear-gradient(90deg, ${colors.up} 0%, ${colors.accent} 100%)`,
-              transform: [{ translateX: charge.mul(width()).add(-width()) }],
+              translate: [charge.mul(width()).add(-width()), 0],
             }}
           />
-          <View pointerEvents="none" style={{ position: "absolute", left: 0, right: 0, top: 0, bottom: 0, flexDirection: "row" }}>
+          <View style={{ pointerEvents: "none", position: "absolute", left: 0, right: 0, top: 0, bottom: 0, flexDirection: "row" }}>
             <Each of={[0, 1, 2, 3, 4]}>{(k) => <View style={{ flex: 1, borderLeftWidth: k() === 0 ? 0 : 2, borderColor: colors.surface }} />}</Each>
           </View>
         </View>
@@ -518,8 +515,8 @@ function Aurora() {
             const color = () => (isDark() ? b().dark : b().light);
             return (
               <View
-                pointerEvents="none"
                 style={{
+                  pointerEvents: "none",
                   position: "absolute",
                   left: b().left,
                   top: b().top,
@@ -649,9 +646,14 @@ function EasingPlot() {
           const b = height - 8;
           const y = (v: number) => b - ((v - lo) / (hi - lo)) * (b - t);
           const x = (v: number) => l + v * (r - l);
-          // Zones outside 0..1: where a curve overshoots.
-          hatch(cx, l, t, r - l, y(1) - t);
-          hatch(cx, l, y(0), r - l, b - y(0));
+          // Zones outside 0..1: where a curve overshoots. A terminal draws
+          // a texture this faint as hairlines at full dot strength, so the
+          // hatching would fill both zones with dots; the dashed lines at
+          // 0 and 1 mark them there.
+          if (!terminal) {
+            hatch(cx, l, t, r - l, y(1) - t);
+            hatch(cx, l, y(0), r - l, b - y(0));
+          }
           cx.strokeStyle = colors.line;
           cx.lineWidth = 1;
           for (const q of [0.25, 0.5, 0.75]) {
@@ -722,8 +724,7 @@ function EasingPlot() {
           cx.fill();
         }}
       />
-      <Scroll horizontal scrollbar={false}>
-        <Tabs style={{ flexDirection: "row", gap: 8 }}>
+      <ChipRow>
           <Each of={curves}>
             {(c, i) => (
               <Chip
@@ -736,8 +737,7 @@ function EasingPlot() {
               />
             )}
           </Each>
-        </Tabs>
-      </Scroll>
+      </ChipRow>
       <Button label="Play" icon="play" onPress={play} />
     </Card>
   );
@@ -758,7 +758,7 @@ function EasingRace() {
         <Each of={curves}>
           {(c, i) => (
             <View style={{ flexDirection: "row", alignItems: "center", height: 26, gap: 10 }}>
-              <Text numberOfLines={1} style={{ width: 84, fontSize: 13, color: colors.muted }}>
+              <Text style={{ numberOfLines: 1, width: 84, fontSize: 13, color: colors.muted }}>
                 {c().name}
               </Text>
               <View onLayout={i() === 0 ? measure : undefined} style={{ flex: 1, height: 12, justifyContent: "center" }}>
@@ -771,9 +771,8 @@ function EasingRace() {
                     width: 12,
                     height: 12,
                     borderRadius: 6,
-                    backgroundColor: tones()[i() % tones().length],
-                    ...finish.knob,
-                    transform: [{ translateX: dots[i()].mul(Math.max(0, width() - 12)) }],
+                    ...toneFill(tones()[i() % tones().length]),
+                    translate: [dots[i()].mul(Math.max(0, width() - 12)), 0],
                   }}
                 />
               </View>
@@ -788,23 +787,39 @@ function EasingRace() {
 }
 
 /** A selectable capsule, a tab of the curves (36 pt, with hit slop up to 44). */
+/** A row of chips: scrolled sideways, or wrapped in a terminal, whose
+ * columns would cut the last chips off. */
+function ChipRow(props: { children: JSX.Element }) {
+  if (terminal) return <Tabs style={{ flexDirection: "row", flexWrap: "wrap", columnGap: TERMINAL_GAP }}>{props.children}</Tabs>;
+  return (
+    <Scroll horizontal scrollbar={false}>
+      <Tabs style={{ flexDirection: "row", gap: 8 }}>{props.children}</Tabs>
+    </Scroll>
+  );
+}
+
 function Chip(props: { label: string; active?: boolean; onPress: () => void }) {
   return (
-    <Tab selected={props.active} onPress={props.onPress} style={tabPress.style} activeStyle={tabPress.activeStyle}>
-      <View
-        style={{
-          height: 36,
-          paddingHorizontal: 14,
-          borderRadius: 18,
-          justifyContent: "center",
-          backgroundColor: props.active ? colors.light : colors.raised,
-          ...(props.active ? finish.light : finish.raised),
-          borderWidth: props.active ? 0 : 1,
-          borderColor: colors.border,
-        }}
-      >
-        <Text style={{ fontSize: 13, fontWeight: "500", color: props.active ? colors.onLight : colors.text }}>{props.label}</Text>
-      </View>
+    <Tab
+      selected={props.active}
+      onPress={props.onPress}
+      style={{
+        ...tabPress.style,
+        margin: 0,
+        padding: 0,
+        height: 36,
+        paddingHorizontal: 14,
+        borderRadius: 18,
+        justifyContent: "center",
+        backgroundColor: props.active ? colors.light : colors.raised,
+        ...(props.active ? finish.light : finish.raised),
+        borderWidth: props.active ? 0 : 1,
+        borderColor: colors.border,
+      }}
+      hoverStyle={props.active ? undefined : finish.hover}
+      activeStyle={tabPress.activeStyle}
+    >
+      <Text style={{ fontSize: 13, fontWeight: "500", color: props.active ? colors.onLight : colors.text }}>{props.label}</Text>
     </Tab>
   );
 }
@@ -846,14 +861,18 @@ function Composition() {
   cleanup(() => all.forEach((a) => a.stop()));
   const run = (name: string, a: CompositeAnimation) => () => {
     state.set({ label: `${name} running`, tone: "info" });
-    a.start().then((finished) => state.set({ label: `${name} ${finished ? "finished" : "stopped"}`, tone: finished ? "accent" : "warn" }));
+    a.start().then(({ finished }) => state.set({ label: `${name} ${finished ? "finished" : "stopped"}`, tone: finished ? "accent" : "warn" }));
   };
+  const staggerButton = () => <Button label="Stagger" variant="secondary" onPress={run("stagger", stagger)} />;
+  const sequenceButton = () => <Button label="Sequence" variant="secondary" onPress={run("sequence", sequence)} />;
+  const loopButton = () => <Button label="Loop" variant="secondary" onPress={run("loop", pulse)} />;
+  const stopButton = () => <Button label="Stop" variant="ghost" icon="pause" onPress={() => all.forEach((a) => a.stop())} />;
+  const resetButton = () => <Button label="Reset" variant="ghost" onPress={() => all.forEach((a) => a.reset())} />;
   return (
     <Card icon="components" title="Composition" subtitle="Each step starts as the last one ends" right={<Badge label={state().label} tone={state().tone} />}>
       <View style={{ height: 116, flexDirection: "row", justifyContent: "center", alignItems: "flex-end", gap: 12, paddingBottom: 14 }}>
         <View
-          pointerEvents="none"
-          style={{ position: "absolute", left: 0, right: 0, bottom: 14, borderTopWidth: 1, borderColor: colors.border, borderStyle: "dashed" }}
+          style={{ pointerEvents: "none", position: "absolute", left: 0, right: 0, bottom: 14, borderTopWidth: 1, borderColor: colors.border, borderStyle: "dashed" }}
         />
         <Each of={tones()}>
           {(color, i) => (
@@ -863,37 +882,41 @@ function Composition() {
                 height: 40,
                 borderRadius: 12,
                 borderCurve: "continuous",
-                backgroundColor: color(),
-                ...finish.knob,
+                ...toneFill(color()),
                 opacity: fade,
-                transform: [
-                  { translateY: ys[i()] },
-                  { rotate: spin.interpolate({ inputRange: [0, 1], outputRange: ["0deg", `${(i() + 1) * 36}deg`] }) },
-                ],
+                translate: [0, ys[i()]],
+                rotate: spin.interpolate({ inputRange: [0, 1], outputRange: ["0deg", `${(i() + 1) * 36}deg`] }),
               }}
             />
           )}
         </Each>
       </View>
-      <View style={{ flexDirection: "row", gap: 8 }}>
-        <View style={{ flex: 1 }}>
-          <Button label="Stagger" variant="secondary" onPress={run("stagger", stagger)} />
+      {/* A terminal's buttons are their labels: one row of them, where
+          two rows of equal shares would stagger them. */}
+      <If
+        when={terminal}
+        else={
+          <>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <View style={{ flex: 1 }}>{staggerButton()}</View>
+              <View style={{ flex: 1 }}>{sequenceButton()}</View>
+              <View style={{ flex: 1 }}>{loopButton()}</View>
+            </View>
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <View style={{ flex: 1 }}>{stopButton()}</View>
+              <View style={{ flex: 1 }}>{resetButton()}</View>
+            </View>
+          </>
+        }
+      >
+        <View style={{ flexDirection: "row", flexWrap: "wrap", columnGap: TERMINAL_GAP }}>
+          {staggerButton()}
+          {sequenceButton()}
+          {loopButton()}
+          {stopButton()}
+          {resetButton()}
         </View>
-        <View style={{ flex: 1 }}>
-          <Button label="Sequence" variant="secondary" onPress={run("sequence", sequence)} />
-        </View>
-        <View style={{ flex: 1 }}>
-          <Button label="Loop" variant="secondary" onPress={run("loop", pulse)} />
-        </View>
-      </View>
-      <View style={{ flexDirection: "row", gap: 8 }}>
-        <View style={{ flex: 1 }}>
-          <Button label="Stop" variant="ghost" icon="pause" onPress={() => all.forEach((a) => a.stop())} />
-        </View>
-        <View style={{ flex: 1 }}>
-          <Button label="Reset" variant="ghost" onPress={() => all.forEach((a) => a.reset())} />
-        </View>
-      </View>
+      </If>
     </Card>
   );
 }
@@ -999,9 +1022,8 @@ function Springs() {
                   width: 24,
                   height: 24,
                   borderRadius: 12,
-                  backgroundColor: colors[s().tone],
-                  ...finish.knob,
-                  transform: [{ translateX: xs[i()] }],
+                  ...toneFill(colors[s().tone]),
+                  translate: [xs[i()], 0],
                 }}
               />
             </View>
@@ -1061,14 +1083,14 @@ function Interpolations() {
         <View style={{ width: D, height: D }}>
           <DialFace size={D} />
           <View
-            pointerEvents="none"
             style={{
+              pointerEvents: "none",
               position: "absolute",
               left: D / 2 - 1.5,
               top: 14,
               width: 3,
               height: D - 28,
-              transform: [{ rotate: t.interpolate({ inputRange: [0, 2], outputRange: ["-120deg", "120deg"] }) }],
+              rotate: t.interpolate({ inputRange: [0, 2], outputRange: ["-120deg", "120deg"] }),
             }}
           >
             <View style={{ height: D / 2 - 22, borderRadius: 1.5, backgroundColor: colors.accent }} />
@@ -1083,7 +1105,7 @@ function Interpolations() {
               borderRadius: 16,
               borderCurve: "continuous",
               backgroundColor: t.interpolate({ inputRange: [0, 1, 2], outputRange: [colors.info, colors.accent, colors.danger] }),
-              transform: [{ rotate: t.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "180deg"], extrapolateRight: "extend" }) }],
+              rotate: t.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "180deg"], extrapolateRight: "extend" }),
             }}
           />
           <Text style={{ fontSize: 11, fontFamily: mono, color: colors.faint }}>extend</Text>
@@ -1096,7 +1118,7 @@ function Interpolations() {
                 height: 52,
                 borderRadius: 26,
                 backgroundColor: colors.up,
-                transform: [{ scale: t.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1.2], extrapolate: "clamp" }) }],
+                scale: t.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1.2], extrapolate: "clamp" }),
               }}
             />
           </View>
@@ -1172,7 +1194,7 @@ function HidingHeader() {
             ...finish.raised,
             borderBottomWidth: 1,
             borderBottomColor: colors.border,
-            transform: [{ translateY: header.mul(-1) }],
+            translate: [0, header.mul(-1)],
             opacity: header.interpolate({ inputRange: [0, H], outputRange: [1, 0], easing: Easing.in(Easing.quad) }),
           }}
         >
@@ -1227,8 +1249,7 @@ function Layout() {
                 borderCurve: "continuous",
                 paddingHorizontal: 10,
                 justifyContent: "center",
-                backgroundColor: tones()[id() % tones().length],
-                ...finish.knob,
+                ...toneFill(tones()[id() % tones().length]),
               }}
             >
               <Text style={{ fontSize: 13, fontWeight: "600", color: onTone(), fontVariant: ["tabular-nums"] }}>{id()}</Text>

@@ -433,38 +433,80 @@ fn cpu_time() -> Option<Duration> {
     Some(time(usage.ru_utime) + time(usage.ru_stime))
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn cpu_time() -> Option<Duration> {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetCurrentProcess, GetProcessTimes},
+    };
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let (mut created, mut exited, mut kernel, mut user) = (zero, zero, zero, zero);
+    // SAFETY: the pseudo handle of this process and four buffers the call fills.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut created,
+            &mut exited,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    // FILETIME counts 100 ns.
+    let ticks = |t: FILETIME| (u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime);
+    (ok != 0).then(|| Duration::from_nanos((ticks(kernel) + ticks(user)) * 100))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn cpu_time() -> Option<Duration> {
     None
 }
 
-/// The physical footprint (`proc_pid_rusage`): the dirty and compressed
-/// memory the process owns, what Activity Monitor shows and what the system
-/// judges it by under memory pressure (unlike the resident size, it leaves
-/// out the frameworks' clean pages every process maps).
+/// The physical footprint (`task_info`'s `TASK_VM_INFO`): the dirty and
+/// compressed memory the process owns, what Activity Monitor shows and what
+/// the system judges it by under memory pressure (unlike the resident size,
+/// it leaves out the frameworks' clean pages every process maps). Mach's
+/// `task_info` is public on every Apple platform; libproc's
+/// `proc_pid_rusage`, which reads the same number, has no header in the iOS
+/// SDK, and App Store review can reject iOS apps for calls outside it.
 #[cfg(target_vendor = "apple")]
 fn memory() -> Option<u64> {
-    unsafe extern "C" {
-        // libSystem's (libproc) on every Apple platform; the `libc` crate
-        // declares it for macOS only.
-        fn proc_pid_rusage(
-            pid: libc::c_int,
-            flavor: libc::c_int,
-            buffer: *mut libc::rusage_info_t,
-        ) -> libc::c_int;
+    /// `struct task_vm_info` (`mach/task_info.h`) as far as
+    /// `phys_footprint`, the fields `TASK_VM_INFO_REV1_COUNT` covers; the
+    /// `libc` crate does not declare it.
+    #[repr(C)]
+    struct TaskVmInfo {
+        /// `virtual_size` to `compressed_lifetime`: two `integer_t`s and
+        /// seventeen `mach_vm_size_t`s, 144 bytes.
+        before: [u64; 18],
+        phys_footprint: u64,
     }
-    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
-    // SAFETY: `info` is a buffer of exactly the layout `RUSAGE_INFO_V2`
-    // names, the only thing the call writes.
+    unsafe extern "C" {
+        // The task's own port (`mach_init.h`, whose `mach_task_self()` is a
+        // macro reading it); the `libc` crate wraps it for macOS only.
+        static mach_task_self_: libc::mach_port_t;
+    }
+    const TASK_VM_INFO: libc::task_flavor_t = 22;
+    const _: () = assert!(std::mem::size_of::<TaskVmInfo>() == 152);
+    let words = std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<libc::natural_t>();
+    let mut count = words as libc::mach_msg_type_number_t;
+    let mut info = std::mem::MaybeUninit::<TaskVmInfo>::uninit();
+    // SAFETY: `mach_task_self_` is set before any code runs and never
+    // changes; `info` has room for `count` words, the most the call writes,
+    // and `count` says how many it wrote.
     let status = unsafe {
-        proc_pid_rusage(
-            std::process::id() as libc::c_int,
-            libc::RUSAGE_INFO_V2,
-            info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+        libc::task_info(
+            mach_task_self_,
+            TASK_VM_INFO,
+            info.as_mut_ptr().cast::<libc::integer_t>(),
+            &mut count,
         )
     };
-    // SAFETY: a zero return means the call filled the buffer.
-    (status == 0).then(|| unsafe { info.assume_init() }.ri_phys_footprint)
+    // SAFETY: success with every word asked for filled the whole buffer.
+    (status == libc::KERN_SUCCESS && count as usize == words)
+        .then(|| unsafe { info.assume_init() }.phys_footprint)
 }
 
 /// The resident set (`/proc/self/statm`'s second field, in pages).
@@ -477,7 +519,27 @@ fn memory() -> Option<u64> {
     Some(pages * u64::try_from(page).ok()?)
 }
 
-#[cfg(not(any(target_vendor = "apple", target_os = "linux", target_os = "android")))]
+/// The working set (resident memory), as on Linux.
+#[cfg(windows)]
+fn memory() -> Option<u64> {
+    use windows_sys::Win32::System::{
+        ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS},
+        Threading::GetCurrentProcess,
+    };
+    // SAFETY: all-integer struct, zero is a valid value.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    counters.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the pseudo handle of this process and a buffer of the size `cb` names.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, counters.cb) };
+    (ok != 0).then_some(counters.WorkingSetSize as u64)
+}
+
+#[cfg(not(any(
+    target_vendor = "apple",
+    target_os = "linux",
+    target_os = "android",
+    windows
+)))]
 fn memory() -> Option<u64> {
     None
 }
@@ -562,5 +624,28 @@ mod tests {
         std::thread::sleep(ms(5));
         #[cfg(unix)]
         assert!(sampler.sample().cpu.is_some());
+    }
+
+    /// `task_info`'s footprint is the one `proc_pid_rusage` reported (the
+    /// two are read a moment apart, so they may differ by what was mapped
+    /// in between).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn footprint_matches_proc_pid_rusage() {
+        let ours = super::memory().expect("task_info");
+        let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+        // SAFETY: `info` is a buffer of exactly the layout `RUSAGE_INFO_V2`
+        // names, the only thing the call writes.
+        let status = unsafe {
+            libc::proc_pid_rusage(
+                std::process::id() as libc::c_int,
+                libc::RUSAGE_INFO_V2,
+                info.as_mut_ptr().cast::<libc::rusage_info_t>(),
+            )
+        };
+        assert_eq!(status, 0);
+        // SAFETY: a zero return means the call filled the buffer.
+        let theirs = unsafe { info.assume_init() }.ri_phys_footprint;
+        assert!(ours.abs_diff(theirs) < 8 << 20, "{ours} vs {theirs}");
     }
 }

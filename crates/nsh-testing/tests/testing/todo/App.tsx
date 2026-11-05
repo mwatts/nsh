@@ -1,5 +1,6 @@
-import { Input, mount, signal, Text, View } from "nsh";
-import { Storage } from "nsh/storage";
+import { mount, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
+import { Storage } from "nsh";
 
 function App() {
   const todos = signal<string[]>([]);
@@ -24,7 +25,7 @@ function App() {
         testID="new-todo"
         placeholder="What to do?"
         value={draft()}
-        onChange={(text) => draft.set(text)}
+        onChange={({ value }) => draft.set(value)}
         onSubmit={add}
       />
       <View onPress={add}>

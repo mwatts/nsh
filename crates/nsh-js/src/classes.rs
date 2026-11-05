@@ -1,4 +1,4 @@
-//! The JS face of Rust's classes (`#[class]`, `nsh_core::ui::ClassDef`):
+//! The JS face of Rust's classes (`#[class]`, `nsh_core::element::ClassDef`):
 //! one constructor and prototype per class and context, made from its
 //! definition when a bundle imports its set (or a member first returns
 //! one of its values).
@@ -21,7 +21,7 @@
 //! A JS function Rust takes is a [`JsCallback`]: a key into the context's
 //! table of functions ([`Functions`], freed with the context), called on
 //! the spot inside a synchronous call, or queued in the engine's post
-//! queue ([`nsh_core::ui::Posts`]) and run by [`run_posted`] in its next
+//! queue ([`nsh_core::element::Posts`]) and run by [`run_posted`] in its next
 //! turn. An instance whose only handle is its object reports the
 //! callbacks it keeps from the object's mark hook, so the collector sees
 //! through them. While a finalizer drops Rust values (QuickJS is
@@ -37,10 +37,10 @@ use std::{
 
 use nsh_core::{
     JsonValue,
-    ui::{
-        CallbackHandle, ClassDef, ClassInstance, Exception, JsCall, JsHost, JsIn, JsKind, JsRaw,
-        Member, MemberCall, MemberKind, Posts, PropError, RustCall, RustOp, SyncCall, Thrown,
-        Tracer,
+    element::{
+        CallbackHandle, ClassDef, ClassInstance, Exception, JsCall, JsClass, JsHost, JsIn, JsKind,
+        JsRaw, Member, MemberCall, MemberKind, Posts, PropError, RustCall, RustOp, SyncCall,
+        Thrown, Tracer,
     },
 };
 use rquickjs::qjs;
@@ -50,6 +50,38 @@ use crate::web::{
     self, Object,
     js::{self, Ctx, R, Raw, Throw, Trace, UNDEFINED, V},
 };
+
+/// The class name of typed array type `kind` (`JS_GetTypedArrayType`'s;
+/// `None`: not a typed array).
+fn typed_array_name(kind: c_int) -> Option<&'static str> {
+    const NAMES: [(qjs::JSTypedArrayEnum, &str); 12] = [
+        (
+            qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_UINT8C,
+            "Uint8ClampedArray",
+        ),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_INT8, "Int8Array"),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_UINT8, "Uint8Array"),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_INT16, "Int16Array"),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_UINT16, "Uint16Array"),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_INT32, "Int32Array"),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_UINT32, "Uint32Array"),
+        (
+            qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_BIG_INT64,
+            "BigInt64Array",
+        ),
+        (
+            qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_BIG_UINT64,
+            "BigUint64Array",
+        ),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_FLOAT16, "Float16Array"),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_FLOAT32, "Float32Array"),
+        (qjs::JSTypedArrayEnum_JS_TYPED_ARRAY_FLOAT64, "Float64Array"),
+    ];
+    NAMES
+        .iter()
+        .find(|(k, _)| *k as c_int == kind)
+        .map(|(_, name)| *name)
+}
 
 /// The JS objects of the live instances, by the instance's address (not
 /// owned: an object leaves when it is finalized).
@@ -431,18 +463,7 @@ pub(crate) fn send(
     promise: bool,
     make: impl FnOnce(&dyn JsHost) -> Result<RustCall, Thrown>,
 ) -> Raw {
-    CallHost::new(cx, this, UNDEFINED, args).send(promise, false, make)
-}
-
-/// [`send`] of a call that starts its task in the JS call (`Later`): JS
-/// gets a promise of the task, and what the start throws throws here.
-pub(crate) fn start(
-    cx: Ctx,
-    this: Raw,
-    args: js::Args<'_>,
-    make: impl FnOnce(&dyn JsHost) -> Result<RustCall, Thrown>,
-) -> Raw {
-    CallHost::new(cx, this, UNDEFINED, args).send(true, true, make)
+    CallHost::new(cx, this, UNDEFINED, args).send(promise, make)
 }
 
 /// The pending exception as a rejected promise (an uncatchable one, an
@@ -500,7 +521,7 @@ unsafe extern "C" fn dispose(
 /// The JS error `thrown` is: its class, its message and its properties
 /// (Node's `code`, `syscall`, `path`, ...), as an own enumerable field each.
 pub(crate) fn error_value(cx: Ctx, thrown: &Thrown) -> V {
-    use nsh_core::ui::ErrorClass;
+    use nsh_core::element::ErrorClass;
     let (class, message, fields) = match thrown {
         Thrown::Type(m) => (ErrorClass::Type, m, &[][..]),
         Thrown::Range(m) => (ErrorClass::Range, m, &[][..]),
@@ -623,11 +644,10 @@ impl<'a> CallHost<'a> {
     fn run(&self, member: &'static Member) -> Raw {
         match member.call {
             MemberCall::Sync(f) => self.run_sync(f),
-            MemberCall::Async(start) => {
-                self.send(true, false, |host| start(host).map(RustCall::Task))
-            }
-            MemberCall::Start(start) => {
-                self.send(true, true, |host| start(host).map(RustCall::Task))
+            // A call returning a promise never throws: what its start
+            // refuses (an argument, a grant, a quota) rejects.
+            MemberCall::Async(start) | MemberCall::Start(start) => {
+                self.send(true, |host| start(host).map(RustCall::Task))
             }
         }
     }
@@ -645,12 +665,10 @@ impl<'a> CallHost<'a> {
     }
 
     /// Sends the call `make` converts this call's values into as an op
-    /// ([`send`]); with `throws`, what `make` throws throws even when the
-    /// call returns a promise (a call starting its task: [`start`]).
+    /// ([`send`]); with `promise`, what `make` refuses rejects the promise.
     fn send(
         &self,
         promise: bool,
-        throws: bool,
         make: impl FnOnce(&dyn JsHost) -> Result<RustCall, Thrown>,
     ) -> Raw {
         let cx = self.cx;
@@ -667,9 +685,9 @@ impl<'a> CallHost<'a> {
             }
             Err(e) => {
                 // Thrown (or rethrown) as a synchronous call's error, then
-                // taken as the promise's unless the call throws.
+                // taken as the promise's.
                 let thrown = self.finish(Err(e));
-                return if promise && !throws {
+                return if promise {
                     rejected_with_exception(cx)
                 } else {
                     thrown
@@ -931,6 +949,68 @@ impl JsHost for CallHost<'_> {
         js::to_number(self.cx, v).ok()
     }
 
+    fn class(&self, v: JsRaw) -> Option<JsClass> {
+        let v = from_raw(v);
+        if !js::is_object(v) {
+            return None;
+        }
+        // SAFETY: class checks of a live object.
+        unsafe {
+            Some(if qjs::JS_IsArray(v) {
+                JsClass::Array
+            } else if qjs::JS_IsFunction(self.cx, v) {
+                JsClass::Function
+            } else if qjs::JS_IsDate(v) {
+                JsClass::Date
+            } else if qjs::JS_IsRegExp(v) {
+                JsClass::RegExp
+            } else if qjs::JS_IsMap(v) {
+                JsClass::Map
+            } else if qjs::JS_IsSet(v) {
+                JsClass::Set
+            } else if qjs::JS_IsError(v) {
+                JsClass::Error
+            } else if qjs::JS_IsArrayBuffer(v) {
+                JsClass::ArrayBuffer
+            } else if qjs::JS_IsDataView(v) {
+                JsClass::View("DataView")
+            } else if let Some(name) = typed_array_name(qjs::JS_GetTypedArrayType(v)) {
+                JsClass::View(name)
+            } else {
+                JsClass::Object
+            })
+        }
+    }
+
+    fn same_value(&self, a: JsRaw, b: JsRaw) -> bool {
+        // SAFETY: a comparison of two live values (it runs no JS).
+        unsafe { qjs::JS_IsSameValue(self.cx, from_raw(a), from_raw(b)) }
+    }
+
+    fn buffer(&self, v: JsRaw) -> Option<Vec<u8>> {
+        js::buffer_source(self.cx, from_raw(v))
+    }
+
+    fn iterate(&self, v: JsRaw) -> Result<Option<Vec<JsRaw>>, PropError> {
+        let v = from_raw(v);
+        if !js::is_iterable(self.cx, v).map_err(|Throw| self.threw())? {
+            return Ok(None);
+        }
+        let mut items = Vec::new();
+        let read = js::for_each(self.cx, v, |item| {
+            items.push(item);
+            Ok(())
+        });
+        read.map_err(|Throw| self.threw())?;
+        self.read(items.len())?;
+        Ok(Some(items.into_iter().map(|i| to_raw(i.take())).collect()))
+    }
+
+    fn invoke(&self, v: JsRaw, name: &str, args: &[JsRaw]) -> Result<JsRaw, PropError> {
+        let args: Vec<Raw> = args.iter().map(|&a| from_raw(a)).collect();
+        self.checked(js::invoke(self.cx, from_raw(v), name, &args))
+    }
+
     fn to_json(&self, v: JsRaw) -> Result<JsonValue, PropError> {
         // SAFETY: a context reference and a dup for the converter.
         let cx = unsafe { rquickjs::Ctx::from_raw(std::ptr::NonNull::new_unchecked(self.cx)) };
@@ -993,6 +1073,16 @@ impl JsHost for CallHost<'_> {
     fn callback(&self, v: JsRaw) -> Option<Rc<dyn CallbackHandle>> {
         let v = from_raw(v);
         js::is_function(self.cx, v).then(|| new_callback(self.cx, v))
+    }
+
+    fn retain(&self, v: JsRaw) -> Option<Rc<dyn CallbackHandle>> {
+        // The functions' table keeps any value; one that is no function is
+        // only ever handed back (`value`) or answers a settling call
+        // (`Callback::settling`), never called. A promise kept is handled:
+        // Rust looks at how it settles (in a later turn), so its rejection
+        // is reported to Rust, not as unhandled.
+        js::mark_handled(self.cx, from_raw(v));
+        Some(new_callback(self.cx, from_raw(v)))
     }
 
     fn free(&self, v: JsRaw) {
@@ -1072,6 +1162,13 @@ impl JsHost for CallHost<'_> {
         Ok(to_raw(crate::host::json_to_js(self.cx, v)))
     }
 
+    fn new_function(&self, f: Box<dyn Fn()>) -> Result<JsRaw, PropError> {
+        self.checked(js::closure(self.cx, Vec::new(), move |_, _, _| {
+            f();
+            Ok(V::undefined())
+        }))
+    }
+
     fn wrap(&self, instance: Rc<dyn ClassInstance>) -> Result<JsRaw, PropError> {
         let existing = classes(self.cx)
             .wrappers
@@ -1094,9 +1191,9 @@ impl JsHost for CallHost<'_> {
         to_raw(self.this)
     }
 
-    fn system(&self) -> nsh_core::ui::System {
+    fn system(&self) -> nsh_core::element::System {
         let shared = crate::dom::shared(self.cx);
-        nsh_core::ui::System::new(
+        nsh_core::element::System::new(
             std::sync::Arc::new(shared.system_access.borrow().clone()),
             shared.system_data_dir.borrow().clone(),
             shared.system_paths.borrow().clone(),
@@ -1105,12 +1202,18 @@ impl JsHost for CallHost<'_> {
         .with_locals(shared.system_locals.clone())
         .with_exit(shared.system_exit_handler.borrow().clone())
         .with_websocket(shared.system_websocket.borrow().clone())
+        .with_refuse_connections(shared.system_refuse_connections.borrow().clone())
         .with_filesystem(shared.system_filesystem.borrow().clone())
         // SAFETY: a short read of the live renderer state.
         .with_os(unsafe { (*crate::state::state(self.cx)).dom.os() })
     }
 
-    fn start_task(&self, task: nsh_core::ui::TaskStart) {
+    fn image_blob(&self, url: &str) -> Option<(std::sync::Arc<str>, nsh_core::ImageData)> {
+        // The same key and bytes a host `<Image>`'s `src` gets.
+        crate::web::blob::resolve_image_url(self.cx, url)
+    }
+
+    fn start_task(&self, task: nsh_core::element::TaskStart) {
         // Past the op limit the app is stopped: the task goes with it.
         let op = nsh_core::Op::Rust(RustOp {
             call: 0,
@@ -1163,7 +1266,8 @@ impl JsHost for CallHost<'_> {
                     return;
                 }
                 // SAFETY: the function lives, and so does its VM; a release
-                // runs outside JS, holding no other reference to the graph.
+                // (outside JS, or a `Stop` JS calls) holds no other
+                // reference to the graph.
                 let removed = unsafe { crate::reactive::graph(cx) }
                     .remove_cleanup(owner, |c| js::same(*c, raw));
                 if let Some(removed) = removed {
@@ -1283,6 +1387,12 @@ impl JsCallback {
 }
 
 impl CallbackHandle for JsCallback {
+    fn value(&self, _host: &dyn nsh_core::element::JsHost) -> Option<JsRaw> {
+        let (cx, v) = JsCallback::value(self)?;
+        // SAFETY: a new reference for the caller, of a value the table owns.
+        Some(to_raw(unsafe { qjs::JS_DupValue(cx, v) }))
+    }
+
     fn call_now(&self, call: JsCall) {
         let Some((cx, _)) = self.value() else {
             // The function or the VM is gone: the call is dropped (its
@@ -1370,18 +1480,86 @@ fn message_of(cx: Ctx, e: Raw) -> String {
     message
 }
 
-/// What `e`, thrown, is: its message and, for an `Error`, its stack.
-fn thrown_of(cx: Ctx, e: Raw) -> Exception {
+/// What `e`, thrown, is: its message, for an `Error` its stack, and for a
+/// traced call the value as JSON ([`thrown_json`]).
+fn thrown_of(cx: Ctx, e: Raw, traced: bool) -> Exception {
     let stack = js::is_object(e)
         .then(|| js::get(cx, e, "stack").ok())
         .flatten()
         .and_then(|s| js::opt_string(cx, s.raw()).ok().flatten())
         .filter(|s| !s.is_empty());
     let _ = js::take_exception(cx);
-    Exception {
-        message: message_of(cx, e),
-        stack,
+    let thrown = if traced { thrown_json(cx, e) } else { None };
+    let mut exception = Exception::from(message_of(cx, e));
+    exception.stack = stack;
+    exception.thrown = thrown;
+    exception
+}
+
+/// `e`, thrown, as JSON for checks of it ([`Exception::thrown`]): an
+/// object's own enumerable properties (an `Error`'s `code`, ...) with its
+/// `name` and `message` when they are strings, any other value as itself.
+/// Only a traced call's reply asks for it (`nsh/test`'s checks): it runs
+/// the app's getters and walks the whole value. `None` when converting it
+/// throws (a getter, a cycle, a value too large), which is dropped; an
+/// uncatchable error (an interrupt) stays pending.
+fn thrown_json(cx: Ctx, e: Raw) -> Option<JsonValue> {
+    // SAFETY: a context reference and a dup the value owns.
+    let rcx = unsafe { rquickjs::Ctx::from_raw(std::ptr::NonNull::new_unchecked(cx)) };
+    // SAFETY: as above.
+    let value = unsafe { rquickjs::Value::from_raw(rcx, qjs::JS_DupValue(cx, e)) };
+    let failed = || {
+        let e = js::take_exception(cx);
+        // SAFETY: a check of a live value.
+        if unsafe { qjs::JS_IsUncatchableError(e.raw()) } {
+            let _ = js::throw(cx, e);
+        }
+        None
+    };
+    // An `Error` is an object whose type rquickjs reports apart
+    // (`Type::Exception`): its own properties are read as an object's.
+    let converted = match value.as_object() {
+        Some(object) if value.type_of() == rquickjs::Type::Exception => object
+            .props::<String, rquickjs::Value>()
+            .filter_map(|entry| match entry {
+                Ok((_, item))
+                    if matches!(
+                        item.type_of(),
+                        rquickjs::Type::Undefined
+                            | rquickjs::Type::Function
+                            | rquickjs::Type::Symbol
+                    ) =>
+                {
+                    None
+                }
+                Ok((key, item)) => Some(crate::protocol::to_json(&item).map(|v| (key, v))),
+                Err(e) => Some(Err(e)),
+            })
+            .collect::<rquickjs::Result<serde_json::Map<_, _>>>()
+            .map(JsonValue::Object),
+        _ => crate::protocol::to_json(&value),
+    };
+    let Ok(mut json) = converted else {
+        return failed();
+    };
+    if let (JsonValue::Object(fields), Some(object)) = (&mut json, value.as_object()) {
+        // `name` comes from the prototype, `message` is not enumerable:
+        // read as JS reads them.
+        for key in ["name", "message"] {
+            if fields.contains_key(key) {
+                continue;
+            }
+            match object.get::<_, rquickjs::Value>(key) {
+                Ok(v) => {
+                    if let Some(text) = v.as_string().and_then(|s| s.to_string().ok()) {
+                        fields.insert(key.to_owned(), JsonValue::String(text));
+                    }
+                }
+                Err(_) => return failed(),
+            }
+        }
     }
+    Some(json)
 }
 
 /// A host for conversions outside a call.
@@ -1418,7 +1596,14 @@ pub(crate) fn run_call(cx: Ctx, mut call: JsCall) {
         }
     };
     let raws: Vec<Raw> = args.iter().map(V::raw).collect();
-    match js::call(cx, function.raw(), UNDEFINED, &raws) {
+    let called = if call.settles() && !js::is_function(cx, function.raw()) {
+        // A value in place of a function (`Callback::settling`) answers
+        // itself, a promise what it settles to.
+        Ok(V::dup(cx, function.raw()))
+    } else {
+        js::call(cx, function.raw(), UNDEFINED, &raws)
+    };
+    match called {
         Ok(result) => {
             if !call.wants_reply() {
                 return;
@@ -1445,7 +1630,8 @@ pub(crate) fn run_call(cx: Ctx, mut call: JsCall) {
                     },
                     move |cx, _, reason| {
                         if let Some(call) = rejected.borrow_mut().take() {
-                            call.reply(Err(thrown_of(cx, reason)));
+                            let traced = call.traced();
+                            call.reply(Err(thrown_of(cx, reason, traced)));
                         }
                         Ok(())
                     },
@@ -1469,7 +1655,8 @@ pub(crate) fn run_call(cx: Ctx, mut call: JsCall) {
                 classes(cx).uncatchable.borrow_mut().get_or_insert(e);
                 call.reply(Err(message.into()));
             } else if call.wants_reply() {
-                call.reply(Err(thrown_of(cx, e.raw())));
+                let traced = call.traced();
+                call.reply(Err(thrown_of(cx, e.raw(), traced)));
             } else {
                 js::report(cx, e);
             }
@@ -1477,7 +1664,7 @@ pub(crate) fn run_call(cx: Ctx, mut call: JsCall) {
     }
 }
 
-/// Runs the JS calls Rust queued ([`nsh_core::ui::Callback::post`],
+/// Runs the JS calls Rust queued ([`nsh_core::element::Callback::post`],
 /// `call_async`), in order. Those queued meanwhile wait for the next turn.
 /// An uncatchable exception (an interrupt) stops them: it is pending when
 /// this fails, and the calls left are dropped.
@@ -1516,7 +1703,10 @@ pub(crate) fn close(cx: Ctx) {
 pub(crate) mod tests {
     use std::{cell::Cell, rc::Rc};
 
-    use nsh_core::ui::{Answer, PropError, Registry, prelude::*};
+    use nsh_core::{
+        element::{Answer, PropError, Registry},
+        prelude::*,
+    };
 
     use crate::{Host, HostOptions};
 
@@ -1719,22 +1909,22 @@ pub(crate) mod tests {
     pub(crate) struct Flaky(bool);
 
     impl JsValue for Flaky {
-        fn ts_type(_types: &mut nsh_core::ui::TsTypes) -> String {
+        fn ts_type(_types: &mut nsh_core::element::TsTypes) -> String {
             "object".into()
         }
 
-        fn from_js(_value: nsh_core::ui::JsIn<'_>) -> Result<Self, PropError> {
+        fn from_js(_value: nsh_core::element::JsIn<'_>) -> Result<Self, PropError> {
             Ok(Flaky(true))
         }
 
         fn to_js<'a>(
             &self,
-            host: &'a dyn nsh_core::ui::JsHost,
-        ) -> Result<nsh_core::ui::JsOwned<'a>, PropError> {
+            host: &'a dyn nsh_core::element::JsHost,
+        ) -> Result<nsh_core::element::JsOwned<'a>, PropError> {
             if !self.0 {
                 return Err(PropError("flaky".to_owned()));
             }
-            Ok(nsh_core::ui::JsOwned::new(host, host.new_object()?))
+            Ok(nsh_core::element::JsOwned::new(host, host.new_object()?))
         }
     }
 
@@ -1840,18 +2030,18 @@ pub(crate) mod tests {
     pub(crate) struct Brittle;
 
     impl JsValue for Brittle {
-        fn ts_type(_types: &mut nsh_core::ui::TsTypes) -> String {
+        fn ts_type(_types: &mut nsh_core::element::TsTypes) -> String {
             "object".into()
         }
 
-        fn from_js(_value: nsh_core::ui::JsIn<'_>) -> Result<Self, PropError> {
+        fn from_js(_value: nsh_core::element::JsIn<'_>) -> Result<Self, PropError> {
             Ok(Brittle)
         }
 
         fn to_js<'a>(
             &self,
-            _host: &'a dyn nsh_core::ui::JsHost,
-        ) -> Result<nsh_core::ui::JsOwned<'a>, PropError> {
+            _host: &'a dyn nsh_core::element::JsHost,
+        ) -> Result<nsh_core::element::JsOwned<'a>, PropError> {
             panic!("brittle");
         }
     }
@@ -1866,34 +2056,34 @@ pub(crate) mod tests {
     }
 
     impl JsValue for Grenade {
-        fn ts_type(_types: &mut nsh_core::ui::TsTypes) -> String {
+        fn ts_type(_types: &mut nsh_core::element::TsTypes) -> String {
             "object".into()
         }
 
-        fn from_js(_value: nsh_core::ui::JsIn<'_>) -> Result<Self, PropError> {
+        fn from_js(_value: nsh_core::element::JsIn<'_>) -> Result<Self, PropError> {
             Ok(Grenade)
         }
 
         fn to_js<'a>(
             &self,
-            host: &'a dyn nsh_core::ui::JsHost,
-        ) -> Result<nsh_core::ui::JsOwned<'a>, PropError> {
-            Ok(nsh_core::ui::JsOwned::new(host, host.null()))
+            host: &'a dyn nsh_core::element::JsHost,
+        ) -> Result<nsh_core::element::JsOwned<'a>, PropError> {
+            Ok(nsh_core::element::JsOwned::new(host, host.null()))
         }
     }
 
     /// An event whose data panics as it converts.
     struct BrittleEvent;
 
-    impl nsh_core::ui::EventToJs for BrittleEvent {
+    impl nsh_core::element::EventToJs for BrittleEvent {
         fn name(&self) -> &'static str {
             "brittle"
         }
 
         fn data_js<'a>(
             &self,
-            _host: &'a dyn nsh_core::ui::JsHost,
-        ) -> Result<nsh_core::ui::JsOwned<'a>, PropError> {
+            _host: &'a dyn nsh_core::element::JsHost,
+        ) -> Result<nsh_core::element::JsOwned<'a>, PropError> {
             panic!("brittle event");
         }
     }
@@ -1910,19 +2100,19 @@ pub(crate) mod tests {
     pub(crate) struct Panicky;
 
     impl JsValue for Panicky {
-        fn ts_type(_types: &mut nsh_core::ui::TsTypes) -> String {
+        fn ts_type(_types: &mut nsh_core::element::TsTypes) -> String {
             "unknown".into()
         }
 
-        fn from_js(_value: nsh_core::ui::JsIn<'_>) -> Result<Self, PropError> {
+        fn from_js(_value: nsh_core::element::JsIn<'_>) -> Result<Self, PropError> {
             panic!("panicky");
         }
 
         fn to_js<'a>(
             &self,
-            host: &'a dyn nsh_core::ui::JsHost,
-        ) -> Result<nsh_core::ui::JsOwned<'a>, PropError> {
-            Ok(nsh_core::ui::JsOwned::new(host, host.undefined()))
+            host: &'a dyn nsh_core::element::JsHost,
+        ) -> Result<nsh_core::element::JsOwned<'a>, PropError> {
+            Ok(nsh_core::element::JsOwned::new(host, host.undefined()))
         }
     }
 
@@ -2018,7 +2208,7 @@ pub(crate) mod tests {
     #[derive(Clone, PartialEq, Props)]
     pub(crate) struct MeterProps {
         #[prop(default)]
-        level: nsh_core::ui::Prop<u32>,
+        level: nsh_core::element::Prop<u32>,
     }
 
     impl Component for Meter {
@@ -2515,7 +2705,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_context_makes_as_many_classes_as_constructors_can_name() {
-        use nsh_core::ui::Class as _;
+        use nsh_core::element::Class as _;
         let host = host();
         // As if 32768 classes were made: the next one's index does not fit
         // its constructor's magic.
@@ -2613,7 +2803,7 @@ pub(crate) mod tests {
 
     #[test]
     fn panics_in_what_the_core_hands_back_stay_in_rust() {
-        use nsh_core::ui::{JsEvent, RustOp};
+        use nsh_core::element::{JsEvent, RustOp};
         let host = host();
         host.eval_source(
             "import { Tools } from \"test/classes\";\n\
@@ -2643,7 +2833,8 @@ pub(crate) mod tests {
             call: 999,
             result: Ok(Box::new(Grenade)),
         });
-        // An event's data panics as it converts: logged.
+        // An event no handler waits for drops unconverted (its data would
+        // panic as it converts).
         host.deliver(JsEvent::Component {
             host: 2,
             event: Box::new(BrittleEvent),
@@ -2671,8 +2862,8 @@ pub(crate) mod tests {
         host.take_ops(&mut ops);
         assert!(ops.iter().any(|op| matches!(
             op,
-            nsh_core::Op::Rust(nsh_core::ui::RustOp {
-                run: nsh_core::ui::RustCall::Post(_),
+            nsh_core::Op::Rust(nsh_core::element::RustOp {
+                run: nsh_core::element::RustCall::Post(_),
                 ..
             })
         )));
@@ -2763,7 +2954,7 @@ pub(crate) mod tests {
     /// returning a value is a promise, which a wrong argument rejects.
     #[test]
     fn ops_returning_nothing_are_plain_calls() {
-        use nsh_core::ui::RustOp;
+        use nsh_core::element::RustOp;
         let host = host();
         host.eval_source(
             "import { text as show } from \"nsh:rt\";\n\

@@ -1,25 +1,22 @@
-// A case of the API's test suite (docs/dev/compatibility.md): `nsh/android`
-// off Android (the headless runtime is iOS): `isAvailable` is false, and its
-// functions are callable and do nothing, so an app that calls them runs on.
-// Its script
+// A case of the API's test suite (docs/dev/compatibility.md): `nsh/mobile`'s
+// `BackHandler` off Android (the headless runtime is iOS): its functions are
+// callable and do nothing, so an app that calls them runs on. Its script
 // checks each.
-import { Text, View, signal } from "nsh";
-import { BackHandler, Toast, isAvailable } from "nsh/android";
+import { Text, View, platform, signal } from "nsh";
+import { BackHandler } from "nsh/mobile";
 
 function App() {
   const calls = signal("not called");
   return (
     <View style={{ flex: 1, paddingTop: 64 }}>
-      <Text>{`Android: ${isAvailable}`}</Text>
+      <Text>{`Android: ${platform.os === "android"}`}</Text>
       <Text>{`Exit: ${typeof BackHandler.exitApp}`}</Text>
       <Text>{`Calls: ${calls()}`}</Text>
       <View
         testID="call"
         onPress={() => {
-          const remove = BackHandler.onBackPress(() => true);
+          const remove = BackHandler.on("press", () => true);
           remove();
-          Toast.show("Saved");
-          Toast.show("Saved for long", "long");
           calls.set(`done, remove ${typeof remove}`);
         }}
       >

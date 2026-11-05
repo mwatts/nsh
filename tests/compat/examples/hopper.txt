@@ -3,7 +3,7 @@
 expect Hop tests
 expect 40 flown · 4 off-nominal in the last 40
 expect Hop 40
-prop text:"Hop 40 · 132 m · hover 12 s" numberOfLines 1
+style text:"Hop 40 · 132 m · hover 12 s" numberOfLines 1
 prop label:Flights role tab
 prop label:Flights accessibilityState selected=true
 prop label:Plan accessibilityState {}
@@ -54,6 +54,8 @@ expect Flying…
 wait 1000
 expect Fly hop
 expect Hop 41: nominal · hover 12 s
+# The log, on the flights tab, has the new hop.
+tap label:Flights
 expect 41 flown · 4 off-nominal in the last 40
 # The vehicle.
 tap label:Vehicle
@@ -64,7 +66,7 @@ covers [props] accessibilityLabel
 covers [props] accessibilityState
 covers [props] accessibilityValue
 covers [props] hitSlop
-covers [props] numberOfLines
+covers [styles] numberOfLines
 covers [props] role
 covers [events] onPress
 covers [styles] flex

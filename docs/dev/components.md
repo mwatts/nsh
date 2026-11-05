@@ -7,27 +7,31 @@ native.
 
 NSH is layered as GPUI Kit is (`architecture.md` "Layers"): `nsh-core` is its `gpui`, `nsh-base` its `gpui-base`, and
 the styled layer, GPUI Kit's `gpui-component`, is never part of NSH. The look of an app is the app's. Rust components
-come from two places:
+come from two places. `nsh/base` also provides `Avatar` and `AvatarGroup`:
+images whose load state drives their fallback natively, and a row that
+places its first `limit` avatars.
 
 - **`nsh/base`**: unstyled base components of `gpui-base`'s scope, the crate `nsh-base` (`crates/nsh-base`,
-  `nsh_base::registry()`): `SafeAreaView`, `KeyboardAvoidingView`, `Button`, `Checkbox`, `Radio`, `RadioGroup`, `Switch`, `Tab`, `Tabs`, `Collapsible`, `Progress`, `SelectionArea` (texts that select
-  together, `text.md` "Selection areas"), `TextView` (`text-view.md`), `ResizablePanelGroup` and `ResizablePanel`, `DockArea`
-  (`dock.md`), the popups on the core's overlays (`Popover`,
-  `Menu` with `MenuItem`, `MenuSeparator` and `Submenu`, `ContextMenu`, `Tooltip`, `Sheet`: "Popups" below), toasts
+  `nsh_base::registry()`): `Button`, `Link` (a press target that opens its `href`: through the core's `openUrl` flow, or the app's `onOpen` with `openWith="app"`), `Carousel` with `CarouselContent`, `CarouselItem`, `CarouselPrevious`, `CarouselNext`, `CarouselPagination` and `CarouselPaginationItem` (slides on a native scroll view: "Carousels" below), `Checkbox`, `Radio`, `RadioGroup`, `Switch`, `Tab`, `Tabs`, `Toggle`, `ToggleGroup`, `Toolbar`, `ToolbarGroup`, `ToolbarSeparator`, `Select` (one value from a list: "Popups" below), `Combobox` (one value or several from the same list), `Calendar` (a date or a range from months of days), `TimeField` (a time of day by segments), `DatePicker` (a calendar and a time field in a popup: "Popups" below), `Collapsible`, `Accordion` with `AccordionItem`, `AccordionHeader`, `AccordionTrigger` and `AccordionPanel`, `Progress`, `Slider`, `Scrollbar` ("Scroll bars" below), `ColorPicker` with `ColorArea`, `ColorSlider`, `ColorField`, `ColorSwatch` and `ColorEyeDropper` (a color in RGB, HSL, HSB or OKLCH, its parts laid out by the app), `NumberInput`, `OtpInput`, `Pagination` (the pages of a set: Previous, the pages around the current one, ellipses, Next; its places made once, a page change changing what they show), `Tree` (items that hold items, virtualized: the expanded items' rows only, the selection and expansion the app's, one Tab stop whose arrows move the selection), `Command` (a command palette: a search field over the app's commands filtered natively by label and keywords, in a virtualized list under their sections' headers; the highlight projected `focus:` while the field keeps the keyboard focus, `onSelect({ id })`), `Table` with `TableHeader`, `TableBody`, `TableFooter`, `TableRow`, `TableHead`, `TableCell` and `TableCaption` (a table's accessibility roles around the app's rows), `TextView` (`text-view.md`), `ResizablePanelGroup` and `ResizablePanel`, `DockArea`
+  (`dock.md`), `Editor` (a code editor, `editor.md`), `DiffView` (the changes between two texts, `diff.md`), `DataTable` (a table over any number of rows and columns, `data-table.md`), the popups on the core's overlays (`Popover`,
+  `HoverCard`, `Menu` with `MenuItem`, `MenuSeparator` and `Submenu`, `ContextMenu`, `Tooltip`, `Sheet`: "Popups" below), toasts
   (`Toast`, `ToastStack` and the class `ToastManager`: "Toasts" below) and the
-  modules `AlertDialog`, `Keyboard`, beside the navigation `nsh-js` makes for it (`NavStack`, `NavPage`, `Dialog`, `createNavStack`); controls
+  module `AlertDialog`, beside the navigation `nsh-js` makes for it (`NavStack`, `NavPage`, `Dialog`, `createNavStack`); controls
   (toggles, sliders, selects, popovers, sheets, ...) join as their behavior is written. It is a UI set
-  (`Registry::ui_set("nsh/base")`) every host serves by default (`set_ui_sets`' default; embedders with a list of their
-  own add `nsh_base::registry()` to it); Rust apps use `nsh_base::{SafeAreaView, …}`, and make navigation and
-  dialogs with `nsh_base::{nav_stack, nav_page, dialog}` (builders of the core's `Stack`, `Screen` and `Modal` host
-  elements; the core's `stack()`, `screen()` and `modal()` are their deprecated old names), and show system
-  alerts with `nsh_base::alert_dialog()` (the prelude's `dialog(Dialog)` is its deprecated old form; import
-  `nsh_base::dialog` by name, as that glob still brings the old one). What goes in is behavior:
+  (`Registry::ui_set("nsh/base")`), with the charts' parts `Plot`, `Line`, `Area`, `Bar`, `Grid`, `Pie`, `Arc`, `RadialLine`, `RadialGrid`, `Sankey`, `Treemap`, `PlotAxis`, `PlotLabel` and `PlotAppearScope` in its submodule `nsh/base/plot` (`Registry::submodule`, `js-modules.md`), every host serves by default (`set_ui_sets`' default; embedders with a list of their
+  own add `nsh_base::registry()` to it). `nsh_base::registry_of` makes it of some of its parts only
+  (`nsh_base::parts`: `core`, the controls, popups, toasts and alerts every app has, and one part per larger
+  component, `text_view`, `editor`, `diff`, `rich_editor`, `data_table`, `table`, `dock`, `resizable`, `plot`): a
+  runtime that registers fewer parts leaves the others' code out of its binary, as nothing else reaches it (Rust
+  builders make a component's instance without the registry). Rust apps use `nsh_base::{button, …}`, make navigation and
+  dialogs with `nsh_base::{nav_stack, nav_page, dialog}` (on the core's `Stack`, `Screen` and `Modal` host
+  elements, whose builders are hidden building blocks of these), and show system alerts with
+  `nsh_base::alert_dialog()`. What goes in is behavior:
   - it owns behavior, state, focus, keyboard handling and accessibility (roles, states, actions), or tells the
     platform (insets, the keyboard's height, the status bar's setting, a system dialog);
   - it has no look: no colors, paddings, radii, fonts or variants of its own; it takes the app's `class` / `style`
-    (and styles per state) and children (the one exception is `TextView`'s default reading typography, colored with
-    the theme's tokens and overridable part by part: `docs/dev/text-view.md`);
+    (and styles per state) and children (the exceptions are `TextView`'s default reading typography and the default looks of `Editor` and `DiffView`, colored
+    with the theme's tokens and overridable part by part: `docs/dev/text-view.md`, `docs/dev/editor.md`, `docs/dev/diff.md`);
   - its state is controlled: it reports changes (`onChange`, `onOpenChange`, ...), the app owns the value;
   - it exposes its parts (a trigger, a thumb, an item, as slots or child components) instead of fixed markup, so an
     app arranges and styles each.
@@ -36,22 +40,31 @@ come from two places:
   cards, list rows with its look), or a community library a third party publishes as a crate, built on `nsh-base`'s
   behavior and the primitives. `examples/gallery-rs` is one (`gallery/native`), and so is the crate
   `nsh init --template rust` / `mixed` writes (`app/native`).
+  What such a crate keeps per engine (the languages and highlighters its editors know,
+  `nsh_base::editor::register_language`; a value of `nsh_core::element::global`) it sets up in `Registry::setup`, a
+  function each engine serving the set runs once in its runtime before the app's first op (`Core::set_components`).
+
+The TSX gallery and website demos share the repository's internal `examples/nsh-gallery-ui` source layer: design
+tokens, finishes, buttons, cards, switches, segmented controls, icons and table part classes. The gallery's
+`ui.tsx` keeps navigation and shell state, and the website's `palette.ts` adapts the shared layer to demo layouts.
+Visual rules are changed in the shared layer; `nsh-base` supplies the components' structure and behavior.
 
 | Where | What |
 |---|---|
-| `crates/nsh-core/src/ui/` | The API (`nsh_core::ui`, `prelude`): `Component`, `Module`, `Class` (`class.rs`, `callback.rs`; direct JS values: `js.rs`), elements, `Styled`, `Theme`, `Registry`, the status bar's layers (`status_bar.rs`), the declarations generator `typescript` |
-| `crates/nsh-macros` | `#[component]`, `#[derive(Props)]`, `#[derive(PropEnum)]`, `#[derive(Event)]`, `#[derive(JsObject)]`; `#[methods]`, `#[module]`, `#[class]`; `#[native_module("…")]` (an app crate's set: `docs/dev/tooling.md`); `style_helpers!` (the spacing methods of `Styled`) |
+| `crates/nsh-core/src/element/` | The API (`nsh_core::element`, `prelude`): `Component`, `Module`, `Class` (`class.rs`, `callback.rs`; direct JS values: `js.rs`), elements, `Styled`, `Theme`, `Registry`, the status bar's layers (`status_bar.rs`), the declarations generator `typescript` |
+| `crates/nsh-macros` | `#[component]`, `#[derive(Props)]`, `#[derive(PropEnum)]`, `#[derive(Event)]`, `#[derive(JsObject)]`; `#[methods]`, `#[module]`, `#[class]`; `#[native_module("…")]` (an app crate's set: `docs/dev/tooling.md`); `#[native_components(<platform>)]` (an app crate's native components on Windows, macOS, Linux or iOS: `docs/dev/tooling.md`); `style_helpers!` (the spacing methods of `Styled`) |
 | `crates/nsh-core/src/core/components.rs` | The core side: instances, children and slots, events; `core/views.rs`: views, their bindings' patches and regions |
-| `crates/nsh-base/` | `nsh/base`'s components and modules, one file each (`safe_area.rs`, `keyboard.rs`, `alert_dialog.rs`, `button.rs`, `checkbox.rs`, `radio.rs`, `switch.rs`, `tabs.rs`; `TextView`, `ResizablePanelGroup` and `DockArea` directories, `text_view/`, `resizable/`, `dock/`), one `Registry` (`lib.rs`) |
-| `crates/nsh-core/src/runtime/` | The runtime's Rust modules (`nsh/android`, `nsh/accessibility`, `nsh/image`, `nsh/clipboard`, `nsh/desktop`), one `Registry` per JS module (`mod.rs`) |
+| `crates/nsh-base/` | `nsh/base`'s components and modules, one file each (`accordion.rs`, its parts on `collapsible.rs`'s reveal, `alert_dialog.rs`, `button.rs`, `checkbox.rs`, `number_input.rs`, `radio.rs`, `slider.rs`, `switch.rs`, `tabs.rs`, `select.rs` on `listbox.rs`; `command.rs`, its items indexed once and filtered natively per query, its moves of the highlight `listbox.rs`'s; `tree.rs`, its items flattened natively into the rows the expanded items show; `color_picker/`, `ColorPicker` and its parts over a color as each space's channels hold it (`model.rs`: the conversions, OKLCH's gamut mapping, the CSS forms it reads and writes); `numeric.rs`, the rules of a number in a range with a step that `Slider` follows and of a number typed as text that `NumberInput` follows; `keys.rs`, the keys a focused control binds; `TextView`, `ResizablePanelGroup`, `DockArea`, `Editor` and `DiffView` directories, `text_view/`, `resizable/`, `dock/`, `editor/`, `diff/`; `rich_editor/`, `RichEditor`'s headless kernel, `docs/dev/rich-editor.md`; `syntax.rs`, the syntax highlighting `TextView` and `Editor` share), one `Registry` (`lib.rs`) |
+| `crates/nsh-base/` | `nsh/base`'s components and modules, one file each (`accordion.rs`, its parts on `collapsible.rs`'s reveal, `alert_dialog.rs`, `button.rs`, `carousel.rs`, `avatar.rs`, `checkbox.rs`, `number_input.rs`, `radio.rs`, `slider.rs`, `switch.rs`, `tabs.rs`, `select.rs` on `listbox.rs`; `command.rs`, its items indexed once and filtered natively per query, its moves of the highlight `listbox.rs`'s; `tree.rs`, its items flattened natively into the rows the expanded items show; `color_picker/`, `ColorPicker` and its parts over a color as each space's channels hold it (`model.rs`: the conversions, OKLCH's gamut mapping, the CSS forms it reads and writes); `numeric.rs`, the rules of a number in a range with a step that `Slider` follows and of a number typed as text that `NumberInput` follows; `keys.rs`, the keys a focused control binds; `TextView`, `ResizablePanelGroup`, `DockArea`, `Editor` and `DiffView` directories, `text_view/`, `resizable/`, `dock/`, `editor/`, `diff/`; `rich_editor/`, `RichEditor`'s headless kernel, `docs/dev/rich-editor.md`; `syntax.rs`, the syntax highlighting `TextView` and `Editor` share), one `Registry` (`lib.rs`) |
+| `crates/nsh-core/src/runtime/` | The runtime's Rust modules (`nsh`'s `Keyboard` and `Image` functions, with its environment, accessibility, clipboard, picker, storage and host modules, `nsh/mobile`, `nsh/desktop`), one `Registry` per JS module (`mod.rs`) |
 | `crates/nsh-js/src/components.rs` | The JS face of components and modules, made from their specs when a bundle imports the module; `classes.rs`: classes' (on the web classes' machinery), synchronous functions', callbacks |
-| `crates/nsh-js/src/declarations.rs` | `nsh/base.d.ts`, `app/native.d.ts`, ...: the declarations generated from each registry (`nsh_core::ui::declarations`) with the re-exports and the navigation |
+| `crates/nsh-js/src/declarations.rs` | `nsh/base.d.ts`, `app/native.d.ts`, ...: the declarations generated from each registry (`nsh_core::element::declarations`) with the re-exports and the navigation |
 | `nsh_engine::EngineConfig::ui_sets` | The UI sets a surface serves besides the runtime's modules (the platforms' `set_ui_sets`; `nsh_base::registry()` by default; an app's own set: `docs/dev/tooling.md`) |
 
 ## Writing a component
 
 - **One file per component**, registered in the crate's `#[native_module]` function (an app's) or in its crate's
-  registry (`nsh_base::registry()`, `nsh/base`'s). Start with `use nsh_core::ui::prelude::*;`. The JS export is the
+  registry (`nsh_base::registry()`, `nsh/base`'s). Start with `use nsh_core::prelude::*;`. The JS export is the
   type's name (`#[component] pub fn Chip` is `Chip`): no name is written by hand. `nsh/base`'s exports are pinned
   by `nsh-base`'s `tests::the_exports_are_pinned`.
 - **Props are a struct** (`#[derive(Clone, Copy, PartialEq, Props)]`, its fields `Prop<T>`), **events an enum**
@@ -60,7 +73,7 @@ come from two places:
   onPress={open} />` with full types; there is no hand-written glue. The props struct's doc comment documents the
   component in TypeScript.
 - **A component runs once** and makes its view with `view()`, `text()`, `image()` and other components
-  (`safe_area_view()`, `chip().label("New")`), styled with GPUI-style methods (`.px_4()`, `.rounded(px(16.0))`, `.active(|s|
+  (`text_view()`, `chip().label("New")`), styled with GPUI-style methods (`.px_4()`, `.rounded(px(16.0))`, `.active(|s|
   s.bg(..))`). What changes is a **binding**: a closure or a signal where the value goes (`text(props.label)`,
   `.bg(move || theme().primary)`, `.style_when(props.disabled, |s| ..)`); when what it read changes, only that part
   is updated. A prop is read with `props.x.get()` in a binding and `get_untracked()` in a listener. The root can be
@@ -80,13 +93,13 @@ come from two places:
 - **The surface is free functions** whose reads subscribe: `window()`, `safe_area()`, `keyboard_height()`, `dark()`,
   `font_scale()`, `locale()`, `cx.insets()`, `global::<G>()`, `provide_context(v)` / `use_context::<T>()`.
 - **Modules are functions without a component**: `#[module] impl AlertDialog { pub async fn show(options:
-  AlertDialogOptions) -> Result<Option<SharedString>, String> }` is `await AlertDialog.show({ … })` in JS (`nsh-base`
+  AlertDialogOptions) -> Result<AlertDialogResult, String> }` is `await AlertDialog.show({ … })` in JS (`nsh-base`
   `alert_dialog.rs`). A module named like a component adds static functions to it.
 - **System UI**: `nsh_base::alert_dialog().title(..).cancel(..).destructive(..).show()` (TSX's `AlertDialog.show({ … })`:
-  await the label of the action chosen, `None` when closed without one), `dismiss_keyboard()`, a screen's
+  await an `AlertDialogResult`, whose `action` is the chosen action's id, `None` when closed without one), `dismiss_keyboard()`, a screen's
   or modal's `.status_bar(..)` (as a view controller's `preferredStatusBarStyle`; a `StatusBarStyle` alone, a
   `StatusBarSetting` or a closure of one), `ModuleCx::set_status_bar(patch)`
-  for the default under them; `.inset_padding(..)` / `.inset_margin(..)` on an element (`SafeAreaView`, `KeyboardAvoidingView`).
+  for the default under them; `.inset_padding(..)` / `.inset_margin(..)` on an element; the safe area and the keyboard as styles: `.pt_safe_area()`, `.pb_keyboard()` (`styles.md` "Environment variables").
 - **Platform-only props** are an `android` / `ios` / `web` prop of a `JsObject` struct (an app's `ChartWeb { … }`).
 - Changing an app's component rebuilds the app's hosts and runners (`rust_app.rs`; `nsh run` does it on save), a
   component of `nsh/base` the dev hosts, `nsh-ios-app` and the Android runtime; TSX using it reloads as usual.
@@ -129,7 +142,7 @@ pub fn Chip(props: ChipProps, cx: Scope<ChipEvent>) -> impl IntoElement {
 
 A component is a function that **runs once** (`Component::view`; `#[component]` makes the unit struct named after
 the function and its `Component` impl): it makes signals and effects, then its view, under an owner of its own (the
-reactive graph of `crate::reactive`, instantiated for Rust in `ui/reactive.rs`). What changes is bound: a setter, a
+reactive graph of `crate::reactive`, instantiated for Rust in `element/reactive.rs`). What changes is bound: a setter, a
 style or a text given a closure, a signal, a memo or a `Prop` (anything `IntoReactive<T>`) is a binding, run again
 when what it read changes, and the core applies only what that one binding produced. Nothing renders again and
 nothing is diffed. Releasing the host disposes the owner: its bindings, effects, tasks, timers, back listeners and
@@ -151,12 +164,15 @@ reasons: `reactive-components.md`.
   defaults, and the TypeScript types (doc comments included: the fields' and variants', while the component's is
   its `#[component] fn`'s, `Component::DOC`; the props struct's and the event enum's own stay Rust's, and so does
   any part of a doc comment from its first heading on, `# Rust` for notes meant for Rust callers). Field and variant names become camel case in JS. An
-  event handler's argument is `value` in TS (`event` for a variant with named fields); `#[args(index)]` on the
-  variant names it (`onSelect?: (index: number) => void`). A variant of several unnamed fields names each
-  (`#[args(open, reason)] OpenChange(bool, OpenChangeReason)`): the handler takes them as its arguments
-  (`onOpenChange?: (open: boolean, reason: OpenChangeReason) => void`; `Event::spread`, the data a JS array the JS face
-  spreads). Value types
-  implement `JsValue` (numbers, `bool`, strings, `Hsla` (a CSS color string, as `Color`), `Option`, `Vec`, `JsonValue`, `ui::Style` (an inline
+  event handler gets one object (`docs/dev/api-naming.md` "Payloads"): a variant with named fields an object of
+  them; a variant of one unnamed field an object with that value as `value`, which `#[args(index)]` on the variant
+  renames (`onSelect?: (event: { index: number }) => void`); a variant of several unnamed fields names each
+  (`#[args(open, reason)] OpenChange(bool, OpenChangeReason)`:
+  `onOpenChange?: (event: { open: boolean; reason: OpenChangeReason }) => void`). `#[args(event)]` on a variant of one
+  field says its value is the event object itself, passed as it is (`#[args(event)] RowPress(DataTablePress)`); a
+  unit variant passes nothing. Value types
+  implement `JsValue` (numbers, `bool`, strings, `Hsla` (a CSS color string, as `Color`), `EdgeInsets` (`number |
+  Partial<Edges>`, as the host prop `hitSlop` takes it), `Option`, `Vec`, `JsonValue`, `element::Style` (an inline
   `StyleProp<ViewStyle>`, decoded as a host element's `style` is: transforms, shadow offsets and native animated
   values included; Rust builds one with `Style::from_decls` / `with`), `PropEnum`s, `JsObject` structs). A field that can change is a `Prop<T>` (`Copy`): in the
   instance each is a memo of its own, so a new value from JS or from a parent reaches only what read it
@@ -171,11 +187,13 @@ reasons: `reactive-components.md`.
   `ios` prop of a `JsObject` struct (an app's `ChartWeb { … }`), as for host elements.
 - **`Scope<E>`** (`Copy`) is what the component has of its own: `cx.emit(event)` (to the app's `on<Event>`, or to the
   parent's listener method, `.on_press(..)`), `cx.insets()` (its screen's or modal's insets, reading subscribes) and
-  `cx.methods(api)` (below). Everything else is a free function of `ui::prelude`.
+  `cx.methods(api)` (below). Everything else is a free function of `nsh_core::prelude`.
 - **The app's content is props too, placed by closures**: the component never creates or touches the app's elements,
   it only lays them out.
   - `header: Prop<Option<Slot>>` is `Some` while the app passes non-empty JSX for it: `props.header.place(|h|
-    h.px_4())` places it (a region; the closure styles the slot's own node).
+    h.px_4())` places it (a region; the closure styles the slot's own node and may give it props, listeners and a
+    ref: `|t| t.accessibility_state(move || ..).on_press(..)`; bindings there are live, as on the view's own nodes;
+    in a TSX app they go to the app's element in the slot, "Children, slots and rows" below).
   - `children: Prop<Children>`: `.child(props.children)` puts them all at one place among the view's own children;
     `.children_each(props.children, |child, at| view().py_3().child(child))` wraps each one (an `Each` keyed by
     the child's node: a child that stays keeps its wrapper; `at` is a `Position`: `index()`, `count()`,
@@ -193,14 +211,28 @@ reasons: `reactive-components.md`.
     the app's function in a root of its own under the component's owner (so context reaches it), inserts what it
     returns into a holder view (`componentRender`: the prop, U+001F, the key) and the holder into the host, replacing
     the key's previous one; the core places the holder as the only child of the key's placeholder (the last one placed
-    when a view places a key twice; none placed: it waits out of the tree for the `Unrender`). The roots go with their
-    holder or with the component (`core/renders.rs`; `nsh-js` `components.rs`). The decoded prop names its host, so a
-    view may pass it on to a nested component's prop. Keys are unique among a component's renders of one prop.
+    when a view places a key twice, skipping those in list cells their lists freed: a cell whose row went still reads
+    the row now at its old index until the list binds it again, so it may place the key of a row that moved to another
+    cell, which keeps showing it; none placed: it waits out of the tree for the `Unrender`). Until its holder
+    arrives a placeholder is empty, so a list cell holding one is not measured (`Core::cells_awaiting_renders`): its
+    row keeps its estimate (or its last size) and stays in the window, and is measured in the commit the holder
+    comes in; measured empty, a list in a view sized by its content would shrink that view's viewport to nothing
+    and render no row. The roots go with their holder or with the component (`core/renders.rs`; `nsh-js`
+    `components.rs`). The decoded prop names its host, so a view may pass it on to a nested component's prop. Keys
+    are unique among a component's renders of one prop.
   - `data: Prop<Rows>`: rows of data the component reads by key, `data: T[]` in TS with `#[props(generic)]` on the
-    props (the props generic over `T`, as a component with rows is; a field typed `Extract<keyof T, string>` names a
-    key TS checks against the rows' type, `nsh_base::plot::RowKey`). `Rows` reads each row's number fields once, when
-    JS sets the prop, into a column per key (`Rows::column(key)`, `NaN` where a row has no number), so the component
-    scales and draws them without calling into JS again (`nsh/base/plot`).
+    props (the props generic over `T = any`, as a component with rows is, the default for a component given no rows
+    of its own). `Rows` reads each row's number and string fields once, when JS sets the prop, into a column per
+    key (`Rows::column(key)`, `NaN` where a row has no number), so the component scales and draws them without calling
+    into JS again (`nsh/base/plot`). A `RowAccessor` prop reads a value of each row: a field name TS checks against
+    the rows' type (`Extract<keyof T, string>`), read natively, or the app's function `(d: T, index) => number`,
+    which `RowAccessor::values` calls once per row in the next JS turn whenever the rows or the function change
+    (`Rows` keeps the JS array for it, `JsHost::retain`; each call gets the app's own row object, `RowRef`), never
+    while the component draws; Rust passes `RowAccessor::key` or `RowAccessor::from_fn`. A `RowText` prop reads a
+    text of each row the same way, for what the component shows as text (a value beside a bar) or reads as a
+    category (a plot's `colorScale`): a field name, its strings as they are and its numbers written as JS's
+    `String(n)` writes them, or the app's function `(d: T, index) => string` for text the app formats
+    (`RowText::texts`).
   - `items: Items`: virtualized rows. In JS the component takes `List`'s data props (`each`, the row renderer as
     children, `keyExtractor`, `onLoadMore`, `header`, ... : `ListItemsProps<T>`, so the component is
     generic over the row type). `.list(props.items, |l| l.flex_1().estimated_item_size(px(48.0)), |row, at|
@@ -210,16 +242,16 @@ reasons: `reactive-components.md`.
 - **Elements** are `view()`, `text(..)` (its `.child(..)`ren are spans, as nested `<Text>`s: texts with styles and
   presses of their own, strings, inline views and images, regions; the core merges them into one paragraph),
   `image(..)`, the other host elements (`input()`, `scroll()`, `nsh_base`'s `nav_stack()` of `nav_page()`s and
-  `dialog()`, `canvas(painter)`, `web_view(url)` / `web_view_html(html, base_url)`, `video(url)`,
+  `dialog()`, `canvas(painter)`, `svg(src)` (an SVG drawn as authored, from an `ImageSrc` as `image`'s or `ImageSrc::svg_markup(text)`: `docs/dev/canvas.md` "SVGs"), `web_view(url)` / `web_view_html(html, base_url)`, `video(url)`,
   `input_accessory_view(native_id)` (iOS's bar over the keyboard; empty on Android), `native(name)` for the
-  embedder's components; `ui/host.rs`), strings (as texts) and other components, made as primitives are
+  embedder's components; `element/host.rs`), strings (as texts) and other components, made as primitives are
   (`chip().label("New").on_press(move || ..)`, below). `.child(..)` (an element, or
   an `Option`, a `Vec`, an array or an iterator of them: `IntoChild<M>`, its marker telling an element from what holds
   elements) / `.children(..)`
   pass it content and a slot's setter (`.header(..)`) fills the slot, as JSX children and slot props do: the content is nodes of
   this view, placed where the nested component's view places the app's; regions in it join its children in place).
   Their abilities are traits: `Styled`, `Accessible`, `Interactive` (`active` / `hover` / `focus` styles, `disabled`,
-  `hit_slop`, and the typed events every element has: `on_press`, `on_long_press`, `on_layout(Bounds<Points>)`,
+  `hit_slop`, and the typed events every element has: `on_press` / `on_long_press` / `on_press_down` / `on_press_up` (`move || ..` or `move |e: &PressEvent| ..`: position, modifiers, clicks), `on_layout(Bounds<Points>)`,
   `on_touch(TouchEvent)`, `on_pan_start`, ..., the touch responder: below), `ParentElement`, `FluentBuilder` (`when`,
   `when_some`, `map`: decided once, when the view is made). Each host element has its own props and typed events
   (every option takes a value, a signal or a closure, `impl IntoReactive<T>`, as TSX's props take a value or an
@@ -234,16 +266,22 @@ reasons: `reactive-components.md`.
   arguments (`move || ..`), or a `Listener` (a type may implement `Fn()` and `Fn(&())`, so one `From` could not take
   both: the marker `M`, inferred, tells them apart; a helper passing a listener on takes `impl IntoListener<E, M>`
   too). It runs
-  under the owner current when it was made (the component, region or row whose view made it: `Owner::scope`, no
-  batch, so writes notify as they happen), so the signals, animated values, refs and tasks it makes are that owner's
-  and go with it rather than living as long as the surface. Once that owner is disposed the listener no longer runs
-  (its view is gone). When the owner is disposed while a listener or task runs under it (a press closing the view it
-  is in, then going on), the graph's current owner becomes `reactive::DISPOSED` rather than the freed slot's id, and
+  under the owner current when it was made (the component, the run of a region or the row whose view made it:
+  `Owner::scope`, no batch, so writes notify as they happen), so the signals, animated values, refs and tasks it
+  makes are that owner's and go with it rather than living as long as the surface. Once that owner is disposed the
+  listener no longer runs (its view is gone), events already queued for its node included: a region that runs again
+  disposes its last run's owner at once, while the core drops that run's handlers only when it reconciles the region,
+  in the commit. A node made again that goes on listening to its layout reports its frame to the new run's listener,
+  as a listener added after layout learns it. This initialization targets the new run's listeners alone; listeners
+  retained from outside the region and JS handlers keep receiving frame changes. The same rule applies to a
+  placed slot: initialization uses the app element that receives the slot's handlers, while retained listeners stay installed. When the owner is disposed while a listener or task runs under it (a
+  press closing the view it is in, then going on), the graph's current owner becomes `reactive::DISPOSED` rather than
+  the freed slot's id, and
   what is made from then on goes at once: signals and memos are disposed (using them panics, as with any disposed
   signal), effects never run, cleanups run at once (a task spawned there is cancelled), animated values and refs do
   nothing. An owner put back after a nested run that was disposed meanwhile is `DISPOSED` too
   (`Graph::enter_owner` / `leave_owner` keep its generation).
-- **What comes and goes is a region** (`ui/flow.rs`): `when(cond, || el).otherwise(|| el)` (TSX `<If when={..} else={..}>`; `If::new`, deprecated, is
+- **What comes and goes is a region** (`element/flow.rs`): `when(cond, || el).otherwise(|| el)` (TSX `<If when={..} else={..}>`; `If::new`, deprecated, is
   the same) makes a branch when the condition flips to it and drops the other; `dynamic(move || ..)` (an element, an `Option`, a `Vec` or an array) is made
   again whenever what it read changes (a component in it is a new one: it runs once per element made, as in TSX);
   `each(items, |item| key, |item, index| row)` makes a row when its key comes and keeps it, its `item` and
@@ -256,7 +294,13 @@ reasons: `reactive-components.md`.
   the host itself (no view of its own); a region as the root goes in the host view.
 - **Canvases** draw what a `Painter` recorded (the Canvas 2D operations: `.fill_style(..)` / `.stroke_style(..)` take
   colors, `CanvasGradient::linear` / `radial` / `conic` and animated values; `.stroke_path(&canvas::svg_path(d))`;
-  `measure_text(font, text)` is `measureText`; operations built by hand take `painter.num(&v)` / `.paint(..)` and go
+  `measure_text(font, text)` is `measureText`; `.fill_style_from_view(initial)`, `.stroke_style_from_view(initial)`,
+  `.line_width_from_view()` and `.line_dash_from_view()` paint with the canvas view's `fill` / `stroke` /
+  `strokeWidth` / `strokeDasharray` (inherited as CSS inherits them, `currentColor` its text color), which the core
+  sets before the platform gets the drawing (`Drawing::view_paints`), so a component's shapes take the app's
+  `fill-*` / `stroke-*` classes and follow them and the appearance without being drawn again;
+  `.fill_background_from_view(area)` fills the current path with the canvas view's background (`bg-*`,
+  `bg-linear-*`: a gradient under a chart's line), which the view then draws only there; operations built by hand take `painter.num(&v)` / `.paint(..)` and go
   in with `.op(..)`; `isPointInPath` / `isPointInStroke` are `painter.is_point_in_path(point, rule)` /
   `.is_point_in_stroke(point)` and, with a `Path2D`, `.path_contains(&path, point, rule)` /
   `.stroke_contains(&path, point)`, on a painter made by a function the drawing and the press handler both call, to
@@ -275,27 +319,29 @@ reasons: `reactive-components.md`.
   | event handlers | closures (`move \|e: &E\| ..`) that write signals; `cx.emit(..)` |
   | `setTimeout` / `setInterval`, `clear*` | `set_timeout(d, f)` / `set_interval(d, f)` return a `Spawned`; `.cancel()` clears it; it ends with the component either way |
   | async work | `spawn(async move { timer(d).await; value.set(..) })` on the engine thread, tokio inside; `background(fut)` / `blocking(f)` for `Send` work on the runtime's threads (not in WebAssembly) |
-  | `fetch(url)` | `fetch(url).await` / `fetch(HttpRequest::post(url, body).header(..)).await` in a task: an `HttpResponse` (`status()`, `ok()`, `header(..)`, `text()`, `body`) or the error; the engine's network stack and capability checks, as JS's, so it works on the web too; the request is cancelled with its task |
+  | `fetch(url)` | `fetch(url).await` / `fetch(HttpRequest::post(url, body).header(..)).await` in a task: an `HttpResponse` (`status()`, `ok()`, `header(..)`, `text()`, `body`) or the error; the engine's network stack and capability checks, as JS's, so it works on the web too; the request is cancelled with its task. `asset:/` URLs (`FileAsset::uri`, `assets!()`), from both, are the app's bundled files: the engine's `Net` answers them from `EngineConfig::assets` on the runtime's blocking pool (in WebAssembly in the turn), with no capability, and downloads what the host serves at `Assets::url` (the web page's files it did not preload); either way the response carries the `asset:/` URL and the type its extension gives (`asset_type`, the dev server's table); a file the host does not have fails as a network error, and so do a path that would leave the host's directory (an empty, `.` or `..` segment, encoded or not, a backslash, a NUL or a colon: `is_inside_assets`; hosts join the path to their directory as it comes) and a method other than `GET` or `HEAD`, refused in `Net::asset` before any host reads the file or is asked where it serves it |
   | `cleanup` | `cleanup(f)` (runs before the owner runs again or goes) |
-  | `windowSize()`, `safeArea()`, `keyboardFrame()`, `colorScheme()`, ... | `window()`, `safe_area()`, `keyboard_height()`, `dark()`, `font_scale()`, `reduce_motion()`, `screen_reader()`, `rtl()`: reading subscribes |
-  | `Window.setTitleBar(style, height)`, `titleBar()`, `Window.close()` (`nsh/desktop`) | `ui::desktop::set_title_bar(style, height)`, `title_bar()`, `close_window()`; the same root commands and native controls, with title-bar insets forwarded through `ui::Environment`; `.window_drag(bool)` on any interactive element marks or excludes a native drag region |
-  | `pixelRatio()`, `Math.round(x * pixelRatio()) / pixelRatio()`, `platform.os` / `version` / `idiom` (`"desktop"`) | `pixel_ratio()`, `round_to_nearest_pixel(v)`, `os()`, `os_version()`, `idiom()`, `is_desktop()` |
+  | `windowSize()`, `safeArea()`, `keyboardFrame()`, `colorScheme()`, `lifecycle()`, ... | `window()`, `safe_area()`, `keyboard_height()`, `dark()`, `font_scale()`, `lifecycle()`, `reduce_motion()`, `screen_reader()`: reading subscribes (`layout_rtl()`, the surface's direction, is a hidden accessor for `nsh-base`'s controls only, which trade Left and Right by it: Rust's `rtl()` is dropped, apps set a view's `direction`) |
+  | `Window.setTitleBar({ style, height })`, `titleBar()`, `Window.close()`, `Window.setTitle(..)`, `minimize()`, ... (`nsh/desktop`) | `element::desktop::set_title_bar(style, height)`, `title_bar()`, `close_window()`, `set_title(..)`, `minimize()`, `toggle_maximize()`, `toggle_full_screen()`, `set_frame(..)`, `set_level(..)`, `order_front()`, `set_menu_bar_visibility(..)`; the same root commands and native controls, with title-bar insets forwarded through `element::Environment`; `.window_drag(bool)` on any interactive element marks or excludes a native drag region |
+  | `Menu.setApplicationMenu(items)`, `Menu.popup(items, at)` (`nsh/desktop`) | `element::desktop::set_application_menu(vec![MenuItem::submenu(..)])` (`None`: the default menu), `popup_menu(items)` / `popup_menu_at(items, at)` (an `Answer<()>` once it closes); `MenuItem::new(label).shortcut("mod+n").icon(asset!("new.svg")).on_select(f)`, `::role(..)`, `::separator()`, `::submenu(..)`. The same `DesktopCommand`s as JS's; a view's item ids start at 2^31, above JS's, and the core runs a view's handler (under the owner that set the menu, while it lives) when the root's `Menu` event reports it; a context menu closing goes to both sides (`element/menus.rs`) |
+  | `pixelRatio()`, `Math.round(x * pixelRatio()) / pixelRatio()`, `platform.os` / `version` / `idiom` / `desktop` / `catalyst` | `pixel_ratio()`, `round_to_nearest_pixel(v)`, `os()`, `os_version()`, `idiom()`, `is_desktop()`, `is_catalyst()` |
   | `Intl.NumberFormat()`, `toLocaleString()` (the user's locale) | `locale()` (a `Locale`: `de-DE`; reading subscribes), formatted with a Rust crate: `Intl` and the locale-aware `toLocale*String`s are JS globals of TS apps |
   | `requestAnimationFrame(cb)`, `cancelAnimationFrame` | `request_animation_frame(\|at\| ..)` returns a `Spawned`; in a task `next_frame().await` (an `Instant`), once per frame in a loop |
   | a view's `direction` style | `.direction(LayoutDirection::Rtl)` (`Styled`); the surface's direction follows the user's language |
   | `import logo from "./logo@2x.png"`, `import font from "./a.ttf"` | `const LOGO: ImageAsset = asset!("logo@2x.png");` (`image(LOGO)` lays out at its natural size), `const A: FontAsset = asset!("a.ttf");` (`.font_family(A.family)`), with `registry.assets(assets!())` (below) |
   | `Image.getSize(src)`, `Image.prefetch(src)` | `image_size(src)` / `prefetch_image(src)`: answers to await in a task |
-  | `Clipboard.writeText(text)`, `await Clipboard.readText()` / `hasText()`, `writeImage(src)`, `readImage()` / `hasImage()`, `readFiles()` (`nsh/clipboard`) | `set_clipboard(text)`, `clipboard_string()` / `clipboard_has_string()`, `set_clipboard_image(uri)`, `clipboard_image()` (an `Option<ClipboardImage>`) / `clipboard_has_image()`, `clipboard_files()`: answers to await in a task (the app's `capabilities.clipboard` applies as for JS) |
-  | `await Storage.getItem(k)`, `setItem(k, v)`, `removeItem(k)`, `keys()`, `clear()` (`nsh/storage`) | `nsh_core::storage::Storage::get_item(k)`, `set_item(k, v)` (`Err(StorageFull)` past the quota), `remove_item(k)`, `get_all_keys()`, `clear()`: synchronous (the entries are in memory on the engine thread), and the same entries the app's JS uses, so a TSX entry and a Rust entry of one app read each other's data |
-  | `announce(message)`, `setAccessibilityFocus(ref)` (`nsh/accessibility`) | `announce_for_accessibility(msg)`, `note.set_accessibility_focus()` (an `ElementRef`) |
-  | `Toast.show(msg, "long")` (`nsh/android`) | `toast(msg, ToastDuration::Long)` (nothing happens off Android) |
+  | `Clipboard.writeText(text)`, `await Clipboard.readText()` / `hasText()`, `writeImage(src)`, `readImage()` / `hasImage()`, `readFiles()` (`nsh`'s `Clipboard`) | `set_clipboard(text)`, `clipboard_string()` / `clipboard_has_string()`, `set_clipboard_image(uri)`, `clipboard_image()` (an `Option<ClipboardImage>`) / `clipboard_has_image()`, `clipboard_files()`: answers to await in a task (the app's `capabilities.clipboard` applies as for JS) |
+  | `await Storage.getItem(k)`, `setItem(k, v)`, `removeItem(k)`, `keys()`, `clear()` (`nsh`'s `Storage`) | `nsh_core::storage::Storage::get_item(k)`, `set_item(k, v)` (`Err(StorageFull)` past the quota), `remove_item(k)`, `get_all_keys()`, `clear()`: synchronous (the entries are in memory on the engine thread), and the same entries the app's JS uses, so a TSX entry and a Rust entry of one app read each other's data |
+  | `announce(message)`, `setAccessibilityFocus(ref)` (`nsh`'s accessibility API) | `announce_for_accessibility(msg)`, `note.set_accessibility_focus()` (an `ElementRef`) |
   | `safeAreaInsets()` | `cx.insets()`: the insets where the component is (the nearest screen's or modal's, else the surface's safe area) |
   | a signal or store at module level | `global::<G>()`: a `Signal<G>` of the surface, made with `Default` (shared by its components and modules) |
   | `context(default)` / `<Ctx.Provider value>` / `Ctx()` | `provide_context(value)` in the body; `use_context::<T>()` below it (through the app's elements too: a component JS made among another's JS children is under where that one places them); provide a signal to change what readers see |
-  | `createAnimatedValue`, `Animated.spring`, `interpolate` | `animated_value(0.0)` (`Copy`, kept by the current owner); `.bind_translate_y(&v)` / `.bind_opacity(..)` / `.bind_background(..)` / `.bind_border_color(..)` / `.bind_color(..)` / `.bind_shadow_color(..)` / `.bind_shadow_opacity(..)` / `.bind_shadow_radius(..)` / `.bind_scale(..)` / `.bind_rotate(..)`, `.pan_values(..)` (drags move it natively), `.pinch_value(&scale)` / `.rotation_value(&angle)` (TS `pinch={{ scale }}`, `rotation={{ angle }}`), `scroll().scroll_value(&v)`, canvas arguments (`Painter::new().fill_rect(0.0, 0.0, &v, 4.0)`); `v.spring(to, Spring::default())` / `.timing(to, ms, easing)` / `.timing_with(to, Timing { delay_ms, .. })` / `.decay(..)` / `.decay_within(.., (min, max), bounce)` return an `AnimationEnd` to await; `v.value()` (`getValue()`; after `v.stop()`, `stop()`'s promise) an `Answer<f32>`; `v.set_offset(..)` / `.flatten_offset()` / `.extract_offset()`; `ui::sample_easing` / `sample_spring` / `sample_decay` (`Easing.sample`, `Animated.sampleSpring` / `sampleDecay`) the curves, to draw them; `v.interpolate(..)`, `.interpolate_with(.., Interpolation { extrapolate_left, extrapolate_right, easing })`, `.add(..)`, `.diff_clamp(..)` derive nodes |
+  | `createAnimatedValue`, `Animated.spring`, `interpolate` | `animated_value(0.0)` (`Copy`, kept by the current owner); `.bind_translate_y(&v)` / `.bind_opacity(..)` / `.bind_background(..)` / `.bind_border_color(..)` / `.bind_color(..)` / `.bind_scale(..)` / `.bind_rotate(..)`, `.pan_values(..)` (drags move it natively), `.pinch_value(&scale)` / `.rotation_value(&angle)` (TS `pinch={{ scale }}`, `rotation={{ angle }}`), `scroll().scroll_value(&v)`, canvas arguments (`Painter::new().fill_rect(0.0, 0.0, &v, 4.0)`); `v.spring(to, Spring::default())` / `.timing(to, ms, easing)` / `.timing_with(to, Timing { delay_ms, .. })` / `.decay(..)` / `.decay_within(.., (min, max), bounce)` return an `AnimationEnd` to await; `v.value()` (`getValue()`; after `v.stop()`, the `{ value }` of `stop()`'s promise) an `Answer<f32>`; `v.set_offset(..)` / `.flatten_offset()` / `.extract_offset()`; `element::sample_easing` / `sample_spring` / `sample_decay` (`Easing.sample`, `Animated.sampleSpring` / `sampleDecay`) the curves, to draw them; `v.interpolate(..)`, `.interpolate_with(.., Interpolation { extrapolate_left, extrapolate_right, easing })`, `.add(..)`, `.diff_clamp(..)` derive nodes |
   | `Animated.sequence / parallel / stagger / delay / loop`, `.start(cb)` / `.stop()` / `.reset()` | `Animation::sequence([Animation::timing(&v, to, Timing::new(ms, easing)), Animation::delay(ms), Animation::spring(..)])`, `::parallel(..)` (`.stop_together(false)`), `::stagger(ms, ..)`, `.looped(iterations)` (`.reset_before_iteration(false)`); `a.start()` returns an `AnimationEnd`, `a.stop()`, `a.reset()` |
-  | `keymap.bind("mod+k", f, { when, repeat })`, `keymap.label("mod+k")` (`nsh/keymap`) | `on_key("mod+k", \|keystroke\| ..)` / `on_key_with(k, KeyOptions { when, repeat }, f)`, bound while the current owner lives; `key_label("mod+k")` (`⌘K`, `Ctrl+K`). The core joins the views' bindings to JS's in the root's one table (a view's after JS's: it wins on the same keystroke) and runs a view's handler itself when the root's `KeyCommand` reports it; their ids start at 2^31, above JS's (`ui/keys.rs`) |
-  | `BackHandler.onBackPress(f)`, the function it returns | `on_back_press(\|\| -> bool)`: registered while the current owner lives (only while a signal holds: inside an `effect`). After modals and before stacks, the views' listeners run newest first, then JS's; when none returns true the core sends `Command::Back`: the top stack pops, else the app exits (`ui/back.rs`) |
+  | `keymap.bind("mod+k", f, { when, repeat, passThrough })`, `keymap.label("mod+k")` (`nsh`'s `keymap`) | `on_key("mod+k", \|keystroke\| ..)` / `on_key_with(k, KeyOptions { when, repeat, pass_through }, f)`, bound while the current owner lives; `key_label("mod+k")` (`⌘K`, `Ctrl+K`). The core joins the views' bindings to JS's in the root's one table (a view's after JS's: it wins on the same keystroke) and runs a view's handler itself when the root's `KeyCommand` reports it; their ids start at 2^31, above JS's (`element/keys.rs`) |
+  | (none: a JS app's scroll view or list is its own; Rust views watch one they did not make) | `watch_scroll(target, \|e: &ScrollEvent\| ..)` (offset, content size and viewport, when first found and on every change, whoever listens to its `on_scroll`), while the current owner lives; `target` (`\|\| r.node()`) is resolved again in every commit, so a ref set later in the render is found; `NodeRef(id).scroll_to(offset, animated)` scrolls a node such a target names. The core runs a scroll watch at the end of the commit round that changed what it reports, and another round sends what it changed; a hover watch has the node listen to the pointer, as a hint's anchor (`element/watch.rs`, `core/watch.rs`; `nsh_base::Scrollbar`) |
+  | (none: JS's elements are in the order JS makes them) | `nsh_core::element::watch_order(\|\| refs, \|order: &[usize]\| ..)` (`#[doc(hidden)]`, for `nsh-base`'s roving focus; not in the prelude), while the current owner lives: the order the tree has the elements in, as indices into the list `refs` gives (those no node in the tree carries last), heard only when it differs from the list's; the core looks at the end of the commit round the watch is made in, of one after the returned `OrderWatch` is `invalidate()`d (an item came) and of one that moved a node inside the subtree the elements share (`Core::insert` of a node with a parent notes the parents it left and joined; a watch looks again when its elements' nearest common ancestor at its last look is one of them or above one: an app's keyed reorder of its elements, never a list of rows each with a group of its own reordered), and another round sends what the handler changed. A round that moved nothing there and invalidated nothing costs nothing (`element/watch.rs`, `core/watch.rs`) |
+  | `BackHandler.on("press", f)`, the function it returns | `on_back_press(\|\| -> bool)`: registered while the current owner lives (only while a signal holds: inside an `effect`). After modals and before stacks, the views' listeners run newest first, then JS's; when none returns true the core sends `Command::Back`: the top stack pops, else the app exits (`element/back.rs`) |
   | `<ErrorBoundary fallback>` | `catch_error(\|\| view, \|error, reset\| fallback)` |
   | a class TS uses (`new Tally(3)`, `tally.add(2)`, `tally.count`, `await tally.save(p)`) | `#[class]` on the struct and its `impl`, `registry.class::<Tally>()`: synchronous members run in the call, `async fn`s return promises |
   | a function returning its value (`checksum(bytes)`) | a `#[module]` function without `cx` (not `async`): it runs in the call |
@@ -309,7 +355,7 @@ reasons: `reactive-components.md`.
 | `<List viewport="parent">` (in a `Scroll` with the rest of the page) | `.viewport(ListViewport::Parent)` (`ListLayout`): laid out at its full length, its rows follow the scroll view around it; fixed when the list is made |
   | `<Feed each={rows} keyExtractor header={Header}>{row}</Feed>` (a component with an `Items` prop) | `feed().items(virtual_list(n, row).keys(move \|\| ids).header(..))` (the `Items` field's setter) |
   | `<Text>a <Text style={link} onPress={f}>b</Text> <View/></Text>` | `text("a ").child(link("b").on_press(..)).child(" ").child(view())`: one paragraph, links and inline views |
-  | `class="group"`, `group-active:`, `dark:`, `disabled:`, `selected:`, `checked:`, `activeStyle` / `hoverStyle` / `focusStyle` / `disabledStyle` | `.group()`, `.group_active(\|s\| ..)`, `.dark(\|s\| ..)`, `.disabled_style(\|s\| ..)`, `.selected(\|s\| ..)`, `.checked(\|s\| ..)` (native, no binding) |
+  | `class="group"`, `group-active:`, `dark:`, `disabled:`, `selected:`, `checked:`, `focus-within:`, `activeStyle` / `hoverStyle` / `focusStyle` / `focusWithinStyle` / `disabledStyle` | `.group()`, `.group_active(\|s\| ..)`, `.dark(\|s\| ..)`, `.disabled_style(\|s\| ..)`, `.selected(\|s\| ..)`, `.checked(\|s\| ..)`, `.focus_within(\|s\| ..)` (native, no binding) |
   | `<Button disabled={saving()} onPress={save} class="px-4 active:opacity-60">Save</Button>` | `button().disabled(move \|\| saving.get()).on_press(move \|\| save()).px_4().active(\|s\| s.opacity(0.6)).child(text("Save"))`: a setter per prop, a listener method per event |
   | `<Button class="bg-blue-500 active:opacity-70 selected:bg-green-500">` (state styles on a component) | `button().bg(..).active(\|s\| s.opacity(0.7))`: `ComponentBuilder`'s `active` / `hover` / `focus` / `disabled_style` and `Styled`'s `selected` / `checked`, on the component's root (`Styled::selected(el, \|s\| ..)` where a `selected` prop's setter comes first) |
   | `<NavPage headerClass="bg-white text-black tint-blue-500">` | `nav_page().header_style_with(\|s\| s.bg(..).text_color(..).tint_color(..))` (theme colors follow the appearance natively; `header_style(Style)`, TS `headerStyle`, wins key by key) |
@@ -326,7 +372,11 @@ reasons: `reactive-components.md`.
     slot's setter takes the content to fill it with (`.header(text(..))`), an `Items` field's a `VirtualList`
     (`.items(virtual_list(..))`); a style field's (`Prop<Style>` or `Style`: `Button`'s `selected_style`) the
     typed styles' closure, as the state styles take (`.selected_style(|s| s.bg(..).text_color(..))`), made into
-    the field's `Style` (`From<StyleRefinement>`); a render prop's (`Option<Renderer<T>>`: `TextView`'s
+    the field's `Style` (`From<StyleRefinement>`); a part that shows text takes a `TextPartStyle` (`Select`'s
+    `item_style`, `OtpInput`'s `cell_style`), the same closure, typed `StyleProp<TextStyle>` in TypeScript so the
+    app's `color` or `fontSize` check (the part's texts inherit them), and a part that edits text an `InputPartStyle`
+    (`NumberInput`'s `input_style`, `Select`'s `search_style`), typed `StyleProp<InputStyle>` for `placeholderColor`,
+    `caretColor` and `selectionColor` too; both are applied with `.inline_style(move || props.input_style.get())`; a render prop's (`Option<Renderer<T>>`: `TextView`'s
     `render_image`) the closure rendering a `&T` (`.render_image(|image| ..)`, made a `Renderer`); the children are
     the element's `.child(..)`ren;
   - a **listener method per event**, named as its TSX handler in snake case (`onPressDown` is
@@ -336,7 +386,7 @@ reasons: `reactive-components.md`.
     they handle the events instead of the app;
   - what every element takes (`Styled`, `ParentElement`, `FluentBuilder`, the inline style, animated values, insets;
     below) and `ComponentBuilder`'s `.active(..)` / `.hover(..)` / `.focus(..)` / `.disabled_style(..)` (the root's
-    states) and `.component_ref(&r)`. `ComponentBuilder` is in the prelude, so `use nsh_core::ui::prelude::*;` and
+    states) and `.component_ref(&r)`. `ComponentBuilder` is in the prelude, so `use nsh_core::prelude::*;` and
     the constructor (`use nsh_base::button;`) are all a caller imports.
 
   A prop's setter is an inherent method, so it comes before a trait's method of the same name: `nsh_base`'s
@@ -352,17 +402,17 @@ reasons: `reactive-components.md`.
   `Component::element(props)` (the props struct whole) and `ComponentElement::on_event` (every event, typed) remain
   for components implemented by hand (`impl Component for X`, which get no constructor) and code generic over
   components; Rust views use the constructors.
-- **Platform services** are free functions (`ui/ambient.rs`): `dialog(Dialog)` (deprecated for apps in favor of
+- **Platform services** are free functions (`element/ambient.rs`, exported from `element` and the prelude): `dialog(Dialog)` (deprecated for apps in favor of
   `nsh_base::alert_dialog()`, which calls it) shows an alert or action sheet and returns a future of the index
   chosen (-1: dismissed; the answer is the root's `Dialog` event, which the core resolves; JS never sees it); `dismiss_keyboard()`, `animate_layout(..)`, `announce_for_accessibility(..)`,
-  `toast(..)`, `set_color_scheme(..)`, the clipboard (`set_clipboard`, `clipboard_string`,
+  `set_color_scheme(..)`, the clipboard (`set_clipboard`, `clipboard_string`,
   `clipboard_has_string`), the image information (`image_size`, `prefetch_image`), display frames
   (`request_animation_frame`, `next_frame`: the core keeps the waiting tasks' answers, the engine asks the platform
   for a frame while one waits, `MountSink::request_frame`, and delivers it at `EngineControl::frame`), and the status
-  bar (below); they are actions the core applies in order with the view's other changes (`ui/services.rs`,
+  bar (below); they are actions the core applies in order with the view's other changes (`element/services.rs`,
   `core/services.rs`). They work wherever the core runs Rust code: a view's body, its bindings, listeners and tasks,
   and modules.
-- **Animated values** (`ui/animated.rs`) are nodes of the platform's animation graph with odd ids (JS's are even, like
+- **Animated values** (`element/animated.rs`) are nodes of the platform's animation graph with odd ids (JS's are even, like
   node ids: the graph indexes nodes by id, so both must stay dense; ids from 2^31 are the graph's own composite steps).
   `AnimatedValue` and `AnimatedNode` are `Copy` handles, as signals are: the owner current when one is made (the
   component, a region, a row; `reactive::Kept`, a slot of the graph holding the node's `Rc`) keeps the node and releases
@@ -382,7 +432,7 @@ reasons: `reactive-components.md`.
   JS the rest). An `Animation` is sent whole as one `AnimationOp::StartComposite` and runs in the graph step after step;
   its composite key (odd, JS's even) is what `reset()` restores by, and dropping the last handle releases it (a run
   going on goes on).
-- **Element refs** (`ui/element_ref.rs`) hold the node of the element that carries them, set when the element is applied
+- **Element refs** (`element/element_ref.rs`) hold the node of the element that carries them, set when the element is applied
   and cleared when it goes; their commands go out through the executor, and an event's handling applies them right after
   its own changes, so they keep their order. `ElementRef` and `ComponentRef` are `Copy` handles kept by the owner
   current when they are made, as animated values are; the element carrying one holds what it names (`RefTarget`) while
@@ -392,9 +442,9 @@ reasons: `reactive-components.md`.
   the platform. `text_index_at(point)` on a text block's ref waits the same way and is answered from the block's last
   final layout (`Core::text_index_at`, the text engine's `index_at`).
 - **Element attributes for system UI**: `.inset_padding(insets)` / `.inset_margin(insets)` add to the padding /
-  margin the styles resolve to (what `SafeAreaView` and `KeyboardAvoidingView` use, so the app's own padding stays),
-  `.inline_style(props.style)` applies a `ui::Style` prop (a value or a binding).
-- **A `ui::Style` holds JS's declarations, Rust's typed styles or both**: JS decodes a style object into declarations
+  margin the styles resolve to (a dialog's or a component's system insets, so the app's own padding stays; `env()` terms add the same way),
+  `.inline_style(props.style)` applies a `element::Style` prop (a value or a binding).
+- **A `element::Style` holds JS's declarations, Rust's typed styles or both**: JS decodes a style object into declarations
   (`StylePatch`, applied as the prop it goes to: `selectedStyle`, the inline style); a Rust caller's closure gives typed
   styles, which the element that takes the style (`.selected_style(..)`, `.checked_style(..)`, `.inline_style(..)`) adds
   to its own in the state's variant, as `.selected(|s| ..)` would (theme colors follow the appearance natively, bound
@@ -421,7 +471,10 @@ implements `Api`, the view registers it with `cx.methods(CounterApi { .. })` for
 `#[component(methods = CounterApi)]` (`Component::METHODS = Methods::of::<CounterApi>()`) names it in the spec, so the
 JS face builds the ref (`CounterRef`: `node` and the methods, typed from the Rust signatures and docs) with no TS
 written. A call converts its arguments in the JS call into a closure an op carries (`RustCall::Method`), so it runs
-in order with the props JS set before it, with the API the view registered. Its return type decides what TS gets:
+in order with the props JS set before it, with the API the view registered. JS gets the ref as the component is
+made, before its view is (that waits for the commit, and for the host to be in the tree): a call made then, from
+the ref callback, waits in the core for the view and runs right after it is made (one whose host goes first fails
+with its host). Its return type decides what TS gets:
 a method returning `()` gives `void`, with no reply (JS calls it and moves on, a wrong argument throws in the call);
 one returning `Result<(), E>` gives `Promise<void>` (rejected with the `Err`'s message: the method runs at the
 commit, after the JS call returned, so it cannot throw); one returning a value gives `Promise<T>` (a wrong argument
@@ -432,7 +485,10 @@ ends (`MethodRun::Async`): its arguments are converted in the JS call (a wrong a
 component's owner holding the API (`Rc`), so it awaits timers, `fetch`, `background` work or signals as any task of
 the view does; its value, an `Err`'s message or a panic's settles the promise (`Action::Return`), and the component
 going first rejects it ("the component went away before the method finished"). Rust calls the methods directly:
-`ComponentRef::api::<CounterApi>()` (an `async` one is awaited there).
+`ComponentRef::api::<CounterApi>()` (an `async` one is awaited there). A command (a method returning `()`) given an
+id, a key or an index the component does not have (`DockArea.selectTab`, `DiffView.goToHunk`, `Editor.fold`,
+`DataTable.scrollToRow`, ...) does nothing and logs a `log::warn!` with the method and the value: it runs at the
+commit, so it cannot throw, and a silent no-op would hide the app's bug.
 
 ## Modules
 
@@ -457,22 +513,22 @@ Parameters are `Arg`s: the `JsValue` types, instances (`Instance<T>`) and `Callb
 or a task, instances and functions ride in its closure as they are (`docs/dev/rust-classes.md`, "How calls
 cross"). A panic in an op rejects it (its actions dropped). `Registry::module::<M>()` registers it; `components.rs` builds
 the object. A module with a component's name is merged into it (the component gets static
-functions). `Registry::reexport` re-exports environment values (`safeArea`, `safeAreaInsets`, `keyboardFrame` in `nsh/base`:
+functions). `Registry::reexport` re-exports environment values (`safeArea`, `safeAreaInsets`, `keyboardFrame` in `nsh`:
 `nsh-js` `env.rs`) under the registry's module, and `Registry::native_values` names the
 values `nsh-js` makes for it (`nsh/base`'s `NavStack`, `NavPage`, `Dialog`, `createNavStack`: `navigation.rs`).
 
 The runtime's Rust modules are written the same way (`crates/nsh-core/src/runtime/`,
-`runtime::registries()`): one `Registry` per JS module (`Registry::runtime("nsh/clipboard")`), always served, which the
+`runtime::registries()`): one `Registry` per JS module (`Registry::runtime("nsh/mobile")`), always served, which the
 core always serves (`Core::set_components` merges the UI sets after them); a call carries what it runs, so a
 runtime module's functions never clash with an app set's of the same name. Runtime modules
-use the same services as components (`cx.toast`, `cx.announce_for_accessibility`, `image_size`), and the core's
+use the same services as components (`cx.announce_for_accessibility`, `image_size`), and the core's
 internal actions for the rest (exiting the app, a ref's accessibility focus).
 `#[module(flat)]` exports functions one by one (top-level exports, not an object's). `#[module(name = "test")]` names a
 module's object in JS (the type's name otherwise); a module named like a function a flat module of the set exports
 is merged into it as into a component: its functions and constants are the function's properties (`test.skip(..)`,
 `describe.only(..)`: `Registry::function_members`; TS declares a namespace of the function's name, and the module is
 no export of its own). A function returning `Result` rejects
-the promise with the error (throws, when it runs in the call); a `NodeRef` parameter is a `YNode` in TS (the node's
+the promise with the error (throws, when it runs in the call); a `NodeRef` parameter is a `ViewRef` in TS (the node's
 id, and its object again as a result).
 
 ## Classes
@@ -523,7 +579,7 @@ statics, and `async fn`s (`this: Instance<Self>` first, for a method) members re
 ## The status bar
 
 The status bar follows UIKit: the topmost view controller decides (`preferredStatusBarStyle`), Info.plist holds the
-default. `ui/status_bar.rs` layers the surface's settings (`StatusBarSetting`: style, hidden, animated, each optional),
+default. `element/status_bar.rs` layers the surface's settings (`StatusBarSetting`: style, hidden, animated, each optional),
 one `StatusBars` per surface, owned by the core. At the bottom is the app's default: `nsh.json` `"statusBar"` (the
 entry's `setup` sends `Command::SetStatusBar`; a Rust app's `Root::status_bar`) and `ModuleCx::set_status_bar(patch)`,
 which patch it. Over it, each screen and modal with a `statusBar` (`ScreenProp::StatusBar`, pages and dialogs share
@@ -536,7 +592,7 @@ the merged result when it differs from the last one sent.
 
 ## Tasks
 
-`ui/task.rs`: a small executor of the core runs futures on the engine thread, so they may hold signals and other
+`element/task.rs`: a small executor of the core runs futures on the engine thread, so they may hold signals and other
 `!Send` handles. Each poll runs inside a tokio runtime's context (`Core::set_task_runtime`; the engine's
 `EngineConfig::runtime`, else one runtime of two threads shared by the process), so the tokio ecosystem works in a
 task: network and file IO, channels; `background(fut)` / `blocking(f)` run `Send` work on the runtime's threads. A
@@ -554,14 +610,63 @@ owner's; awaiting a `Spawned` gives its output.
 
 ## Environment
 
-The engine hands the core what views may read (`ui::Environment`: window, safe area, keyboard height, appearance,
+The engine hands the core what views may read (`element::Environment`: window, safe area, keyboard height, appearance,
 font scale, reduced motion, screen reader, direction, pixel ratio, OS, its version, idiom, locale). The core keeps
-each part in a signal of the surface (`ui/ambient.rs`), as it does the theme, the globals and each screen's or modal's
+each part in a signal of the surface (`element/ambient.rs`), as it does the theme, the globals and each screen's or modal's
 insets: `window()` and the like read them, so a binding that read a part runs again when it changes and nothing else
 does. The surface's direction follows the user's language: its root's (`Prop::LayoutDirection`, which JS sets from
 the language), else the platform's; in a Rust app the core sets the root's direction from the language from the start
 and again when it changes. A view's `direction` style sets its subtree's, and each node's resolved direction is what
 layout, text and overlay placement read.
+
+## In a terminal
+
+In the Terminal idiom (`idiom() == Idiom::Terminal`, the terminal backend) `nsh-base`'s controls show the terminal's
+own form of themselves, as system UI keeps the platform's look elsewhere: text from the terminal's palette, laid out at
+its natural size on the Cell grid, so the painter draws it as any text and never guesses a control from GUI geometry.
+The app's indicator parts are not mounted there (their `*Class` / `*Style` / slot are ignored); the control's `class`,
+`style`, every prop and event, and the app's children (labels) stay. The state the terminal marks natively (the
+focused control, the selected or active row, the hovered item, a disabled control) is the painter's, from the roles and
+accessibility states the components report (listbox, tree and tab rows their selected state, menu items their focus, checkable ones their checked state, every control its disabled one), never a reverse or dim of their own, so the bandless look of a terminal without known colors marks them too. The marks' colors (`terminal::Tone`): what is on in the accent (`terminal::ACCENT`, a saturated blue the terminal draws as its own palette's blue), what is off in the theme's muted foreground; every state also reads by shape alone, and a disabled control is the painter's to fade; a `Select`'s list, a `Combobox`'s popup and menus are anchored overlays, which the painter raises as popovers. The glyphs and the helpers that build them are in one place,
+`crates/nsh-base/src/terminal.rs` (`nsh_base::terminal`), for the components, the painter and these docs.
+
+| Component | Terminal form |
+|---|---|
+| `Checkbox` | `[✓]` (the `✓` in the accent), `[ ]` (muted) or `[–]` (the dash in the accent) and a space in place of the indicator, then the children in a view of their own beside it (a column: a choice card's title over its description) |
+| `Radio` | `(●)` (the dot in the accent) or `( )` (muted) and a space before the children, in a row (an app's own dot among its children is the app's to leave out) |
+| `Switch` | a checkbox's mark and a space in place of the track and thumb: on `[✓]`, off `[ ]`, as terminal apps show an on / off setting (a knob on a track would read as a slider); the role stays a switch for screen readers |
+| `Slider` | one row of `─` as wide as the slider, `━` from `min` to the value (a range: between its thumbs) in the accent, the rest muted, a `●` view per thumb on its value's Cell (focus, keys, drags and screen readers as elsewhere); vertical: a column of `│` / `┃` |
+| `Progress` | one row as wide as the bar: full Cells `█`, the partial Cell by eighths `▏▎▍▌▋▊▉`, then `░`, the filled Cells in the accent; indeterminate: a four-Cell segment moving one Cell every 120 ms (only while indeterminate; reduced motion: `░` only) |
+| `ColorSlider` | one row of Cells over the slider's width, each filled with the channel's color at that point of the track (role `Image`, hidden from screen readers: the terminal paints it as the color itself, quantized at 256 colors, no fill where it paints none) the thumb a `│` on the Cell of the value (`terminal::COLOR_THUMB`), no line along the track; the slider is the focusable adjustable control, keys as elsewhere, a press or a drag on a Cell picks its value (`color_picker/tui.rs`) |
+| `ColorArea` | a grid of such Cells filling the area, as many as its width and its whole rows hold (at most 240 by 64): the hue at each column's saturation and each row's brightness, the picked Cell `◆`; keys, presses and drags as elsewhere |
+| `ColorSwatch` | its color as such a fill, four Cells by one row unless the app sizes it; no checkerboard |
+| `Calendar` | `cal`'s month: each day its number, right-aligned in a column of two Cells, the columns two blank Cells apart (26 Cells a month; months two Cells further apart), the weekdays' and the header's labels the app's `renderItem`'s; the calendar draws the days, the years and the `‹` / `›` arrows itself as text and leaves out `itemClass` / `itemStyle`; today bold, the days of the months around muted; the painter bands the selected days and fades the disabled ones from their states; the weekdays over their columns (labels, 24pt apart); the month and year views (four years a row) centered in the days' width, so the calendar keeps its width as the view changes |
+| `Pagination` | a row of words: Previous, the pages, `…` and Next as text without `itemClass` / `itemStyle` (the app's `renderItem` content kept), two blank Cells apart (an ellipsis a Cell of padding on each side besides the row's gap); the painter bands the current page from its selected state |
+| `NumberInput` | with `controlsRight`, the decrement and the increment side by side on the field's row (− then +), not one over the other |
+| `Select` | one row: the app's `trigger` content, or without one the chosen titles (the app's `placeholder`, muted, while nothing is chosen); the marks over the end of the trigger's band (`terminal::trigger_marks`), each in a slot of three Cells that takes the press (`terminal::mark_slot`): `▾` on the Cell before its last (the last blank, matching the Cell of padding before the text), `×` three Cells before it in place of `clearButton`, muted, in the accent while the trigger is focused or open, pressed or hovered, dim with a disabled trigger; the app's `trigger` leaves those Cells free (three, six with the clear), base's own content leaves them as a box of their width after it; a press on `▾` opens or closes the list; the list opens under it (no cover) |
+| `Combobox` | the input one row (no `inputClass` / `inputStyle`), `×` and `▾` in place of `clearButton` and `triggerButton`, on its row in slots of three Cells side by side that take the press, a blank Cell after the `▾`, muted and lit as a `Select`'s; the app's `prefix` and `suffix` a Cell apart from them |
+| `DatePicker` | the app's `trigger` with a `Select`'s marks over its band's end (`▾`, and `×` in place of `clearButton` while it has a date to clear) |
+| list rows (`Select`, `Combobox`) | each item's title from the row's start, `✓` at the row's end while chosen (a blank Cell while not, a blank Cell before it), one full-width row; headers their title, bold and muted; the list as wide as its widest row, at least the trigger's width; no `renderItem`, `renderGroup` or row classes |
+| `Command` rows | the app's `renderItem` content, without `itemClass` or `itemStyle`: the terminal marks the highlighted row (its projected `focus:`) as one band over the whole row |
+| `OtpInput` | its field (`caret(false)`) is no wider than a Cell and stands on the middle Cell of the cell that takes the next digit, so the terminal's own cursor shows where it goes; an empty cell shows its slot, `·` muted (`terminal::OTP_EMPTY`), a masked digit `●` (`terminal::OTP_MASK`); the cells' look is the app's `cellClass`: with a border and no fill a cell is a framed box (three rows, its digit in the middle), the painter drawing the next cell's line in the accent |
+| `Tabs` | no indicator; the tabs in a row, two Cells apart; the painter draws the selected tab bold (a band only while focused) and the others muted, from each tab's selected state |
+| `MenuItem` | a checkable item is its content from the row's start, then the mark at the row's end in place of the indicator: `✓` checked, `●` on a checked `menuitemradio` item, a blank Cell unchecked, so the titles start in one column and the marks line up at the right |
+| `Submenu` | its trigger is one menu item row: the trigger's content, then ` ›` in the theme's muted foreground |
+| `MenuSeparator` | a row of `─` across the menu |
+| `AccordionTrigger` | `▸ ` closed / `▾ ` open, then the children in a row of their own a Cell apart (the trigger's own gap does not part them from the disclosure; an app's own chevron is the app's to leave out) |
+| `AccordionPanel` | its content after two blank Cells, under the trigger's title |
+| `Tree` | a row the tree draws (no `renderItem`): two Cells of indent a level, `▸ ` / `▾ ` on a folder, two spaces on a leaf, the label; an app's row (`renderItem`) is the app's, its folders marked by the painter in the leading columns the terminal's layout gives a disclosure |
+| `TextView` | blocks are one blank row apart, headings included, with no blank row after the last; a rule draws nothing; a heading is its text without the `#` marks, set in bold over its inline styles: h1 and h2 in the accent, h3 in the foreground, h4 and below muted, and h1 alone ruled with `─` across the view in the line color; list markers are text a Cell before the content (`1. ` right-aligned to the widest number, `• ` / `◦ ` / `▪ ` by depth) and stay on their item's first row, a task's `☐` / `☑` (the accent when checked); a footnote reference `[1]`; a quote has `▎` in the accent a Cell before its text, the text muted; a code block is a band one Cell wider than its longest line on each side (its lines wrap at the view's width), under its language as ` ts ` on the line color; an alert is one band from the body text's left edge to its right, a Cell of padding, its icon and then its text, tinted (on 16 colors and mono, a `│` in its color down its left side); a table is rows of Cells ruled `┌─┬─┐`, `│`, `├─┼─┤`, `└─┴─┘`, a Cell each side of a cell's text, the header bold, its widest column narrowed a Cell at a time (to six at least) until it fits the view, cells wrapping; an image alone in its paragraph reads as `[alt]` on a line, muted (left out with its row when it has no alt text); a formula without the app's `renderMath` is read as text on a band, its TeX's commands their Unicode symbols, `\text{…}` its content, `\frac{a}{b}` `a/b`, spacing a space (`text_view/math.rs`) |
+| `RichEditor` | a list marker in flow before its item's content, a space after it, numbers right-aligned to the list's widest (Cells round the indent it sits in elsewhere); a table's box closed on every side; a `blockquote` (its `to_dom` tag) has `▎` in the accent down its left side, a Cell before its blocks; an `hr` is a row of `─` across the editor, in place of the app's hairline (`horizontalRule` part); the caret is the terminal's own cursor, at the sink, which sits on the caret's Cell |
+| `DataTable` | a sortable title's indicator is text: `↑` ascending, `↓` descending, `↕` unsorted |
+| `Scrollbar` | nothing: the terminal draws its own scroll bars |
+| `Tooltip` | a line, not a bubble: its children on the status line, the viewport's bottom row (`status_line.rs`), at once while the focus or the pointer is on its trigger (the pointer's over the focus's, a toast's message over both); the core's hint overlay follows the trigger and asks as elsewhere, shown with no size and holding the line; no `delay` but `Infinity`, no look or transitions of its own |
+
+Rows that fill a width (a slider's track, a progress bar, a separator) are `terminal::line`: a view one Cell by
+itself, stretched by its parent, whose text is made for the number of whole Cells its frame holds (`on_layout` over
+the width of one glyph, `measure_text`, which is one Cell in the terminal's text engine), one line, clipped. The checks
+are static (`is_terminal()` once per component): outside a terminal no node or binding of the terminal forms is made.
+Tests: `crates/nsh-base/tests/base/terminal.rs`.
 
 ## Assets
 
@@ -569,10 +674,13 @@ A crate ships files in its `assets/` directory, as TS imports them: `asset!("log
 relative to `assets/`) reads the file at compile time and is an `ImageAsset { url, size, scales }` (the natural size in
 points, `Size<Points>`: `@2x` / `@3x` divide the pixels; `scales` lists the `@1.5x`–`@4x` siblings of a file named
 without a density, which `assets!()` ships and images pick from by the screen's pixel ratio, as for TS imports), a
-`FontAsset { uri, family }` (`.ttf`, `.otf`: the family from the font's name table) or a `FileAsset { uri }`; a missing
+`FontAsset { uri, family }` (`.ttf`, `.otf`, `.woff`, `.woff2`: the family from the font's name table, a WOFF's of the font it holds) or a `FileAsset { uri }`; a missing
 or unreadable file fails the build (a variant too, and one whose pixels are off its scale), a changed one builds the
-crate again (`include_bytes!`). An `.svg` is a `FileAsset`, where TS's import gives an `ImageAsset` (the macro reads
-no SVG: sizing one takes usvg): `image(ICON.uri)` shows it, laid out by its style.
+crate again (`include_bytes!`). An `.svg` is an `ImageAsset` too, as TS's import gives, with no `scales` (a vector
+draws for any pixel ratio): its size in points is its root's `width` and `height` in absolute units (else one of them
+and the `viewBox`'s ratio, else the `viewBox`'s size), read by the macro's own small parser of the root tag (a proc
+macro cannot use usvg); one sized in `em` / `ex`, or by what it draws, fails the build. `svg(asset!("icon.svg"))` draws
+it as vectors, `image(asset!("icon.svg"))` as a raster.
 The URI is `asset:/@<package>/<path>`, apart from the app's own files. The registry
 ships the directory: `registry.assets(assets!())` lists every file (`AssetFile`: URI, the file where the crate was
 built, kind), which `nsh` (`rust_app.rs`, from the description of the set: each file's path and source) serves in development and
@@ -586,8 +694,8 @@ copies into packages next to the imported assets, and whose fonts the engine reg
 follow Tailwind's default scale, independent of the app's Tailwind theme. They cover what classes and styles do:
 per-side borders and colors (`.border_t(px(6.0)).border_t_color(..)`), `.border_dashed()`, per-corner and start / end
 radii (`.rounded_tl(..)`, `.rounded_ss(..)`), `.border_curve(BorderCurve::Continuous)`; shadows of their own
-(`.shadow([BoxShadow { .. }])`, React Native's `.shadow_opacity(..).shadow_radius(..).shadow_offset(..)`,
-`.shadow_color(..)` for both and the presets), `.inset_shadow_sm()`, rings, outlines, text shadows; 3D transforms and
+(`.shadow([BoxShadow { .. }])`, `.shadow_color(..)` for them and the presets), `.inset_shadow_sm()`, rings, outlines,
+text shadows (`.text_shadow([TextShadow { .. }])`, the presets, `.text_shadow_color(..)`); 3D transforms and
 skews, `.transform_origin(..)` / `.origin_top_left()`, `.backface_hidden()`; decorations (`.underline().line_through()`
 draw both, `.text_decoration_wavy()`, `.text_decoration_color(..)`), `.uppercase()`, `.tabular_nums()`,
 `.writing_direction(..)`; gradients (`.bg_linear_to_br().gradient_from(..).gradient_via(..).gradient_to(..)`,
@@ -595,7 +703,7 @@ draw both, `.text_decoration_wavy()`, `.text_decoration_color(..)`), `.uppercase
 `.mix_blend_mode(..)`, the pointer (`.cursor_pointer()`, `.cursor(Cursor::Text)`), transitions (`.transition_colors().duration(150.0).ease_out()`), keyframes (`.animate_spin()`; with TS's own timing keys
 `.animation(KeyframeAnimation::new(Keyframes::Spin).duration(800.0))`),
 grids (`.grid_cols(3)`, `.col_span(2)`), `.flex_grow(n)`. Tailwind's palette is typed too
-(`ui::palette::SKY.shade(500)`). An element records declarations (`StyleRefinement`); the core lowers them into the
+(`element::palette::SKY.shade(500)`). An element records declarations (`StyleRefinement`); the core lowers them into the
 same rules Tailwind classes compile to (`ClassList`), cached and shared between elements with the same styles. There
 is no string to parse and no `.class()`; the one way classes reach a view's element is the app's:
 `.app_class(props.heading_class)` (a prop of the app's Tailwind classes for one of the component's parts,
@@ -623,13 +731,21 @@ it changes, and they are resolved again when the tokens change (`Components::app
   `.project_checked(props.checked)` / `.project_indeterminate(props.indeterminate)` / `.project_disabled(props.disabled)`
   (`gpui-base`'s `SwitchThumb::new(checked)`, `CheckboxIndicator::state(..)`): the app writes `checked:` /
   `indeterminate:` / `disabled:` in the part's class, and only the control's root is an accessibility element.
+  `.project_focused(..)` does the same for `focus:` on the part the keys act on while the control keeps the
+  platform's focus (a list's highlighted option, the cell of a code input that takes the next character): NSH has
+  no active descendant, and the platform's focus stays where it is.
+  What a part shows beyond the states screen readers hear is a boolean `data-*` attribute:
+  `.project_data("range-start", is_start)` (`Prop::ProjectedData`) applies the part's `data-range-start:` classes and,
+  with `group`, the `group-data-range-start:` ones inside it, as Tailwind's `data-*` variants; a view whose classes
+  read none sends nothing when its attributes change. A component names its attributes in its docs, as a calendar's
+  days do (`data-range-start`, `data-today`, ...) and a code input's cells (`data-filled`).
 - What never changes is plain Rust, decided when the view is made: `.when(variant == Variant::Ghost, |v| ..)`.
 - The app's `class` / `classList` on a component (Tailwind) is merged after the root's rules; at equal rank it wins.
   The styles a view gives a nested component element merge the same way (bound ones too: `Patch::Nested`).
 
 ## The theme
 
-The core has no theme, as GPUI has none: it keeps **design tokens** (`ui::Tokens`: colors with a light and a dark
+The core has no theme, as GPUI has none: it keeps **design tokens** (`element::Tokens`: colors with a light and a dark
 value, numbers and font families, named as CSS custom properties without `--`: `muted-foreground`, `radius`,
 `font-sans`), gives no name a meaning but `font-sans` (the app's default font, as Tailwind's `--font-sans` is a
 page's; `font-mono` is the monospaced one) and has none of its own. The theme is `nsh/base`'s: `nsh_base::Theme`
@@ -640,7 +756,7 @@ page's; `font-mono` is the monospaced one) and has none of its own. The theme is
 `theme().sidebar_ring`, `theme().radius`), plus Tailwind's fonts `font-sans` / `font-mono` (`theme().font_sans`,
 `theme().font_mono`; `None`, the system's fonts). `theme()` returns the theme of the tokens drawn with now, made once
 per change of them; an app's own tokens are read by name (`theme().color("up")`). The defaults are shadcn's `neutral` theme (`default-theme.json`, `radius` 0.625rem = 10 pt); no component of
-`nsh/base` draws with them but `TextView`'s reading typography.
+`nsh/base` draws with them but `TextView`'s reading typography and the default looks of `Editor` and `DiffView`.
 
 A theme file is shadcn's registry `cssVars`, as shadcn and tweakcn export them: `{ "cssVars": { "theme": {…},
 "light": {…}, "dark": {…} } }` (`theme`'s values in both appearances, `light`'s in the light one and in the dark one
@@ -656,13 +772,21 @@ them (`bg-surface`, `bg-up/30`, `rounded-(--radius-card)`; `styles.md`) and TS r
 `interface Tokens`, which nsh writes per app into `.nsh/types/nsh/tokens.d.ts` from the theme
 (`nsh_bundler::tokens_declaration`). The bundler checks the
 theme; the entry hands the file to the renderer (`nsh:rt` `setup`), which sends it to the root (`uiTheme`) before any
-view is made; the core makes tokens of it with what a UI set brings (`Registry::tokens_from`: `nsh/base`'s
-`tokens_of`, which also gives the defaults when the engine starts). A Rust app's root carries them
-(`Root::tokens`). `nsh_base::theme()` reads the tokens from a signal of the surface (`ui::ambient::tokens`): new
-tokens run again the bindings that read them. An embedding app can give a surface its own (`Core::set_host_tokens`,
-`EngineControl::set_tokens`; sent from `Engine::start_with`'s `setup` they are in the first frame): they win over the
-app's until cleared, and the app's names they lack stay, so an embedded app looks like its host (`embedding.md`, "GPUI
-and GPUI Kit apps").
+view is made and has `token()` read its tokens at once (`Core::theme_tokens`, given to JS before the bundle runs: the
+op reaches the core only after the turn of the first render, which reads them already); the core makes tokens of it
+with what a UI set brings (`Registry::tokens_from`: `nsh/base`'s `tokens_of`, which also gives the defaults when the
+engine starts). A Rust app's root carries them (`Root::tokens`), and an app that picks its theme while it runs sets
+them with `element::set_tokens(tokens)` (`set_tokens(theme.into())` of an `nsh_base::Theme`; the setter beside the
+`tokens()` accessor, as `set_color_scheme` is beside `color_scheme()`). The core sends the tokens drawn with to the
+platform when they change (`Command::Tokens` on the root), which colors its own controls with them (Linux's menus:
+`docs/dev/linux.md`; Android's alerts and action sheets: `popover` behind, `popover-foreground` for the title and
+the options, `muted-foreground` for the message, `primary` for the buttons and `destructive` for a destructive action,
+over the system dialog's shape; iOS's alerts take `primary` as their tint, which iOS 17 draws the regular and cancel
+actions in and iOS 26 does not use; an app without a theme of its own keeps the system's colors on both). `nsh_base::theme()` reads the tokens from a signal of
+the surface (`element::tokens`): new tokens run again the bindings that read them. An embedding app can give a
+surface its own (`Core::set_host_tokens`, `EngineControl::set_tokens`; sent from `Engine::start_with`'s `setup` they
+are in the first frame and JS's first render): they win over the app's until cleared, and the app's names they lack
+stay, so an embedded app looks like its host (`embedding.md`, "GPUI and GPUI Kit apps").
 
 ## The host node and ids
 
@@ -688,7 +812,9 @@ forgotten.
 A view JS made (`<Chip>` in TSX) is made when its host is first in the root's tree, so it is under the view that
 placed it: it adopts the owner of the nearest component above it (where that one places its JS children, else its
 own owner), and `use_context` and failures reach that far (`owner_above`, `adopt`). Until then it waits
-(`components.waiting`).
+(`components.waiting`). A component a Rust view passes as a nested component's content (`tabs().child(tab())`)
+joins that host as JS children do (`Instance::joined`) and waits the same way, so it reads the context of the view
+that places it, not only its maker's.
 
 JS allocates even node ids (from 2), the core odd ones (from 3), so both id spaces stay dense and never collide. JS
 never sees the made nodes; their events are the component's (below).
@@ -708,8 +834,9 @@ what changed.
 - **Regions** are effects too (`Patch::Region`): the core reconciles that region's nodes alone, in place among its
   parent's other children before the region's anchor (the next static node, or the next region's first node);
   keyed elements (an `Each`'s rows) match by key and stay. Each element of a region is made under an owner of its
-  own (the branch, the row), disposed with what it made when the element leaves; a region in a nested component's
-  content joins that component's children in place (`join_nested_at`).
+  own (the run of a `dynamic`, `when` or `catch_error`, the row of an `each`), disposed with what it made when the
+  element leaves: a region that runs again disposes its last run's; a region in a nested component's content joins
+  that component's children in place (`join_nested_at`).
 - **Failures**: Rust code of the view (its body, a binding, a listener, an effect, a task) runs shielded. A panic
   disposes the owner it happened under and goes to the nearest `catch_error` above it (`boundary_of`), else it is
   logged (`js` target). A panic never unwinds through the graph.
@@ -734,13 +861,49 @@ what changed.
   component goes, they leave its view and stay (JS's, or the content of the view above).
 - Named slots: the JS face creates one holder view per slot **the app passes** (`componentSlot`), filled with that
   prop's JSX. `Prop<Option<Slot>>` is `Some` while the holder has children (the core sets it when it fills or
-  empties); `place(..)` is a region of it, and the slot's element *is* the holder: its styles and handlers apply to
-  it, the core places it but never releases it (it is JS's).
+  empties); `place(..)` is a region of it, and the slot's element is the holder: the core places it but never
+  releases it (it is JS's). Its bound parts are bindings (`Patch`es), as on the view's own nodes. The element's styles
+  (and what shapes the holder's box) apply to the holder. A holder the place does not style (its layout style a
+  view's that nothing styles, `place(|s| s)` or listeners and props only) holding one node is laid out through, as a
+  Rust fill placed as it is: that node is an item of the holder's parent in its place (`layout_tree.rs`, "holders
+  laid out through", `LayoutTree::set_holder`), so the app's `flex: 1`, `alignSelf`, `margin-left: auto` or a
+  percentage on its element act in the component's layout as on the component's own child; the holder takes the
+  node's box and the node sits at its origin, so the native views keep their tree. A holder the place styles, or
+  holding several nodes, is a box of its own (a column, as any view). A render's holder (`componentRender`) follows
+  the same rule in its placeholder. Everything else the element gives (accessibility, `disabled`,
+  `focusable` and other host props, listeners, touch responder, element ref: `core/slots.rs` `split`) goes to the
+  slot's target: the app's element when the holder holds exactly one (not raw text or a list), else the holder. So the
+  app's `active:` / `focus:` / `disabled:` classes and state styles on its own element follow the presses, focus and
+  `disabled` the component gives it, and a ref measures the app's element (a popup anchored to what it draws goes by
+  its own box, as a Rust fill's: below). The target follows
+  the holder's content (JS inserting or removing in it, `Core::retarget_slot`). On the app's element the two sides
+  combine (`slots::merged`): the component's values win, the app's fill in what it leaves unset (field by field in
+  `accessibilityState`); `disabled`, the state flags and projected states hold when either sets them; both sides'
+  listeners run, the component's first. The app's element may be a component's host (a `Button` as a popover's
+  trigger): its own side is its view's root, the slot's component hears its events first, then its own (touch handlers run from the inner component outward, and both participate in responder negotiation); left on the
+  holder, the slot's presses would never come: the root is the innermost press target. JS's ops on it go through the core (`Core::js_slot_op`), which keeps JS's
+  own values and sends the combination, and puts them back when the component's part leaves the element (another
+  element joins the holder, the element leaves it, the slot or the component goes). JS's values from before are read
+  from the node (accessibility, `disabled`, `pointerEvents`, `focusable`, projected states); another host prop the
+  component sets too returns to its default when it drops it, unless JS set it since. A slot a Rust view fills keeps
+  a node of the nested view's own around its content when the place gives it anything (below).
 - A slot a Rust view fills (`.fill(name, el)`) has no holder: its content is
   nodes of that view (an element, or a region whose nodes come and go), which the nested component keeps as the
   slot's `Fill` and its view places where it places the slot, as JS children are placed (`Placement`). A place that
   only places it (`place(|s| s)`) puts the nodes there as they are (`ElKind::Filled`); a place that styles it
-  (`place(|h| h.px_4())`) makes a node of the nested view's own with those styles around them. The slot's prop is
+  (`place(|h| h.px_4())`) or gives it props or listeners makes a node of the nested view's own with them around them,
+  which lays one node out through while the place styles none of its layout, as JS's holders. That node is a holder
+  as JS's are (`Core::reconcile_wrapper`, `Components::fill_holders`): its styles stay on it, the rest goes to the
+  fill's one element (the same rule: not raw text, a list or another holder), combined with what
+  the placing view gives that element as JS's side is (`Core::apply_target_attrs`, `Core::target_events`), and follows
+  the fill's nodes as they are placed and released. So a component's `on_focus` / `on_blur` on its trigger hear the
+  focus of a Rust app's element, which only the focused element gets, as they do a TSX app's. An overlay placed against
+  what the element taking a slot's props draws (`anchor_content`, a popup's) goes by the slot's holder
+  (`Core::content_anchor`), this node or JS's holder alike: the element's own box, as large as the component's layout
+  stretches it or its minimum size makes it, whether a TSX or a Rust app passed it, not the box around its children.
+  Any other anchor's children only stand for it along an axis its style leaves `auto` (a wrapper its parent stretches);
+  along one it sizes (a trigger 28 points tall, its label centered), its own box is what shows
+  (`Core::content_bounds`). The slot's prop is
   `Some` while the fill has nodes. The fill is the placing view's content: reconciled whenever that view reconciles
   the nested element (a new element replaces the old in its place), released with it, and taken out of a place that
   goes before that place's node is deleted. A view passes a slot it is given on to a nested component's slot by
@@ -774,6 +937,20 @@ what changed.
   opening and released after. Until they are made, `Children::is_empty()` is true. The content a Rust view passes
   such a component (`drawer().child(..)`) is lazy the same way: the core keeps it in a region of a signal it
   sets when the nested component starts or stops placing its children (slots and rows stay), instead of telling JS.
+- Content that comes and goes with a reveal (`Collapsible`'s `reveal`, `gpui-base`'s `MotionReveal`): the view puts
+  it in a clip view (`overflow_hidden`) whose height is zero while closed and the content's own while open, and calls
+  `ElementRef::animate_layout` on the clip with a critically damped spring in the effect that follows `open`, so the
+  commit that changes the height animates every frame it moves on the platform's animator (the clip's, the views
+  after it) and no other (a list updating in the same commit elsewhere changes at once), with no JS per frame. The content's region follows a signal that turns on with `open` and off after the motion's duration
+  (`set_timeout`, voided by a newer change: layout animations report no end), so it stays in the tree, clipped, while
+  the clip closes. Reduced motion skips both. Heights are not animated values, so this is how a component sizes
+  something with motion. `collapsible::follow_open` is that signal and effect; `AccordionPanel` shares it, its own
+  view the clip (zero high while closed, `invisible()` once the reveal has closed it, so content it keeps mounted takes
+  no keyboard focus), and without `reveal` it is `hidden()` while closed.
+- Parts that find their whole through context (`Accordion`): the root provides what its items need (the app's
+  `value`, `multiple`, `disabled` and its `emit`), each item provides its own (whether it is open, disabled, and the
+  toggle that computes the root's next value), and the trigger and panel of the item read that: the app arranges the
+  parts freely in JSX, and only the root reports.
 
 ## Events
 
@@ -785,22 +962,74 @@ what changed.
   it does: regions change them when they are reconciled. A node a region makes again (kept, the same id) drops the
   handlers, responders and `on_event` listeners its last run gave it, so it hears the new run's only. A listener runs
   in the graph like any other Rust code of the view: the signals it writes run their bindings once it returns.
-- A slot's node (JS's holder, the app's list of an `Items` prop, or another component's content) gets the
-  handlers of the component it is a slot of, then its maker's: JS's (the app's `onLoadMore` on a component with rows)
-  or the view's that passed it.
+- A slot's node (JS's holder or the app's element in it, the app's list of an `Items` prop, or another
+  component's content) gets the handlers of the component it is a slot of, then its maker's: JS's (the app's
+  `onPress` on its trigger, `onLoadMore` on a component with rows) or the view's that passed it.
 - A component's own list reports its viewable rows to it in the core, waiting for `minimum_view_time` when set
   (a task of the list's owner).
 - `cx.emit(event)` is routed after the code that emitted it: to JS as the event itself (`JsEvent::Component`, its
   data converted by the `Event` derive's `data_js` when JS hears it; the JS face calls the app's
   `on<Name>(data)`), or, for a nested component, to the
   `on_event` listener of the view that made it, typed, whose own emits are routed in turn until none are left.
+- `after_answer(f)` (`element/ambient.rs`) runs `f` once the app has handled every event emitted so far and the
+  props it set in answer have reached the components: what a view shows of its own until the app's value comes back
+  (a slider's drag value) is let go of there, with no frame of the app's earlier value between. A timer or
+  `next_frame` may fire before that: a component's event to JS is only queued (`Core::events`); the engine's next
+  commit round hands it to JS, applies the ops its handler queued and only then commits, which sets the new props.
+  The executor keeps the closures in two queues: `Core::take_events` (the engine handing the events out) makes the
+  waiting ones due, and the next `Core::commit` runs the due ones first, before its views render, each under the owner
+  current when it was registered (dropped unrun once that owner is disposed), so what they change shows in that
+  commit with the app's props. The engine's commit loop goes on for another round while some are due
+  (`Core::has_due_answers`), so they go out in the batch of the events they waited for. With a Rust owner, whose
+  listener ran when the event was emitted, `f` runs in the commit after the one that rendered what the listener
+  changed. The web's browser engine delivers the events the same way (its JS runs in the engine's call, its ops are
+  taken after it), so it needs nothing of its own. Unused, it costs nothing: the queues stay unallocated and nothing
+  is due, so the engine commits no extra round (`events_nothing_waits_for_cost_no_round`).
 - The back button: `on_back_press` listeners of views run newest first, after modals' and before stacks', then JS's
-  (`ui/back.rs`).
+  (`element/back.rs`).
+- Keys while the control has the keyboard focus: a signal of the focus (`on_focus` / `on_blur`), and
+  `keys::bind_while(focused, keys, handler)`, which binds them in an effect that returns early while it is false,
+  so the bindings of the global keymap come and go with the focus (`DataTable` does the same by hand).
+- Roving focus (`roving.rs`, WAI-ARIA's tab list, radio group and toolbar): `Tabs`, `RadioGroup`, `ToggleGroup` and
+  `Toolbar` provide a `Roving` through context, and each `Tab` / `Radio` under one, and each `Toggle`, `Button` and
+  `Link` under a toolbar or a toggle group (a `Bar`), registers its ref, its current state (`selected`, `checked`,
+  `pressed`; none for a toolbar's items), its `disabled` (its own or its bar's) and what moving to it does (a press,
+  `Change(true)`, nothing for a toolbar's items: the toolbar pattern only moves the focus); an item outside a group
+  stays a stop of its own. A `Menu`'s or `Popover`'s trigger in a bar is one of its items too (`bar_trigger`): the
+  popup reads the bar where it is made and registers its trigger slot's element under the ref it anchors to, so the
+  view the app puts there takes the stop's `focusable`, the focus listeners and the bar's `disabled`; the popup leaves
+  the bar for what it makes (`popup_bar`), so a `Button` the app puts there is that one item, not one of its own. A `ToggleGroup` or `ToolbarGroup` inside a toolbar provides the toolbar's `Roving` again
+  (with its own `disabled` added), so its items are the toolbar's and the toolbar stays one stop. A popup's content
+  (`Popover`, `HoverCard`, `Sheet`, `Menu`, the dropdown of `popup.rs`) leaves the bar (`leave_bar`): its controls are stops of
+  their own though its trigger is a toolbar's item.
+  Only the stop is `focusable`: the item the focus is on, else the item it last left (a toolbar) or the current one
+  (the others), else the first enabled, so Tab passes the group in one step. Each item's `focusable` reads a flag of
+  its own, which one effect of the group sets when the stop changes, so a move runs the bindings of the item left and
+  the item reached only, however many items there are. While an item has the focus the group binds its arrows (both
+  pairs, and Home / End for tabs and toggle groups; the axis's pair and Home / End for a toolbar, leaving the other
+  pair to its items); a key sets the target as the focused item first, which makes it the stop (its `focusable` mounts
+  before the `focus()` command of the same batch, as a ref's `focus()` only moves to stops), focuses it and activates
+  it. Items are in the tree's order, not the order they registered: the core makes components in an order of its own
+  (an item inside a `ToolbarGroup`, or a popover's trigger, renders after the toolbar's later children), so the group
+  watches its items' order (`watch_order`) and invalidates the watch as an item comes; the core sorts their refs by
+  their place in the tree at the end of that round, and of any round that moved a node among them (an app's keyed
+  reorder of the items; a move outside the subtree they share costs the group nothing), and the group's flags change
+  in the same batch.
+  `Roving::current` is the current item's ref, tracked: `Tabs` points its indicator at it.
+- A part that follows another element (`Tabs`' indicator): a view with `View::follow(move || list.current())`, absolute
+  in the list and first among its children (drawn behind the tabs), `pointer-events: none`. The core spans the
+  target's frame along the list's main axis after each layout (`core/follow.rs`: the frames from the target up to the
+  follower's parent summed, the follower's margins on that axis taken off; across it the follower's own layout), so a
+  selection change is one frame item and its layout animation (`View::follow_transition`), and a resize moves it in
+  the batch that moves the tabs. The ref is looked up as the core places it, so the target may render after the
+  follower. `Tabs` hides it while no tab is selected (`Roving::current` is `None`) and keeps it on the first of
+  several selected; it is `accessibility_elements_hidden` and takes no focus, so screen readers and the roving keys
+  see the tabs alone. `ToggleGroup`'s segmented highlight, a pagination's marker or a listbox's highlight are the same view.
 
 ## The JS face and the declarations
 
 `nsh-js` `components.rs` makes each component's and module's JS from its spec (`ComponentSpec`, `ModuleSpec`) when a
-bundle first imports the module, and `classes.rs` each class's from its `ClassDef`. `nsh_core::ui::declarations(registry,
+bundle first imports the module, and `classes.rs` each class's from its `ClassDef`. `nsh_core::element::declarations(registry,
 omit)` writes their declarations (into the registry's module file, `nsh/base.d.ts`, `app/native.d.ts`; `nsh-js` `declarations.rs` adds
 the re-exports and native values it makes): the named types the props, events, methods and functions use (`export
 type Foreground = ...` for a `PropEnum`, `export interface AlertDialogAction` for a `JsObject`, each once, with its doc
@@ -825,34 +1054,74 @@ blocked last wins while both do, and the other's block comes back when it lets g
 
 ## Native components of the embedder
 
-`nsh/native`'s `nativeComponent` is the other kind: a platform view the embedding app registered (Swift / Java
+`nsh`'s `nativeComponent` is the other kind: a platform view the embedding app registered (Swift / Java
 `NshComponent`, `docs/dev/embedding.md`). Those are views of their own on the main thread; Rust components are
 compositions of primitives in the core.
 
 ## Popups
 
-`nsh/base`'s popups (`crates/nsh-base`: `popup.rs`, `popover.rs`, `menu.rs`, `tooltip.rs`, `sheet.rs`) are made of
-the core's overlays (`elements.md` "Overlays"), which place them and report presses outside, Escape and back; the
-components decide to close. They draw nothing: the app styles each part (`popupClass` / `popupStyle`,
-`backdropClass` / `backdropStyle`) and its content.
+`nsh/base`'s popups (`crates/nsh-base`: `popup.rs`, `popover.rs`, `hover_card.rs`, `menu.rs`, `tooltip.rs`, `sheet.rs`,
+`Select`'s list, `listbox.rs`, and `DatePicker`'s calendar, `date_picker.rs`) are made of the core's overlays (`elements.md` "Overlays"), which place them and
+report presses outside, Escape and back; the components decide to close. They draw nothing: the app styles each
+part (`popupClass` / `popupStyle`, `backdropClass` / `backdropStyle`) and its content. `Popover`, `HoverCard` and a
+desktop `Menu` are placed against what their trigger draws (`anchor_content`), which for the app's trigger element is
+its own box, whether a TSX or a Rust app passed it (`Core::content_anchor`): a trigger the popup's column stretches, or
+one taller than its label by its minimum height, has its popup lined up with its edges, not its label's.
 
 Their callbacks are one set, as `Dialog`'s (`popup.rs`: `OpenState`, `lifecycle`):
 
 - **`open` / `defaultOpen`**: the open state is controlled when the app sets `open` (`Prop<Option<bool>>`), the
   popup's own (`OpenState`'s signal, from `defaultOpen`) otherwise. A user's request changes the own state at once
   when there is one; a controlled popup waits for the app to change `open`.
-- **`onOpenChange(open, reason)`**: every request to open or close (`OpenState::request`; not a request for what it
+- **`onOpenChange({ open, reason })`**: every request to open or close (`OpenState::request`; not a request for what it
   already is), whether controlled or not, with why: `OpenChangeReason`: `"triggerPress"`, `"pressOutside"`,
-  `"backdropPress"`, `"cancel"` (Escape or back), `"select"` (a menu's item), `"hover"`, `"longPress"`,
-  `"contextMenu"`. The app changing `open` itself is not reported here.
+  `"backdropPress"`, `"cancel"` (Escape or back), `"select"` (a menu's item), `"hover"`, `"focus"` (a hover card's
+  trigger gained or lost the keyboard focus), `"longPress"`, `"contextMenu"`, `"swipe"`. The app changing `open` itself is not reported here.
 - **`onOpen` / `onClose`**: after it is all there and after it is all gone (a sheet, or a menu as a sheet, once its
-  motion is over; a popup at once), whoever opened or closed it, the app's `open` included (`lifecycle`, an effect on
-  what is shown). `Tooltip` has these two and `onOpenChange`.
+  motion is over; a popup as it is made, and once its exit ran: at once without an ending look), whoever opened or
+  closed it, the app's `open` included (`lifecycle`, an effect on what is shown). `Tooltip` has these two and
+  `onOpenChange`; `HoverCard` these three and `onPosition`.
+- **`onPosition({ placement, bounds, available })`** (`Popover`, `HoverCard`, and `Menu` / `ContextMenu` on the desktops): the
+  popup's overlay was placed (the core's `onPosition`, `elements.md` "Overlays"): the side it went on (the other side
+  of `placement` when only that one had room), its frame in the root view, the room on that side, so an app points
+  an arrow or an entrance at its trigger.
 - **`onCancel`**: each attempt of the user to close it without choosing: Escape or back, a press outside, a press on
   the backdrop. It is emitted before `onOpenChange`, whether or not a `closeOn<Trigger>` flag (`closeOnEscape`,
   `closeOnPressOutside`, `closeOnBackdropPress`, read natively when the user acts) let it close, so an app with a flag
   set to `false` can ask first and close itself. A menu's chosen item is no cancel (`"select"`); Escape in a
   sheet's submenu goes back a level and is none either.
+
+**Checkable menu items.** A `MenuItem` with `checked` (`Prop<Option<bool>>`, `None` a plain item) is a
+`menuitemcheckbox`, or a `menuitemradio` by its `role`, with `accessibilityState.checked`, as `gpui-component`'s
+`PopupMenuItem::checked`; the value is the app's and `onSelect` is the press, which closes the menu unless
+`closeOnSelect` is false. The item's `checked:` styles (`checkedStyle`) follow that state, and so does its
+indicator, as `Checkbox`'s: a view of its own around the slot, placed before the content and styled by
+`indicatorClass` / `indicatorStyle`, takes the item's checked and disabled states as a part of it (`Interactive::project_checked`,
+`project_disabled`), so it is no checkable element of its own. Projected states style that node only: the app's mark
+inside (`indicator`) follows them through `group-checked:` with `group` on the part, or is shown and hidden by the
+part's own `checked:` styles. A new value rebinds that item's state and its indicator's projection alone, so only the
+item and its indicator are sent (`crates/nsh-base/tests/base/menu.rs`).
+
+**Presence.** A popup's entrance and exit are the app's transitions between its look and its states' looks, as a
+toast's `transitionStatus` and Base UI's `data-starting-style` / `data-ending-style` (gpui-kit's popups have no exit):
+`Popover`'s, `HoverCard`'s, `Menu`'s and `ContextMenu`'s `popupStartingClass` / `popupStartingStyle` and `popupEndingClass` /
+`popupEndingStyle` (a desktop menu's `Submenu`s take its menu's), `Tooltip`'s `startingClass` / `startingStyle` and
+`endingClass` / `endingStyle` (its own `class` / `style` are the bubble's). `popup.rs`' `PopupPresence` follows the
+open state: opened, the popup is made with its starting look, which it keeps until the next display frame (or 50 ms
+where none comes, as `Toast`'s), so `transition-*` classes run from it; closed, it stays mounted with its ending look
+and `pointer-events-none`, while the touch screens' backdrop goes and presses outside and Escape are no attempts any more,
+for as long as its transitions then run: the platforms run transitions without reporting their end, so it asks the
+core (`ElementRef::transition_time`, an `Action::TransitionTime` the commit answers from the node's resolved
+`transition`, the app's `class`, `style` and theme included: the longest duration plus delay, two seconds at most),
+waits that long, then unmounts, and `onClose` follows. A generation counter keeps a stale frame or exit from acting on
+a newer change: opened again on its way out, the popup goes back to its look (its transitions run back) and was
+never gone, so neither `onClose` nor `onOpen` fires. Without a look for a state, or while the user asks for less
+motion, it skips that state: a popup with no ending look is gone in the turn that closed it, and nothing more is sent
+for one with no looks. The state's classes are important (`!`) over the part's `class` and `style`, as a toast's; its
+style comes after the part's (`Style::then`), applied with `Element::state_inline_style`, which follows the typed
+styles a Rust app's state style has even when the part's has none. Closing a desktop menu closes its submenus, and
+closing a submenu its own, each with its exit. A sheet (`Sheet`, menus on touch screens, `Select`'s list) keeps
+`SheetMotion`.
 
 How a popup presents itself follows the device (`is_desktop()`; one presentation, `auto`, for now), by what the popup
 is for, never by replacing one popup with another everywhere:
@@ -860,10 +1129,114 @@ is for, never by replacing one popup with another everywhere:
 | | Desktops (and desktop browsers) | Phones and tablets |
 |---|---|---|
 | `Popover` | anchored to its trigger; a press outside closes it and goes on to what is under the pointer | anchored to its trigger (what it shows belongs next to it); a press outside only closes it (a transparent backdrop overlay takes it) |
-| `Menu` | a popup at its trigger (`placement`, `align`, `offset`, `margin`); `Submenu`s cascade beside their item, on hover or press | a sheet at the bottom over a backdrop; a `Submenu` shows its items in place of its menu's, with its `back` row (the app's: no built-in strings); Escape / back return a level |
+| `Menu` | a popup at its trigger (`placement`, `align`, `offset`, `margin`); `Submenu`s cascade beside their item, on hover or press, or Right / Return on it (Left / Escape go back to it) | a sheet at the bottom over a backdrop; a `Submenu` shows its items in place of its menu's, with its `back` row (the app's: no built-in strings); Escape / back return a level |
 | `ContextMenu` | the secondary button opens it at the pointer (`onContextMenu`'s `page`) | a finger held 400 ms on the trigger opens it as the menu's sheet (observed touches: the trigger's own presses and the scroll views around it go on; 10 points of movement cancel) |
-| `Tooltip` | after the pointer rests on the trigger for `delay` (500 ms); leaving or pressing hides it | only when the app opens it (`open`, `defaultOpen`): no pointer to rest |
+| `Tooltip` | after the pointer rests on the trigger for `delay` (500 ms), and at once while the keyboard focus is on it; leaving or pressing hides it, and so do the focus leaving and Escape (resting on it again while it goes takes it back) | while the keyboard focus is on the trigger (a hardware keyboard), else only when the app opens it (`open`, `defaultOpen`): no pointer to rest |
+| `HoverCard` | anchored to its trigger; opens after the pointer rests on the trigger for `openDelay` (600 ms) or the keyboard focus comes to it, stays while the pointer moves between the trigger and the card, closes `closeDelay` (300 ms) after the pointer left both or the focus left the trigger; Escape and a press outside close it at once | anchored to its trigger; a press on the trigger opens and closes it (`gpui-base`'s), a press outside closes it and goes on |
 | `Sheet` | an edge panel (`side`) over a backdrop | the same |
+| `Select`, `Combobox`, `DatePicker` | a popup at its trigger (`placement`, `align`, `offset`, `margin`), at least as wide as the trigger and never taller than the room on its side (`onPosition`'s `available`); a press outside closes it and goes on, leaving the keyboard focus where it went (any other close gives it back to the trigger) | a sheet at the bottom over a backdrop, below the status bar at most, with `Menu`'s motion; its search field takes the keyboard only when pressed |
+
+`HoverCard` (`hover_card.rs`) is `gpui-base`'s `HoverCard` on `Popover`'s overlay and presence. On the desktops the
+pointer is followed by Rust listeners, `onMouseEnter` / `onMouseLeave` on the `trigger` slot (the app's element) and on
+the card's overlay, and the keyboard focus by `onFocus` / `onBlur` on the trigger; the delays are one timer of the
+components' executor (`set_timeout`, a `Spawned` the next request cancels), as `gpui-base`'s `HoverCardState` keeps
+one open or close task. Entering the trigger or focusing it waits `openDelay`; leaving the trigger with the pointer not
+on the card, leaving the card with the pointer not on the trigger, or the trigger losing the focus waits `closeDelay`,
+and the close is dropped when it comes due with the pointer on either part (where the pointer is, `Over`, is a
+`stored` value, read only by the timer: no signal, nothing rendered again). The card counts as left when it goes (a
+`cleanup` of its region: a view taken away hears no leave). Escape and back (`onCancel`) and a press outside close it at
+once, with no timer. So a hover that does not open the card sends the platform nothing, and moving between the two
+parts sends nothing either; the card's opening and closing are `Popover`'s mount items. On phones and tablets
+(`!is_desktop()`) the trigger gets a press listener instead, which toggles it (`gpui-base`'s `tap_to_open`, its
+default there), and the card's press outside closes it without a backdrop, so the press goes on to what is under it.
+
+`Select`'s and `Combobox`'s list (`listbox.rs`) is a state machine of its own, since `gpui-base`'s
+`Select` root leaves it to `gpui-component`'s styled `SearchableList` (`api-naming.md`): the rows for the query
+(search: a case-insensitive substring of the titles; adjacent items of one `group` under a header, a section with no
+match dropped), the highlight (Up / Down around the ends over the enabled items, Home / End, Page Up / Down by the
+rows wholly in view, typeahead from `a`–`z` and `0`–`9` keys, the pointer when it moved), revealing the highlighted
+row once per move and only when it is not wholly in view (`scrollToIndex` to the nearer edge, from the list's
+viewability report at 99.5%), and where the highlight goes when the items change (its value, else the first enabled
+item). The keys are bound while it is open (`When::Always` while the search field edits; Home and End stay the
+field's), and the trigger's while it has the keyboard focus and the list is closed (Down, Up, Return, Space open it;
+typeahead chooses). The rows are a `virtual_list` with `viewport: parent` in the popup's scroll view: the popup is as
+tall as its rows up to the room it has, and a list of thousands makes only the rows in view. Each row is an option
+(`selected` the chosen value, `disabled`), shows `focus:` while highlighted (`project_focused`) and takes the screen
+reader's focus when a key highlights it (`set_accessibility_focus`, only while a screen reader runs: on the web it
+moves the DOM focus; while the search field edits, the title is announced instead). The app's `renderItem` gets
+what the item is (`SelectEntry`: its value, title, `disabled`, group and index), never the row's state, as `Tree`'s
+`TreeEntry` and `Command`'s `CommandEntry`: its content is rendered under the item's key once and kept while the
+highlight moves or the value changes, the states being the row's classes (`group-focus:`, `group-selected:` inside).
+The desktops choose on press down, so the search field keeps the keyboard focus. The trigger's role, states, focus and presses are bound on the
+`trigger` slot, so in a TSX app they are the app's element's ("Named slots"): the popup is placed against it
+(`Overlay::anchor`), at least as wide as its layout reports, and waits for that first layout (open at first, it would
+be made before the slot is filled).
+
+`Combobox` (`combobox.rs`) is the same list with an array value. `Hooks::selected` says which rows are selected (the
+select's one value, the combobox's set); with `multiple` its `choose` toggles the item and leaves the list open,
+without it replaces the value and closes. It keeps the value as the user last left it (`latest`): the app's value
+reaches the props a turn after its `onChange` handler set it, so toggles in a row start from what the user did and
+`onConfirm`, sent on every close, reports it. The query is a `listbox::Query`: the search field's own, each opening
+starting from `defaultQuery`, or the app's `query`, whose changes highlight the first match as typing does. The
+footer is a part of the popup after the rows (`listbox::Footer`). Mod+Return closes it with `"select"`. A press on
+the input opens and closes the list in every idiom, as `gpui-component`'s trigger does (`"triggerPress"`); on touch
+screens the focus a tap gives opens it, and the press of that tap is then skipped (`focus_opened`). The input reports
+the press after the focus it takes: the terminal (`docs/dev/tui.md`) and the headless driver report an `Input`'s
+`onPress` today; the other backends follow in a later change, and until then a press on the input there opens the
+list on touch screens only (through the focus).
+
+`DatePicker` (`date_picker.rs`) is `Select`'s popup (`popup::dropdown`, at least as wide as the trigger, a sheet on
+touch screens) around presets, a calendar and, with `timePrecision`, a time field. Its calendar is `calendar.rs`'s grid
+with every prop of `Calendar` passed on (`calendar::Config`); opening it on the desktops puts the keyboard on the
+days (`Grid::focus_days`). A complete date is the value and closes it with `"select"`; with a time the popup stays
+open on the desktops, each edit reported, until the selected day is pressed again (`gpui-component`'s double click),
+while in a sheet (touch screens, the `sheet` the content is made for) a tap on a day picks it at its time and closes,
+as a single date does: a touch has no double click (`api-naming.md`). The trigger's keys are bound while it has the
+focus: Return opens and closes (`gpui-base`'s `Confirm`), Delete and Backspace clear while it is closed. The value
+crosses to JS in the HTML inputs' forms (`date`, `datetime-local`), at the precision of `timePrecision`
+(`PickedDate`).
+
+`Calendar` (`calendar.rs`) is a grid of items (`Grid`: the shown page, the view, the cursor) over `gpui-base`'s
+`Date` and `Matcher`. Its days are one Tab stop: only the cursor's day (`stop`) is focusable, and the arrow, Home / End and
+Page keys move the cursor (past disabled days, which the core never focuses: `Grid::enabled_toward`; the stop
+itself skips a disabled selected day or today), turning the months past the shown ones (`gpui-base`'s days take presses only). A
+JS function (`Matcher::Js`, as `gpui-base`'s `Matcher::Custom`) is asked for the shown days in a spawned task (the
+next JS turn), its answers kept as a set; a newer page's answers replace an older one's. The grid fills the width it
+is given, as a table's columns do: the months share the body and the items of a row (weekdays, days, the months and
+years to pick) share it equally (`flex: 1`; a short last row of years is padded), so a calendar in a phone's sheet
+spans it while one in a popup that fits its content keeps its items' widths; the header's items keep their own. The
+app's `renderItem` gets a `CalendarEntry`, what an item is (its kind, value, date, month, `today`, `outside`), and the
+states are the item's (`selected` for screen readers and `selected:`, every day of a complete range as React Aria's;
+`disabled`; the real focus; `project_data` for `data-range-start` / `-end` / `-middle`, `data-today`,
+`data-outside`): a day's content is rendered under its month and date, so the keys, a pick and the focus render
+nothing, a turn renders the days it brings once each, and with several months those still shown keep theirs (their
+holders move to the cells that now show them). `TimeField`'s `renderSegment` likewise gets a
+`TimeFieldSegmentEntry` (`segment`, `value`, `label`), its selection `focus:` (`project_focused`).
+`TimeField` (`time_field.rs`) is `gpui-base`'s `SegmentEditor` over one
+transparent native text field, as `OtpInput`'s (its `diff` / `echoed`): what the field gains or loses goes to the
+selected segment, then the field holds the time again; a value the app sets is shown unless it is the user's change
+coming back.
+
+On the web, `Sheet` wraps its two overlays in a modal root with no platform animation. The embedding player
+reports that root’s presentation size independently of the app, so both the backdrop and panel follow
+`dialogs: "viewport"`. SheetMotion retains ownership of entering, leaving and controlled close requests.
+
+`Sheet` opts into downward dragging with `closeOnSwipe` (default false, bottom side). Its pan updates
+`SheetMotion.drag_y` on the platform's animation graph; a clamped fraction of the measured panel height drives both
+translation and backdrop opacity. Release past 30% or 800 points/second requests `onOpenChange({ open: false, reason: "swipe" })`
+after `onCancel`; a shorter, cancelled or declined gesture returns the panel. Reduced motion snaps the release.
+`Interactive::pan_enabled` filters the mounted pan values and event mask together, retaining the listeners and
+children while a sheet enters, exits or changes permission. `pan_scroll_handoff` asks UIKit to share the touched
+descendant scroll's pan: its initial offset consumes the first part of the drag, and the remaining downward
+distance moves the panel while the scroll stays at its adjusted top. Other backends retain their usual scroll
+arbitration. `SheetMotion` tags completion callbacks and fallback timers with a generation, so a prior exit cannot
+unmount a reopened sheet or its backdrop.
+
+`SheetMotion` derives the programmatic translation from the remaining fade fraction times the current measured
+distance from the edge. Lazy JS children can fill in over several layout rounds in one native batch; later content
+can also resize a panel during its entrance. Each layout updates that distance in the native graph, preserving the
+animation's progress and completion time. `Sheet`, phone menus and compact dock drawers share this path. Dragging
+is a separate value in points, so entrance measurement does not clamp or replace the finger's displacement.
 
 The menus' items reach their menu through context (`MenuContext`: the close function, the sheet's path of submenus,
 the level's open submenu), so the app arranges them freely. Every item of a sheet's hidden levels is out of the tree
@@ -874,12 +1247,126 @@ presented by the platform (`navigation.rs`); `AlertDialog` and `nsh/desktop`'s m
 view's root, so the component's host is the overlay. It is given as an element's `tooltip` (as GPUI's
 `.tooltip(..)`), never placed among children: the core takes such an element as the hint overlay itself, in the
 element (`Core::adopt_hint_tooltips` once its view made it one; Rust: `IntoTooltip for TooltipElement`), so the
-element is what the pointer rests on and what it is placed against. The core follows the pointer on it and asks
-(`on_hint_show` / `on_hint_hide`); the tooltip's open state (`OpenState`, controlled or not, `disabled` ignoring
+element is what the pointer rests on and what it is placed against. The core follows the pointer and the keyboard
+focus on it and asks (`on_hint_show` / `on_hint_hide`, with a `HintReason`: `onOpenChange`'s `reason` `"hover"`,
+`"focus"`, or `"cancel"` for Escape); the tooltip's open state (`OpenState`, controlled or not, `disabled` ignoring
 the requests) decides, as `hint_open`. The tooltip itself is the bubble (the app's `class` / `style`), its children
 what it says; it never takes the pointer (`pointer_events(None)`). An element's `tooltip` prop (`Interactive::tooltip`,
-`Prop::Tooltip`) takes a text too, in a minimal bubble of the theme's tokens, or any other element as it is, in a
-hint overlay the core makes itself (`Core::set_tooltip`).
+`Prop::Tooltip`) takes any other element too, shown as it is in a hint overlay the core makes itself
+(`Core::set_tooltip`); it takes no text, so every tooltip's look is the app's.
+
+## Carousels
+
+`nsh/base`'s `Carousel` (`carousel.rs`, `gpui-component`'s parts and names) is a scroll view and the state around it,
+with no scrolling of its own:
+
+- **The content** (`CarouselContent`) is a `scroll()` along the axis, its indicator off. Each `CarouselItem`
+  registers with the carousel through context and reports its frame (`on_layout`: its place in the content, which a
+  scroll does not change). The carousel keeps the slides in the tree's order (`watch_order`, as the roving focus
+  does: a slide inserted before the others or moved by a keyed list renders last), so the last slide's report ends a
+  layout pass and the track is made once from all of its frames, never from old and new ones mixed (a pass that
+  leaves the last slide in place settles on the next turn). Once every slide is laid out, the snap points are their
+  starts less the first one's,
+  held to the scroll range, which a `watch_scroll` of the content reports (its content size and viewport, no
+  offset). The scroll view gets them as `snap_offsets` (equal ones once) with `disable_interval_momentum`, so a
+  fling moves one slide on every platform (`ScrollBehavior::snap_target`, Android's port, the web's `nsh.js`) and a
+  finger, the wheel and the touchpad move it natively with no work of the engine's. Slides are indexed by where they
+  start along the axis; several resting where the last does (the end of the range with several per view) are one
+  stop, the first of them, for previous, next and the keys.
+- **The slide shown** is a memo: a swipe's slide while the app has not answered it (`pending`, cleared by the next
+  `index`, and by `after_answer` once the app has handled the `onChange`: an app that kept its `index` shows it again,
+  the content springing back to it, animated, as a release; `Ctl::let_go_after_answer`), else the app's `index`, else
+  the carousel's own (from `defaultIndex`). An answer that comes while the user drags again lets go of the swipe's
+  slide where that drag rests, never under the finger (`answered_in_drag`). An effect scrolls the content to
+  its snap point when it changes (animated unless `reduce_motion()`) and when the snap points move (at once: a resize
+  keeps the slide); it sends nothing while the content rests there (`Ctl::at`).
+- **The user's scroll** is reported where the platform reports it come to rest (`on_scroll_end`): the nearest snap
+  point's slide becomes the one shown and goes to `onChange`; a rest between snap points (the headless driver, which
+  does not snap) is scrolled onto the slide. Controls, pagination items and keys emit `onChange` and set the own
+  index while uncontrolled. The desktops (the core's scrolling, AppKit's) also report a rest when an animated
+  `ScrollTo` arrives, and one that arrived just before the next `ScrollTo` reached the platform is still on its way:
+  the carousel keeps the target in flight and the few it replaced (`Ctl::superseded_rest`), ignores a rest at a
+  replaced one, and drops them all on a drag's start or any other rest (a mouse wheel's starts no drag).
+- **What the app pauses its own rotation by**: `onDragStart` from `on_scroll_drag_start`, `onDragEnd` where that
+  scroll comes to rest; `onFocus` / `onBlur` for the carousel as a whole: the core's focus-within of the carousel's
+  view (`ElementRef::on_focus_in` / `on_focus_out`), so its controls, its pagination items and the app's focusable
+  views in the slides are all in it, and a move between them (a blur and a focus in one batch) reports nothing. The
+  keys are bound while the carousel's own view, a control or a pagination item has the focus (a count of them), not
+  while a view of the app's in a slide has it (an input there keeps its arrows). A control or pagination item that turns disabled while it
+  has the focus gives it to the carousel's view first (`Ctl::keep_focus`), where the platform would move it out
+  (AppKit to the window). Slides that move on by themselves are the app's timer setting `index`
+  (`api-naming.md`).
+- **The pagination** keeps its items for an indicator that follows the item of the slide shown (`View::follow`, as
+  `Tabs`' does, with the same spring). A change of slide reruns the selected memo of the two items it concerns; no
+  slide renders again.
+
+**A seamless loop** (`looping`, read when the carousel is made) is `gpui-component`'s runway, made of the scroll
+view and the animation graph:
+
+- The content gets a runway before and after the slides (`Ctl::runway`, hidden from screen readers and the pointer,
+  out of the layout until measured), a period long less the gap: the period runs from the first slide's start to
+  the last one's end, plus the gap between the first two. The middle period, where the slides are laid out, rests
+  between offsets `P` and `2P`; the snap points repeat over the three periods, so a swipe crosses the seam with no
+  work of the engine's.
+- Each slide is drawn in the period nearest the viewport's center: a translation of `y - (y mod P)` with
+  `y = offset + shift`, where `offset` follows the scroll (`scroll_value`), `shift` is half the viewport less the
+  slide's center plus half a period, and the graph's `Mod` is Euclidean. The offset, the period and one shift per
+  slide are values made once (three derived nodes per slide, made when it registers); a relayout only `set`s them.
+  Without `looping` none of this exists.
+- A scroll that rests outside the middle period moves back into it by one period, without animation
+  (`Ctl::recenter`): every slide is drawn where it was, so nothing moves on screen and no `onChange` is sent. After
+  an animated scroll across the seam (next on the last slide, previous on the first, the app's `index` from the last
+  to the first or back: the adjacent period's snap point, one step) it runs on a timer of `RECENTER_MS` as well,
+  since iOS reports no rest for a scroll it was asked for; a later scroll or a drag cancels it.
+- Seamless only while the period is at least the viewport and the widest slide: each slide then shows once at a
+  time. Shorter, the slides are laid out without runways or translations and previous / next go around by scrolling
+  back across them.
+
+Each slide is in the tree once: screen readers and the pagination see it once, wherever it is drawn.
+
+## Scroll bars
+
+`Scrollbar` (`crates/nsh-base/src/scrollbar.rs`) is `gpui-base`'s `Scrollbar` as `gpui-shell` places it: a view the
+app puts where it wants (over the target's edge, beside a fixed header) that names the scroll view or list it moves
+(`scroll`: TS a `ref`, Rust a `ScrollbarTarget` of an `ElementRef`). It watches the target (`watch_scroll`): the
+platforms report every scroll view's offset and the core lays out its content, so the thumb follows the offset, the
+content (a list's extent as it grows) and the viewport with nothing in JS. The thumb's length is the viewport's share
+of the content along the rail (the track's content box, measured), no shorter than `minThumbLength`; its place the
+offset's share of the scroll range, held to the ends while the target overscrolls (a `translate` along the axis, so
+the track's padding and the app's alignment place it across). The length and the place are on a view of the bar's own
+around the thumb part, which the app's transitions never reach: a `transition-all` on the thumb (for a thumb that
+widens) would otherwise animate its place and make it trail the content. A press on the thumb drags it by the
+pointer's offset; a press on the track puts the thumb's middle there and a drag goes on from there, both as
+`ScrollTo` commands to the target. A drag moves the thumb in the batch that sends the command, not when the platform
+reports the scroll a frame or two later, and while it goes on the reports of earlier commands do not move it back.
+`mode` decides when it shows, as `gpui-base`'s: `scrolling` (a move of the target, until `motion.idle` after; the
+pointer on the bar while it shows keeps it), `hover` (also while the pointer is over the bar, which a hidden bar
+follows with a mouse) or `always`; a drag keeps it, and it never shows while the content fits. Its fades are
+`gpui-base`'s `VisibilityAnimation`: two animated values bound natively, the track's opacity and the rail's slide
+(across the axis by the track's thickness, which the track clips), started with `motion.enter` / `exit` scaled by
+the distance still to cover (the bar samples its fade to know where the native one is), linear / cubic out in and
+cubic in out, none for `always` or reduced motion, so the first state snaps. Hidden, the track takes no presses. Its
+look, and the thumb's motion (a width growing on `hover:`), are the app's. The target's own indicator stays the app's
+to turn off (`scrollbar={false}`).
+
+**Built-in bars.** A view needs no bar placed for one: `set_scrollbar_theme` (TS `Scrollbar.setTheme`, a module
+function: an `Action::BuiltInScrollbars` that carries the theme as an `AnyValue` and the UI set's maker, so a Rust app
+that never registered `nsh-base` gets bars too) has the core draw the bar of every view whose `scrollbar` is `true`,
+and a view's own theme is its `scrollbar` prop (`ScrollbarSetting::Themed`, kept as JSON; the registry's
+`scrollbars_from` names the UI set that makes its bars). The maker returns no bar for an axis the theme has no look
+for, and the view keeps the platform's indicator. The core (`core/scrollbars.rs`) makes the bar as a component of
+its own, a child of the view marked `decoration`: last among the children, so it draws above them and what JS
+appends goes before it; out of what counts as the view's children (`first:`, `last:`, `space-*`); a layout root of
+its own, sized to the view's frame after the views' and the lists' layout; and pinned over the viewport by a sticky
+range across all of the content, which the platforms apply on the main thread as they pin sticky cells, so it never
+waits for the engine while the content scrolls. The view's `ScrollConfig` turns the indicator off and says the bar
+`replaced` it, so the desktop backends' horizontal views do not keep theirs beside it. A new theme makes every bar
+made for `true` again. A component's given class (`app_class`) now reaches its root, which the bar's size relies on.
+A multiline input scrolls its text natively, so its bar is a sibling instead (`Node::beside`): inserted just after the
+input in its parent, stacked with it, laid out at its frame and made again where the input moves. Its
+`InputConfig` turns the text view's indicator off (`scrollbar_visible`) and asks the platform to report its scrolling
+(`replaced`: `EngineControl::input_scroll`, the offset, the text's size and the viewport's, `Core::set_input_scroll`),
+which the bar's `watch_scroll` reads as a scroll view's; the bar's `ScrollTo` commands scroll the text.
 
 ## Toasts
 
@@ -894,7 +1381,7 @@ as `gpui-component`'s notifications are, and is never part of NSH (the gallery's
 | `ToastTransitionStatus` (`Starting`, `Present`, `Ending`) | the same (`PropEnum`) | `"starting" \| "present" \| "ending"` |
 | `Toast::new(id).transition_status(..)`, role alert | the component `Toast` (`toast.rs`) | `<Toast transitionStatus>` |
 | `ToastStack::new(id, state).item(id, child).motion(..).placement(Anchor).focus_handle(..)` | the component `ToastStack` (`stack.rs`): its children are the items (`children_each`, keyed by node), `Anchor` an enum of the same eight edges, `.state(ToastStackState)` | `<ToastStack motion placement onExpandedChange>` |
-| `ToastStackState::is_expanded()` | the same, a signal the stack's `ExpandedChange` writes | `onExpandedChange(expanded)` |
+| `ToastStackState::is_expanded()` | the same, a signal the stack's `ExpandedChange` writes | `onExpandedChange({ expanded })` |
 
 The manager is a class rather than a reactive helper because it is `gpui-base`'s data structure, not a view: the app
 keeps it, renders `visible(limit)` (a signal of its own) and calls `advance` on a timer while anything is mounted,
@@ -909,11 +1396,17 @@ springs whose response is the motion's `duration` (`spring_of`). Distances from 
 (`stack_heights`, `distance`): collapsed `collapsedPeek` per rank, expanded the newer items' heights plus
 `expandedGap` per rank; the stack's own height is the collapsed or expanded one, so its hover area follows.
 
+In a terminal the stack is the status line's (`terminal_stack`, docs/dev/tui.md "Interaction"): its children stay
+mounted in the line's row (`status_line::row`, at the viewport's bottom), each hidden but the newest, so a newer
+toast replaces the one there; it claims the line (`Claim::Toast`, over a tooltip's hint) while it holds a child, takes
+no Cell where the app places it, hears Escape and back, and neither expands nor moves. A `Toast` there applies no
+state classes, so it shows and goes in one frame.
+
 NSH's additions fit the same pieces: gpui-base expands the stack for hover and focus; NSH's views report no focus, and
 a finger down on the stack (observed `onTouch`) expands it as the pointer does, so a toast being read or swiped is
 paused. A `Toast` takes a swipe (the core's responder, claimed once the pointer moved 10 points toward
 `swipeDirection` along its axis, so its buttons stay presses; released past `swipeThreshold`, measured from where the
-pointer went down, or flicked at 0.5 points per millisecond, it moves out and emits `DismissRequest`). The stack hears
+pointer went down, or flicked at 500 points per second, it moves out and emits `DismissRequest`). The stack hears
 Escape and back while it has children (an overlay of no size, `onCancel`), so nothing else loses them to an empty
 stack. A `Toast`'s `accessibilityLabel` is announced once as it mounts (`announce_for_accessibility`, every platform's
 announcement). The state classes are the app's look for the status: `startingClass` in the first frame while

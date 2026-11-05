@@ -9,6 +9,51 @@ Please submit **one PR that does one thing**. It makes your change easier to rev
 Before writing code, read [AGENTS.md](AGENTS.md) (the project rules, commands and conventions) and the page of
 [docs/dev](docs/dev/README.md) for the area you change.
 
+## Component design standards
+
+Native Shell provides native views, rendering, animation and interaction. Its goal is not to reproduce the default
+appearance of iOS, Android, macOS or Windows controls. Apps need their own colors, typography, spacing, shapes and
+state feedback; even a faithful system-styled button or switch cannot cover those design requirements. NSH supplies
+customizable views and unstyled behavior so apps can build a coherent design across platforms.
+
+Native integration is substantive: platform text fields provide text editing, selection menus, input methods and
+supported autofill services; components expose focus and accessibility semantics; animation and input run through
+the native runtime and platform backends. Preserve and improve these capabilities while leaving visual choices to
+the app. Check the affected platform's documented support rather than assuming every backend has identical system
+integration. See [Input](website/elements/input.md) and [Goals and design principles](website/docs/goals.md).
+
+NSH provides the primitives and unstyled foundation, corresponding to [GPUI Kit](https://gpui-kit.com)'s `gpui` and `gpui-base` layers.
+The styled-library role of `gpui-component` belongs to applications and third-party libraries. `nsh/base` should
+solve complex behavior, reactive state, input, focus, accessibility and adaptive presentation, with tests at the
+owning layer and customization through states, slots and parts. This includes complex workspace components such
+as `Dock`; complexity is a reason to share behavior, not to prescribe appearance.
+
+Website demos and Gallery are example applications. Their gradients, shadows, radii and motion exercise the
+framework's customization capabilities; they are not default styling for the base components. Keep visual
+experiments in examples and styled application/community components. Component implementations and PRs must
+preserve this separation, including the existing documented exceptions for system-managed presentation and
+`TextView` reading defaults.
+
+Apply these boundaries when proposing components:
+
+- **Common controls have one shared API.** Extend `nsh/base`'s `Switch`, `Button`, `Checkbox` and similar components.
+  Expose the parts and states applications need to style them. Do not add a second system-styled control to a
+  platform module: it would make apps select and maintain separate controls for the same behavior on each target.
+- **Platform modules require a platform-specific interaction or capability.** `nsh/mobile` accepts mobile-specific
+  capabilities whose role has no equivalent shared control. `TabBar` is the mobile system navigation bar, with its
+  platform-managed interaction and presentation; it is not precedent for a catalog of native-looking form controls.
+  A different appearance, size, tint or animation alone does not qualify a common control for this module.
+- **Prefer a shared abstraction when the role is shared.** A notification or toast proposal should first establish
+  a single cross-platform contract and adapt presentation internally where appropriate, rather than introduce
+  parallel controls that applications must choose between. This is a design criterion, not a new API declaration.
+- **Validate the integration.** Check input, keyboard and focus behavior, accessibility, intrinsic measurement,
+  controlled state and customization on the affected targets, alongside the public API and compatibility checks.
+
+[GPUI Kit](https://gpui-kit.com)'s separation of unstyled behavior and app-owned appearance informs NSH's component layers. NSH's platform
+backends additionally integrate with platform view and text-input infrastructure. Custom-rendered frameworks must
+supply their own integration with those services; rendering architecture alone does not establish whether a
+particular framework supports accessibility or autofill.
+
 ## NSH and React Native
 
 NSH has a design of its own, and React Native is a reference for which capabilities a mobile UI framework
@@ -72,7 +117,8 @@ Commit subjects and pull request titles name the area first, then say what chang
 ```
 
 - The area is the part of NSH the change is about, in lower case: a crate without its `nsh-` prefix (`core`,
-  `animation`, `js`, `engine`, `package`, `bundler`, `dev`, `cli`, `xtask`, `base`), a platform (`ios`, `android`, `macos`,
+  `animation`, `js`, `engine`, `package`, `bundler`, `dev`, `cli`, `xtask`), a component of `nsh-base` by its name in snake case, never `base` (`rich_editor`,
+  `editor`, `input`, `data_table`), a platform (`ios`, `android`, `macos`,
   `windows`, `linux`), a JS layer or module (`runtime`, `list`, `animated`, `navigation`), or `tailwind`, `text`, `docs`, `examples`, `gallery`, `ci`. A change to all the desktop
   backends (macOS, Windows and Linux) is `desktop`, one to both mobile platforms (iOS and Android) is `mobile`. Name
   one area only, never several separated by commas: when a change spans several, look at it as a whole and name the
@@ -109,6 +155,11 @@ entries, then squash merges it. A failing check removes the entry; fix the failu
 
 - Rust through rustup: `rust-toolchain.toml` selects stable and installs the iOS and Android targets. A nightly
   toolchain for `cargo +nightly fmt`.
+- [huacnlee/cargo](https://github.com/huacnlee/cargo), recommended: a drop-in Cargo fork whose Git worktrees share one
+  build directory that stays under a size limit on its own, with nothing to configure. Install it with
+  `curl -fsSL https://huacnlee.github.io/cargo/install.sh | sh` (Windows:
+  `irm https://huacnlee.github.io/cargo/install.ps1 | iex`). It replaces `~/.cargo/bin/cargo`, updates itself, and its
+  README says how to put rustup's back.
 - Xcode, for the iOS, simulator and Mac Catalyst targets.
 - For Linux: the GTK 4 (4.14 or later) development packages (`libgtk-4-dev`, `gtk4`,
   `gtk4-devel`), WebKitGTK 6.0's for web views (`libwebkitgtk-6.0-dev`, `webkitgtk-6.0`,

@@ -20,8 +20,8 @@ use objc2::{
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSApplicationDelegate,
     NSApplicationTerminateReply, NSAutoresizingMaskOptions, NSBackingStoreType, NSEvent,
-    NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSView, NSWindow, NSWindowDelegate,
-    NSWindowStyleMask,
+    NSEventModifierFlags, NSEventType, NSMenu, NSMenuItem, NSResponder, NSScreen, NSView, NSWindow,
+    NSWindowDelegate, NSWindowStyleMask,
 };
 use objc2_foundation::{
     NSNotification, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, NSString,
@@ -32,11 +32,11 @@ use crate::{
     surface::Surface,
 };
 
-static UI_SETS: RwLock<Option<Vec<nsh_core::ui::Registry>>> = RwLock::new(None);
+static UI_SETS: RwLock<Option<Vec<nsh_core::element::Registry>>> = RwLock::new(None);
 
 /// Sets the UI sets every engine serves (default: `nsh/base`); an app
 /// with Rust components of its own calls this before [`run_app`].
-pub fn set_ui_sets(sets: Vec<nsh_core::ui::Registry>) {
+pub fn set_ui_sets(sets: Vec<nsh_core::element::Registry>) {
     *UI_SETS.write().unwrap_or_else(|e| e.into_inner()) = Some(sets);
 }
 
@@ -60,8 +60,35 @@ pub(crate) fn root() -> Option<Root> {
     root.map(|root| root())
 }
 
+/// The app's native components ([`set_components`]). Process-wide, as the
+/// UI sets of [`set_ui_sets`] are: only the hosts and runners nsh generates
+/// for an app's crate set it, so in an embedding app it stays `None` and
+/// each registry holds only what was registered on its own view.
+static COMPONENTS: RwLock<Option<fn(&crate::native::Components)>> = RwLock::new(None);
+
+/// Sets what registers the app's own native components (`nsh.json`
+/// `"rust"`, `#[native_components(macos)]`): every [`AppView`] calls it on
+/// its [`AppOptions::components`] when it is made, so the app's elements
+/// find them as an embedding app's. It runs before the code holding the
+/// view can register: a name registered on the view afterwards
+/// ([`AppView::register_component`]) replaces the crate's. The development
+/// host and release runner nsh generates for such an app call this before
+/// [`run_app`].
+pub fn set_components(register: fn(&crate::native::Components)) {
+    *COMPONENTS.write().unwrap_or_else(|e| e.into_inner()) = Some(register);
+}
+
+/// Registers the app's native components ([`set_components`]) on
+/// `components`.
+fn register_app_components(components: &crate::native::Components) {
+    let register = *COMPONENTS.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(register) = register {
+        register(components);
+    }
+}
+
 /// The UI sets engines serve.
-pub(crate) fn ui_sets() -> Vec<nsh_core::ui::Registry> {
+pub(crate) fn ui_sets() -> Vec<nsh_core::element::Registry> {
     UI_SETS
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -106,6 +133,20 @@ pub struct AppOptions {
     pub title: String,
     /// The initial window size in points.
     pub size: (i32, i32),
+    /// The display [`run_app`]'s window opens on, centered. `None` (the
+    /// default), or a display that is not there, centers it where AppKit
+    /// centers a new window. `nsh run --display` sets it, and `nsh test
+    /// --target macos` (a secondary display, unless `--display` names one),
+    /// so a test run's windows keep off the screen in use.
+    pub display: Option<WindowDisplay>,
+    /// Keeps [`run_app`]'s window at [`size`](Self::size) when it does not
+    /// fit on its display: AppKit shrinks a window taller than its screen
+    /// when it shows it (`constrainFrameRect:toScreen:`), and the app would
+    /// lay out in less room than asked. False by default (AppKit's
+    /// behavior); `nsh test --target macos` sets it (the development host's
+    /// `--keep-window-size`), so a test's window is the size it opens it at
+    /// whichever display it is on.
+    pub keep_size: bool,
     /// Hides the standalone window on close while retaining its engine.
     /// Reopening from the Dock shows the same window. Quit still stops the app.
     /// Only used by [`run_app`]; defaults to false.
@@ -154,6 +195,8 @@ impl Default for AppOptions {
             app_id: "com.longbridge.nsh.host".to_owned(),
             title: "nsh".to_owned(),
             size: (1200, 800),
+            display: None,
+            keep_size: false,
             keep_alive_on_close: false,
             components: Default::default(),
             appearance: Appearance::System,
@@ -165,6 +208,19 @@ impl Default for AppOptions {
             host: nsh_engine::HostChannel::default(),
         }
     }
+}
+
+/// The display a window opens on ([`AppOptions::display`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WindowDisplay {
+    /// The display at this index of the system's list (`NSScreen.screens`;
+    /// 0 is the primary display, the one with the menu bar).
+    Index(usize),
+    /// The first display of the list besides the primary one, that does not
+    /// mirror it (shows the same part of the desktop); the primary one when
+    /// there is no other.
+    Secondary,
 }
 
 /// One nsh surface as an AppKit view: an engine running one app.
@@ -225,6 +281,7 @@ impl AppView {
                 | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
         container.addSubview(root);
+        register_app_components(&options.components);
         surface.native.set_components(options.components.clone());
         let view = Rc::new(AppView {
             surface,
@@ -280,6 +337,7 @@ impl AppView {
             trace: options.trace,
             network: Some(crate::net::network()),
             websocket: None,
+            refuse_connections: None,
             filesystem: None,
             assets: Some(Arc::new(AssetReader(options.asset_base.clone()))),
             environment: self.surface.environment.get(),
@@ -297,13 +355,16 @@ impl AppView {
             clipboard: None,
             host: options.host.clone(),
             picker: None,
+            speech: None,
         };
         crate::image::set_asset_base(&self.surface, options.asset_base.clone());
         *self.surface.chunks.borrow_mut() = options.chunks.clone();
         self.surface
             .native
             .set_asset_base(options.asset_base.clone());
-        self.surface.native.set_app(&config.app);
+        self.surface
+            .native
+            .set_app(&config.app, config.data_dir.as_deref());
         self.surface.start(config);
     }
 
@@ -322,15 +383,12 @@ impl AppView {
     /// Shows (or hides) the performance monitor: a panel at the top right
     /// with the frame rate, what frames cost the main thread, what commits
     /// cost the engine thread (JS, layout), and the process' CPU, GPU and
-    /// memory. Measuring starts with it and stops when it hides; it
-    /// survives reloads.
+    /// memory, also logged once a second (target `nsh::perf`). Measuring
+    /// starts with it and stops when it hides; it survives reloads.
     pub fn set_fps_monitor(&self, show: bool) {
         let mut hud = self.fps.borrow_mut();
         match (show, hud.is_some()) {
-            (true, false) => {
-                let log = self.options.borrow().trace;
-                *hud = Some(crate::fps::Hud::show(self, log));
-            }
+            (true, false) => *hud = Some(crate::fps::Hud::show(self)),
             (false, true) => *hud = None,
             _ => {}
         }
@@ -356,7 +414,7 @@ impl AppView {
 
     /// The embedding app's text size relative to the default (1.0), which
     /// stands in for the user's: every text that allows font scaling (texts,
-    /// inputs, the components' labels, alerts and toasts) is laid out again
+    /// inputs, the components' labels and alerts) is laid out again
     /// at it, and `fontScale()` reads it, at once and for every app loaded
     /// later. Lengths stay as they are (spacing, sizes, radii, `rem`):
     /// boxes sized by their text grow with it. `None` follows the system's
@@ -404,6 +462,11 @@ fn initial_environment() -> Environment {
         color_scheme: ColorScheme::Light,
         os: Os::MacOs,
         idiom: Idiom::Desktop,
+        screen_color: true,
+        file_requests: true,
+        speech: true,
+        notifications: true,
+        web_input: true,
         ..Environment::default()
     }
 }
@@ -420,6 +483,25 @@ thread_local! {
 }
 
 define_class!(
+    /// [`run_app`]'s window when [`AppOptions::keep_size`] is set: AppKit
+    /// leaves its frame as it is, the window may be taller or wider than its
+    /// screen.
+    #[unsafe(super(NSWindow, NSResponder, NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "NshKeptSizeWindow"]
+    struct KeptSizeWindow;
+
+    unsafe impl NSObjectProtocol for KeptSizeWindow {}
+
+    impl KeptSizeWindow {
+        #[unsafe(method(constrainFrameRect:toScreen:))]
+        fn constrain_frame_rect(&self, rect: NSRect, _screen: Option<&NSScreen>) -> NSRect {
+            rect
+        }
+    }
+);
+
+define_class!(
     /// Closes the app with its window.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -429,6 +511,12 @@ define_class!(
     unsafe impl NSObjectProtocol for Delegate {}
 
     unsafe impl NSApplicationDelegate for Delegate {
+        // Before launching finishes, or a press that starts the app is lost.
+        #[unsafe(method(applicationWillFinishLaunching:))]
+        fn will_finish_launching(&self, _notification: &NSNotification) {
+            crate::notifications::install();
+        }
+
         #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
         fn should_terminate_after_last_window_closed(&self, _app: &NSApplication) -> bool {
             false
@@ -595,15 +683,30 @@ pub fn run_app(source: AppSource, options: AppOptions) -> std::process::ExitCode
         | NSWindowStyleMask::Closable
         | NSWindowStyleMask::Miniaturizable
         | NSWindowStyleMask::Resizable;
-    // SAFETY: NSWindow's designated initializer.
-    let window = unsafe {
-        NSWindow::initWithContentRect_styleMask_backing_defer(
-            NSWindow::alloc(mtm),
-            frame,
-            style,
-            NSBackingStoreType::Buffered,
-            false,
-        )
+    let window = if options.keep_size {
+        // SAFETY: NSWindow's designated initializer, sent to a subclass
+        // that adds no state of its own.
+        let window: Retained<KeptSizeWindow> = unsafe {
+            msg_send![
+                KeptSizeWindow::alloc(mtm),
+                initWithContentRect: frame,
+                styleMask: style,
+                backing: NSBackingStoreType::Buffered,
+                defer: false
+            ]
+        };
+        Retained::into_super(window)
+    } else {
+        // SAFETY: NSWindow's designated initializer.
+        unsafe {
+            NSWindow::initWithContentRect_styleMask_backing_defer(
+                NSWindow::alloc(mtm),
+                frame,
+                style,
+                NSBackingStoreType::Buffered,
+                false,
+            )
+        }
     };
     // SAFETY: the window is kept in `RUNNING` until it closes.
     unsafe { window.setReleasedWhenClosed(false) };
@@ -613,6 +716,9 @@ pub fn run_app(source: AppSource, options: AppOptions) -> std::process::ExitCode
     let view = AppView::new(mtm, options.clone());
     window.setContentView(Some(&view.view()));
     window.center();
+    if let Some(display) = options.display {
+        center_on_display(&window, display);
+    }
     match source {
         AppSource::Rust(root) => view.load(App::Rust(root)),
         AppSource::Bundle(bundle) => view.load(App::Js(bundle)),
@@ -634,6 +740,47 @@ pub fn run_app(source: AppSource, options: AppOptions) -> std::process::ExitCode
     app.setDelegate(None);
     drop(delegate);
     std::process::ExitCode::SUCCESS
+}
+
+/// Centers `window` on `display` (its visible part: below the menu bar,
+/// beside the Dock), its title bar on it when the window is taller; leaves
+/// it where it is when there is no such display.
+fn center_on_display(window: &NSWindow, display: WindowDisplay) {
+    let screens = NSScreen::screens(MainThreadMarker::from(window));
+    let index = match display {
+        WindowDisplay::Index(index) => index,
+        WindowDisplay::Secondary => {
+            let frames: Vec<NSRect> = screens.iter().map(|s| s.frame()).collect();
+            match secondary(&frames) {
+                Some(index) => index,
+                None => return,
+            }
+        }
+    };
+    if index >= screens.count() {
+        log::warn!(
+            "there is no display {} ({} connected): the window opens on the main one",
+            index + 1,
+            screens.count()
+        );
+        return;
+    }
+    let area = screens.objectAtIndex(index).visibleFrame();
+    let size = window.frame().size;
+    let x = area.origin.x + ((area.size.width - size.width) / 2.0).max(0.0);
+    // From the bottom: a window taller than the area keeps its top (the
+    // title bar) inside it, as AppKit keeps it when it shows the window.
+    let y = area.origin.y + area.size.height - size.height;
+    let y = y - ((area.size.height - size.height) / 2.0).max(0.0);
+    window.setFrameOrigin(NSPoint::new(x, y));
+}
+
+/// The first of the displays (their frames, the primary display's first)
+/// besides the primary one that does not mirror it: a mirror shows the
+/// same part of the desktop, so its frame is the primary's.
+fn secondary(frames: &[NSRect]) -> Option<usize> {
+    let primary = frames.first()?;
+    frames.iter().position(|f| f != primary)
 }
 
 /// The app menu (About, Hide, Quit), Edit (the text commands fields
@@ -711,4 +858,28 @@ fn main_menu(mtm: MainThreadMarker, title: &str) -> Retained<NSMenu> {
     window.addItem(&NSMenuItem::separatorItem(mtm));
     item(&window, "Close", Some(sel!(performClose:)), "w");
     bar
+}
+
+#[cfg(test)]
+mod tests {
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    use super::secondary;
+
+    fn frame(x: f64, y: f64, w: f64, h: f64) -> NSRect {
+        NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    }
+
+    /// A secondary display is the first that is not the primary one or a
+    /// mirror of it; one display alone has none.
+    #[test]
+    fn the_secondary_display_skips_the_primary_and_its_mirrors() {
+        let primary = frame(0.0, 0.0, 3008.0, 1692.0);
+        let built_in = frame(3008.0, 0.0, 1800.0, 1169.0);
+        assert_eq!(secondary(&[primary]), None);
+        assert_eq!(secondary(&[]), None);
+        assert_eq!(secondary(&[primary, built_in]), Some(1));
+        assert_eq!(secondary(&[primary, primary, built_in]), Some(2));
+        assert_eq!(secondary(&[primary, primary]), None);
+    }
 }

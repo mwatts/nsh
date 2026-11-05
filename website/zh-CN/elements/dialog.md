@@ -1,7 +1,6 @@
 ---
 title: Dialog
 description: Dialog 组件：在所有内容之上的模态界面，用于全屏流程、sheet 和由应用设定样式的对话框。
-order: 21
 group: base
 demo: el-dialog
 ---
@@ -13,10 +12,10 @@ Dialog 在应用其余内容之上、在它自己的原生窗口层中呈现内�
 Dialog 负责行为，外观交给应用：它的样式设定弹出层（包含子元素的视图）的样式，在 TSX 中 `backdropClass` / `backdropStyle` 在它后面加一层背景。
 
 ```rust tabs
-use nsh_base::{button, dialog, safe_area_view};
-use nsh_core::ui::prelude::*;
+use nsh_base::{button, dialog};
+use nsh_core::prelude::*;
 
-/// 白色文字的蓝色按钮。
+/// A blue button with a white label.
 fn primary(label: &'static str, on_press: impl Fn() + 'static) -> impl IntoElement {
     button()
         .on_press(on_press)
@@ -35,7 +34,7 @@ fn example() -> impl IntoElement {
         .flex_1()
         .justify_center()
         .p_6()
-        .child(primary("打开", move || open.set(true)))
+        .child(primary("Open", move || open.set(true)))
         .child(when(open, move || {
             dialog()
                 .presentation(ModalPresentation::PageSheet)
@@ -43,12 +42,14 @@ fn example() -> impl IntoElement {
                 .flex_1()
                 .bg(white())
                 .child(
-                    safe_area_view()
+                    view()
                         .flex_1()
-                        .p_5()
+                        .px_5()
+                        .pt_safe_area_plus(px(20.0))
+                        .pb_safe_area_plus(px(20.0))
                         .gap_3()
-                        .child(text("一个 sheet").text_2xl().font_weight(FontWeight::BOLD))
-                        .child(primary("关闭", move || open.set(false))),
+                        .child(text("A sheet").text_2xl().font_weight(FontWeight::BOLD))
+                        .child(primary("Close", move || open.set(false))),
                 )
         }))
 }
@@ -56,31 +57,39 @@ fn example() -> impl IntoElement {
 
 ```tsx tabs
 import { signal, Text, View } from "nsh";
-import { Button, Dialog, SafeAreaView } from "nsh/base";
+import { Button, Dialog } from "nsh/base";
 
 function Example() {
   const open = signal(false);
   return (
     <View style={{ flex: 1, justifyContent: "center", padding: 24 }}>
       <Button onPress={() => open.set(true)} class="items-center rounded-lg bg-blue-600 px-4 py-3 active:opacity-70">
-        <Text class="font-semibold text-white">打开</Text>
+        <Text class="font-semibold text-white">Open</Text>
       </Button>
-      <Dialog open={open()} presentation="pageSheet" onOpenChange={(next) => open.set(next)} class="flex-1 bg-white">
-        <SafeAreaView style={{ flex: 1, padding: 20, gap: 12 }}>
-          <Text style={{ fontSize: 24, fontWeight: "700" }}>一个 sheet</Text>
+      <Dialog open={open()} presentation="pageSheet" onOpenChange={(e) => open.set(e.open)} class="flex-1 bg-white">
+        <View
+          style={{
+            flex: 1,
+            gap: 12,
+            paddingHorizontal: 20,
+            paddingTop: "calc(env(safe-area-inset-top) + 20px)",
+            paddingBottom: "calc(env(safe-area-inset-bottom) + 20px)",
+          }}
+        >
+          <Text style={{ fontSize: 24, fontWeight: "700" }}>A sheet</Text>
           <Button onPress={() => open.set(false)} class="items-center rounded-lg bg-blue-600 px-4 py-3 active:opacity-70">
-            <Text class="font-semibold text-white">关闭</Text>
+            <Text class="font-semibold text-white">Close</Text>
           </Button>
-        </SafeAreaView>
+        </View>
       </Dialog>
     </View>
   );
 }
 ```
 
-在 TSX 中，`open` 不为 `false` 时显示，变为 `false` 时关闭。在 Rust 中，它在视图中时呈现，离开视图时消失，所以由 `when` 持有它。无论哪种方式，它都会给内容提供 dialog 的安全区域 inset，供其内部的 [`SafeAreaView`](./safe-area-view.md) 和 `safeAreaInsets()`（Rust 组件中为 `cx.insets()`）读取。[`Button`](./button.md) 同样来自 `nsh/base`，是由应用设定样式的按压目标。
+在 TSX 中，`open` 不为 `false` 时显示，变为 `false` 时关闭。在 Rust 中，它在视图中时呈现，离开视图时消失，所以由 `when` 持有它。无论哪种方式，它都会给内容提供 dialog 的安全区域 inset，供其内部的 [`env(safe-area-inset-*)`](./safe-area.md) 变量和 `safeAreaInsets()`（Rust 组件中为 `cx.insets()`）读取。[`Button`](./button.md) 同样来自 `nsh/base`，是由应用设定样式的按压目标。
 
-`nsh_core::ui::prelude` 中也有一个较旧的、已弃用的 `dialog` 函数：像上面那样按名称导入 `nsh_base::dialog`，显式导入会取代它。如果需要系统提示框或操作表，请使用 [`AlertDialog`](./alert-dialog.md)。
+`nsh_core::prelude` 中也有一个较旧的、已弃用的 `dialog` 函数：像上面那样按名称导入 `nsh_base::dialog`，显式导入会取代它。如果需要系统提示框或操作表，请使用 [`AlertDialog`](./alert-dialog.md)。
 
 ## 属性
 
@@ -88,6 +97,7 @@ function Example() {
 |---|---|---|---|---|
 | `open` | 打开期间位于视图中（`when(open, ..)`） | `boolean` | `true` | 为 true 时显示。 |
 | `animation` | `.animation(ModalAnimation::Fade)` | `"slide" \| "fade" \| "none"` | `"slide"` | 出现和离开的方式。 |
+| `transitionShader` | `.transition_shader(TransitionShader::new(program))` | `{ source: string; uniforms?: Record<string, ShaderUniform>; duration?: number }` | 无 | 通过一个 WGSL 着色器出现和离开，取代它的 `animation`：`shade(uv)` 以 `sample_from` 读取后面的内容、以 `sample_to` 读取对话框，`nsh.progress` 在 `duration` 毫秒内（默认 350）从 0 走到 1，关闭时从 1 回到 0。系统要求减少动态效果时，它使用自己的 `animation`。见 [Shader](./shader.md)。 |
 | `presentation` | `.presentation(ModalPresentation::PageSheet)` | `"fullScreen" \| "pageSheet" \| "formSheet"` | `"fullScreen"` | 在 iOS 上的形式：`fullScreen` 以透明背景覆盖整个屏幕；`pageSheet` 和 `formSheet` 是系统 sheet，下面的内容保持可见（在大屏上 `formSheet` 是一个更小的居中 sheet）。 |
 | `closeOnEscape` | `.close_on_escape(..)` | `boolean` | `true` | Escape 和 Android 返回键在原生侧关闭它。 |
 | `closeOnBackdropPress` | `.close_on_backdrop_press(..)` | `boolean` | `true` | 按下背景层时关闭它。 |
@@ -96,7 +106,7 @@ function Example() {
 | `onOpen` | `.on_open(..)` | `() => void` | | 已完全出现。 |
 | `onClose` | `.on_close(..)` | `() => void` | | 已离开：用户关闭了它，或应用移除了它。 |
 | `onCancel` | `.on_cancel(..)` | `() => void` | | 用户尝试关闭它（Escape、返回、按下背景层、下滑），无论 `closeOn*` 是否允许关闭。 |
-| `onOpenChange` | `.on_cancel(..)` | `(open: boolean, reason: "cancel" \| "backdropPress" \| "swipe") => void` | | 用户关闭了它：在这里同步 `open`。在 Rust 中，由 `on_cancel` 把对话框移出视图。 |
+| `onOpenChange` | `.on_cancel(..)` | `(e: { open: boolean; reason: "cancel" \| "backdropPress" \| "swipe" }) => void` | | 用户关闭了它：在这里同步 `open`。在 Rust 中，由 `on_cancel` 把对话框移出视图。 |
 | `class`、`style` | `Styled` 方法 | `string`、`StyleProp<ViewStyle>` | | 弹出层：包含子元素的视图。 |
 | `backdropClass`、`backdropStyle` | 铺满对话框的子视图 | `string`、`StyleProp<ViewStyle>` | | 铺满 dialog、位于弹出层后面的背景层，设置其中之一时出现。 |
 | `children` | `.child(..)` | `JSX.Element` | | 内容。 |
@@ -111,7 +121,7 @@ function Example() {
 
 ## 打开与关闭
 
-对话框的状态属于应用。用户关闭 dialog（Escape、Android 返回键、按下背景层、下滑 sheet）时，它在原生侧关闭并通知应用，由应用把状态改成一致：TSX 中是 `onOpenChange(false, reason)`，Rust 中是 `on_cancel`。在 TSX 中，`open` 一直为 `true` 时 dialog 保持关闭，`open` 从 `false` 变为 `true` 时再次打开。
+对话框的状态属于应用。用户关闭 dialog（Escape、Android 返回键、按下背景层、下滑 sheet）时，它在原生侧关闭并通知应用，由应用把状态改成一致：TSX 中是 `onOpenChange({ open: false, reason })`，Rust 中是 `on_cancel`。在 TSX 中，`open` 一直为 `true` 时 dialog 保持关闭，`open` 从 `false` 变为 `true` 时再次打开。
 
 由于主线程从不等待应用代码，每个 `closeOn*` 标志都在用户操作时由原生侧读取。要在关闭前先确认，把这些标志设为 `false`：此时用户的尝试会调用 `onCancel`，由应用自己关闭对话框（TSX 中把 `open` 设为 `false`，Rust 中把它移出视图）：
 
@@ -189,7 +199,7 @@ when(confirm, move || {
 <Dialog
   open={confirm()}
   animation="fade"
-  onOpenChange={(next) => confirm.set(next)}
+  onOpenChange={({ open }) => confirm.set(open)}
   backdropClass="bg-black/40"
   class="m-auto w-80 gap-3 rounded-2xl bg-white p-5"
 >

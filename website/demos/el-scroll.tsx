@@ -1,5 +1,5 @@
-import { mount, Scroll, signal, Text, View, type YNode } from "nsh";
-import { desktop, Inspector, Panel, size, ui, wide } from "./palette";
+import { mount, Scroll, type ScrollRef, signal, Text, View } from "nsh";
+import { button, buttonText, desktop, Inspector, Panel, size, ui, wide } from "./palette";
 
 // The page colors, read when they render: they follow the theme.
 const colors = (): string[] => [ui().accent, ui().info, ui().violet, ui().down, ui().warn, ui().up];
@@ -9,7 +9,7 @@ function App() {
   // A page is as wide as the scroll view: 390 on a phone, wider on a desktop.
   const width = signal(390);
   const y = signal(0);
-  let scroller!: YNode;
+  let scroller!: ScrollRef;
   const rows = Array.from({ length: 40 }, (_, i) => i + 1);
 
   /** Pages as wide as the scroll view; `inset`: each page's margin. */
@@ -19,8 +19,8 @@ function App() {
       pagingEnabled
       scrollbar={false}
       style={style}
-      onLayout={(e) => width.set(e.size.width)}
-      onMomentumEnd={(e) => page.set(Math.round(e.x / width()))}
+      onLayout={({ bounds }) => width.set(bounds.size.width)}
+      onMomentumEnd={({ offset }) => page.set(Math.round(offset.x / width()))}
     >
       <Each of={colors()}>
         {(color, index) => (
@@ -36,14 +36,9 @@ function App() {
   const toTop = (compact: boolean) => (
     <View
       onPress={() => scroller.scrollTo({ y: 0, animated: true })}
-      activeStyle={{ opacity: 0.6 }}
-      style={
-        compact
-          ? { ...ui().raised, alignSelf: "flex-start", borderRadius: 8, height: size.control, paddingHorizontal: 12, justifyContent: "center" }
-          : { ...ui().raised, borderRadius: 10, paddingHorizontal: 12, paddingVertical: 6 }
-      }
+      {...button("secondary", { size: compact ? "md" : "sm" })}
     >
-      <Text style={{ color: ui().text, fontSize: compact ? 13 : undefined }}>scrollTo top</Text>
+      <Text style={buttonText()}>scrollTo top</Text>
     </View>
   );
 

@@ -1,7 +1,7 @@
 ---
 title: Scroll
 description: 原生滚动视图：纵向和横向滚动、分页与吸附、下拉刷新、缩放以及滚动事件。
-order: 5
+order: 40
 group: primitives
 demo: el-scroll
 ---
@@ -11,7 +11,7 @@ demo: el-scroll
 `Scroll` 是原生滚动视图（iOS 和 Mac Catalyst 上是 UIScrollView，Android 上是 ScrollView）。它把所有子元素作为内容进行布局，并在原生侧滚动：滚动、惯性滑动、回弹和吸附都由平台以屏幕刷新率完成。Rust 用 `scroll()` 创建，TSX 用从 `nsh` 导入的 `<Scroll>`。
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 scroll().flex_1().child(
     view().p_4().gap_2().child(each(
@@ -44,7 +44,7 @@ scroll().flex_1().child(
 |---|---|---|---|---|
 | `horizontal` | `.horizontal()` | `boolean` | `false` | 横向滚动。 |
 | `scrollable` | `.scrollable(..)` | `boolean` | `true` | 用户可以滚动。 |
-| `scrollbar` | `.scrollbar(..)` | `boolean` | `true` | 显示滚动条。在桌面和桌面浏览器中，横向视图始终保留滚动条：它是鼠标的滚动条。 |
+| `scrollbar` | `.scrollbar(..)` | `boolean \| ScrollbarTheme` | `true` | 显示滚动条：平台的滚动指示器，或应用设置主题后的[内置滚动条](./scrollbar.md#内置滚动条)；对象是该视图自己的主题。在桌面和桌面浏览器中，横向视图始终保留滚动条：它是鼠标的滚动条。 |
 | `bounces` | `.bounces(..)` | `boolean` | `true` | 允许越过边缘回弹。 |
 | `pagingEnabled` | `.paging(..)` | `boolean` | `false` | 停在视口尺寸的整数倍处。 |
 | `snapToInterval` | `.snap_interval(px(..))` | `number` | `0` | 停在该长度的整数倍处（0 表示关闭）。 |
@@ -67,6 +67,8 @@ scroll().flex_1().child(
 |---|---|---|---|
 | `refreshing` | `.refreshing(..)` | `boolean` | 显示刷新指示器。 |
 | `onRefresh` | `.on_refresh(..)` | `() => void` | 用户下拉刷新：开始加载，并在结束前保持 `refreshing` 为真。 |
+| `refreshIndicator` | `.refresh_indicator(Some(height))` | `{ height: number }` | 应用自己绘制指示器，高 `height` 点：平台的转圈隐藏，下拉到 `height` 即刷新，刷新中在内容上方留出 `height`。`height` 不大于 0 时视为未设。 |
+| `pullValue` | `.pull_value(&value)` | `AnimatedValue` | 一个动画值，写入视图被拉过顶部的距离（静止为 0，随下拉增大；刷新中为内容上方留出的空间，设了 `refreshIndicator` 时等于 `height`），用来绘制应用的指示器。 |
 
 ```rust tabs
 let refreshing = signal(false);
@@ -128,7 +130,7 @@ scroll()
 ```
 
 ```tsx tabs
-let photo!: YNode;
+let photo!: ScrollRef;
 <Scroll ref={photo} maximumZoomScale={4} centerContent style={{ flex: 1, backgroundColor: "#000" }}>
   <Image src={picture} style={{ width: 390, height: 520 }} onPress={() => photo.zoomTo({ scale: 1, animated: true })} />
 </Scroll>;
@@ -139,9 +141,9 @@ let photo!: YNode;
 | 事件 | Rust | 载荷 | 触发时机 |
 |---|---|---|---|
 | `onScroll` | `.on_scroll` | `ScrollEvent` | 偏移量变化（每帧最多一次，且不比 `scrollEventThrottle` 更频繁）。 |
-| `onScrollDragStart` / `onScrollDragEnd` | `.on_scroll_drag_start` / `.on_scroll_drag_end` | `{ x, y }`（`Point<Points>`） | 用户开始 / 停止拖动。 |
-| `onMomentumStart` / `onMomentumEnd` | `.on_momentum_start` / `.on_momentum_end` | `{ x, y }` | 拖动后的惯性滑动开始 / 停止。被新一次拖动打断的滑动同样以 `onMomentumEnd` 结束。 |
-| `onScrollEnd` | `.on_scroll_end` | `{ x, y }` | 滚动停了下来。 |
+| `onScrollDragStart` / `onScrollDragEnd` | `.on_scroll_drag_start` / `.on_scroll_drag_end` | `{ offset }`（`Point<Points>`） | 用户开始 / 停止拖动。 |
+| `onMomentumStart` / `onMomentumEnd` | `.on_momentum_start` / `.on_momentum_end` | `{ offset }` | 拖动后的惯性滑动开始 / 停止。被新一次拖动打断的滑动同样以 `onMomentumEnd` 结束。 |
+| `onScrollEnd` | `.on_scroll_end` | `{ offset }` | 滚动停了下来。 |
 | `onRefresh` | `.on_refresh` | 无 | 触发了下拉刷新。 |
 
 `ScrollEvent` 为 `{ offset: Point; contentSize: Size; size: Size; zoomScale }`（Rust 中为 `offset`、`content_size`、`size`、`zoom_scale`）：偏移量、（缩放后的）内容尺寸、视口尺寸和缩放比例（不缩放时为 1）。
@@ -164,14 +166,14 @@ scroller.scroll_to(point(px(0.0), px(0.0)), true);
 ```
 
 ```tsx tabs
-let scroller!: YNode;
+let scroller!: ScrollRef;
 <Scroll ref={scroller}>…</Scroll>;
 scroller.scrollTo({ y: 0, animated: true });
 ```
 
 ## 键盘
 
-滚动视图中的输入框会在原生侧自动避开键盘：滚动视图获得底部内边距，并自行滚动到获得焦点的输入框。对于滚动视图之外的内容，请使用 `nsh/base` 的 [`KeyboardAvoidingView`](./keyboard-avoiding-view.md)。参见[表单与键盘](../docs/forms-and-keyboard.md)。
+滚动视图中的输入框会在原生侧自动避开键盘：滚动视图获得底部内边距，并自行滚动到获得焦点的输入框。对于滚动视图之外的内容，请在底部内边距或外边距中使用 [`env(keyboard-inset-height)`](./keyboard.md)。参见[表单与键盘](../docs/forms-and-keyboard.md)。
 
 ## 从右到左
 

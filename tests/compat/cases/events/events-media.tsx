@@ -7,9 +7,9 @@
 // text. Its
 // script checks each.
 import { Text, View, signal } from "nsh";
-import { Image } from "nsh/image";
-import { Video } from "nsh/video";
-import { WebView } from "nsh/webview";
+import { Image } from "nsh";
+import { Video } from "nsh";
+import { WebView } from "nsh";
 
 type Navigation = { url: string; title: string; loading: boolean; canGoBack: boolean; canGoForward: boolean };
 
@@ -31,7 +31,7 @@ function App() {
         style={{ width: 64, height: 48 }}
         onLoadStart={() => add(image, "start")}
         onProgress={(e) => add(image, `progress ${e.loaded}/${e.total}`)}
-        onLoad={(e) => add(image, `load ${e.width}x${e.height}`)}
+        onLoad={({ size }) => add(image, `load ${size.width}x${size.height}`)}
         onLoadEnd={() => add(image, "end")}
       />
       <Text>Image: {image().join(" | ")}</Text>
@@ -64,6 +64,7 @@ function App() {
         onNavigationStateChange={(e) => add(web, `nav ${nav(e)}`)}
         onMessage={(e) => add(web, `message ${e.data}`)}
         onError={(e) => add(web, `error ${e.message}`)}
+        onDownload={(e) => add(web, `download ${e.state} ${e.filename} ${e.bytes ?? "-"} ${e.message ?? "-"}`)}
       />
       <Text>Web: {web().join(" | ")}</Text>
     </View>

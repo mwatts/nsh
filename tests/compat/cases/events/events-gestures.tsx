@@ -6,14 +6,15 @@
 // each.
 import { Text, View, signal } from "nsh";
 
-type Pan = { translationX: number; translationY: number; velocityX: number; velocityY: number };
+type Pan = { translation: { x: number; y: number }; velocity: { x: number; y: number } };
 
 function pan(e: Pan): string {
-  return `${e.translationX},${e.translationY} v ${e.velocityX},${e.velocityY}`;
+  return `${e.translation.x},${e.translation.y} v ${e.velocity.x},${e.velocity.y}`;
 }
 
 function App() {
   const drag = signal("none");
+  const cancelled = signal(false);
   const pinch = signal("none");
   const rotation = signal("none");
   return (
@@ -22,9 +23,10 @@ function App() {
         testID="drag"
         style={{ height: 40 }}
         onPanStart={(e) => drag.set(`start ${pan(e)}`)}
-        onPanEnd={(e) => drag.set(`${drag()}; end ${pan(e)}`)}
+        onPanEnd={(e) => { drag.set(`${drag()}; end ${pan(e)}`); cancelled.set(e.cancelled ?? false); }}
       />
       <Text>Pan: {drag()}</Text>
+      <Text>Cancelled: {String(cancelled())}</Text>
       <View
         testID="pinch"
         style={{ height: 40 }}

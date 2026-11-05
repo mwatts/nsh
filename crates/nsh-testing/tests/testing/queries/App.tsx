@@ -1,7 +1,7 @@
 // Views to find and act on: rows with the same buttons, a disabled
 // button, a long press, an input to clear, a note that goes away.
-import { Input, mount, signal, Text, View } from "nsh";
-import { Button } from "nsh/base";
+import { mount, signal, Text, View } from "nsh";
+import { Button, Input } from "nsh/base";
 
 function App() {
   const items = signal(["Milk", "Eggs"]);
@@ -31,7 +31,7 @@ function App() {
       <View onPress={() => log.set("tap")} onLongPress={() => log.set("held")} delayLongPress={200}>
         <Text>Hold me</Text>
       </View>
-      <Input testID="draft" value={draft()} onChange={(t) => draft.set(t)} />
+      <Input testID="draft" value={draft()} onChange={({ value }) => draft.set(value)} />
       <Text>{`Draft: ${draft()}`}</Text>
     </View>
   );

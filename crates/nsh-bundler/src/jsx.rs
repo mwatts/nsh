@@ -63,32 +63,38 @@ pub(crate) enum Compiled {
 }
 
 /// nsh's primitives, by their home (module, export), and what their tags
-/// compile to: `nsh`'s, `nsh/base`'s `Dialog` and `nsh/ios`'s
-/// `InputAccessoryView`, then the modules that exported them before `nsh`
-/// did (deprecated, still compiled alike). The first home of a name is the
-/// one hints name.
+/// compile to: `nsh`'s, `nsh/base`'s `Input` and `Dialog` and
+/// `nsh/mobile`'s `InputAccessoryView`.
 pub(crate) const PRIMITIVES: &[(&str, &str, Compiled)] = &[
     ("nsh", "View", Compiled::Host("view")),
     ("nsh", "Text", Compiled::Host("text")),
     ("nsh", "Scroll", Compiled::Host("scroll")),
-    ("nsh", "Input", Compiled::Host("input")),
     ("nsh", "Overlay", Compiled::Host("overlay")),
+    ("nsh", "Shader", Compiled::Host("shader")),
+    ("nsh", "ShaderEffect", Compiled::Host("shadereffect")),
+    (
+        "nsh",
+        "ShaderTransition",
+        Compiled::Host("shadertransition"),
+    ),
+    ("nsh", "ScreenEffect", Compiled::Host("screeneffect")),
+    (
+        "nsh",
+        "ScreenTransition",
+        Compiled::Host("screentransition"),
+    ),
     ("nsh", "Image", Compiled::Host("image")),
     ("nsh", "WebView", Compiled::Host("webview")),
     ("nsh", "Video", Compiled::Host("video")),
     ("nsh", "List", Compiled::List),
     ("nsh", "Canvas", Compiled::Component("canvas")),
+    ("nsh/base", "Input", Compiled::Host("input")),
     ("nsh/base", "Dialog", Compiled::Component("modal")),
     (
-        "nsh/ios",
+        "nsh/mobile",
         "InputAccessoryView",
         Compiled::Component("inputaccessory"),
     ),
-    ("nsh/image", "Image", Compiled::Host("image")),
-    ("nsh/webview", "WebView", Compiled::Host("webview")),
-    ("nsh/video", "Video", Compiled::Host("video")),
-    ("nsh/list", "List", Compiled::List),
-    ("nsh/canvas", "Canvas", Compiled::Component("canvas")),
 ];
 
 /// The control flow tags, global unless a binding of the name shadows them.
@@ -306,7 +312,10 @@ fn decode_entities(s: &str) -> String {
     while let Some(at) = rest.find('&') {
         out.push_str(&rest[..at]);
         rest = &rest[at..];
-        let Some(end) = rest[..rest.len().min(12)].find(';') else {
+        // Search the bytes rather than slice the text: byte 12 may fall
+        // inside a character (`& 中文测试`). `;` is ASCII, so its index is a
+        // character boundary, which the slices below rely on.
+        let Some(end) = rest.bytes().take(12).position(|b| b == b';') else {
             out.push('&');
             rest = &rest[1..];
             continue;
@@ -1405,6 +1414,24 @@ mod tests {
     }
 
     #[test]
+    fn entities_beside_multibyte_text_decode() {
+        // Slicing 12 bytes after an `&` could split a character: it panicked.
+        assert_eq!(decode_entities("A & 中文测试"), "A & 中文测试");
+        assert_eq!(decode_entities("&中文测试试&amp;"), "&中文测试试&");
+        assert_eq!(
+            decode_entities("&amp;中文 &lt;b&gt; &#x4e2d;"),
+            "&中文 <b> 中"
+        );
+        assert_eq!(decode_entities("日本&"), "日本&");
+        let code = compile(
+            r#"import { Text } from "nsh";
+            export const a = <Text>A & 中文测试</Text>;"#,
+        )
+        .unwrap();
+        assert!(code.contains("A & 中文测试"), "{code}");
+    }
+
+    #[test]
     fn import_meta_url_is_the_module_s_own() {
         let code =
             compile("const here = new URL(\".\", import.meta.url); const meta = import.meta;")
@@ -1454,39 +1481,7 @@ mod tests {
         assert!(!code.contains(r#"from "nsh";"#), "{code}");
     }
 
-    #[test]
-    fn primitives_compile_in_place_by_their_imports() {
-        let code = flat(
-            &compile(
-                r#"import { View as Box, Text } from "nsh";
-            import { Image } from "nsh/image";
-            import { WebView } from "nsh/webview";
-            import { List } from "nsh/list";
-            import { Canvas } from "nsh/canvas";
-            export const a = <Box><Text>t</Text><Image src="x" /><WebView src="about:blank" /></Box>;
-            export const b = <List each={[1]}>{(i) => <Text>{i()}</Text>}</List>;
-            export const c = <Canvas draw={() => {}} />;
-            Image.prefetch("x");"#,
-            )
-            .unwrap(),
-        );
-        for tag in ["view", "text", "image", "webview"] {
-            assert!(code.contains(&format!(r#"_$element("{tag}")"#)), "{code}");
-        }
-        assert!(code.contains("_$component(_$list, {"), "{code}");
-        // `Canvas` is a native component of its own (the drawing).
-        assert!(code.contains("_$component(Canvas, {"), "{code}");
-        // Used as a value, `Image` stays imported.
-        assert!(
-            code.contains(r#"import { Image } from "nsh/image";"#),
-            "{code}"
-        );
-        assert!(!code.contains("nsh/webview"), "{code}");
-        assert!(!code.contains("nsh/list"), "{code}");
-    }
-
-    /// Every primitive compiles alike imported from `nsh`, where it lives
-    /// now, as from the module it was first exported from.
+    /// Every primitive compiles in place by its import from `nsh`.
     #[test]
     fn primitives_from_nsh_compile_in_place() {
         let code = flat(
@@ -1558,9 +1553,9 @@ mod tests {
         assert!(err.contains("write <InputAccessoryView>"), "{err}");
         let err = error("export const a = <each of={[]}>{() => null}</each>;");
         assert!(err.contains("write <Each> (a global: no import)"), "{err}");
-        let err = error("export const a = <safe-area-view />;");
+        let err = error("export const a = <text-view />;");
         assert!(
-            err.contains(r#"write <SafeAreaView> and `import { SafeAreaView } from "nsh/base"`"#),
+            err.contains(r#"write <TextView> and `import { TextView } from "nsh/base"`"#),
             "{err}"
         );
         let err = error(
@@ -1814,14 +1809,14 @@ mod tests {
     fn imports_tags_use_stay_and_type_only_ones_go() {
         let code = flat(
             &compile(
-                r#"import { SafeAreaView, Edge, Edges } from "nsh/base";
+                r#"import { Button, Edges } from "nsh/base";
             let r: Edges | undefined;
-            export const a = <SafeAreaView ref={r} />;"#,
+            export const a = <Button ref={r} />;"#,
             )
             .unwrap(),
         );
         assert!(
-            code.contains(r#"import { SafeAreaView } from "nsh/base";"#),
+            code.contains(r#"import { Button } from "nsh/base";"#),
             "{code}"
         );
         assert!(

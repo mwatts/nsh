@@ -10,18 +10,19 @@ group: platforms
 A native component is a view the **embedding app** registers by name: a map, a camera preview, a chart library, any
 `UIView` on iOS, `android.view.View` on Android, `NSView` on macOS, `gtk::Widget` on Linux, or Direct2D drawing or a
 child `HWND` on Windows. The NSH app uses it like any other element: a Rust app makes it with `native(name)` from
-`nsh_core::ui::prelude`, a TSX app declares it with `nativeComponent()` from [`nsh/native`](../modules/nsh-native.md). NSH lays it out with the rest of the
+`nsh_core::prelude`, a TSX app declares it with `nativeComponent()` from [`nsh`](../modules/nsh.md#nativecomponent-and-nativemodule). NSH lays it out with the rest of the
 app, sends it props, delivers its events to handlers and forwards commands from a `ref`.
 
 Because NSH renders with the system's own views, a native component is just one more subview in the same hierarchy:
 there is no layering problem, it clips, scrolls and receives touches like a `<View>`.
 
 > [!NOTE]
-> Native components exist only where an app embeds NSH ([iOS](./ios.md), [Android](./android.md),
+> Native components are registered by the app that embeds NSH ([iOS](./ios.md), [Android](./android.md),
 > [macOS](./macos.md#embedding-in-a-mac-app), [Linux](./linux.md#embedding-in-a-gtk-app),
-> [Windows](./windows.md#embedding-in-a-win32-app)).
-> A packaged standalone app (`nsh package`) or a development host registers none, so the element renders an empty
-> view there (the name is logged once as unknown).
+> [Windows](./windows.md#embedding-in-a-win32-app)), or on Windows, macOS, Linux and iOS by the app's own Rust crate,
+> whose components the development host and the packaged app (`nsh package`) register
+> ([Registering from the app's crate](#registering-from-the-apps-crate)). A name nothing registered renders an empty
+> view (the name is logged once as unknown).
 
 ## How it fits together
 
@@ -41,8 +42,7 @@ closure of one, sent again when it changes), `.on_native_event(..)` hears its ev
 for the name with the props and events it uses.
 
 ```rust tabs
-use nsh_base::safe_area_view;
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 use serde_json::json;
 
 const COLORS: [&str; 4] = ["#8250df", "#0969da", "#1a7f37", "#cf222e"];
@@ -51,9 +51,11 @@ const COLORS: [&str; 4] = ["#8250df", "#0969da", "#1a7f37", "#cf222e"];
 pub fn App() -> impl IntoElement {
     let taps = signal(0_u64);
     let badge = element_ref();
-    safe_area_view()
+    view()
         .flex_1()
         .p(px(20.0))
+        .pt_safe_area_plus(px(20.0))
+        .pb_safe_area_plus(px(20.0))
         .gap(px(16.0))
         .bg(rgb(0xf6f8fa))
         .child(text("Rendered by nsh").text_size(px(22.0)).font_weight(FontWeight::BOLD))
@@ -81,9 +83,8 @@ pub fn App() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { mount, signal, Text, type YNode } from "nsh";
-import { nativeComponent } from "nsh/native";
-import { SafeAreaView } from "nsh/base";
+import { mount, type NativeComponentRef, signal, Text, View } from "nsh";
+import { nativeComponent } from "nsh";
 
 /** The host app's badge: a label it draws, sized to its text. */
 const Badge = nativeComponent<{ text: string; color?: string }, { tap: { count: number } }>("embed.badge", {
@@ -95,9 +96,9 @@ const colors = ["#8250df", "#0969da", "#1a7f37", "#cf222e"];
 
 function App() {
   const taps = signal(0);
-  let badge: YNode | undefined;
+  let badge: NativeComponentRef | undefined;
   return (
-    <SafeAreaView style={{ flex: 1, padding: 20, gap: 16, backgroundColor: "#f6f8fa" }}>
+    <View style={{ flex: 1, padding: 20, paddingTop: "calc(env(safe-area-inset-top) + 20px)", paddingBottom: "calc(env(safe-area-inset-bottom) + 20px)", gap: 16, backgroundColor: "#f6f8fa" }}>
       <Text style={{ fontSize: 22, fontWeight: "700" }}>Rendered by nsh</Text>
       <Badge
         ref={(node) => (badge = node)}
@@ -110,7 +111,7 @@ function App() {
         style={{ alignSelf: "flex-start", borderRadius: 8, overflow: "hidden" }}
       />
       <Text>{`JS saw ${taps()} taps`}</Text>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -125,7 +126,7 @@ The TSX version is `examples/embedded/App.tsx`, which both embedding samples in 
 function nativeComponent<P extends object = {}, E extends object = {}>(
   name: string,
   spec: NativeComponentSpec<P, E>,
-): (props: NativeComponentProps<P, E>) => YNode;
+): (props: NativeComponentProps<P, E>) => JSX.Element;
 ```
 
 | Parameter | Type | Description |
@@ -155,8 +156,28 @@ or a TSX `text={label()}` reads a signal, the new value is sent when the signal 
 | The element is created | Every own prop that is set, right after the component is made |
 | A prop's value changes | That prop with its new value |
 | A prop becomes `undefined` | That prop with no value (`nil` in Swift, `null` in Java) |
+| A prop bound to an animated value moves | `setAnimatedNumber` / `setAnimatedColor`, on the frames it changes |
 
-Props carry JSON values; keep the interface to data (functions, class instances and `AnimatedValue`s stay in the app).
+Props carry JSON values; keep the interface to data (functions and class instances stay in the app).
+
+### Animated props
+
+A prop can also be an animated value: an `AnimatedValue`, or a node derived from one (`interpolate`, a scroll view's
+`scrollValue` or `pullValue`). It is then not sent as JSON: NSH binds it, and the component is handed the value on the UI
+thread on every frame it changes, without going through JS, so it can follow a drag or a pull to refresh.
+
+```tsx
+const pull = createAnimatedValue(0);
+<Scroll pullValue={pull} refreshIndicator={{ height: 72 }} refreshing={refreshing()} onRefresh={refresh}>
+  <Spinner progress={pull.interpolate({ inputRange: [0, 72], outputRange: [0, 1] })} />
+</Scroll>
+```
+
+The component receives numbers with `setAnimatedNumber(name, value)` and colors with `setAnimatedColor(name, argb)`
+(`0xAARRGGBB`); by default both call `setProp` with the number, so a component that does not implement them still
+gets the value. Rust components implement `set_animated_number` and `set_animated_color`, and Rust code binds a prop
+with `native(name).bind_animated_prop("progress", &value)`. Giving the prop a plain value again unbinds it and sends that
+value. The web has no registered components.
 
 ## Events
 
@@ -218,7 +239,7 @@ map.command("zoomTo", json!({ "level": 3 }));
 ```
 
 ```tsx tabs
-let map: YNode | undefined;
+let map: NativeComponentRef | undefined;
 
 <MapView ref={(node) => (map = node)} latitude={52.52} longitude={13.405} style={{ flex: 1 }} />;
 
@@ -583,6 +604,74 @@ hidden with its view, receives its own input, and sits above everything NSH draw
 with web views). `ComponentContext::emit`, `set_size` (points) and `redraw` work from any thread. Register before
 `AppView::load`; a registry belongs to one `AppView` (and the views made from the same `AppOptions`).
 
+A component also takes the mouse wheel and touchpad scrolls over it with `wheel` (an image viewer zooms with them). The
+`Wheel` it gets holds the pointer (`x`, `y`, the component's points), the distance in points (`dx`, `dy`, positive
+toward the right and down, as scroll views move their content) and in wheel notches (`notches_x`, `notches_y`, with
+fractions from precision touchpads and high-resolution wheels), whether it came in fine steps (`precise`) and the
+modifiers held (`shift`, `ctrl`, `alt`). It returns `true` for a scroll it took; the scroll views around it scroll with
+the rest, and by default with all of them. A scroll a scroll view has begun stays on that view. Ctrl + wheel is also a
+precision touchpad's pinch, and Shift + wheel arrives as the wheel sent it (`dy`, with `shift`):
+
+```rust
+use nsh_platform_windows::Wheel;
+
+impl NativeComponent for ImageView {
+    // draw, set_prop, ...
+
+    fn wheel(&mut self, event: &Wheel) -> bool {
+        if !event.ctrl {
+            return false; // the scroll views around it scroll
+        }
+        // √2 per notch, about the pointer.
+        let factor = 2f32.powf(-event.notches_y / 2.0);
+        self.zoom_about(event.x, event.y, factor);
+        self.context.redraw();
+        true
+    }
+}
+```
+
+## Registering from the app's crate
+
+An app with a Rust crate of its own (`nsh.json` `"rust"`, [Rust](./rust.md)) registers native components in that
+crate, so they work in the hosts NSH builds for the app: the development host of `nsh run` and `nsh test --target`, and
+the app `nsh package` makes. A function with `#[native_components(<platform>)]` at the crate's root (`lib.rs`) registers
+them on that platform's `Components`, and the host calls it for every view it makes, as an embedding app registers on
+its `AppView`:
+
+```rust
+use std::rc::Rc;
+use nsh_core::prelude::*;
+
+#[native_components(windows)]
+fn components(components: &nsh_platform_windows::Components) {
+    use nsh_platform_windows::{ComponentContext, NativeComponent};
+    components.register(
+        "embed.badge",
+        Rc::new(|context: ComponentContext| -> Box<dyn NativeComponent> {
+            Box::new(Badge { on: false, context })
+        }),
+    );
+}
+```
+
+The platform is `windows`, `macos`, `linux` or `ios`, and the components are those of
+`nsh_platform_windows`, `nsh_platform_macos`, `nsh_platform_linux` or `nsh_platform_ios` (the sections above). The
+function compiles only on its platform, so a crate has one per platform it supports, each registering the same names,
+and depends on each platform's crate for that platform only, at the version and from the source of its other NSH
+crates (`nsh-core` and the rest; the CLI checks that they all match):
+
+```toml
+[target.'cfg(windows)'.dependencies]
+nsh-platform-windows = { version = "0.3", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.3", default-features = false }
+```
+
+The host registers the crate's components when it makes each view, before the code holding the view registers its
+own: a name registered on the view after that (`AppView::register_component`) replaces the crate's.
+
 ## Rules and limits
 
 - **Register before loading.** Factories apply to elements created after the registration. Register every name before
@@ -596,9 +685,12 @@ with web views). `ComponentContext::emit`, `set_size` (points) and `redraw` work
   small values, not large blobs, on every change.
 - **One bundle, both platforms.** Register the same names with the same props and events on iOS and Android, so one
   bundle runs on both.
+- **Names under `nsh/` are NSH's.** NSH's own components (the system's tab bar of `nsh/mobile`'s `TabBar`) are
+  registered under `nsh/`; name yours after your app or company (`embed.badge`), and a registration under `nsh/` logs
+  a warning and keeps NSH's.
 
 ## See also
 
-- [`nsh/native` reference](../modules/nsh-native.md)
+- [`nativeComponent` reference](../modules/nsh.md#nativecomponent-and-nativemodule)
 - [Embedding in iOS apps](./ios.md) and [in Android apps](./android.md)
 - [Architecture](./architecture.md): how props and events cross threads

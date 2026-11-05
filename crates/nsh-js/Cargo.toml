@@ -12,9 +12,12 @@ repository.workspace = true
 workspace = true
 
 [features]
-# A VM without QuickJS' parser and compiler (they are left out of the
-# binary): it runs bytecode only. The web runtime of published apps.
-bytecode-only = []
+default = ["zlib", "crypto"]
+# The standard module `zlib`: deflate, gzip, brotli and zstd.
+zlib = ["quickjs-jit-stdlib/zlib", "quickjs-jit-stdlib/zlib-zstd"]
+# The standard module `crypto` and its globals (`crypto`, `Crypto`,
+# `SubtleCrypto`, `CryptoKey`): hashes, random values, Web Crypto.
+crypto = ["quickjs-jit-stdlib/crypto"]
 
 [dependencies]
 serde_json.workspace = true
@@ -42,9 +45,11 @@ rquickjs.workspace = true
 getrandom-stdlib.workspace = true
 
 [dev-dependencies]
+# The declarations tests read the specs' text (nsh-core `declarations`).
+nsh-core = { workspace = true, features = ["declarations"] }
 brotli.workspace = true
 flate2.workspace = true
 zstd.workspace = true
 # The typed API check reads the crate's public API.
 syn = { workspace = true, features = ["visit"] }
-nsh-base.workspace = true
+nsh-base = { workspace = true, features = ["editor", "highlight", "plot", "rich-editor"] }

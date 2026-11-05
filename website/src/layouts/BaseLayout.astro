@@ -1,6 +1,9 @@
 ---
 import '../styles/global.css';
+import 'virtual:nsh-gallery-ui.css';
+import exampleTheme from '../../../examples/nsh-gallery-ui/theme.json';
 import { BASE, SITE_DESCRIPTION, SITE_TITLE, SITE_URL, type Lang } from '../lib/site';
+import { isLatestVersion, siteVersions, latestVersion, versionHref, versionPath } from '../lib/versions';
 
 export interface Props {
   title?: string;
@@ -11,13 +14,18 @@ export interface Props {
   robots?: string;
 }
 
-const { title, description = SITE_DESCRIPTION, lang = 'en', alternates, robots } = Astro.props;
+const { title, description = SITE_DESCRIPTION, lang = 'en', alternates, robots: robotsProp } = Astro.props;
+// Other versions are not indexed: their canonical is the same page of the latest.
+const robots = robotsProp ?? (isLatestVersion ? undefined : 'noindex');
 
 // A title that already names the site (the home pages') is used as it is.
 const pageTitle = !title || title === SITE_TITLE
   ? `${SITE_TITLE} — Build once, native everywhere | Rust UI framework`
   : title.startsWith(SITE_TITLE) ? title : `${title} · ${SITE_TITLE}`;
-const canonical = new URL(Astro.url.pathname.replace(/\/+$/, '') || '/', SITE_URL).href;
+const latest = siteVersions.find((version) => version.id === latestVersion);
+const canonical = isLatestVersion || !latest
+  ? new URL(Astro.url.pathname.replace(/\/+$/, '') || '/', SITE_URL).href
+  : new URL(versionHref(latest, versionPath(Astro.url.pathname, BASE)), SITE_URL).href;
 const abs = (route: string) => new URL(`${BASE.replace(/\/$/, '')}${route}`, SITE_URL).href;
 ---
 
@@ -30,8 +38,8 @@ const abs = (route: string) => new URL(`${BASE.replace(/\/$/, '')}${route}`, SIT
     <meta name="description" content={description} />
     {robots && <meta name="robots" content={robots} />}
     <meta name="color-scheme" content="dark light" />
-    <meta name="theme-color" content="#101113" media="(prefers-color-scheme: dark)" />
-    <meta name="theme-color" content="#f4f4f2" media="(prefers-color-scheme: light)" />
+    <meta name="theme-color" content={exampleTheme.cssVars.dark.background} media="(prefers-color-scheme: dark)" />
+    <meta name="theme-color" content={exampleTheme.cssVars.light.background} media="(prefers-color-scheme: light)" />
     <!-- Before first paint: `theme` in localStorage is "light" or "dark";
          absent follows the system. <html> gets `dark` or `light`. -->
     <script is:inline>
@@ -65,8 +73,12 @@ const abs = (route: string) => new URL(`${BASE.replace(/\/$/, '')}${route}`, SIT
     <meta property="og:title" content={pageTitle} />
     <meta property="og:description" content={description} />
     <meta property="og:url" content={canonical} />
-    <meta property="og:image" content={abs('/icon-512.png')} />
-    <meta name="twitter:card" content="summary" />
+    <meta property="og:image" content={abs('/og-image.png')} />
+    <meta property="og:image:type" content="image/png" />
+    <meta property="og:image:width" content="1200" />
+    <meta property="og:image:height" content="630" />
+    <meta property="og:image:alt" content={`${SITE_TITLE}: Build once, native everywhere`} />
+    <meta name="twitter:card" content="summary_large_image" />
     <link rel="alternate" type="text/plain" title="llms.txt" href={`${BASE}llms.txt`} />
 
   </head>

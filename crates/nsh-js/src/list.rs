@@ -39,6 +39,8 @@ const FORWARDED: &[&str] = &[
     "scrollbar",
     "refreshing",
     "onRefresh",
+    "pullValue",
+    "refreshIndicator",
     "onLoadMore",
     "onLoadMoreAtStart",
     "onScrollEnd",
@@ -120,6 +122,10 @@ struct Cell {
 struct ListData {
     props: JsValue,
     node: JsValue,
+    /// The items memo (`props.each`), which the cells' items read.
+    items: JsValue,
+    /// How the items changed (`[at, removed, inserted]`), for the core.
+    splices: Vec<[u32; 3]>,
     /// The owner the list was made under: cells are made as its roots.
     owner: u32,
     /// Cells by slot.
@@ -153,6 +159,7 @@ fn free_data(cx: *mut JsContext, data: ListData) {
     unsafe {
         qjs::JS_FreeValue(cx, data.props);
         qjs::JS_FreeValue(cx, data.node);
+        qjs::JS_FreeValue(cx, data.items);
         for cell in data.cells.into_iter().flatten() {
             qjs::JS_FreeValue(cx, cell.node);
             qjs::JS_FreeValue(cx, cell.index);
@@ -249,6 +256,8 @@ pub(crate) fn render(cx: *mut JsContext, props: JsValue) -> Result<JsValue, JsVa
     let data = Box::new(ListData {
         props: unsafe { qjs::JS_DupValue(cx, props) },
         node: unsafe { qjs::JS_DupValue(cx, node) },
+        items: UNDEFINED,
+        splices: Vec::new(),
         owner: reactive::current_owner(cx),
         cells: Vec::new(),
         extras: Vec::new(),
@@ -262,9 +271,18 @@ pub(crate) fn render(cx: *mut JsContext, props: JsValue) -> Result<JsValue, JsVa
         unsafe { qjs::JS_FreeValue(cx, node) };
         e
     };
-    // The items: tells the core how they changed (by identity: the common
-    // start and end stay), so measurements follow their items.
-    let func = native(cx, splice_run, 1, &mut [node, props]);
+    // The items: cells move with theirs, and the core learns how they
+    // changed (by identity: the common start and end stay), so
+    // measurements follow their items.
+    let list_id = qjs::JS_NewFloat64(id as f64);
+    let func = native(cx, items_run, 1, &mut [list_id, props]);
+    let items = reactive::memo(cx, func, false);
+    let func = native(cx, splice_run, 0, &mut [node, items, list_id]);
+    match lists(cx).map.borrow_mut().get_mut(&id) {
+        Some(d) => d.items = items,
+        // SAFETY: ours (the list went meanwhile).
+        None => unsafe { qjs::JS_FreeValue(cx, items) },
+    }
     let r = reactive::render_effect(cx, func);
     // SAFETY: the effect keeps its own value.
     unsafe { qjs::JS_FreeValue(cx, r) };
@@ -387,8 +405,10 @@ fn set(cx: *mut JsContext, node: JsValue, name: &str, value: JsValue) -> Result<
     r
 }
 
-/// A run of the items effect: the items set last in, the current out.
-unsafe extern "C" fn splice_run(
+/// A run of the items memo: the items, once the cells moved with theirs
+/// (as the core moves them, and Rust lists' `move_rows`): otherwise each
+/// shows the item now at its old index until it is bound again.
+unsafe extern "C" fn items_run(
     cx: *mut JsContext,
     _this: JsValue,
     argc: c_int,
@@ -398,7 +418,7 @@ unsafe extern "C" fn splice_run(
 ) -> JsValue {
     // SAFETY: two data values; values got are freed or returned.
     unsafe {
-        let (node, props) = (*data, *data.add(1));
+        let (list, props) = (*data, *data.add(1));
         let old = arg(argc, argv, 0);
         let next = get(cx, props, "each");
         if qjs::JS_IsException(next) {
@@ -426,23 +446,78 @@ unsafe extern "C" fn splice_run(
             let removed = old_len - start - end;
             let inserted = next_len - start - end;
             if removed > 0 || inserted > 0 {
-                let mut values = [
-                    qjs::JS_NewFloat64(start as f64),
-                    qjs::JS_NewFloat64(removed as f64),
-                    qjs::JS_NewFloat64(inserted as f64),
-                ];
-                let splice = qjs::JS_NewArrayFrom(cx, 3, values.as_mut_ptr());
-                if let Err(e) = set(cx, node, "splice", splice) {
-                    qjs::JS_FreeValue(cx, next);
-                    return e;
+                let mut id = 0f64;
+                qjs::JS_ToFloat64(cx, &mut id, list);
+                let indices: Vec<JsValue> =
+                    match lists(cx).map.borrow_mut().get_mut(&(id as NodeId)) {
+                        Some(d) => {
+                            d.splices
+                                .push([start as u32, removed as u32, inserted as u32]);
+                            d.cells
+                                .iter()
+                                .flatten()
+                                .map(|c| qjs::JS_DupValue(cx, c.index))
+                                .collect()
+                        }
+                        None => Vec::new(),
+                    };
+                for index in indices {
+                    if let Some(i) = reactive::peek_number(cx, index)
+                        && i as i64 >= start + removed
+                    {
+                        let moved = i + (inserted - removed) as f64;
+                        reactive::set_signal(cx, index, qjs::JS_NewFloat64(moved));
+                    }
+                    qjs::JS_FreeValue(cx, index);
                 }
             }
         }
-        if let Err(e) = set(cx, node, "count", qjs::JS_NewFloat64(next_len as f64)) {
-            qjs::JS_FreeValue(cx, next);
+        next
+    }
+}
+
+/// A run of the items effect: tells the core how the items changed and
+/// their count.
+unsafe extern "C" fn splice_run(
+    cx: *mut JsContext,
+    _this: JsValue,
+    _argc: c_int,
+    _argv: *mut JsValue,
+    _magic: c_int,
+    data: *mut JsValue,
+) -> JsValue {
+    // SAFETY: three data values; values got are freed.
+    unsafe {
+        let (node, items, list) = (*data, *data.add(1), *data.add(2));
+        let next = qjs::JS_Call(cx, items, UNDEFINED, 0, ptr::null_mut());
+        if qjs::JS_IsException(next) {
+            return next;
+        }
+        let len = length(cx, next);
+        qjs::JS_FreeValue(cx, next);
+        let mut id = 0f64;
+        qjs::JS_ToFloat64(cx, &mut id, list);
+        let splices = lists(cx)
+            .map
+            .borrow_mut()
+            .get_mut(&(id as NodeId))
+            .map(|d| std::mem::take(&mut d.splices))
+            .unwrap_or_default();
+        for [at, removed, inserted] in splices {
+            let mut values = [
+                qjs::JS_NewFloat64(at as f64),
+                qjs::JS_NewFloat64(removed as f64),
+                qjs::JS_NewFloat64(inserted as f64),
+            ];
+            let splice = qjs::JS_NewArrayFrom(cx, 3, values.as_mut_ptr());
+            if let Err(e) = set(cx, node, "splice", splice) {
+                return e;
+            }
+        }
+        if let Err(e) = set(cx, node, "count", qjs::JS_NewFloat64(len as f64)) {
             return e;
         }
-        next
+        UNDEFINED
     }
 }
 
@@ -781,15 +856,15 @@ pub(crate) fn bind(
 
 /// A new cell for `slot`, showing item `first`.
 fn make_cell(cx: *mut JsContext, list: NodeId, slot: u32, first: u32) -> Result<(), JsValue> {
-    let (props, list_node, owner) = {
+    let (props, items, list_node, owner) = {
         let map = lists(cx).map.borrow();
         let d = &map[&list];
-        (d.props, d.node, d.owner)
+        (d.props, d.items, d.node, d.owner)
     };
     let mut made = None;
     let (root, r) = reactive::with_root_under(cx, owner, || -> Result<(), JsValue> {
         let index = reactive::new_signal(cx, qjs::JS_NewFloat64(first as f64));
-        let item_fn = native(cx, item_run, 0, &mut [props, index]);
+        let item_fn = native(cx, item_run, 0, &mut [items, index]);
         let item = reactive::memo(cx, item_fn, false);
         let cell = dom::create_element(cx, Tag::Cell)?;
         made = Some((cell, index));
@@ -811,7 +886,13 @@ fn make_cell(cx: *mut JsContext, list: NodeId, slot: u32, first: u32) -> Result<
         let r = if has(cx, props, "separator") {
             // SAFETY: a placeholder for the separator once made.
             let holder = unsafe { qjs::JS_NewArray(cx) };
-            let between = native(cx, separated_run, 0, &mut [content, props, index, holder]);
+            let owner = qjs::JS_NewFloat64(reactive::current_owner(cx) as f64);
+            let between = native(
+                cx,
+                separated_run,
+                0,
+                &mut [content, props, index, holder, owner],
+            );
             unsafe { qjs::JS_FreeValue(cx, holder) };
             let r = dom::insert_value_at(cx, cell, between, None);
             unsafe { qjs::JS_FreeValue(cx, between) };
@@ -849,7 +930,7 @@ fn make_cell(cx: *mut JsContext, list: NodeId, slot: u32, first: u32) -> Result<
     r
 }
 
-/// A cell's item: `props.each[index()]`, or the last one past the end (the
+/// A cell's item: `items()[index()]`, or the last one past the end (the
 /// data shrank before the core unbound the cell).
 unsafe extern "C" fn item_run(
     cx: *mut JsContext,
@@ -861,12 +942,12 @@ unsafe extern "C" fn item_run(
 ) -> JsValue {
     // SAFETY: two data values; values got are freed or returned.
     unsafe {
-        let (props, index) = (*data, *data.add(1));
+        let (items, index) = (*data, *data.add(1));
         let i = qjs::JS_Call(cx, index, UNDEFINED, 0, ptr::null_mut());
         let mut n = 0f64;
         qjs::JS_ToFloat64(cx, &mut n, i);
         qjs::JS_FreeValue(cx, i);
-        let each = get(cx, props, "each");
+        let each = qjs::JS_Call(cx, items, UNDEFINED, 0, ptr::null_mut());
         let len = length(cx, each);
         let r = if n >= 0.0 && (n as i64) < len {
             qjs::JS_GetPropertyInt64(cx, each, n as i64)
@@ -888,7 +969,7 @@ unsafe extern "C" fn separated_run(
     _magic: c_int,
     data: *mut JsValue,
 ) -> JsValue {
-    // SAFETY: four data values; values got are freed or returned.
+    // SAFETY: five data values; values got are freed or returned.
     unsafe {
         let (content, props, index, holder) = (*data, *data.add(1), *data.add(2), *data.add(3));
         let i = qjs::JS_Call(cx, index, UNDEFINED, 0, ptr::null_mut());
@@ -907,7 +988,12 @@ unsafe extern "C" fn separated_run(
         }
         let mut separator = qjs::JS_GetPropertyUint32(cx, holder, 0);
         if qjs::JS_IsUndefined(separator) {
-            separator = reactive::untracked_with(cx, || slot(cx, component));
+            let mut owner = 0f64;
+            qjs::JS_ToFloat64(cx, &mut owner, *data.add(4));
+            // The cached separator lives with the cell, not this rerunning computation.
+            separator = nsh_core::reactive::with_owner(reactive::Js(cx), owner as u32, || {
+                slot(cx, component)
+            });
             if qjs::JS_IsException(separator) {
                 return separator;
             }
@@ -1138,7 +1224,7 @@ fn report(cx: *mut JsContext, id: NodeId) -> JsValue {
     }
 }
 
-/// `nsh/list`: `List` (its tags compile to `nsh:rt`'s `list`, the same
+/// `nsh`'s `List` (its tags compile to `nsh:rt`'s `list`, the same
 /// function).
 pub(crate) const EXPORTS: &[crate::modules::Item] = &[(
     "List",
@@ -1150,11 +1236,11 @@ pub(crate) const EXPORTS: &[crate::modules::Item] = &[(
          Positions, columns, sticky headers and viewability are computed natively.\n\n\
          Rows are recycled: keep per-item state in your data (keyed by id), not in\n\
          signals created inside the row.",
-        &["<T>(props: ListProps<T>): YNode"],
+        &["<T>(props: ListProps<T>): JSX.Element"],
     ),
 )];
 
-/// `nsh/list`'s types.
+/// `List`'s types.
 pub(crate) const TYPES: &str = r#"/** A component (`Header`) or an element (`<Header />`). */
 export type ListSlot = (() => JSX.Element) | JSX.Element;
 
@@ -1167,10 +1253,10 @@ export interface ViewToken<T> {
 }
 
 export interface ViewabilityConfig {
-  /** Percent of the viewport an item must cover to count as viewable. */
-  viewAreaCoveragePercentThreshold?: number;
-  /** Percent of an item that must be visible. Without either threshold, any visible pixel counts. */
-  itemVisiblePercentThreshold?: number;
+  /** How much of the viewport an item must cover to count as viewable, from 0 to 1. */
+  viewAreaCoverageThreshold?: number;
+  /** How much of an item must be visible, from 0 to 1. Without either threshold, any visible pixel counts. */
+  itemVisibleThreshold?: number;
   /** Milliseconds items must stay viewable before they are reported. */
   minimumViewTime?: number;
 }
@@ -1178,7 +1264,7 @@ export interface ViewabilityConfig {
 /** A list's props: its own, and those of the scroll view it is (the test
  * id, accessibility, classes, touch and layout events, ...), which it
  * passes on as they are. */
-export interface ListProps<T> extends Omit<ViewProps, "children">, ScrollingHostProps, ListHostProps {
+export interface ListProps<T> extends Omit<ViewProps, "children" | "ref">, ScrollingHostProps, ListHostProps {
   each: readonly T[];
   /** Above the items, scrolling with them. */
   header?: ListSlot;
@@ -1207,7 +1293,7 @@ export interface ListProps<T> extends Omit<ViewProps, "children">, ScrollingHost
   onLoadMoreAtStart?: () => void;
   /** How close to the start (in viewports) `onLoadMoreAtStart` fires; default 1. */
   loadMoreAtStartThreshold?: number;
-  ref?: YNode | ((node: YNode) => void);
+  ref?: ListRef | ((node: ListRef) => void);
   /** Renders one row. Called once per recycled cell; `item` and `index`
    * change when the cell is reused for another item. */
   children: (item: () => T, index: () => number) => JSX.Element;
@@ -1223,6 +1309,82 @@ export type ListItemsProps<T> = Pick<ListProps<T>, "each" | "children" | "keyExt
 mod tests {
     use crate::{Host, HostOptions};
 
+    #[test]
+    fn cached_separators_keep_their_cell_owner() {
+        let host = Host::with_options(HostOptions::default()).unwrap();
+        host.with_raw(|raw| {
+            // SAFETY: the host owns the live context for this closure.
+            let cx = unsafe { rquickjs::Ctx::from_raw(std::ptr::NonNull::new_unchecked(raw)) };
+            crate::reactive::install_globals(&cx);
+        });
+        host.eval_source(
+            r#"
+            import { List, signal, cleanup, effect } from "nsh";
+            import { text } from "nsh:rt";
+            const items = signal(["a", "b", "c", "d"].map(id => ({ id })));
+            const color = signal("red");
+            const state = globalThis.separators = { made: 0, cleaned: 0, colors: [], items, color };
+            state.dispose = __nsh_reactive.createRoot(dispose => {
+                List({
+                    get each() { return items(); },
+                    keyExtractor: item => item.id,
+                    children: item => text(item().id),
+                    separator: () => {
+                        const id = state.made++;
+                        cleanup(() => state.cleaned++);
+                        effect(() => { state.colors[id] = color(); });
+                        return text("-");
+                    },
+                });
+                return dispose;
+            });
+            "#,
+        )
+        .unwrap();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        let list = ops
+            .iter()
+            .find_map(|op| match op {
+                nsh_core::Op::Create {
+                    id,
+                    tag: nsh_core::Tag::List,
+                } => Some(*id),
+                _ => None,
+            })
+            .unwrap();
+        host.bind_list(list, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
+        let check = |source| {
+            assert!(
+                host.eval_script("separator-lifetime", source).unwrap(),
+                "{source}"
+            )
+        };
+        check("separators.made === 3 && separators.cleaned === 0");
+        check(
+            "separators.items.set(separators.items().map(item => ({...item}))); separators.cleaned === 0",
+        );
+        check("separators.color.set('blue'); separators.colors.join() === 'blue,blue,blue'");
+        // Reordering and reusing a cell for the last row only hide its cached separator.
+        check("separators.items.set([...separators.items()].reverse()); separators.cleaned === 0");
+        host.bind_list(list, &[(0, 3), (1, 2), (2, 1), (3, 0)]);
+        check("separators.made === 4 && separators.cleaned === 0");
+        check("separators.items.set(separators.items().slice(0, 1)); separators.cleaned === 0");
+        check(
+            "separators.color.set('green'); separators.colors.join() === 'green,green,green,green'",
+        );
+        check(
+            "separators.items.set(['a', 'b', 'c', 'd'].map(id => ({id}))); separators.made === 4",
+        );
+        host.bind_list(list, &[(0, 0), (1, 1), (2, 2), (3, 3)]);
+        check("separators.made === 4 && separators.cleaned === 0");
+        check("separators.dispose(); separators.cleaned === 4");
+        check("separators.dispose(); separators.cleaned === 4");
+        check(
+            "separators.color.set('black'); separators.colors.join() === 'green,green,green,green'",
+        );
+    }
+
     /// A list's slots are its own: it makes each once and never passes
     /// them to its scroll view (as compiled JSX passes them: getters that
     /// make the slot's elements each time they are read).
@@ -1232,7 +1394,7 @@ mod tests {
         host.eval_source(
             "import { mount } from \"nsh\";\n\
              import { text } from \"nsh:rt\";\n\
-             import { List } from \"nsh/list\";\n\
+             import { List } from \"nsh\";\n\
              mount(() => List({\n\
                each: [1, 2],\n\
                children: (n) => text(`Row ${n()}`),\n\

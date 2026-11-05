@@ -146,12 +146,14 @@ text("Made with ")
 </Text>
 ```
 
-Inline elements cut off by `numberOfLines` or an ellipsis are hidden; copying the text leaves them out.
+Inline elements cut off by `numberOfLines` or an ellipsis are hidden; copying the text leaves them out. Text inside an
+inline element takes the color of the text around it, as CSS's `color` reaches an inline block, unless it sets its own
+(the `LIVE` badge above does); its font and line height stay its own.
 
 The style key `verticalAlign` places an inline element in its line, as CSS's `vertical-align` places an image:
 `"baseline"` (the default) stands its bottom on the baseline, `"text-top"` and `"text-bottom"` put its top or bottom
 at the top or bottom of the text's font, and `"middle"` centers it half the font's x height above the baseline. The
-line grows to hold the element wherever it reaches past the font. An icon at the start of a paragraph that should
+line grows to hold the element wherever it reaches past the font, also with a fixed `lineHeight`. An icon at the start of a paragraph that should
 line up with the text's bottom, as Android's `ImageSpan` draws it, takes `"text-bottom"`. The classes are
 `align-baseline`, `align-text-top`, `align-text-bottom` and `align-middle`; in Rust `.align_text_bottom()` and the
 others of the same names.
@@ -169,17 +171,17 @@ others of the same names.
 | `color` | A [color](./styling.md#colors). Default black | `.text_color(..)` |
 | `fontSize` | Points. Default 14 | `.text_size(px(..))`, `.text_sm()`, `.text_lg()`, ... |
 | `fontWeight` | `"normal"` (400), `"bold"` (700), or `100`–`900` (number or string) | `.font_weight(FontWeight::BOLD)` |
-| `fontStyle` | `"normal"`, `"italic"` | `.italic()` |
+| `fontStyle` | `"normal"`, `"italic"`: color emoji stay upright | `.italic()` |
 | `fontFamily` | A system family, a generic family, or an [imported font](./fonts.md) | `.font_family(..)` |
 | `lineHeight` | Points | `.line_height(px(..))` |
 | `letterSpacing` | Points | `.letter_spacing(px(..))` |
-| `textAlign` | `"auto"`, `"left"`, `"center"`, `"right"`, `"justify"` | `.text_left()`, `.text_center()`, `.text_right()`, `.text_justify()` |
+| `textAlign` | `"auto"`, `"left"`, `"center"`, `"right"`, `"justify"`, `"start"`, `"end"`: `left` and `right` keep their sides right to left, `start` and `end` follow the direction | `.text_left()`, `.text_center()`, `.text_right()`, `.text_justify()` |
 | `textAlignVertical` | `"auto"`, `"top"`, `"center"`, `"bottom"`: where text shorter than its box sits | |
 | `textTransform` | `"none"`, `"uppercase"`, `"lowercase"`, `"capitalize"` | `.normal_case()`, `.uppercase()`, `.lowercase()`, `.capitalize()` |
 | `textDecorationLine` | `"none"`, `"underline"`, `"line-through"`, `"underline line-through"` | `.no_underline()`, `.underline()`, `.line_through()` |
 | `textDecorationColor`, `textDecorationStyle` | Color; `"solid"`, `"double"`, `"dotted"`, `"dashed"`, `"wavy"` | `.text_decoration_color(..)`, `.text_decoration_wavy()`, ... |
 | `textDecorationThickness`, `textUnderlineOffset` | Points, or `"auto"` (thickness also `"from-font"`) | `.text_decoration_thickness(px(..))`, `.underline_offset(px(..))` |
-| `textShadowColor`, `textShadowOffset`, `textShadowRadius` | A shadow behind the glyphs | `.text_shadow_color(..)`, `.text_shadow_offset(..)`, `.text_shadow_radius(..)` |
+| `textShadow` | CSS's `text-shadow`, a shadow behind the glyphs: `"2px 2px 4px rgb(0 0 0 / 0.6)"` (offsets, blur, color), or its layers as numbers, `[{ x: 2, y: 2, blur: 4, color: "#00000099" }]`; several layers draw as the widest | `.text_shadow([TextShadow { .. }])`, `.text_shadow_sm()`, ..., `.text_shadow_color(..)` |
 | `fontVariant` | OpenType features: `["tabular-nums"]`, `"small-caps"`, `"oldstyle-nums"`, `"lining-nums"`, `"proportional-nums"` | `.tabular_nums()`, `.small_caps()`, `.oldstyle_nums()`, `.lining_nums()`, `.proportional_nums()` |
 | `writingDirection` | `"auto"`, `"ltr"`, `"rtl"`: the base direction of the paragraph | `.writing_direction(WritingDirection::Rtl)` |
 
@@ -192,15 +194,18 @@ text("Shadow")
     .text_size(px(26.0))
     .font_weight(FontWeight::EXTRA_BOLD)
     .text_color(white())
-    .text_shadow_color(rgba(0x00000099))
-    .text_shadow_offset(point(px(2.0), px(2.0)))
-    .text_shadow_radius(px(4.0))
+    .text_shadow([TextShadow {
+        offset_x: px(2.0),
+        offset_y: px(2.0),
+        radius: px(4.0),
+        color: rgba(0x00000099).into(),
+    }])
 ```
 
 ```tsx tabs
 <Text style={{ fontSize: 18, fontVariant: ["tabular-nums"] }}>{price().toFixed(2)}</Text>
 <Text style={{ textDecorationLine: "underline", textDecorationStyle: "wavy", textDecorationColor: "#cf222e" }}>Typo</Text>
-<Text style={{ fontSize: 26, fontWeight: "800", color: "#ffffff", textShadowColor: "rgba(0,0,0,0.6)", textShadowOffset: { width: 2, height: 2 }, textShadowRadius: 4 }}>
+<Text style={{ fontSize: 26, fontWeight: "800", color: "#ffffff", textShadow: "2px 2px 4px rgba(0,0,0,0.6)" }}>
   Shadow
 </Text>
 ```
@@ -211,18 +216,18 @@ text("Shadow")
 
 ```rust tabs
 text(long_description).number_of_lines(2)
-text(file_path).number_of_lines(1).ellipsize_mode(EllipsizeMode::Middle)
+text(file_path).number_of_lines(1).text_overflow(EllipsizeMode::Middle)
 ```
 
 ```tsx tabs
-<Text numberOfLines={2}>{longDescription}</Text>
-<Text numberOfLines={1} ellipsizeMode="middle">{filePath}</Text>
+<Text style={{ numberOfLines: 2 }}>{longDescription}</Text>
+<Text style={{ numberOfLines: 1, textOverflow: "ellipsis-middle" }}>{filePath}</Text>
 ```
 
-| Prop | Rust | Description |
+| Style key / prop | Rust | Description |
 |---|---|---|
-| `numberOfLines` | `.number_of_lines(n)` | The most lines shown; `0` (default) is unlimited |
-| `ellipsizeMode` | `.ellipsize_mode(EllipsizeMode::Tail)` | Where text that does not fit is cut: `"tail"` (default), `"head"`, `"middle"`, `"clip"` |
+| `numberOfLines` (style) | `.number_of_lines(n)` | The most lines shown; `0` (default) shows them all |
+| `textOverflow` (style) | `.text_overflow(EllipsizeMode::Middle)` | How text that does not fit is cut: an ellipsis at the end (`"ellipsis"`, default), at the start (`"ellipsis-start"`) or in the middle (`"ellipsis-middle"`), or `"clip"` |
 | `adjustsFontSizeToFit` | `.shrink_to_fit(min_scale)` | Shrink the font until the text fits its lines and box |
 | `minimumFontScale` | | How far `adjustsFontSizeToFit` may shrink (0–1) |
 
@@ -235,12 +240,12 @@ text(move || total.get())
 ```
 
 ```tsx tabs
-<Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5} style={{ fontSize: 48, width: 200 }}>
+<Text adjustsFontSizeToFit minimumFontScale={0.5} style={{ numberOfLines: 1, fontSize: 48, width: 200 }}>
   {total()}
 </Text>
 ```
 
-The Tailwind classes `truncate` and `line-clamp-*` do the same and lose to the props when both are set.
+The Tailwind classes `line-clamp-*`, `text-ellipsis` and `text-clip` set the same keys, and `truncate` (`.truncate()`) is one line cut with an ellipsis; as style keys they also take state styles and variants.
 
 ## System text size
 
@@ -251,7 +256,7 @@ Text follows the user's text size setting (Dynamic Type on iOS, font size on And
 | `allowFontScaling` | `.allow_font_scaling(false)` | `false` keeps the size fixed. Default `true` |
 | `maxFontSizeMultiplier` | `.max_font_size_multiplier(1.5)` | The largest scale applied, e.g. `1.5`. `0` is no limit |
 
-`font_scale()` in Rust and `fontScale()` from [`nsh/device`](../modules/nsh-device.md) in TSX are the current scale, and change when the user changes the setting. Inputs take `allowFontScaling` and `maxFontSizeMultiplier` too.
+`font_scale()` in Rust and `fontScale()` from [`nsh`](../modules/nsh.md#device) in TSX are the current scale, and change when the user changes the setting. Inputs take `allowFontScaling` and `maxFontSizeMultiplier` too.
 
 ```rust tabs
 text("Tab label").max_font_size_multiplier(1.3).text_size(px(13.0))
@@ -265,19 +270,24 @@ Prefer limiting the scale over turning it off: large text is an accessibility se
 
 ## Selection
 
-`selectable` (`.selectable(true)`) lets the user select and copy the text, as in the system's own text views: a long press selects the word under the finger, the handles move the selection's ends, and the edit menu offers Copy and Select All (iOS adds Look Up, Translate and Share; Android Share). A selection stays inside one text block. The style key `selectionColor` (`.selection_color(..)`, `selection:text-*`) colors the highlight and the handles. The class `select-text` does the same as `selectable`.
+The style key `userSelect: "text"` (`.select_text()`, the class `select-text`) lets the user select and copy the text, as in the system's own text views: a long press selects the word under the finger, the handles move the selection's ends, and the edit menu offers Copy and Select All (iOS adds Look Up, Translate and Share; Android Share). A selection stays inside one text block. The style key `selectionColor` (`.selection_color(..)`, `selection:text-*`) colors the highlight and the handles. `userSelect` set on a view reaches the texts inside it that set none.
 
-In desktop browsers text is selectable by default, as on a web page, except inside interactive elements (views with press or touch handlers, such as buttons and pressable rows); `selectable={false}` (`.selectable(false)`) or the class `select-none` keeps a text unselectable there. Phone and tablet browsers follow the native rule.
+In desktop browsers text is selectable by default, as on a web page, except inside interactive elements (views with press or touch handlers, such as buttons and pressable rows); `userSelect: "none"` (`.select_none()`, the class `select-none`) keeps a text unselectable there. Phone and tablet browsers follow the native rule.
 
 ```rust tabs
-text(order_number).selectable(true).selection_color(rgb(0x7c3aed))
+text(order_number).select_text().selection_color(rgb(0x7c3aed))
 ```
 
 ```tsx tabs
-<Text selectable style={{ selectionColor: "#7c3aed" }}>{orderNumber}</Text>
+<Text style={{ userSelect: "text", selectionColor: "#7c3aed" }}>{orderNumber}</Text>
 ```
 
-To copy from code (a Copy button), use `set_clipboard(..)` in Rust or [`nsh/clipboard`](../modules/nsh-clipboard.md) in TSX.
+To copy from code (a Copy button), use `set_clipboard(..)` in Rust or [`Clipboard`](../modules/nsh.md#clipboard) in TSX.
+
+In the terminal host, drag across a selectable view or Text to select whole graphemes; a double click selects a word and a triple click its paragraph, and dragging on from either extends the selection by words or paragraphs.
+Selected Cells use reversed colors. Copy with Ctrl+C, Ctrl+Shift+C, Ctrl+Insert, Alt+W or Cmd+C; the host sends the
+text through OSC 52 to the terminal clipboard. Shift+click extends the selection, Ctrl+A / Cmd+A selects the area,
+and Esc or any other key clears it. With nothing selected, Ctrl+C quits the terminal host.
 
 ## onTextLayout
 

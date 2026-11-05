@@ -15,7 +15,7 @@ these elements and styled by the app, so the app's look is entirely its own.
 Every example on these pages comes in Rust and TSX: pick a tab, and every example on the page follows.
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn app() -> impl IntoElement {
     let count = signal(0_u32);
@@ -56,7 +56,7 @@ function App() {
 mount(App);
 ```
 
-In Rust, the primitives are functions of `nsh_core::ui::prelude` (`view()`, `text(..)`, `image(..)`) and the base
+In Rust, the primitives are functions of `nsh_core::prelude` (`view()`, `text(..)`, `image(..)`) and the base
 components come from the `nsh_base` crate. Styles are typed methods (`.flex_1()`, `.gap_3()`, `.px(px(20.0))`,
 `.bg(..)`), state styles take a closure (`.active(|s| s.opacity(0.6))`), listeners are closures of their event
 (`.on_press(move || ..)`, `.on_change(move |text: &str| ..)`) and `.child(..)` adds children. A piece of UI is a plain function returning
@@ -70,32 +70,30 @@ could not infer their item types. The compiler recognizes the elements through t
 views in place, so importing them costs nothing at run time. See [JSX and components](../docs/jsx-and-components.md).
 
 ```tsx
-import { Canvas, Image, Input, List, Overlay, Scroll, Text, Video, View, WebView } from "nsh";
-import { Button, Dialog, Menu, NavPage, NavStack, Popover, SafeAreaView, Sheet, Tooltip } from "nsh/base";
+import { Canvas, Image, List, Overlay, Scroll, Shader, Text, Video, View, WebView } from "nsh";
+import { Button, Dialog, Menu, NavPage, NavStack, Popover, Sheet, Tooltip, Input } from "nsh/base";
 ```
-
-> [!NOTE]
-> Apps built for earlier releases import `Image`, `List`, `Canvas`, `WebView` and `Video` from `nsh/image`,
-> `nsh/list`, `nsh/canvas`, `nsh/webview` and `nsh/video`; those imports keep working and name the same elements.
 
 ## Primitives
 
-Imported from `nsh` in TSX, from `nsh_core::ui::prelude` in Rust.
+Imported from `nsh` in TSX, from `nsh_core::prelude` in Rust.
 
 | Element | Rust | Native view (iOS / Android) | Page |
 |---|---|---|---|
-| `<View>` | `view()` | UIView / ViewGroup | [View](./view.md) |
+| `<View>` | `view()` | UIView / ViewGroup; with `selectable`, the texts inside it select together | [View](./view.md), [Text selection](./text-selection.md) |
 | `<Text>` | `text(content)` | CoreText view / StaticLayout view | [Text](./text.md) |
 | `<Image>` | `image(src)` | a view with an image layer / an image view | [Image](./image.md) |
 | `<Scroll>` | `scroll()` | UIScrollView / ScrollView | [Scroll](./scroll.md) |
-| `<Input>` | `input()` | UITextField or UITextView / EditText | [Input](./input.md) |
 | `<List>` | `virtual_list(count, \|at\| row)` | UIScrollView / ScrollView with recycled cells | [List](./list.md) |
 | `<Canvas>` | `canvas(painter)` | a view replaying a 2D drawing | [Canvas](./canvas.md) |
+| `<Shader>` | `shader(program)` | a view whose box a WGSL program draws on the GPU, under its children | [Shader](./shader.md) |
 | `<WebView>` | `web_view(url)`, `web_view_html(html, base)` | WKWebView / android.webkit.WebView | [WebView](./web-view.md) |
 | `<Video>` | `video(url)` | AVPlayerLayer / MediaPlayer on a TextureView | [Video](./video.md) |
 | `<Overlay>` | `overlay()` | a view on top of the window (or the dialog it is in), placed against an anchor | [Overlay](./overlay.md) |
 | `<If>`, `<Each>` | `when(..)`, `each(..)`, `dynamic(..)` | control flow: the elements they choose | [Control flow](./control-flow.md) |
-| `<InputAccessoryView>` (`nsh/ios`) | `input_accessory_view(id)` | a bar over the keyboard on iOS | [nsh/ios](../modules/nsh-ios.md) |
+| `<InputAccessoryView>` (`nsh/mobile`) | `input_accessory_view(id)` | a bar over the keyboard on iOS | [`InputAccessoryView`](../modules/nsh-mobile.md#inputaccessoryview) |
+
+Padding and margin keep content clear of system UI with CSS's `env()`: `env(safe-area-inset-top)` and the other edges ([Safe area](./safe-area.md)) and `env(keyboard-inset-height)` ([Keyboard](./keyboard.md)).
 
 ## Base
 
@@ -104,27 +102,45 @@ and take their look from the app.
 
 | Component | Rust | What it does | Page |
 |---|---|---|---|
-| `<Button>` | `nsh_base::button()` | A pressable control with its states and its role | [Button](./button.md) |
-| `<Checkbox>` | `nsh_base::checkbox()` | A checked, unchecked or indeterminate control with an indicator | [Checkbox](./checkbox.md) |
-| `<Radio>`, `<RadioGroup>` | `nsh_base::radio()`, `radio_group()` | One option of a set the user picks one of, and the set | [Radio](./radio.md) |
-| `<Tab>`, `<Tabs>` | `nsh_base::tab()`, `tabs()` | One tab of a tab list, and the list | [Tabs](./tabs.md) |
-| `<Switch>` | `nsh_base::switch()` | An on / off control with a track and a thumb | [Switch](./switch.md) |
-| `<Collapsible>` | `nsh_base::collapsible()` | A region whose content expands and collapses | [Collapsible](./collapsible.md) |
-| `<Progress>` | `nsh_base::progress()` | A progress bar: how far a task is, or that it is under way | [Progress](./progress.md) |
-| `<Dialog>` | `nsh_base::dialog()` | Presents its children over everything else | [Dialog](./dialog.md) |
-| `<NavStack>`, `<NavPage>` | `nsh_base::nav_stack()`, `nsh_base::nav_page()` | Native navigation: a stack of pages with the platform's header and back gestures | [NavStack](./nav-stack.md) |
-| `<SafeAreaView>` | `nsh_base::safe_area_view()` | Pads its content clear of notches, bars and the home indicator | [SafeAreaView](./safe-area-view.md) |
-| `<KeyboardAvoidingView>` | `nsh_base::keyboard_avoiding_view()` | Keeps its content above the software keyboard | [KeyboardAvoidingView](./keyboard-avoiding-view.md) |
 | `AlertDialog` | `nsh_base::alert_dialog()` | The system's alert and action sheet | [AlertDialog](./alert-dialog.md) |
-| `<TextView>` | `nsh_base::text_view()` | Shows a Markdown or HTML document with texts and views | [TextView](./text-view.md) |
-| `<SelectionArea>` | `nsh_base::selection_area()` | Makes the texts inside it select together | [SelectionArea](./selection-area.md) |
-| `<Popover>` | `nsh_base::popover()` | Content anchored to a trigger, on top of everything | [Popover](./popover.md) |
-| `<Menu>`, `<ContextMenu>`, `<MenuItem>`, `<MenuSeparator>`, `<Submenu>` | `nsh_base::menu()`, ... | Menus: popups with cascading submenus on desktops, sheets on phones | [Menu](./menu.md) |
-| `<Tooltip>` | `nsh_base::tooltip()` | A hint next to its trigger, on hover or a held finger | [Tooltip](./tooltip.md) |
-| `<Sheet>` | `nsh_base::sheet()` | A panel at an edge of the screen over a backdrop | [Sheet](./sheet.md) |
-| `<Toast>`, `<ToastStack>` | `nsh_base::toast()`, `toast_stack()` | A toast's semantic root; toasts laid out as layers from an edge | [Toast](./toast.md) |
-| `<ResizablePanelGroup>`, `<ResizablePanel>` | `nsh_base::h_resizable()`, `resizable_panel()` | Panels side by side or stacked, with handles that resize them | [Resizable](./resizable.md) |
+| `<Accordion>` and its parts | `nsh_base::accordion()`, `accordion_item()`, ... | Stacked sections that expand and collapse under their headings, one at a time or several | [Accordion](./accordion.md) |
+| `<Avatar>`, `<AvatarGroup>` | `nsh_base::avatar()`, `avatar_group()` | A person's picture, or a fallback while it loads or when it fails, and a row of them that shows the first few | [Avatar](./avatar.md) |
+| `<Button>` | `nsh_base::button()` | A pressable control with its states and its role | [Button](./button.md) |
+| `<Carousel>` and its parts | `nsh_base::carousel()`, `carousel_content()`, ... | Slides shown one place at a time, swiped natively, with previous / next, a pagination, the keys and a seamless loop | [Carousel](./carousel.md) |
+| `<Checkbox>` | `nsh_base::checkbox()` | A checked, unchecked or indeterminate control with an indicator | [Checkbox](./checkbox.md) |
+| `<Collapsible>` | `nsh_base::collapsible()` | A region whose content expands and collapses | [Collapsible](./collapsible.md) |
+| `<Command>` | `nsh_base::command()` | A command palette: a search field over commands filtered natively, a virtualized list, the keys of a Cmd+K palette | [Command](./command.md) |
+| `<DataTable>` | `nsh_base::data_table()` | A table of rows and columns of any number, selectable, sortable, with resizable and movable columns | [DataTable](./data-table.md) |
+| `<Dialog>` | `nsh_base::dialog()` | Presents its children over everything else | [Dialog](./dialog.md) |
+| `<DiffView>` | `nsh_base::diff_view()` | The changes between two texts or of a patch, split or unified | [DiffView](./diff-view.md) |
 | `<DockArea>` | `nsh_base::dock_area()` | A workspace of splits, tab groups and edge docks the user arranges | [Dock](./dock.md) |
+| `<Editor>` | `nsh_base::editor()` | A code editor with highlighting, several carets, folding and search | [Editor](./editor.md) |
+| `<HoverCard>` | `nsh_base::hover_card()` | A preview of what its trigger points at, while the pointer rests on it | [HoverCard](./hover-card.md) |
+| `<Input>` | `nsh_base::input()` | The native text input (UITextField or UITextView / EditText) | [Input](./input.md) |
+| `<Link>` | `nsh_base::link()` | A press target that opens a page, a site or a route of the app | [Link](./link.md) |
+| `<Menu>`, `<ContextMenu>`, `<MenuItem>`, `<MenuSeparator>`, `<Submenu>` | `nsh_base::menu()`, ... | Menus: popups with cascading submenus on desktops, sheets on phones | [Menu](./menu.md) |
+| `<NavStack>`, `<NavPage>` | `nsh_base::nav_stack()`, `nsh_base::nav_page()` | Native navigation: a stack of pages with the platform's header and back gestures | [NavStack](./nav-stack.md) |
+| `<NumberInput>` | `nsh_base::number_input()` | A number typed in a field or stepped with buttons and keys | [NumberInput](./number-input.md) |
+| `<OtpInput>` | `nsh_base::otp_input()` | A one-time code of a fixed number of digits, typed, pasted or autofilled into cells | [OtpInput](./otp-input.md) |
+| `<Pagination>` | `nsh_base::pagination()` | The pages of a set: Previous, the pages around the current one, ellipses and Next | [Pagination](./pagination.md) |
+| `<Tree>` | `nsh_base::tree()` | Items that hold items, expanded and collapsed, one selected: virtualized, one stop of the keyboard focus | [Tree](./tree.md) |
+| `<Plot>`, `<Line>`, `<Area>`, `<Bar>`, `<Grid>`, `<Pie>`, `<Arc>` (`nsh/base/plot`) | `nsh_base::plot::{plot, line, area, bar, grid, pie, arc}` | A chart's frame and its marks, drawn natively from the app's rows | [Plot](./plot.md) |
+| `<Popover>` | `nsh_base::popover()` | Content anchored to a trigger, on top of everything | [Popover](./popover.md) |
+| `<Progress>` | `nsh_base::progress()` | A progress bar: how far a task is, or that it is under way | [Progress](./progress.md) |
+| `<Radio>`, `<RadioGroup>` | `nsh_base::radio()`, `radio_group()` | One option of a set the user picks one of, and the set | [Radio](./radio.md) |
+| `<ResizablePanelGroup>`, `<ResizablePanel>` | `nsh_base::h_resizable()`, `resizable_panel()` | Panels side by side or stacked, with handles that resize them | [Resizable](./resizable.md) |
+| `<Scrollbar>` | `nsh_base::scrollbar()` | A scroll bar of the app's own look for a scroll view or a list | [Scrollbar](./scrollbar.md) |
+| `<Select>` | `nsh_base::select()` | One value chosen from a list of items, with the keyboard, search and sections | [Select](./select.md) |
+| `<Sheet>` | `nsh_base::sheet()` | A panel at an edge of the screen over a backdrop | [Sheet](./sheet.md) |
+| `<Slider>` | `nsh_base::slider()` | A value, or a range of two, picked along a track | [Slider](./slider.md) |
+| `<Switch>` | `nsh_base::switch()` | An on / off control with a track and a thumb | [Switch](./switch.md) |
+| `<Table>` and its parts | `nsh_base::table()`, `table_row()`, ... | A table of the app's own rows and cells, with a table's roles | [Table](./table.md) |
+| `<Tab>`, `<Tabs>` | `nsh_base::tab()`, `tabs()` | One tab of a tab list, and the list | [Tabs](./tabs.md) |
+| `<TextView>` | `nsh_base::text_view()` | Shows a Markdown or HTML document with texts and views | [TextView](./text-view.md) |
+| `<Toast>`, `<ToastStack>` | `nsh_base::toast()`, `toast_stack()` | A toast's semantic root; toasts laid out as layers from an edge | [Toast](./toast.md) |
+| `<Toggle>`, `<ToggleGroup>` | `nsh_base::toggle()`, `toggle_group()` | A button that is on or off, and a toolbar of them | [Toggle](./toggle.md) |
+| `<Toolbar>`, `<ToolbarGroup>`, `<ToolbarSeparator>` | `nsh_base::toolbar()`, `toolbar_group()`, `toolbar_separator()` | A bar of buttons, toggles and links, one stop of the keyboard focus | [Toolbar](./toolbar.md) |
+| `<Tooltip>` | `nsh_base::tooltip()` | A hint next to its trigger, on hover or a held finger | [Tooltip](./tooltip.md) |
 
 > [!NOTE]
 > A string is only drawn inside a `Text`. A string child of a `View` creates no native view and takes no part in
@@ -152,13 +168,21 @@ only hears about it afterwards. Only the innermost pressable view responds; insi
 
 | Prop | Rust | Type | Default | Description |
 |---|---|---|---|---|
-| `onPress` | `.on_press(..)` | `() => void` | | A tap ended inside the view. |
-| `onLongPress` | `.on_long_press(..)` | `() => void` | | The finger stayed down for `delayLongPress`. |
-| `onPressDown` | `.on_press_down(..)` | `() => void` | | A finger went down on the view. |
-| `onPressUp` | `.on_press_up(..)` | `() => void` | | The finger lifted or left. |
+| `onPress` | `.on_press(..)` | `(e: PressEvent) => void` | | A tap ended inside the view. |
+| `onLongPress` | `.on_long_press(..)` | `(e: PressEvent) => void` | | The finger stayed down for `delayLongPress`. |
+| `onPressDown` | `.on_press_down(..)` | `(e: PressEvent) => void` | | A finger went down on the view. |
+| `onPressUp` | `.on_press_up(..)` | `(e: PressEvent) => void` | | The finger lifted or left. |
 | `delayLongPress` | `.long_press_delay(ms)` | `number` | `500` | Milliseconds before a press becomes a long press. |
 | `hitSlop` | `.hit_slop(EdgeInsets::all(px(8.0)))` | `number \| Partial<Edges>` | | Extends the touch area beyond the bounds, in points. |
-| `pointerEvents` | `.pointer_events(PointerEvents::BoxNone)` | `"auto" \| "none" \| "box-none" \| "box-only"` | `"auto"` | Which touches the view and its children receive: `"none"` neither, `"box-none"` only the children, `"box-only"` only the view itself. |
+
+`PressEvent` is `{ position, pagePosition, modifiers, clickCount }`: where the pointer was in the view and in its root
+view (`Point`s), the modifier keys held when the press began and the consecutive clicks (2 for a double click). Where
+the platform reports no pointer, it is the view's origin with no keys and one click.
+
+The style key `pointerEvents` (`.pointer_events(PointerEvents::BoxNone)` in Rust, the classes `pointer-events-*`)
+decides which touches the view and the views in it receive: `"none"` neither (a view inside that sets `"auto"` takes
+them again), `"box-none"` only the views in it, `"box-only"` only the view itself
+([touch and gestures](../docs/touch-and-gestures.md#pointerevents)).
 
 The press feedback is the app's: `activeStyle` (or `active:` classes, `.active(..)` in Rust) applies while the view is
 pressed, natively, with no round trip to the app's code (below).
@@ -167,17 +191,21 @@ pressed, natively, with no round trip to the app's code (below).
 
 Styles that apply while the view is in a state, over its own styles, natively. Each is the object form of a Tailwind
 variant. Later states win (selected, checked and indeterminate, then hover, focus, active); `disabledStyle` wins over all, and the others do not
-apply while the view is disabled.
+apply while the view is disabled. Each takes the element's own style: a `TextStyle` on a `<Text>`, an `InputStyle` on
+an `<Input>`, an `ImageStyle` on an `<Image>`, a `ViewStyle` elsewhere.
 
 | Prop | Rust | Class variant | Applies |
 |---|---|---|---|
 | `activeStyle` | `.active(\|s\| ..)` | `active:` | While pressed. |
 | `hoverStyle` | `.hover(\|s\| ..)` | `hover:` | While a pointer is over the view. |
 | `focusStyle` | `.focus(\|s\| ..)` | `focus:` | While the view has focus. |
+| `focusWithinStyle` | `.focus_within(\|s\| ..)` | `focus-within:` | While the view or a view inside it has focus (the content of an `Overlay` counts as inside the view it is in). |
 | `disabledStyle` | `.disabled_style(\|s\| ..)` | `disabled:` | While `disabled`. |
 | `checkedStyle` | `.checked(\|s\| ..)`, `.checked_style(style)` | `checked:` | While `accessibilityState.checked` is `true` (a checkbox, a switch, a radio; `"mixed"` is not checked). |
 | `indeterminateStyle` | `.indeterminate(\|s\| ..)`, `.indeterminate_style(style)` | `indeterminate:` | While `accessibilityState.checked` is `"mixed"` (a checkbox that is neither checked nor unchecked). |
-| | `.selected(\|s\| ..)` | `selected:` | While `accessibilityState.selected` is `true` (a selected `Button`, a tab). |
+| `selectedStyle` | `.selected(\|s\| ..)` | `selected:` | While `accessibilityState.selected` is `true` (a selected `Button`, a tab). |
+| `expandedStyle` | `.expanded(\|s\| ..)`, `.expanded_style(style)` | `aria-expanded:` | While `accessibilityState.expanded` is `true` (a `Popover`'s or `Menu`'s trigger while its popup is open). |
+| `pressedStyle` | `.aria_pressed(\|s\| ..)`, `.pressed_style(style)` | `aria-pressed:` | While `accessibilityState.pressed` is `true` (a toggle button that is on; `"mixed"` is not pressed). Not `activeStyle`, a press in progress. |
 
 ```rust tabs
 view()
@@ -205,21 +233,23 @@ desktop browsers, with an iPad's pointer or a Mac's mouse on iOS, and with a mou
 
 | Prop | Rust | Type | Description |
 |---|---|---|---|
-| `onHoverIn` | `.on_hover_in(..)` | `() => void` | The mouse came over the view or a view inside it. |
-| `onHoverMove` | `.on_hover_move(..)` | `(e: HoverEvent) => void` | The mouse moved over the view (or a view inside it) with no button down. |
-| `onHoverOut` | `.on_hover_out(..)` | `() => void` | The mouse left the view and the views inside it, or the window. |
+| `onMouseEnter` | `.on_mouse_enter(..)` | `(e: MouseEvent) => void` | The mouse came over the view or a view inside it (the DOM's `mouseenter`). |
+| `onMouseMove` | `.on_mouse_move(..)` | `(e: MouseEvent) => void` | The mouse moved over the view (or a view inside it), with or without a button down, or a modifier key was pressed or released while it rests there with none down (the DOM's `mousemove`). |
+| `onMouseLeave` | `.on_mouse_leave(..)` | `(e: MouseEvent) => void` | The mouse left the view and the views inside it, or the window; `e` is where it was last (the DOM's `mouseleave`). |
 
-Like CSS `:hover`, a view counts as hovered while the mouse is over it or over anything inside it, so the views around
-the one under the mouse hear `onHoverIn` too (from the outside in; `onHoverOut` from the inside out). The events come
-after the fact and never on touches; a move with a button down is a touch (`onTouchMove`, the responder). A view removed
-from under the mouse hears `onHoverOut`, on Linux and Windows at the next mouse move.
+Like CSS `:hover` and the DOM's `mouseenter`, a view counts as hovered while the mouse is over it or over anything
+inside it, so the views around the one under the mouse hear `onMouseEnter` too (from the outside in; `onMouseLeave`
+from the inside out). The events come after the fact and never on touches. A view removed from under the mouse hears
+`onMouseLeave`, on Linux and Windows at the next mouse move.
 
-`HoverEvent` says where the mouse is, as GPUI's `MouseMoveEvent` does: `position` in the view (a `Point` in points, its
-transforms undone), `pagePosition` in the root view it is in, as touches give it, and the `modifiers` held (`control`,
-`alt`, `shift`, `platform`: Command on Apple platforms, the Windows key elsewhere); in Rust `position`, `page_position`
-and `modifiers`. Moves
-come at most once a frame, the latest one, and always before the `onHoverOut` that follows them, so a handler can
-redraw on each move:
+`MouseEvent` says where the mouse is, as GPUI's `MouseMoveEvent` does: `position` in the view (a `Point` in points, its
+transforms undone), `pagePosition` in the root view it is in, as touches give it, the `modifiers` held (`control`,
+`alt`, `shift`, `platform`: Command on Apple platforms, the Windows key elsewhere), and `pressedButton`, the button held
+down (`"left"`, `"right"`, `"middle"`, `"back"` or `"forward"`, GPUI's `MouseButton`) or `null`; in Rust `position`,
+`page_position`, `modifiers` and `pressed_button`. On the desktops and the web a drag is also a touch (`onTouchMove`,
+the responder), and its moves reach `onMouseMove` with `pressedButton` set: feedback that only follows the hover skips
+those; on iOS and Android the hover reports the pointer with no button down. Moves come at most once a frame, the
+latest one, and always before the `onMouseLeave` that follows them, so a handler can redraw on each move:
 
 ```rust tabs
 // A crosshair over a chart.
@@ -227,8 +257,8 @@ let at = signal(None::<Points>);
 
 view()
     .h(px(200.0))
-    .on_hover_move(move |e: &HoverEvent| at.set(Some(e.position.x)))
-    .on_hover_out(move || at.set(None))
+    .on_mouse_move(move |e: &MouseEvent| at.set(Some(e.position.x)))
+    .on_mouse_leave(move |_: &MouseEvent| at.set(None))
     .child(when(move || at.get().is_some(), move || {
         view()
             .absolute()
@@ -244,7 +274,7 @@ view()
 // A crosshair over a chart.
 const at = signal<number | null>(null);
 
-<View onHoverMove={(e) => at.set(e.position.x)} onHoverOut={() => at.set(null)} style={{ height: 200 }}>
+<View onMouseMove={(e) => at.set(e.position.x)} onMouseLeave={() => at.set(null)} style={{ height: 200 }}>
   <If when={at() !== null}>
     <View style={{ position: "absolute", left: at()!, top: 0, bottom: 0, width: 1, backgroundColor: "#888" }} />
   </If>
@@ -254,25 +284,42 @@ const at = signal<number | null>(null);
 ### Tooltips
 
 `tooltip` gives any element a hint, shown above it on the desktops (macOS, Windows, Linux, the GPUI backend and
-desktop browsers) once the pointer has rested on it for half a second, until the pointer leaves or presses it. Phones
-and tablets show none. The hint never takes the pointer or presses, so the element works exactly as it does without it.
+desktop browsers) once the pointer has rested on it for half a second, until the pointer leaves or presses it, and on
+every device while the keyboard focus is on it, until the focus leaves or Escape is pressed. The hint never takes the pointer or presses, so the element works exactly as it does without it.
 
 | Prop | Rust | Type | Description |
 |---|---|---|---|
-| `tooltip` | `.tooltip(..)` | `string \| JSX.Element` | A text, in a small bubble drawn with the theme's `popover` tokens (`bg-popover`, `text-popover-foreground`, `border-border`: the theme decides how it looks), or an element, shown as it is (a `Tooltip` of `nsh/base` is the tooltip itself). |
+| `tooltip` | `.tooltip(..)` | `JSX.Element` | The hint, an element the app styles: a [`Tooltip`](tooltip.md) of `nsh/base` is the tooltip itself, with its placement, delay and events; any other element is shown as it is. |
 
 ```rust tabs
-view().on_press(save).tooltip("Save the document").child(text("💾"))
+view()
+    .on_press(save)
+    .tooltip(
+        tooltip()
+            .rounded_md()
+            .bg(rgb(0x111827))
+            .px_2()
+            .py_1()
+            .child(text("Save the document").text_color(white())),
+    )
+    .child(text("💾"))
 ```
 
 ```tsx tabs
-<View onPress={save} tooltip="Save the document">
+<View
+  onPress={save}
+  tooltip={
+    <Tooltip class="rounded-md bg-gray-900 px-2 py-1">
+      <Text class="text-white">Save the document</Text>
+    </Tooltip>
+  }
+>
   <Text>💾</Text>
 </View>
 ```
 
-For a tooltip of its own look, placement, delay or events, give a [`Tooltip`](tooltip.md) of `nsh/base` as the
-`tooltip`, as GPUI's `.tooltip(..)` takes one.
+The `Tooltip` sets its own look, placement, delay and events, as GPUI's `.tooltip(..)` takes one. An app with many
+tooltips keeps one small component of its own that wraps a text in its `Tooltip`.
 
 ### Context menus
 
@@ -308,13 +355,30 @@ touchscreens, a long press opens menus: handle `onLongPress` with the same funct
 
 ### Keyboard focus
 
-On macOS and the web, Tab moves the keyboard focus between the views that take presses (and the inputs), Return or
-Space presses the focused view, and focus styles (`focus:`, `.focus(..)`) style it. A click presses a view without
-focusing it, so focus styles show for keyboard focus only.
+On macOS and the web, Tab moves the keyboard focus between its stops in tree order: the inputs, the views that take
+presses, and every `focusable` view. Focus styles (`focus:`, `.focus(..)`) style the focused view, and Return or Space
+presses it when it takes presses. A click presses a view without focusing it, so focus styles show for keyboard focus
+only.
+
+Focus and presses are separate. A view that takes keys while it has the focus (a chart, a slider, a list that moves
+its selection with the arrow keys) sets `focusable` and binds its keys while focused (`onFocus` / `onBlur` with
+[`keymap`](../modules/nsh.md#keymap)); a press on it still reaches a pressable around it, such as a card that
+opens a page.
+
+A ref's `focus()` moves the keyboard focus to a stop as Tab does (its focus styles show and `onFocus` fires), say to
+give it back to the trigger of a popup that closed, and `blur()` takes it off.
+
+A view around the focus styles itself with `focus-within:` (`focusWithinStyle`, `.focus_within(..)`) while the focus
+is on it or on any view inside it: a field's frame around the input that edits, a toolbar while one of its buttons has
+the focus. The content of an `Overlay` is inside the view the overlay is in, wherever it shows, so a popup counts as
+part of the view that holds its trigger. In Rust, a component hears the focus come into an element and leave it with
+its ref's `on_focus_in(..)` and `on_focus_out(..)`: moving between views inside it is neither.
 
 | Prop | Rust | Type | Default | Description |
 |---|---|---|---|---|
-| `focusable` | `.focusable(..)` | `boolean` | `true` | Whether a view that takes presses is a stop of Tab; `false` leaves it to the pointer (a backdrop that closes a popover, rows the arrow keys move between). |
+| `focusable` | `.focusable(..)` | `boolean` | `true` for views that take presses | Whether the view is a stop of Tab. `true` makes any view one, whether it takes presses or leaves them to the views around it; `false` leaves a pressable to the pointer (a backdrop that closes a popover, rows the arrow keys move between). |
+| `onFocus` | `.on_focus(..)` | `() => void` | | Tab (or `focus()`) gave the view the keyboard focus. |
+| `onBlur` | `.on_blur(..)` | `() => void` | | The keyboard focus left the view. |
 
 ```rust tabs
 view()
@@ -326,6 +390,16 @@ view()
 
 // An overlay's backdrop: a click closes it, Tab goes past it to the content.
 view().absolute().inset_0().focusable(false).on_press(close)
+
+// A chart in a card: Tab stops at the chart, a click opens the card's page.
+view().on_press(open_page).child(
+    view()
+        .h(px(160.0))
+        .focusable(true)
+        .focus(|s| s.bg(rgb(0xe0f2fe)))
+        .on_focus(move || focused.set(true))
+        .on_blur(move || focused.set(false)),
+)
 ```
 
 ```tsx tabs
@@ -335,21 +409,31 @@ view().absolute().inset_0().focusable(false).on_press(close)
 
 {/* An overlay's backdrop: a click closes it, Tab goes past it to the content. */}
 <View class="absolute inset-0" focusable={false} onPress={close} />
+
+{/* A chart in a card: Tab stops at the chart, a click opens the card's page. */}
+<View onPress={openPage}>
+  <View
+    class="h-40 focus:bg-sky-100"
+    focusable
+    onFocus={() => focused.set(true)}
+    onBlur={() => focused.set(false)}
+  />
+</View>
 ```
 
 ### Layout and identity
 
 | Prop | Rust | Type | Description |
 |---|---|---|---|
-| `onLayout` | `.on_layout(\|frame: &Bounds<Points>\| ..)` | `(bounds: Bounds) => void` | The view's frame relative to its parent, `{ origin, size }`, after each layout that changes it. |
-| `ref` | `.element_ref(&handle)` | `YNode \| (node: YNode) => void` | The native node (see [ref methods](#ref-methods)). `ref={el}` assigns a variable, `ref={fn}` calls a function. |
+| `onLayout` | `.on_layout(\|frame: &Bounds<Points>\| ..)` | `(e: { bounds: Bounds }) => void` | `bounds` is the view's frame relative to its parent, `{ origin, size }`, after each layout that changes it. |
+| `ref` | `.element_ref(&handle)` | `ViewRef \| (node: ViewRef) => void` | The element's ref (see [ref methods](#ref-methods)): `ViewRef`, or the element's own type over it. `ref={el}` assigns a variable, `ref={fn}` calls a function. |
 | `nativeID` | `.native_id(id)` | `string` | Names the view for others, e.g. the `InputAccessoryView` an input refers to. |
 | `testID` | `.test_id(id)` | `string` | An identifier for UI tests (on Android, the view's resource id). |
 | `key` | `.key(key)` | `string` | The element's identity among its siblings. |
 
 ### Gestures driving animated values
 
-These props bind a gesture to [native animated values](../modules/nsh-animated.md) that move on the UI thread, with no
+These props bind a gesture to [native animated values](../modules/nsh.md#animation) that move on the UI thread, with no
 work in the app's code per frame. See [touch and gestures](../docs/touch-and-gestures.md).
 
 | Prop | Rust | Type | Description |
@@ -362,9 +446,10 @@ work in the app's code per frame. See [touch and gestures](../docs/touch-and-ges
 | `rotation` | `.rotation_value(&angle)` | `{ angle?: AnimatedValue }` | Two-finger rotations drive `angle` (degrees). |
 | `onRotationStart` / `onRotationEnd` | `.on_rotation_start(..)` / `.on_rotation_end(..)` | `(e: { rotation: number; velocity: number }) => void` | A rotation started / ended. |
 
-`PanEvent` is `{ translationX, translationY, velocityX, velocityY, valueX?, valueY? }` (in Rust `translation`,
-`velocity_x`, `velocity_y`, `value_x`, `value_y`): the translation since the start, the velocity in points per second,
-and the bound values at that moment (a drag can grab a value mid-animation).
+`PanEvent` is `{ cancelled, translation, velocity, value? }` (in Rust `cancelled`, `translation`, `velocity_x`,
+`velocity_y`, `value_x`, `value_y`): whether the system cancelled the drag, the translation since the start and the
+velocity in points per second (`Point`s), and the bound values at that moment, `{ x?, y? }` for the axes `pan` binds
+(a drag can grab a value mid-animation).
 
 ### Raw touches and the responder system
 
@@ -379,7 +464,7 @@ Returning `true` from `onResponderGrant` keeps native scroll views from taking t
 (`{ activeOffsetX, activeOffsetY, failOffsetX, failOffsetY }`) makes the view the responder only once the platform
 activates its pan, so drags inside scroll views leave the other axis to them
 ([Touch and gestures](../docs/touch-and-gestures.md#pans-inside-scroll-views-panactivation)).
-`PanResponder` in [`nsh/gesture`](../modules/nsh-gesture.md) builds on them. In Rust, `.on_touch(..)` hears every touch
+`PanResponder` in [`PanResponder`](../modules/nsh.md#panresponder) builds on them. In Rust, `.on_touch(..)` hears every touch
 (`TouchEvent`), `.claim_touches(..)` decides when the view takes them, and `.on_responder_grant(..)`,
 `.on_responder_move(..)`, `.on_responder_release(..)` and the others follow the responder.
 
@@ -391,7 +476,8 @@ activates its pan, so drags inside scroll views leave the other axis to them
 | `accessibilityLabel` | `.label(..)` | `string` | What screen readers read. Views without a label read their texts. |
 | `accessibilityHint` | `.hint(..)` | `string` | What activating the element does. |
 | `role` | `.role(AccessibilityRole::Button)` | `AccessibilityRole` | What the element is (`"button"`, `"header"`, `"link"`, `"switch"`, …). |
-| `accessibilityState` | `.accessibility_state(..)` | `{ disabled?, selected?, checked?, busy?, expanded? }` | The state assistive technologies report (`checked` may be `"mixed"`). |
+| `accessibilityState` | `.accessibility_state(..)` | `{ disabled?, selected?, checked?, busy?, expanded?, pressed?, current? }` | The state assistive technologies report (`checked` and `pressed` may be `"mixed"`; `current` is `true` or `"page"`, `"step"`, `"location"`, `"date"`, `"time"`). |
+| `accessibilityLevel` | `.accessibility_level(..)` | `number` | The level of a heading (1 the top), the depth of a tree item (1 at the top). |
 | `accessibilityValue` | `.accessibility_value(..)` | `{ min?, max?, now?, text? }` | The value of a range or textual element. |
 | `accessibilityElementsHidden` | | `boolean` | Hides the view and its subtree from assistive technologies. |
 | `importantForAccessibility` | | `"auto" \| "yes" \| "no" \| "no-hide-descendants"` | Whether the view is exposed. |
@@ -446,22 +532,28 @@ See [platform-specific code](../docs/platform-specific.md).
 
 ## Ref methods
 
-`ref` receives a `YNode` in TSX; in Rust, `element_ref()` makes an `ElementRef` handle that `.element_ref(&handle)`
-attaches. Their methods send commands to the native view, in order with the changes made before them in the same turn.
-Each element page says which apply to it.
+In TSX, `ref` receives the element's ref, whose type is the element's own: `ViewRef` (`focus`, `blur`, `measure`) for
+`View`, `Text`, `Image`, `Canvas`, `Overlay` and `Shader`, and a type over `ViewRef` with the element's methods for the
+others: `InputRef` (`Input`), `ScrollRef` (`Scroll`), `ListRef` (`List`), `WebViewRef` (`WebView`), `VideoRef`
+(`Video`) and `NativeComponentRef` (native components). In Rust, `element_ref()` makes an `ElementRef` handle that
+`.element_ref(&handle)` attaches. Their methods send commands to the native view, in order with the changes made
+before them in the same turn. Each element page says which apply to it. Type a ref variable with its element's own
+type (`let field!: InputRef` for an `<Input>`): a variable typed `ViewRef` does not fit an element whose ref has methods
+of its own.
 
-| Method | Rust | Applies to | Description |
+| Method | Rust | Ref | Description |
 |---|---|---|---|
-| `focus()` / `blur()` | `focus()` / `blur()` | `<Input>` | Focuses (shows the keyboard) / unfocuses. |
-| `setSelection(start, end?)` | `set_selection(start, end)` | `<Input>` | Selects `start..end` in UTF-16 units; a caret without `end`. |
-| `scrollTo({ x?, y?, animated? })` | `scroll_to(point, animated)` | `<Scroll>`, `List` | Scrolls to an offset. |
-| `zoomTo({ scale, x?, y?, animated? })` | `zoom_to(scale, center, animated)` | zoomable `<Scroll>` | Zooms to `scale` around a content point. |
-| `scrollToOffset({ offset, animated? })` | `scroll_to_offset(offset, animated)` | `List` | Scrolls to an offset along the list's axis. |
-| `scrollToIndex({ index, animated?, viewPosition?, viewOffset? })` | `scroll_to_index(index, position, offset, animated)` | `List` | Scrolls an item into view. |
-| `scrollToEnd({ animated? })` | `scroll_to_end(animated)` | `List` | Scrolls to the end of the content. |
-| `reload()`, `goBack()`, `goForward()`, `stopLoading()`, `injectJavaScript(script)`, `postMessage(data)` | `reload()`, `go_back()`, `go_forward()`, `stop_loading()`, `inject_java_script(..)`, `post_message(..)` | `WebView` | Controls the page. |
-| `seek(seconds)` | `seek(seconds)` | `Video` | Jumps to a time. |
-| `command(name, args?)` | `command(name, args)` | native components | Calls a command of a registered native component ([`nsh/native`](../modules/nsh-native.md)). |
+| `focus()` / `blur()` | `focus()` / `blur()` | `ViewRef` | Focuses an `<Input>` (shows the keyboard), or gives a view that takes presses the keyboard focus / unfocuses. |
+| `measure()` | `measure()` | `ViewRef` | [Where the view is](../docs/touch-and-gestures.md#where-a-view-is-measure). |
+| `setSelection(start, end?)` | `set_selection(start, end)` | `InputRef` | Selects `start..end` in UTF-16 units; a caret without `end`. |
+| `scrollTo({ x?, y?, animated? })` | `scroll_to(point, animated)` | `ScrollRef`, `ListRef` | Scrolls to an offset. |
+| `zoomTo({ scale, x?, y?, animated? })` | `zoom_to(scale, center, animated)` | `ScrollRef` (a zoomable `<Scroll>`) | Zooms to `scale` around a content point. |
+| `scrollToOffset({ offset, animated? })` | `scroll_to_offset(offset, animated)` | `ListRef` | Scrolls to an offset along the list's axis. |
+| `scrollToIndex({ index, animated?, viewPosition?, viewOffset? })` | `scroll_to_index(index, position, offset, animated)` | `ListRef` | Scrolls an item into view. |
+| `scrollToEnd({ animated? })` | `scroll_to_end(animated)` | `ScrollRef`, `ListRef` | Scrolls to the end of the content. |
+| `reload()`, `goBack()`, `goForward()`, `stopLoading()`, `injectJavaScript(script)`, `postMessage(data)` | `reload()`, `go_back()`, `go_forward()`, `stop_loading()`, `inject_java_script(..)`, `post_message(..)` | `WebViewRef` | Controls the page. |
+| `seek(seconds)` | `seek(seconds)` | `VideoRef` | Jumps to a time. |
+| `command(name, args?)` | `command(name, args)` | `NativeComponentRef` | Calls a command of a registered native component ([`nativeComponent`](../modules/nsh.md#nativecomponent-and-nativemodule)). |
 
 ```rust tabs
 let field = element_ref();
@@ -472,9 +564,10 @@ view()
 ```
 
 ```tsx tabs
-import { Input, View, type YNode } from "nsh";
+import { type InputRef, View } from "nsh";
+import { Input } from "nsh/base";
 
-let input!: YNode;
+let input!: InputRef;
 <View onPress={() => input.focus()}>
   <Input ref={input} placeholder="Tap the row to type" />
 </View>;
@@ -484,5 +577,5 @@ let input!: YNode;
 
 The main thread never waits for the app's code. When the system needs an answer on the spot (may this text change, may
 the back button pop, may this sheet close), NSH answers it natively from props set beforehand (`maxLength`,
-`popOnBack`, `closeOnSwipe`, `pointerEvents`, …), and the event reaches the app afterwards. This is why such behavior
+`popOnBack`, `closeOnSwipe`, …), and the event reaches the app afterwards. This is why such behavior
 is a prop, not a return value of a handler.

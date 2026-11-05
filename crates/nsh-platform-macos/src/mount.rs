@@ -8,7 +8,11 @@ use std::{cell::RefCell, rc::Rc};
 use nsh_core::{Command, LayoutAnimation, MountItem, NodeId, ROOT_ID, ViewKind, canvas::Damage};
 use rustc_hash::FxHashMap;
 
-use crate::{surface::Surface, view::NshView};
+use crate::{
+    sight::Sights,
+    surface::Surface,
+    view::{NshView, Views},
+};
 
 /// The views of a surface.
 pub(crate) struct Mounter {
@@ -24,6 +28,9 @@ pub(crate) struct Mounter {
     /// Views whose drawing changed while they could not be seen
     /// ([`Mounter::draw_when_shown`]).
     stale: RefCell<Vec<NshView>>,
+    /// The ancestors [`Mounter::revisit`] resolved (kept for the
+    /// allocations; cleared on each pass).
+    sights: RefCell<Sights<NshView>>,
 }
 
 impl Mounter {
@@ -36,6 +43,7 @@ impl Mounter {
             layout_animation: None,
             rtl: false,
             stale: RefCell::default(),
+            sights: RefCell::default(),
         }
     }
 
@@ -61,6 +69,12 @@ impl Mounter {
     /// rows out of sight, and a pulse on each of them would otherwise
     /// redraw them all on every frame.
     pub(crate) fn draw_when_shown(&self, view: &NshView, damage: Damage) {
+        // Already waiting: it was out of sight, and anything that could
+        // show it since (a move, a batch) has the frame revisit it. Charts
+        // below the fold get new values on every frame of their appear.
+        if view.is_stale() {
+            return;
+        }
         if view.shown() {
             match damage {
                 Damage::Rect(r) => view.redraw_rect(r),
@@ -74,24 +88,38 @@ impl Mounter {
     /// Draws the views [`Mounter::draw_when_shown`] put off that can be
     /// seen now (after scrolls, batches and frames). Views out of the tree
     /// wait (their content is drawn once they show); deleted ones are
-    /// dropped.
-    pub(crate) fn revisit(&self) {
+    /// dropped. Whether the pass ran (it does not while one runs).
+    ///
+    /// The views it keeps share their ancestors: each ancestor's visible
+    /// part is resolved once per pass ([`Sights`]), which keeps a pass
+    /// over the hundreds of out-of-sight views of a long page cheap.
+    pub(crate) fn revisit(&self) -> bool {
         let Ok(mut stale) = self.stale.try_borrow_mut() else {
-            return;
+            return false;
         };
         if stale.is_empty() {
-            return;
+            return true;
         }
+        let Ok(mut sights) = self.sights.try_borrow_mut() else {
+            return false;
+        };
+        // Nothing moves while the pass decides (drawing comes after), so
+        // what it resolves stays true until it ends.
+        sights.clear();
         let shown: Vec<NshView> = stale
-            .extract_if(.., |v| !self.alive(v) || v.shown())
+            .extract_if(.., |v| !self.alive(v) || sights.shows(&Views, v))
             .collect();
+        sights.clear();
+        drop(sights);
         drop(stale);
         for view in shown {
             view.set_stale(false);
             if self.alive(&view) {
                 view.redraw();
+                crate::shader::shown(&view);
             }
         }
+        true
     }
 
     /// Whether `view` is still mounted (not deleted).
@@ -105,7 +133,7 @@ impl Mounter {
         crate::navigation::end_batch(surface);
         crate::system::end_batch(surface);
         crate::input::content_moved(surface, false);
-        crate::selection_area::end_batch(surface);
+        crate::selectable_view::end_batch(surface);
     }
 
     fn get(&self, id: NodeId) -> Option<&NshView> {
@@ -182,11 +210,16 @@ impl Mounter {
                 crate::file_drop::deleted(surface, *id);
                 if let Some(view) = self.views.remove(id) {
                     crate::native::deleted(surface, &view);
+                    crate::shader::deleted(surface, &view);
                     // A removal animation detaches the view when it ends.
                     if !crate::transition::removing(surface, &view, self.layout_animation.as_ref())
                     {
+                        crate::transition::deleted(&view);
                         self.detach(surface, &view);
                     }
+                    // After the detach: a dialog closing through its shader
+                    // has read it.
+                    crate::navigation::deleted(surface, &view);
                 }
             }
             MountItem::Frame { id, frame } => {
@@ -220,7 +253,7 @@ impl Mounter {
                 match view.kind() {
                     ViewKind::Stack => crate::navigation::stack_resized(surface, view),
                     ViewKind::Canvas => view.changed(),
-                    _ => {}
+                    _ => crate::shader::resized(surface, view),
                 }
             }
             MountItem::ViewStyle { id, style } => {
@@ -230,6 +263,7 @@ impl Mounter {
                 crate::transition::style_changed(surface, view, &old);
                 view.moved();
                 crate::decor::style_changed(view, &old);
+                crate::access::style_changed(view, &old);
             }
             MountItem::Text {
                 id,
@@ -238,7 +272,11 @@ impl Mounter {
                 content,
             } => {
                 if let Some(view) = self.get(*id) {
+                    let old = view.state().text.as_ref().map(|t| t.text.clone());
                     crate::text::set(view, text, layout, *content);
+                    if let Some(old) = old {
+                        crate::transition::text_changed(surface, view, &old, text);
+                    }
                     self.draw_when_shown(view, Damage::All);
                     crate::access::text_changed(view);
                 }
@@ -265,6 +303,7 @@ impl Mounter {
                 id,
                 horizontal,
                 scrollbar_visible,
+                replaced,
                 mirrored,
                 ..
             } => {
@@ -274,6 +313,7 @@ impl Mounter {
                         view,
                         *horizontal,
                         *scrollbar_visible,
+                        *replaced,
                         *mirrored,
                     );
                 }
@@ -322,6 +362,26 @@ impl Mounter {
                 if let Some(view) = self.get(*id) {
                     crate::canvas::set(surface, view, drawing.clone());
                     self.draw_when_shown(view, Damage::All);
+                }
+            }
+            MountItem::ShaderTransition { id, duration } => {
+                if let Some(view) = self.get(*id) {
+                    crate::shader::start_transition(surface, view, *duration);
+                }
+            }
+            MountItem::ShaderInput { id } => {
+                if let Some(view) = self.get(*id) {
+                    crate::shader::input_changed(surface, view);
+                }
+            }
+            MountItem::NavShader { id, shader } => {
+                if let Some(view) = self.get(*id) {
+                    crate::navigation::set_shader(surface, view, shader.clone());
+                }
+            }
+            MountItem::Shader { id, layer } => {
+                if let Some(view) = self.get(*id) {
+                    crate::shader::set(surface, view, layer.clone());
                 }
             }
             MountItem::Gestures { id, values } => {
@@ -378,7 +438,11 @@ impl Mounter {
             }
             MountItem::Command { id, command } => self.command(surface, *id, command),
             // The animator's (`Surface::apply`).
-            MountItem::Animation(_) | MountItem::AnimationBindings { .. } => {}
+            MountItem::Animation(_)
+            | MountItem::AnimationBindings { .. }
+            | MountItem::ComponentPropSlots { .. }
+            | MountItem::TreeOrder(_)
+            | MountItem::ProjectStates { .. } => {}
         }
     }
 
@@ -403,15 +467,30 @@ impl Mounter {
     fn command(&self, surface: &Rc<Surface>, id: NodeId, command: &Command) {
         let view = self.views.get(&id);
         match command {
-            Command::Focus => view.map_or((), crate::text_input::focus),
+            // An input edits; a pressable takes the keyboard focus as Tab
+            // gives it.
+            Command::Focus => match view {
+                Some(view) if view.kind() == ViewKind::Input => crate::text_input::focus(view),
+                Some(view) if id != ROOT_ID => crate::input::focus_control(surface, view),
+                _ => {}
+            },
             Command::Blur => match view {
                 Some(view) if view.kind() == ViewKind::Input => crate::text_input::blur(view),
+                Some(view) if id != ROOT_ID => {
+                    crate::input::blur_control(surface, view);
+                    crate::text_input::blur_all(surface);
+                }
                 _ => crate::text_input::blur_all(surface),
             },
             Command::SetSelection { start, end } => {
                 if let Some(view) = view {
                     crate::text_input::set_selection(view, *start, *end);
                 }
+            }
+            Command::ScrollTo { y, animated, .. }
+                if view.is_some_and(|v| v.kind() == ViewKind::Input) =>
+            {
+                crate::text_input::scroll_to(view.expect("an input"), *y, *animated);
             }
             Command::ScrollTo { .. }
             | Command::ScrollToEnd { .. }
@@ -438,6 +517,7 @@ impl Mounter {
             | Command::StopLoading
             | Command::InjectJavaScript(_)
             | Command::PostMessage(_)
+            | Command::SendInput(_)
             | Command::Seek(_)
             | Command::Native { .. } => {
                 if let Some(view) = view {

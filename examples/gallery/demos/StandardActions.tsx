@@ -1,5 +1,5 @@
 import { cleanup, signal, Text } from "nsh";
-import { platform } from "nsh/device";
+import { platform } from "nsh";
 import { Buffer } from "buffer";
 import console from "console";
 import { createHash, randomUUID } from "crypto";
@@ -33,7 +33,7 @@ export function StandardActions() {
   function Action(props: { name: string; detail: string; action: () => Promise<string> }) {
     return <Card icon="system" title={props.name} subtitle={props.detail}>
       <Button label={`Run ${props.name}`} disabled={busy()[props.name] ?? false} onPress={() => { void run(props.name, props.action); }} />
-      <Text selectable style={{ color: colors.text, fontSize: 13, fontFamily: mono }}>{results()[props.name] ?? "Ready"}</Text>
+      <Text style={{ userSelect: "text", color: colors.text, fontSize: 13, fontFamily: mono }}>{results()[props.name] ?? "Ready"}</Text>
     </Card>;
   }
   const dataDirectory = () => {
@@ -114,7 +114,7 @@ export function StandardActions() {
     return <Action name="Request host exit" detail="process.exit(0) · Gallery keeps this demo open by denying exit requests" action={async () => {
       try { process.exit(0); }
       catch (error) {
-        if (!(error instanceof TypeError) || !error.message.includes("process.exit() is not granted")) throw error;
+        if (!(error instanceof Error) || !("code" in error) || error.code !== "ERR_ACCESS_DENIED") throw error;
         return "Exit request blocked by Gallery policy. You can continue exploring.";
       }
       return "Exit requested from the host";
@@ -122,7 +122,7 @@ export function StandardActions() {
   }
   function Tcp() {
     return <Action name="TCP" detail={platform.os === "web" ? "net.connect · browser hosts return an unsupported-operation error" : "net.connect · Socket.write/read/close · local echo on 127.0.0.1:9876"} action={async () => {
-      const socket = await net.connect("127.0.0.1", 9876);
+      const socket = await net.connect({ host: "127.0.0.1", port: 9876 });
       const close = () => socket.close();
       if (disposed) { close(); return "Closed"; }
       release.add(close);

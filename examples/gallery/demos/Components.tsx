@@ -1,38 +1,14 @@
-import { Input, type InputProps, type JSX, signal, Text, View, type YNode } from "nsh";
-import { announce, reduceMotion, screenReaderEnabled, setAccessibilityFocus } from "nsh/accessibility";
-import { LayoutAnimation } from "nsh/animated";
-import { locale, pixelRatio, platform } from "nsh/device";
-import { InputAccessoryView } from "nsh/ios";
-import { Dialog, KeyboardAvoidingView, NavPage, SafeAreaView, safeArea, Sheet } from "nsh/base";
+import { type InputRef, type JSX, signal, Text, View, type ViewRef } from "nsh";
+import { announce, reduceMotion, screenReaderEnabled, setAccessibilityFocus } from "nsh";
+import { LayoutAnimation } from "nsh";
+import { locale, pixelRatio, platform } from "nsh";
+import { InputAccessoryView } from "nsh/mobile";
+import { Dialog, Input, type InputProps, NavPage, Sheet } from "nsh/base";
+import { safeArea } from "nsh";
 import { Icon, type IconName } from "../icons";
 import { nav } from "../nav";
 import { TitleBar } from "../TitleBar";
-import {
-  Appear,
-  Badge,
-  Button,
-  Caption,
-  Card,
-  colors,
-  DemoPage,
-  finish,
-  header,
-  hint,
-  IconTile,
-  Inset,
-  isDark,
-  mono,
-  PageHeader,
-  Press,
-  radius,
-  Row,
-  Segmented,
-  tints,
-  Toggle,
-  type Tone,
-  toneColor,
-  toneTint,
-} from "../ui";
+import { Appear, Badge, Button, Caption, Card, colors, DemoPage, finish, header, hint, IconTile, Inset, isDark, mono, PageHeader, Press, radius, Row, Segmented, tints, Toggle, type Tone, toneColor, toneTint } from "../ui";
 
 // One device pixel, in points (reading it in a binding follows the screen).
 const hairline = () => 1 / pixelRatio();
@@ -47,6 +23,7 @@ function Field(props: InputProps) {
       {...props}
       style={{
         placeholderColor: colors.faint,
+        caretColor: colors.accent,
         selectionColor: colors.accent,
         height: 48,
         paddingHorizontal: 14,
@@ -75,7 +52,7 @@ function LinkRow(props: { icon: IconName; title: string; note: string; onPress: 
         <IconTile name={props.icon} size={34} />
         <View style={{ flex: 1, gap: 2 }}>
           <Text style={{ fontSize: 15, fontWeight: "500", color: colors.text }}>{props.title}</Text>
-          <Text numberOfLines={1} style={{ fontSize: 12, color: colors.faint, fontFamily: mono }}>
+          <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.faint, fontFamily: mono }}>
             {props.note}
           </Text>
         </View>
@@ -148,7 +125,7 @@ function PressableSheet() {
       <Caption label="Scales and darkens while pressed" note="active:scale-[0.97]" />
       <Sheet
         open={sheet()}
-        onOpenChange={(open) => sheet.set(open)}
+        onOpenChange={({ open }) => sheet.set(open)}
         backdropStyle={{ backgroundColor: "rgba(0,0,0,0.5)" }}
         popupStyle={{
           gap: 16,
@@ -215,11 +192,17 @@ function PressFeedback() {
           <Badge label={disabled() ? "Off" : "On"} tone={disabled() ? "neutral" : "up"} />
         </Tile>
       </View>
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+      <View style={{ flexDirection: "row", alignItems: "center", gap: platform.idiom === "terminal" ? 24 : 12 }}>
         <View style={{ flex: 1 }}>
           <Caption label="Last pressed" note={last()} />
         </View>
-        <Toggle value={disabled()} onChange={(v) => disabled.set(v)} label="Disable the third tile" />
+        {/* The terminal's switch is a glyph: its label beside it says what it turns on. */}
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
+          <If when={platform.idiom === "terminal"}>
+            <Text style={{ fontSize: 12, color: colors.muted }}>Disable</Text>
+          </If>
+          <Toggle value={disabled()} onChange={(v) => disabled.set(v)} label="Disable the third tile" />
+        </View>
       </View>
     </Card>
   );
@@ -227,18 +210,18 @@ function PressFeedback() {
 
 function Accessory() {
   const text = signal("");
-  let input: YNode | undefined;
+  let input: InputRef | undefined;
   return (
     <Card icon="text" title="Input accessory" subtitle="A bar over the iOS keyboard" right={<Badge label="nsh/ios" />}>
       <Field
         ref={(node) => (input = node)}
         value={text()}
-        onChange={(v) => text.set(v)}
+        onChange={({ value }) => text.set(value)}
         placeholder="Focus me"
         ios={{ inputAccessoryViewID: "counter" }}
       />
       <Caption
-        label={platform.idiom === "desktop" ? "Desktops have no input accessories" : platform.os === "android" ? "Android has no input accessories" : "The bar counts what you type"} note='inputAccessoryViewID="counter"' />
+        label={platform.desktop ? "Desktops have no input accessories" : platform.os === "android" ? "Android has no input accessories" : "The bar counts what you type"} note='inputAccessoryViewID="counter"' />
       <InputAccessoryView nativeID="counter" style={{ backgroundColor: colors.surface }}>
         <View
           style={{
@@ -266,15 +249,23 @@ const behaviors = [
 ] as const;
 
 const behaviorNote = {
-  padding: "The bottom pads: the tinted background stays under the keyboard.",
-  height: "The view shrinks: its background ends at the keyboard.",
+  padding: "padding-bottom: env(keyboard-inset-height). The tinted background stays under the keyboard.",
+  height: "margin-bottom: env(keyboard-inset-height). The view shrinks: its background ends at the keyboard.",
 } as const;
 
 function AvoidingPage() {
   const behavior = signal<"padding" | "height">("padding");
   return (
-    <NavPage title="KeyboardAvoidingView" {...header} header={<PageHeader title="KeyboardAvoidingView" />}>
-      <KeyboardAvoidingView behavior={behavior()} style={{ flex: 1, backgroundColor: tints.info }}>
+    <NavPage title="Keyboard inset" {...header} header={<PageHeader title="Keyboard inset" />}>
+      <View
+        style={{
+          flex: 1,
+          backgroundColor: tints.info,
+          ...(behavior() === "padding"
+            ? { paddingBottom: "env(keyboard-inset-height)" }
+            : { marginBottom: "env(keyboard-inset-height)" }),
+        }}
+      >
         <View style={{ flex: 1, padding: 16, gap: 16 }}>
           <Appear>
             <Card icon="form" title={`behavior="${behavior()}"`} subtitle="Focus the field at the bottom">
@@ -285,7 +276,7 @@ function AvoidingPage() {
           <View style={{ flex: 1 }} />
           <Field placeholder="Type here" />
         </View>
-      </KeyboardAvoidingView>
+      </View>
     </NavPage>
   );
 }
@@ -298,7 +289,17 @@ function ModalOptions() {
       icon="system"
       title="Dialog options"
       subtitle="statusBarTranslucent, orientations"
-      right={<Toggle value={translucent()} onChange={(v) => translucent.set(v)} label="statusBarTranslucent" />}
+      right={
+          // The terminal's switch is a glyph: its label beside it says what it turns on.
+          platform.idiom === "terminal" ? (
+            <View style={{ flexDirection: "row", gap: 8 }}>
+              <Text style={{ fontSize: 12, color: colors.muted }}>Translucent</Text>
+              <Toggle value={translucent()} onChange={(v) => translucent.set(v)} label="statusBarTranslucent" />
+            </View>
+          ) : (
+            <Toggle value={translucent()} onChange={(v) => translucent.set(v)} label="statusBarTranslucent" />
+          )
+        }
     >
       <Text style={{ fontSize: 14, lineHeight: 20, color: colors.muted }}>
         Android: translucent content reaches under the status bar. iOS: this dialog allows portrait and landscape.
@@ -310,12 +311,22 @@ function ModalOptions() {
         animation="slide"
         android={{ statusBarTranslucent: translucent() }}
         ios={{ supportedOrientations: ["portrait", "landscape"] }}
-        onOpenChange={(open) => visible.set(open)}
+        onOpenChange={({ open }) => visible.set(open)}
         style={{ flex: 1 }}
       >
         <View style={{ flex: 1, backgroundColor: isDark() ? "#16200d" : "#eef5dc" }}>
           <TitleBar />
-          <SafeAreaView style={{ flex: 1, padding: 16, gap: 12 }}>
+          <View
+            style={{
+              flex: 1,
+              padding: 16,
+              paddingTop: "calc(env(safe-area-inset-top) + 16px)",
+              paddingRight: "calc(env(safe-area-inset-right) + 16px)",
+              paddingBottom: "calc(env(safe-area-inset-bottom) + 16px)",
+              paddingLeft: "calc(env(safe-area-inset-left) + 16px)",
+              gap: 12,
+            }}
+          >
             <View style={{ flexDirection: "row", paddingTop: 8 }}>
               <Badge label={translucent() ? "translucent" : "opaque bar"} tone="accent" />
             </View>
@@ -325,7 +336,7 @@ function ModalOptions() {
             </Text>
             <View style={{ flex: 1 }} />
             <Button label="Close" onPress={() => visible.set(false)} />
-          </SafeAreaView>
+          </View>
         </View>
       </Dialog>
     </Card>
@@ -336,8 +347,8 @@ function PlatformInfo() {
   const rows = (): [string, string][] => [
     ["platform.os", platform.os],
     ["platform.version", platform.version],
-    ["platform.idiom / catalyst", `${platform.idiom} / ${platform.catalyst}`],
-    ["platform.select", platform.select({ ios: "ios branch", android: "android branch" }) ?? ""],
+    ["platform.idiom / desktop / catalyst", `${platform.idiom} / ${platform.desktop} / ${platform.catalyst}`],
+    ["platform.select", platform.select({ ios: "ios branch", android: "android branch", default: "default branch" }) ?? ""],
     ["pixelRatio()", String(pixelRatio())],
     ["10.3 on whole pixels", String(Math.round(10.3 * pixelRatio()) / pixelRatio())],
     ["screenReaderEnabled()", String(screenReaderEnabled())],
@@ -345,17 +356,17 @@ function PlatformInfo() {
     ["locale()", locale()],
   ];
   const announced = signal(0);
-  let target: YNode | undefined;
+  let target: ViewRef | undefined;
   return (
     <Card icon="spark" title="Platform" subtitle="platform, pixelRatio, announce" right={<Badge label={platform.os} tone="accent" />}>
       <View>
         <Each of={rows()}>
           {(row, i) => (
             <Row first={i() === 0}>
-              <Text numberOfLines={1} style={{ flex: 1, fontSize: 12, color: colors.muted, fontFamily: mono }}>
+              <Text style={{ numberOfLines: 1, flex: 1, fontSize: 12, color: colors.muted, fontFamily: mono }}>
                 {row()[0]}
               </Text>
-              <Text numberOfLines={1} style={{ fontSize: 14, color: colors.text, fontVariant: ["tabular-nums"] }}>
+              <Text style={{ numberOfLines: 1, fontSize: 14, color: colors.text, fontVariant: ["tabular-nums"] }}>
                 {row()[1]}
               </Text>
             </Row>
@@ -393,7 +404,7 @@ export function Components() {
         () => (
           <Card title="Keyboard avoidance" subtitle="Content outside scroll views" flush>
             <Inset padding={0} gap={0}>
-              <LinkRow icon="form" title="KeyboardAvoidingView" note="padding / height" onPress={() => nav.push({ name: "page", page: AvoidingPage })} />
+              <LinkRow icon="form" title="Keyboard inset" note="env(keyboard-inset-height)" onPress={() => nav.push({ name: "page", page: AvoidingPage })} />
             </Inset>
           </Card>
         ),

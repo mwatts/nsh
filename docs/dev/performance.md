@@ -2,16 +2,67 @@
 
 Performance is the project's first priority; the rules are in `AGENTS.md`. Changes to hot paths come with before /
 after `nsh test --trace` timings and item counts (`nsh trace` before it, in the records below). Current baselines
-(Apple Silicon):
+(Apple Silicon except where noted):
 
-`onMouseMove` (Desktop and web): Linux x86_64, debug CLI, five interleaved runs of
+Windows cursor refresh after a style batch, against main `a5036af4`, debug host, one native run per revision:
+`echo 'await app.press("+1")' | nsh test examples/counter/App.tsx --target windows --trace`.
+Both runs produce 56 ops / 50 mount items / 21 nodes initially and 10 ops / 7 mount items / 24 nodes after the press.
+Initial commits measured 1164 → 1139 µs; press commits 380 → 329 µs. These single samples establish unchanged work
+counts on the counter's unchanged-cursor path. A batch compares cursor values while applying view styles, then
+refreshes once if any changed; other batches skip the cursor hit test.
+
+GPUI idle wakeups (Linux x86_64, debug `nsh-gpui-host --bundle`, lavapipe, a headless Wayland compositor answering
+frame callbacks at 60 Hz; voluntary context switches per second, all threads, over 10 s; against main `da3f1683`):
+static text 4.1 → 4.2 (the `blocking` pool's two threads; no frame drawn); an `autoFocus` field while it blinks
+64 → 63; the same field 14–24 s after it was focused 68 → 2.1 (the caret stays shown after GTK's 10 s); the field's
+window suspended while it keeps the keyboard 13.7 → 2.1 (the blink timer stopped); unfocused 2.1 → 2.1; after a 1 s
+fade ended 2.1 → 2.1. Each blink drew a frame, about 30 wakeups under lavapipe (the four `llvmpipe` threads and the
+renderer's). Under X11 (Xvfb) GPUI's refresh timer keeps the main thread at ~64 a second whatever the app does
+(`docs/dev/gpui.md` "Idle windows").
+
+
+Span test-id metadata (macOS arm64, debug CLI, three runs per revision against `e02b40f8`):
+`echo 'await app.press("Rename ID")' | nsh test crates/nsh-testing/tests/testing/queries/Spans.tsx --trace`.
+The first commit stays at 31 ops / 25 mount items / 13 nodes; renaming stays at 1 op / 1 item / 13 nodes.
+Rename commit times were 47–208 → 37–79 µs (medians 48 → 64 µs). The regression engine counts
+zero additional preparations, measurements and layouts after a metadata update, versus an additional layout
+before the fix; the mounted layout is reused, including fitted font sizes, without `onTextLayout`.
+The counter control stays at 56 ops / 49 items / 21 nodes initially and 10 ops / 7 items / 24 nodes after `+1`,
+matching the item-count baseline below. Its minimum initial / press times were 357 / 181 → 315 / 189 µs.
+These noisy single-frame timings establish stable work counts rather than a speedup.
+
+
+The first `onMouseMove` (moves with a button down too, desktops and web; since merged with the hover moves into one
+`onMouseMove`): Linux x86_64, debug CLI, five interleaved runs of
 `echo 'await app.press("+1")' | nsh test examples/counter/App.tsx --trace`, against main `fd772aef`.
 The first commit stays at 56 ops / 49 mount items / 21 nodes; the press stays at 10 ops / 7 items / 24 nodes.
 Minimum first-commit times were 277 → 280 µs, press times 180 → 189 µs (medians 189 → 202 µs for the press).
 Cold-start timings varied widely (277–633 µs), so these runs establish unchanged work counts rather than a speedup.
 Without mouse listeners, each backend skips the new mouse hit test. Mouse moves share the existing 8 ms hover
-coalescing interval, with the latest coordinates kept independently per view and event kind.
+coalescing interval, with the latest coordinates kept independently per view and event kind (one kind since the merge).
 
+
+`Editor` and `DiffView` at 200 000 lines (15 MB of Rust, Linux x86_64, release CLI, headless, `--trace`; the apps
+are `mount`ed TSX building the text in JS). Editor: first frame 98 ms, of which 69 ms is the app's JS building the
+string and the first commit 29 ms (22 ops / 1218 mount items / 508 nodes; before: 184 ms, fold candidates and every
+row's width computed up front); a typed character, Enter or undo 1.4–2.4 ms (17 items, 77 for Enter / undo; before:
+3.4 ms more, the `onChange` text built twice); scrolling 3000 points commits 13 times, 0.7 ms each (median; at most
+3.3 ms, when the row window moves: before, 151 commits of 0.15 ms, one per frame, the window moving by a row). Highlighting runs off the
+engine thread (before: 4 ms per frame on it, 22 s of frames to reach the end); a jump to line 199 000 shows guessed
+colors in under 300 ms (12 ms of parsing per 100 lines). DiffView (a change every 500 lines): first frame 166 ms, of
+which 95 ms is JS and the commit with the line diff 72 ms (3083 items); scrolling 3000 points commits 8 times, 1.9 ms
+each, 16 ms in all (before: 150 commits, 51 ms). A round of the gallery's language server on 50 000 lines (macOS desktop
+size, release CLI, headless): the commit taking 50 006 diagnostics and 50 002 decorations 23 ms, 7.5 and 6 ms of it
+resolving them (before: 145 ms, 53 and 52 ms, four rope lookups per position; the gutter's severities and the
+diagnostics at a point scanned every mark).
+
+The gallery's Editor demo at 200 000 lines (its TypeScript sample pasted 3449 times, a macOS window of 1440×900,
+release CLI, `--target macos --trace`): the paste's commit 21 → 13.5 ms; a sample pasted into that file 8.4 → 5.7 ms
+(1832 items: the gutter measured its digit once per row, an element made again per row for each number); the commit
+taking the 6900 problems 12.4 → 7.4 ms (fields read by atom, not through a C string allocated each). The engine's idle
+collection walks the whole VM, 30–90 ms with the demo's language server holding the file's model: it ran every second
+between the turns of pastes and of the server's slices (21 collections in the run), now only after 0.3 s without a
+message or a due timer (7, none between pastes).
 
 - counter, headless (debug): first frame ~0.5–0.65ms (58 ops / 49 mount items), one tap ~0.15ms (12 ops / 8 items).
 - counter, Catalyst (release): first frame ~1.05–1.15ms (of which ~0.7ms is cold CoreText layout of 10 texts), one tap ~0.12ms.
@@ -52,6 +103,15 @@ coalescing interval, with the latest coordinates kept independently per view and
   3.85 → 4.09 ms; first-frame totals were 127.3 → 124.5 ms. These noisy single runs establish unchanged
   engine work counts, not a speedup or a measurement of Java touch dispatch. Passive feedback reuses the root's
   touch tracker; observers are picked at finger-down and cancelled when a native gesture takes over.
+- Android, animated values (Pixel 10 Pro, 120 Hz, release-dev host, the gallery's Animations demo with its three loops,
+  `simpleperf stat` over 10 s, three runs each): the UI thread runs ~4.09 G instructions before setting the camera
+  distance only when it moves and ~2.99 G after (-27%), its CPU time ~2.22 → ~2.04 s; `Mounter.outputs` gets 1000+
+  values a frame there (ART allocates the array as a large object), every bound value of the page, moved or not.
+  RenderThread is unchanged (~18.2 G).
+- Android, going back (Pixel 10 Pro, 120 Hz, dev host, Text → the gallery's index with the back button, `gfxinfo
+  framestats` over the 300 ms slide, three runs each): 23 → 33 frames, mean frame time ~35 → ~13 ms, RenderThread
+  issue ~12 → ~5.5 ms a frame once the slides move by whole pixels; after a back gesture's release ~13–19 → ~4–5 ms.
+  The first frame still records the index again (it was `INVISIBLE`): 20–44 ms of UI-thread drawing.
 - Android emulator (arm64, release): rebinding one gallery row while scrolling ~0.3–0.4ms (JS ~60µs); text costs per new
   text: `PrecomputedText` ~120µs, measure ~50µs, final layout reused. First gallery frame 20–50ms (noisy on the emulator).
 
@@ -72,7 +132,7 @@ coalescing interval, with the latest coordinates kept independently per view and
 
   JS does half the work or less. Running once costs the first frame ~40% more core time than rendering did: each
   bound part of an element is a computation of the graph that runs as the view is made (its first value is applied
-  with the element's static parts, `core/views.rs`), and each prop a signal (`ui/prop.rs`); the rest of the core's
+  with the element's static parts, `core/views.rs`), and each prop a signal (`element/prop.rs`); the rest of the core's
   time (node creation, styles, Taffy) is the same in both. Updates cost what they change: an update of one title runs
   its text's and label's bindings, and a large view with one changing value costs what that value costs
   (`bench_view_tick`, below). The components' JS face must stay one effect per instance reading the props directly:
@@ -182,6 +242,53 @@ coalescing interval, with the latest coordinates kept independently per view and
   median ~5µs vs ~14µs in JS, commit ~15µs vs ~22µs. Scrolling a 1000-row `List` (avatar, two texts, a bound color)
   6000 pt: ~77µs vs ~150µs of JS per rebinding frame, commit ~205µs vs ~276µs.
 
+## Shader pictures on Linux
+
+What the GTK backend reads back for shaders' pictures (`nsh-platform-linux` `shader.rs`, `docs/dev/shaders.md`), and
+when. A picture is drawn, rendered by the window's GSK renderer into a texture and downloaded synchronously on the
+main thread, so the work is held by counts the backend's tests check on Xvfb, not by timings of one machine:
+
+- An effect or a running transition pictures its children only when GTK drew one of them again since the last
+  picture (`same_nodes` over the render nodes GTK kept) or the core marked them (`ShaderInput`). An effect that reads
+  `nsh.time` draws itself on every frame, which takes the children's kept nodes and compares them, without rendering
+  or downloading: ten frames over unchanged children are one picture, a child drawn again one more
+  (`an_effect_renders_its_children_again_only_after_they_change`). Before, every frame rendered and downloaded the
+  box and its overflow (400 × 400 points at 2× is 2.5 MB a frame).
+- A view that reads `sample_backdrop` takes what is behind it again (the surface's views drawn anew up to it,
+  rendered, downloaded and hashed) at most once per painted frame: after a batch (the core marks every backdrop
+  reader once anything changed, `ShaderInput`) and after a view that draws before it changed on the UI thread (an
+  ancestor's own drawing, or a view drawn earlier); a change on the UI thread in it, above it or in a shader's own
+  frame takes nothing. A picture whose pixels hash as the last one's is not given to the shader, which then renders
+  no frame for it: a change that leaves the view's box as it was costs the drawing, the readback and the hash, not
+  an upload and a shader frame. Each reader is listed once, however often its layer is sent (every uniform update
+  sends it). Before, any change on the UI thread took every reader's backdrop again and gave it to its shader.
+
+## The browser engine (published web apps)
+
+Headless Chromium over CDP, a published package (`nsh package --target web`), 2026-10-28:
+
+- A call from app code into the runtime (a signal read or set, an element made) outside a Wasm entry costs ~1µs
+  however many values the app holds: the weak tracing runs at most every 100ms after the call
+  (`values.js` `schedule`), not inside it. With a full trace per call it cost ~0.11ms at 1 700 retained values and
+  ~1.2ms at 14 400 (a chat of 165 messages of 20 signals each), and a message pushed every second froze the page.
+- The gallery's DataTable demo, quotes ticking every 33ms and no scroll, 10s: the rows are read a row per call
+  (`JsHost::primitives`, op 49), ~220 000 value calls in 3s instead of ~8.7 million (a cell took five), script
+  ~2.65s instead of ~3.86s, main thread ~4.7s instead of ~5.95s, garbage collection ~52ms instead of ~162ms.
+- The same demo scrolled, the frame rate unlimited (`--disable-frame-rate-limit`): the animator sends every bound
+  value with each batch (the gallery's sidebar: ~69 canvas slots, ~26 transforms, ~7 opacities), and `nsh.js` writes
+  and draws only those that changed, and draws a canvas again when its size changes, not when it moves. The wheel,
+  300 steps of 30pt: main thread ~3.8s instead of ~4.5s, median frame ~9.2ms instead of ~12.2ms; its scroll bar
+  dragged 150 steps: script ~4.3ms per batch instead of ~5.6ms.
+- Shader views (`nsh.js`, `docs/dev/shaders.md` "The web"), the gallery's Shaders page in a Chrome window over CDP
+  (1200 × 713 points at 2×, 120 Hz, Apple M5 through ANGLE's Metal renderer, the development host), 2026-11-04:
+  two `nsh.time` shaders in sight, then the `ScreenEffect` (Duotone) turned on below them. With the screen effect,
+  each frame asked for two `shaderFrame` callbacks, so the frames doubled until one display frame took 9 to 24 s;
+  now it holds 120 fps (p50 8.3 ms, p95 9.5 ms), ~3.3 ms of `shaderFrame` a frame, ~3 ms of it the surface's picture
+  (`paintInputs`). Each view drawing into the corner of a shared canvas that fits the largest and copying it out,
+  instead of resizing the canvas to each view and transferring it whole: ~0.1 ms a view (`drawShader`) instead of
+  ~0.65 ms, and of ~1.6 ms with the screen effect, whose size the canvas took and gave back on every frame; the page
+  without the screen effect ~0.3 ms of `shaderFrame` a frame instead of ~2 ms.
+
 ## The performance monitor (`nsh_engine::perf`)
 
 `PerfMonitor` collects one surface's timings for an on-screen monitor (`--fps`; the macOS backend's `fps.rs` draws it)
@@ -223,6 +330,20 @@ draw a panel.
   noise (four runs each, ABBA, presented frames by screen capture): Stocks idle window updates 75–96 /s both, `main`
   p50 ~1.9 → ~1.7 ms, CPU ~38–40% both; a test canvas (524×340: a 400-point area and line, 400 bars, a pulsing ring,
   a moving square) presented 86–117 fps before and 92–119 after, `main` p50 ~1.2 → ~1.0 ms, CPU ~17% both.
+
+  Kept static parts (`canvas.rs` `Prefix`, `docs/dev/canvas.md`; `examples/gallery/tools/perf.py --only
+  Stocks,Canvas,Animations --seconds 6`, two runs each, the display kept awake): a long static part, painted unchanged
+  30 times, is kept as a `CGLayer` and its canvas drawn at once. Canvas demo idle: canvas phase 0.24–0.27 →
+  0.09–0.11 ms, CPU 7–10% → 4–6%, GPU 5–6% → 0%, ~200–220 → ~106 MB; Stocks and Animations unchanged (their
+  drawings are short or change every few frames, so none is kept). Tried and not kept: the layer for every drawing
+  (Stocks' frame p95 ~3.3 → ~4.2 ms: its sparklines change ~15 times a second and replay faster than a layer draws),
+  every canvas at once (Stocks p95 ~3.3 → ~7.5 ms, 2% of frames over a refresh: the main thread fills the screen's
+  RGBA16F backing stores), 8-bit contents (canvas phase ~0.45 → ~1.6 ms).
+
+  Canvases drawn at once unless they paint often (`canvas.rs` `Cadence`: 10 paints a second): three 340×40 line
+  charts redrawn every 2 s (a menu-bar panel's) hold ~83 MB of footprint asynchronously and ~21 MB at once, with
+  ~30% less CPU time over 40 s. The gallery's tour is unchanged in frame time and CPU; peak memory on the pages with
+  canvases drops (Canvas scrolling ~383 → ~310 MB, Animations ~290 → ~232, Gestures ~279 → ~221).
 
   List binds while scrolling (release host, 120 Hz MacBook Pro; the list scrolled by chained native
   `scrollToOffset({ animated: true })` every 300 ms, no input; each display link refresh logged with its link
@@ -275,7 +396,119 @@ draw a panel.
 
 The dev profile builds `quickjs-jit-sys` and `taffy` with `opt-level = 3`, so debug timings are meaningful too; release uses fat LTO.
 
+- Linux (GTK 4, release; a 1896×1030 window on a 120 Hz headless Hyprland output, NVIDIA; `--fps` readings and the
+  host's threads' CPU from `/proc`, 20 s runs). Before = main as of `8ff7b9f6` (GSK's Vulkan renderer, canvases
+  replayed into a Cairo recording surface on every change):
+
+  | Scenario | Before: fps, frame p95, CPU | After: fps, frame p95, CPU |
+  |---|---|---|
+  | Stocks (live prices, sparklines, chart, a tick every 50 ms) | 75–87, 17–21 ms, 82–85% | 117–120, 5–6 ms, 31–32% (29% at 1200×800) |
+  | Canvas demo | 118–120, 6–11 ms, 17–23% | 120, 2.6–4.4 ms, 5–10% |
+  | Animations demo | 66–85, 21–25 ms, 73% | 120, 2.0 ms, 12–13% |
+
+  Every page of the gallery draws its frames in under 8.3 ms at p95 (`examples/gallery/tools/perf.py`). On Stocks
+  the GL renderer alone gave 116 fps at 62%; the canvas rasters (tiles, partial redraws over the kept static part,
+  canvases out of sight waiting) took it to the rest. What is left is GSK's rendering (~12% of the main thread: GL
+  commands for the damaged areas), Cairo's rasterizing (~8%, strokes most of it: the chart's full redraw on every
+  tick costs ~1.7 ms, a sparkline's pulse ~21 µs) and the engine (~5%: the demo's market in JS, canvas recording,
+  layout). `fillRect` / `fillText` after a long path set it aside once instead of copying it out and back per
+  call: a 400-point line then 240 bars, 840×340, 1.68 → 0.63 ms (`cargo test --release -p nsh-platform-linux
+  bench_rects_after_a_path -- --ignored --nocapture`). Memory: visiting a demo again adds nothing; the first visits
+  grow by bounded caches (decoded images, up to 128 MB) and libraries loaded on first use (WebKitGTK).
+
+- Windows (Win32 / Direct2D, release; i7-13700KF, RTX 3060 Ti, a 1200 × 800 point window on a 4K 144 Hz display at
+  150%; `--fps` readings through `nsh test --target windows --fps`, 4 s per scenario). Before = this branch with
+  only the monitor added (every canvas whose animated value changed recorded again in full; every view pushed a
+  content clip; every child of a scroll view drawn):
+
+  | Scenario | Before: fps, frame p95, over one refresh, paint / canvas per frame, CPU | After |
+  |---|---|---|
+  | Stocks | 144, 8.2–8.8 ms, 11–28%, 4.4 / 1.8 ms, 87–98% | 144, 6.6–6.9 ms, 3–5%, 2.7 / 0.3 ms, 52–71% |
+  | Canvas demo | 144, 2.7–5.0 ms, 0–1%, 2.2–2.5 / 0.21 ms, 30–32% | 144, 2.6–2.7 ms, 0%, 2.0–2.4 / 0.08 ms, 28–50% |
+
+  Stocks re-recorded ~3100 canvases a second (its 22 sparklines and the chart, on every pulse), 280 ms of the main
+  thread; recording only what follows the first animated operation takes that to ~26 ms (the sparklines erase their
+  left edge with `destination-out`, inside the head). What is left is drawing the whole window on every refresh
+  (~690 views; text ~0.6 ms of it, `EndDraw` ~0.05 ms). CPU readings vary by ±10 points between runs on this machine.
+
+  Partial frames (`docs/dev/windows.md` "Partial frames": a frame draws the changed views' areas over the kept back
+  buffer of a `FLIP_SEQUENTIAL` swap chain, once, in a clip of up to 24 rectangles, and presents them with `Present1`),
+  same setup. Before = the whole window drawn on every frame:
+
+  | Scenario | Before: frame p95, over one refresh, paint per frame, CPU | After |
+  |---|---|---|
+  | Stocks (~34 changed views a frame) | 6.6–6.9 ms, 3–5%, 2.7 ms, 52–71% | 3.7–4.3 ms, 0–1%, 1.4 ms, 36–43% |
+  | Animations demo | 2.6 ms, 0%, 2.3 ms, 32–40% | 1.0 ms, 0%, 0.9 ms, 20–28% |
+  | Canvas demo | 2.6–2.7 ms, 0%, 2.0–2.4 ms, 28–50% | 0.95 ms, 0%, 0.8 ms, 21–26% |
+
+  Drawing each area in a pass of its own (up to 6) was tried first: Stocks' paint only went 2.7 → 2.2 ms, the
+  passes each walking the tree and the merged areas covering ~30% of the window.
+
 - Tailwind containing blocks, font-relative lengths and intrinsic text sizes (PR #323 follow-up, Linux,
   debug counter trace against `70254f80`): first commit 656 → 674µs, press commit 313 → 312µs;
   both runs produce 56 ops / 49 mount items / 21 nodes initially and 10 ops / 7 mount items / 24 nodes
   after `+1`. Single runs establish unchanged work counts; timings are a smoke check, not a benchmark.
+
+## Terminal frame budget
+
+The terminal budget is **apply + draw p95 below 4 ms per frame at 200 × 60 Cells**, in a release build.
+The ignored host test follows the `bench_gallery_scroll` pattern:
+
+```sh
+cargo test --release -p nsh-tui-host --test host bench_terminal_scroll -- --ignored --nocapture --test-threads=1
+```
+
+It loads a pinned copy of the former terminal gallery's `LongList` and `Page` layout (500 rows, dark palette,
+from revision `945be71d`, retained in `tests/fixtures/performance/LongList.tsx`), then a DataTable with
+10,000 rows and 24 columns, through `AppView`. Each workload scrolls by three rows per frame, reversing every
+100 frames. It discards 20 warm-up frames and measures 240 frames with a 16 ms wait between frames for engine
+work. Loading, bundling and waits are outside the samples. Median and nearest-rank p95 cover apply + draw;
+phase means identify apply, draw and flush costs. It prints mean bytes and changed Cells per frame, then fails
+if either workload exceeds the p95 budget. The flushed buffer must show the initial content and then scroll
+away from it, so an empty screen cannot establish a baseline.
+
+The backend is ratatui's `TestBackend`; the same diff also passes through `CrosstermBackend` into memory to
+count its encoded bytes. Those include cursor and style escapes, and the monitor's line. The reported flush
+cost includes this test transport and encoding, not a terminal emulator, SSH or a real stdout write. The live
+monitor measures the real writer. Apply + draw excludes the monitor's formatting, ratatui's diff and flushing.
+
+| Workload (200 × 60 Cells) | Apply + draw median / p95 | Apply / draw / flush means | Bytes / Cells per frame |
+|---|---|---|---|
+| Terminal Long list, 500 rows | 1.144 / 2.242 ms | 0.128 / 1.177 / 0.193 ms | 3,674 B / 959 Cells |
+| DataTable, 10,000 × 24 | 1.103 / 2.592 ms | 0.169 / 1.189 / 0.205 ms | 7,446 B / 1,052 Cells |
+
+Measured on Apple M4 Max, macOS 27.0.1, on the `tui-backend` branch after the terminal's surfaces, borders and
+focus bands, 240 frames each: both workloads pass the budget. Drawing each surface's fill, frame and marks raised
+the Long list's draw from 0.474 to 1.177 ms; the DataTable's fell from 1.765 to 1.189 ms.
+Tickets changing terminal rendering, input or layout
+bring before / after runs of this command on the same machine and workload, plus the existing `nsh test --trace`
+commit timings and mount-item counts. An unchanged workload and profile are essential for comparing results.
+
+
+## Terminal idle CPU
+
+```sh
+cargo test --release -p nsh-tui-host --test host bench_terminal_idle_cpu -- --ignored --nocapture --test-threads=1
+```
+
+This ignored benchmark runs in an isolated scenario process and starts the actual host binary on a private
+100 × 24 PTY with a static Text app. The scenario watchdog and runner deadline cover setup and cleanup; their
+process costs are outside the sampled host PID. It
+runs once with the monitor hidden and once with `--fps`, lets startup and the idle HUD update settle for two
+seconds, then measures five seconds. CPU is the child's user + system CPU time divided by elapsed wall time
+(percent of one core), read through `proc_pid_rusage` on macOS or `/proc/<pid>/stat` on Linux. It reports terminal
+bytes during the same window, requires zero bytes and CPU below 2%, then sends SIGTERM and requires exit within
+one second. The separate lifecycle regressions close the PTY and check that the process exits, rather than
+measuring a disconnected process that should no longer exist.
+
+| Static app, 100 × 24 Cells | Idle CPU, one core | Bytes in 5 s |
+|---|---|---|
+| Monitor hidden | 0.003% | 0 |
+| `--fps`, after idle update | 0.003% | 0 |
+
+The reported incident was 10–45% CPU per orphan after a tmux terminal was killed, with SIGTERM unable to end it.
+Source inspection found crossterm's default Unix read loop retrying EOF/EIO without returning to the host's
+shutdown flag. The fix selects its bounded reader, checks terminal lifetime, and makes input/output cancellable.
+The macOS debug host suite passes, including the one-second signal, hangup and full-output shutdown checks.
+Measured on Apple M4 Max, macOS 27.0.1, revision 4799709f. Repeat the same command
+before and after future scheduler or transport changes; the CPU sample excludes startup and termination.

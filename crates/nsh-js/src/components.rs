@@ -1,5 +1,5 @@
 //! The JS face of Rust components and modules, made from their specs
-//! (`nsh_core::ui`).
+//! (`nsh_core::element`).
 //!
 //! A component is a host view naming it (`component`), its own props
 //! converted into their Rust types when they change (one render effect
@@ -26,7 +26,9 @@ use std::{
 
 use nsh_core::{
     Command, EventKind, Op, Prop,
-    ui::{ComponentSpec, FunctionCall, JsEvent, JsIn, JsResult, ModuleSpec, PropKind, RustCall},
+    element::{
+        ComponentSpec, FunctionCall, JsEvent, JsIn, JsResult, ModuleSpec, PropKind, RustCall,
+    },
 };
 use rquickjs::qjs;
 use rustc_hash::FxHashMap;
@@ -50,6 +52,7 @@ const HOST_PROPS: &[&str] = &[
     "activeStyle",
     "hoverStyle",
     "focusStyle",
+    "focusWithinStyle",
     "disabledStyle",
     "testID",
     "onLayout",
@@ -64,6 +67,10 @@ pub(crate) struct Components {
     /// Calls waiting for a result: call number -> (resolve, reject), owned.
     pending: RefCell<FxHashMap<u32, (JsValue, JsValue)>>,
     calls: Cell<u32>,
+    /// The events each component host has an `on<Event>` handler for, so
+    /// an event nobody handles is not converted to JS (a component may
+    /// report on every scroll frame).
+    handled: RefCell<FxHashMap<nsh_core::NodeId, Box<[&'static str]>>>,
 }
 
 impl Components {
@@ -174,11 +181,19 @@ pub(crate) fn measure(cx: *mut JsContext, id: u32) -> JsValue {
 /// or rejects the call's promise.
 pub(crate) fn deliver(cx: *mut JsContext, event: JsEvent) -> Result<(), JsValue> {
     match event {
-        JsEvent::Event(..) => Ok(()),
+        JsEvent::Event(..) | JsEvent::LayoutListener { .. } => Ok(()),
         JsEvent::Component { host, event } => {
-            let host_js = crate::classes::host_outside_calls(cx);
             let name = event.name();
-            let spread = event.spread();
+            let handled = components(cx)
+                .handled
+                .borrow()
+                .get(&host)
+                .is_some_and(|names| names.contains(&name));
+            if !handled {
+                // Dropped here, unconverted: no handler would read it.
+                return Ok(());
+            }
+            let host_js = crate::classes::host_outside_calls(cx);
             let data = catch_unwind(AssertUnwindSafe(move || {
                 event.data_js(&host_js).map(|d| d.into_raw())
             }));
@@ -201,9 +216,6 @@ pub(crate) fn deliver(cx: *mut JsContext, event: JsEvent) -> Result<(), JsValue>
                 }
             };
             let data = crate::classes::from_raw(data);
-            if spread {
-                return component_event_with(cx, host, name, data, true);
-            }
             component_event(cx, host, name, data)
         }
         JsEvent::Children { host, wanted } => {
@@ -277,18 +289,6 @@ fn component_event(
     name: &str,
     data: JsValue,
 ) -> Result<(), JsValue> {
-    component_event_with(cx, host, name, data, false)
-}
-
-/// [`component_event`]; `spread`: the handler takes the items of `data`
-/// (an array) as its arguments (`{ name, data, spread: true }`).
-fn component_event_with(
-    cx: *mut JsContext,
-    host: nsh_core::NodeId,
-    name: &str,
-    data: JsValue,
-    spread: bool,
-) -> Result<(), JsValue> {
     let Some(handler) = dom::handler(cx, host, EventKind::NativeEvent) else {
         // SAFETY: ours.
         unsafe { qjs::JS_FreeValue(cx, data) };
@@ -300,9 +300,6 @@ fn component_event_with(
         let event = qjs::JS_NewObject(cx);
         qjs::JS_SetPropertyStr(cx, event, c"name".as_ptr(), new_string(cx, name));
         qjs::JS_SetPropertyStr(cx, event, c"data".as_ptr(), data);
-        if spread {
-            qjs::JS_SetPropertyStr(cx, event, c"spread".as_ptr(), qjs::JS_TRUE);
-        }
         let mut args = [event];
         let r = qjs::JS_Call(cx, handler, UNDEFINED, 1, args.as_mut_ptr());
         qjs::JS_FreeValue(cx, event);
@@ -316,7 +313,7 @@ fn component_event_with(
 }
 
 /// Settles call `call` with `result`: resolved with the value (converted
-/// now), or rejected with its error (a [`nsh_core::ui::JsError`]'s class
+/// now), or rejected with its error (a [`nsh_core::element::JsError`]'s class
 /// and properties; an `Error` of the message when the value does not
 /// convert, or its conversion panics).
 fn settle(cx: *mut JsContext, call: u32, result: JsResult) -> Result<(), JsValue> {
@@ -341,7 +338,7 @@ fn settle(cx: *mut JsContext, call: u32, result: JsResult) -> Result<(), JsValue
             value
                 .to_js_value(&host)
                 .map(|v| V::own(cx, crate::classes::from_raw(v.into_raw())))
-                .map_err(|e| nsh_core::ui::Thrown::Error(e.0))
+                .map_err(|e| nsh_core::element::Thrown::Error(e.0))
         })
     }))
     .unwrap_or_else(|payload| Err(crate::classes::panic_message(payload).into()));
@@ -391,7 +388,9 @@ pub(crate) fn module_function(cx: *mut JsContext, module: &ModuleSpec, function:
 }
 
 /// The conversion of a module function with a context.
-type MakeOp = fn(&dyn nsh_core::ui::JsHost) -> Result<nsh_core::ui::OpCall, nsh_core::ui::Thrown>;
+type MakeOp = fn(
+    &dyn nsh_core::element::JsHost,
+) -> Result<nsh_core::element::OpCall, nsh_core::element::Thrown>;
 
 unsafe extern "C" fn call_op(
     cx: *mut JsContext,
@@ -426,7 +425,7 @@ unsafe extern "C" fn call_task(
     // QuickJS passes `argc` live arguments.
     let (start, args) = unsafe {
         (
-            std::mem::transmute::<*const (), nsh_core::ui::AsyncCall>(opaque as *const ()),
+            std::mem::transmute::<*const (), nsh_core::element::AsyncCall>(opaque as *const ()),
             crate::web::js::Args::new(argc, argv),
         )
     };
@@ -434,7 +433,7 @@ unsafe extern "C" fn call_task(
 }
 
 /// A function starting its task in the JS call (`Later`): what the start
-/// throws throws.
+/// refuses rejects, as every call returning a promise.
 unsafe extern "C" fn call_start(
     cx: *mut JsContext,
     this: JsValue,
@@ -447,11 +446,11 @@ unsafe extern "C" fn call_start(
     // QuickJS passes `argc` live arguments.
     let (start, args) = unsafe {
         (
-            std::mem::transmute::<*const (), nsh_core::ui::AsyncCall>(opaque as *const ()),
+            std::mem::transmute::<*const (), nsh_core::element::AsyncCall>(opaque as *const ()),
             crate::web::js::Args::new(argc, argv),
         )
     };
-    crate::classes::start(cx, this, args, |host| start(host).map(RustCall::Task))
+    crate::classes::send(cx, this, args, true, |host| start(host).map(RustCall::Task))
 }
 
 /// A module's object: its functions.
@@ -488,7 +487,7 @@ pub(crate) fn add_functions(cx: *mut JsContext, obj: JsValue, module: &ModuleSpe
         unsafe { qjs::JS_SetPropertyStr(cx, obj, name.as_ptr(), func) };
     }
     for constant in &module.constants {
-        use nsh_core::ui::ConstantValue;
+        use nsh_core::element::ConstantValue;
         let value = match constant.value {
             ConstantValue::Undefined => UNDEFINED,
             ConstantValue::String(value) => new_string(cx, value),
@@ -524,7 +523,7 @@ pub(crate) fn runtime_module(cx: *mut JsContext, specifier: &str, module: &str) 
 }
 
 /// Puts the functions of module `module` of the runtime registry
-/// `specifier` on `obj` (`Image.getSize` on `nsh/image`'s component).
+/// `specifier` on `obj` (`Image.getSize` on `nsh`'s `Image`).
 pub(crate) fn add_runtime_functions(
     cx: *mut JsContext,
     obj: JsValue,
@@ -724,10 +723,23 @@ fn render_component(
         }
         Some(api)
     };
-    let handles_events = spec
+    let handled: Box<[&'static str]> = spec
         .events
         .iter()
-        .any(|e| has(cx, props, &handler_name(e.name)));
+        .filter(|e| has(cx, props, &handler_name(e.name)))
+        .map(|e| e.name)
+        .collect();
+    let handles_events = !handled.is_empty();
+    if handles_events {
+        let id = dom::node_id(cx, node).unwrap_or(0);
+        components(cx).handled.borrow_mut().insert(id, handled);
+        let mut cdata = [qjs::JS_NewFloat64(id as f64)];
+        // SAFETY: the function keeps a dup of `cdata`; the owner takes it.
+        let cleanup = unsafe {
+            qjs::JS_NewCFunctionData(cx, Some(forget_handled), 0, 0, 1, cdata.as_mut_ptr())
+        };
+        reactive::add_cleanup(cx, cleanup);
+    }
     // Lazy children: made while this signal (the core's `$children`) is
     // true.
     let lazy = (spec.lazy_children && spec.takes_children() && has(cx, props, "children"))
@@ -933,7 +945,7 @@ fn set_rust_prop(
     node: JsValue,
     spec: &ComponentSpec,
     key: &'static str,
-    decode: nsh_core::ui::PropDecode,
+    decode: nsh_core::element::PropDecode,
     value: JsValue,
 ) -> Result<(), JsValue> {
     let Some(id) = dom::node_id(cx, node) else {
@@ -947,7 +959,7 @@ fn set_rust_prop(
         // The app's conversion: a panic in it throws, as in a call.
         // A render function is this component's.
         let decoded = catch_unwind(AssertUnwindSafe(|| {
-            nsh_core::ui::__decoding_props_of(id, || {
+            nsh_core::element::__decoding_props_of(id, || {
                 decode(JsIn::new(&host, crate::classes::to_raw(value)))
             })
         }));
@@ -1007,8 +1019,8 @@ unsafe extern "C" fn call_method(
     // A wrong argument's error names the component (`Stepper.setValue`).
     crate::classes::send(cx, this, args, method.promises(), |host| {
         make.start(host, id).map_err(|e| match e {
-            nsh_core::ui::Thrown::Type(m) => {
-                nsh_core::ui::Thrown::Type(format!("{}.{m}", spec.export))
+            nsh_core::element::Thrown::Type(m) => {
+                nsh_core::element::Thrown::Type(format!("{}.{m}", spec.export))
             }
             other => other,
         })
@@ -1090,23 +1102,9 @@ unsafe extern "C" fn on_native_event(
             qjs::JS_FreeValue(cx, handler);
             return UNDEFINED;
         }
-        let data = get(cx, event, "data");
-        let spread = get(cx, event, "spread");
-        let mut args = if qjs::JS_IsBool(spread) && qjs::JS_IsArray(data) {
-            let mut length = 0i32;
-            let len = get(cx, data, "length");
-            qjs::JS_ToInt32(cx, &mut length, len);
-            qjs::JS_FreeValue(cx, len);
-            let length = length.max(0) as u32;
-            let items = (0..length)
-                .map(|i| qjs::JS_GetPropertyUint32(cx, data, i))
-                .collect();
-            qjs::JS_FreeValue(cx, data);
-            items
-        } else {
-            vec![data]
-        };
-        qjs::JS_FreeValue(cx, spread);
+        // One argument: the event's data, one object (`api-naming.md`
+        // "Payloads").
+        let mut args = vec![get(cx, event, "data")];
         let r = qjs::JS_Call(
             cx,
             handler,
@@ -1231,6 +1229,26 @@ impl Renders {
             Some((holder, n as u32))
         }
     }
+}
+
+/// The cleanup of a component with event handlers: its host's handled
+/// events go.
+unsafe extern "C" fn forget_handled(
+    ctx: *mut JsContext,
+    _this: JsValue,
+    _argc: c_int,
+    _argv: *mut JsValue,
+    _magic: c_int,
+    data: *mut JsValue,
+) -> JsValue {
+    let mut id = 0.0;
+    // SAFETY: one data value, the host's id as a number (`render_component`).
+    unsafe { qjs::JS_ToFloat64(ctx, &mut id, *data) };
+    components(ctx)
+        .handled
+        .borrow_mut()
+        .remove(&(id as nsh_core::NodeId));
+    UNDEFINED
 }
 
 /// The cleanup of a component with render functions: the roots of what

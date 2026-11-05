@@ -7,7 +7,8 @@
 //! subtree in this order:
 //!
 //! 1. shadows and background ([`crate::decor::draw_background`]),
-//! 2. the content, clipped to the bounds: text, image, canvas,
+//! 2. the content, clipped to the bounds: a shader's frame (to the rounded
+//!    bounds), text, image, canvas,
 //! 3. the children (clipped to the bounds when the view clips),
 //! 4. the hosted items ([`crate::view::Native`]) and the scroll indicator,
 //! 5. the border ([`crate::decor::draw_border`]).
@@ -644,6 +645,7 @@ pub(crate) fn draw_content(cx: &mut DrawCx<'_>, view: &NshView, world: Mat4) {
         // stays in its backing store.
         cx.push_clip_rect(0.0, 0.0, w, h);
     }
+    crate::shader::draw(cx, &state);
     crate::text::draw(cx, &state);
     crate::image::draw(cx, &state);
     match cx.measured {
@@ -686,7 +688,7 @@ pub(crate) fn draw_content(cx: &mut DrawCx<'_>, view: &NshView, world: Mat4) {
     }
     cx.set_transform(world);
     let state = view.state();
-    crate::scroll::draw_indicator(cx, &state);
+    crate::scroll::draw_indicator(cx, view, &state);
     if clip {
         cx.pop();
     }
@@ -793,7 +795,7 @@ impl Element for SurfaceElement {
             Some(theme) => theme.background.light.into(),
             None => crate::system::window_background(&surface),
         };
-        if background.0 & 0xff != 0 {
+        if background.0 & 0xff != 0 && !surface.transparent.get() {
             window.paint_quad(gpui::fill(bounds, hsla(background)));
         }
         // Before the tree: painting a native component's element leaves its

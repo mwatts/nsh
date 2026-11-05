@@ -65,11 +65,13 @@ final class TextBox extends android.view.ViewGroup implements Node {
 
     /** `selectable`. */
     private boolean selectable;
-    /** `selectable={false}`: out of selection areas too. */
+    /** `selectable={false}`: out of selectable views too. */
     boolean excluded;
-    /** The selection area whose gesture this touch is ({@link SelectionArea}), if any. */
-    private SelectionArea areaGesture;
-    /** What a selection area has selected here (UTF-16 offsets), or -1. */
+    /** It continues the text before it (`ViewProps.continues_text`: a wrapped line's later part). */
+    boolean continuesText;
+    /** The selectable view whose gesture this touch is ({@link SelectableView}), if any. */
+    private SelectableView areaGesture;
+    /** What a selectable view has selected here (UTF-16 offsets), or -1. */
     private int areaStart = -1, areaEnd = -1;
     /** `selectionColor`: the highlight and the handles' tint; null: the theme's. */
     private Integer selectionColor;
@@ -128,7 +130,7 @@ final class TextBox extends android.view.ViewGroup implements Node {
         return selectionColor;
     }
 
-    /** What a selection area selected here: [{@code start}, {@code end}), or -1, -1. */
+    /** What a selectable view selected here: [{@code start}, {@code end}), or -1, -1. */
     void setAreaSelection(int start, int end) {
         if (start == areaStart && end == areaEnd) return;
         areaStart = start;
@@ -153,9 +155,9 @@ final class TextBox extends android.view.ViewGroup implements Node {
     @android.annotation.SuppressLint("ClickableViewAccessibility")
     @Override
     public boolean onTouchEvent(android.view.MotionEvent e) {
-        // In a selection area, the area selects (across its texts), not the text.
+        // In a selectable view, the area selects (across its texts), not the text.
         if (e.getActionMasked() == android.view.MotionEvent.ACTION_DOWN) {
-            areaGesture = excluded ? null : mounter.selectionAreaOf(this);
+            areaGesture = excluded ? null : mounter.selectableViewOf(this);
         }
         if (areaGesture != null) {
             forwardPress(e, areaGesture.selecting());
@@ -201,7 +203,9 @@ final class TextBox extends android.view.ViewGroup implements Node {
     /** The long press: selects the word under the finger. */
     private void selectWordAtDown() {
         if (layout == null || layout.getText().length() == 0) return;
-        int offset = offsetAt(downX, downY);
+        long hit = hitAt(downX, downY);
+        // The character under the finger: the one before a caret at a wrapped line's end.
+        int offset = TextLayouts.hitOffset(hit) - (TextLayouts.hitUpstream(hit) ? 1 : 0);
         if (offset < 0) return;
         CharSequence text = layout.getText();
         int length = text.length();
@@ -221,12 +225,15 @@ final class TextBox extends android.view.ViewGroup implements Node {
         setSelection(start, end, false);
     }
 
+    /** The caret nearest to ({@code x}, {@code y}) (view pixels): see {@link TextLayouts#hitTest}. */
+    private long hitAt(float x, float y) {
+        return TextLayouts.hitTest(layout, x - contentX, y - contentY, 1f);
+    }
+
     /** The character offset nearest to ({@code x}, {@code y}) (view pixels), -1 without text. */
     private int offsetAt(float x, float y) {
         if (layout == null) return -1;
-        float ly = Math.max(0, Math.min(y - contentY, layout.getHeight() - 1));
-        int line = layout.getLineForVertical((int) ly);
-        return layout.getOffsetForHorizontal(line, x - contentX);
+        return TextLayouts.hitOffset(hitAt(x, y));
     }
 
     /** Selects [{@code start}, {@code end}); with {@code toolbar}, shows the toolbar too. */
@@ -473,10 +480,15 @@ final class TextBox extends android.view.ViewGroup implements Node {
         if (ly < -slack || ly > layout.getHeight() + slack) return -1;
         int line = layout.getLineForVertical((int) ly);
         if (lx < layout.getLineLeft(line) - slack || lx > layout.getLineRight(line) + slack) return -1;
-        int offset = layout.getOffsetForHorizontal(line, lx);
+        long hit = TextLayouts.hitTest(layout, lx, ly, 1f);
+        int offset = TextLayouts.hitOffset(hit);
         // The nearest caret: the character is the one before it when the
-        // point is left of the caret.
-        if (offset > layout.getLineStart(line) && lx < layout.getPrimaryHorizontal(offset)) offset--;
+        // point is left of the caret, and when it ends a wrapped line.
+        boolean before = TextLayouts.hitUpstream(hit);
+        if (!before && offset > layout.getLineStart(line)) {
+            before = lx < TextLayouts.caretRect(layout, offset, false, 1f)[0];
+        }
+        if (before) offset--;
         int best = -1;
         for (int i = 0; i < linkEvents.length; i++) {
             int start = links[i * 3], end = links[i * 3 + 1];
@@ -518,13 +530,14 @@ final class TextBox extends android.view.ViewGroup implements Node {
         if (selStart >= 0) highlight(canvas, selStart, selEnd);
         else if (areaStart >= 0) highlight(canvas, Math.min(areaStart, layout.getText().length()),
                 Math.min(areaEnd, layout.getText().length()));
-        if (colored) {
-            // An animated `color`: the text drawn as is into a layer, then
-            // painted over in the color where it drew (antialiasing kept).
+        if (colored || transitioning) {
+            // An animated `color`, or a transition of the text's color: the
+            // text drawn as is into a layer, then painted over in the color
+            // where it drew (antialiasing kept).
             int saved = canvas.saveLayer(null, null);
             layout.draw(canvas);
             drawDecorations(canvas);
-            canvas.drawColor(color, android.graphics.PorterDuff.Mode.SRC_IN);
+            canvas.drawColor(colored ? color : transitionColor, android.graphics.PorterDuff.Mode.SRC_IN);
             canvas.restoreToCount(saved);
         } else {
             layout.draw(canvas);
@@ -563,6 +576,84 @@ final class TextBox extends android.view.ViewGroup implements Node {
         colored = on;
         this.color = color;
         invalidate();
+    }
+
+    /** The runs draw all of the text in one color ({@link #uniformColor}); not for several (or none yet). */
+    private boolean uniform;
+    private int uniformColor;
+    /** A transition of the text's color (`transition-colors`), and the color it draws the whole text in now. */
+    private android.animation.ValueAnimator colorTransition;
+    private int transitionTo;
+    private boolean transitioning;
+    private int transitionColor;
+
+    /**
+     * The text changed to one drawn in {@code to} (unless {@code one} is false: several colors),
+     * the view's effects being {@code fx}: its color moves to the new one over the view's
+     * transition when that covers colors and the text is one color before and after, as
+     * `nsh_core::transition::recolor` decides on the other backends. The new layout is drawn in the
+     * color on screen, so no frame lays it out again; a change mid-way starts from where the color
+     * is. Unboxed: a text updating live allocates nothing for its color.
+     */
+    void recolor(boolean one, int to, Effects fx) {
+        boolean wasOne = uniform;
+        int from = uniformColor;
+        uniform = one;
+        uniformColor = to;
+        boolean covered = fx != null && (fx.transitionProps & 1) != 0
+                && fx.transitionDuration + fx.transitionDelay > 0
+                // Reduced motion (no animator duration scale): at once.
+                && android.animation.ValueAnimator.areAnimatorsEnabled()
+                && isAttachedToWindow();
+        if (!covered || !one || !wasOne) {
+            stopColorTransition();
+            return;
+        }
+        if (from == to) {
+            // The same color: a transition running to it goes on.
+            if (colorTransition != null && transitionTo != to) stopColorTransition();
+            return;
+        }
+        final int start = transitioning ? transitionColor : from;
+        final int end = to;
+        android.animation.ValueAnimator running = colorTransition;
+        android.animation.ValueAnimator a = android.animation.ValueAnimator.ofFloat(0, 1);
+        a.setDuration((long) fx.transitionDuration);
+        a.setStartDelay((long) fx.transitionDelay);
+        a.setInterpolator(Effects.interpolator(fx.transitionEasing));
+        a.addUpdateListener(animation -> {
+            if (colorTransition != animation) return;
+            transitionColor = Mounter.lerpColor(start, end, (float) animation.getAnimatedValue());
+            invalidate();
+        });
+        a.addListener(new android.animation.AnimatorListenerAdapter() {
+            @Override
+            public void onAnimationEnd(android.animation.Animator animation) {
+                if (colorTransition != animation) return;
+                // Done: the runs' own color (the new one) draws again.
+                colorTransition = null;
+                transitioning = false;
+                invalidate();
+            }
+        });
+        colorTransition = a;
+        transitionTo = end;
+        if (running != null) running.cancel();
+        // The new runs draw in the old color until the first frame.
+        transitioning = true;
+        transitionColor = start;
+        invalidate();
+        a.start();
+    }
+
+    private void stopColorTransition() {
+        android.animation.ValueAnimator running = colorTransition;
+        colorTransition = null;
+        if (running != null) running.cancel();
+        if (transitioning) {
+            transitioning = false;
+            invalidate();
+        }
     }
 
     private final android.graphics.Paint decorationPaint = new android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG);

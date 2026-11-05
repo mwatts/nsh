@@ -147,10 +147,10 @@ impl ClassTs {
     };
 
     /// This declaration, or [`ClassTs::NONE`] in builds without
-    /// declarations (`nsh_core::ui::DECLARATIONS`): the text is then not in
+    /// declarations (`nsh_core::element::DECLARATIONS`): the text is then not in
     /// the binary.
     pub(crate) const fn declared(self) -> ClassTs {
-        if nsh_core::ui::DECLARATIONS {
+        if nsh_core::element::DECLARATIONS {
             self
         } else {
             ClassTs::NONE
@@ -850,6 +850,16 @@ pub(crate) fn fetch_event(
         return Ok(());
     }
     fetch::event(cx, id, event)
+}
+
+/// Fails request `id`, which the app's capabilities do not grant
+/// (`fetch` rejects with a `TypeError` whose `code` is
+/// `ERR_ACCESS_DENIED`).
+pub(crate) fn fetch_refused(cx: Ctx, id: crate::net::RequestId, message: &str, url: &str) -> R<()> {
+    if !web(cx).built {
+        return Ok(());
+    }
+    fetch::refused(cx, id, message, url)
 }
 
 /// Cancels the requests whose response bodies were collected unread.

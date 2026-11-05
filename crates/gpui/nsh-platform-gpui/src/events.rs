@@ -84,6 +84,7 @@ fn cancel_press(surface: &Rc<Surface>, modifiers: &gpui::Modifiers) {
             time: surface.clock(),
             modifiers: crate::keys::modifiers(modifiers),
             clicks: 0,
+            pressed_button: None,
         },
     );
 }
@@ -103,6 +104,8 @@ fn cursor_style(c: Cursor) -> CursorStyle {
         Cursor::NotAllowed => CursorStyle::OperationNotAllowed,
         Cursor::ResizeEw => CursorStyle::ResizeLeftRight,
         Cursor::ResizeNs => CursorStyle::ResizeUpDown,
+        Cursor::ResizeNwse => CursorStyle::ResizeUpLeftDownRight,
+        Cursor::ResizeNesw => CursorStyle::ResizeUpRightDownLeft,
         Cursor::Wait | Cursor::Progress | Cursor::Help => CursorStyle::Arrow,
         Cursor::Hidden => CursorStyle::Arrow,
     }
@@ -200,6 +203,7 @@ pub(crate) fn install(
                 time: s.clock(),
                 modifiers: crate::keys::modifiers(&e.modifiers),
                 clicks: e.click_count as u32,
+                pressed_button: None,
             },
         );
         cx.stop_propagation();
@@ -219,6 +223,10 @@ pub(crate) fn install(
         let Some(button) = button(e.button) else {
             return;
         };
+        // Whatever this release ends, the button held is no longer known
+        // (one pressed outside the surface, a Control-click released as
+        // the left button): the next move says it again.
+        s.input.button.set(None);
         let pressed = s.input_pressed.get();
         if pressed & 1 << button == 0 {
             return;
@@ -238,6 +246,7 @@ pub(crate) fn install(
                 time: s.clock(),
                 modifiers: crate::keys::modifiers(&e.modifiers),
                 clicks: e.click_count as u32,
+                pressed_button: None,
             },
         );
         crate::rt::flush(cx);
@@ -279,6 +288,7 @@ pub(crate) fn install(
                 time: s.clock(),
                 modifiers: crate::keys::modifiers(&e.modifiers),
                 clicks: 0,
+                pressed_button: e.pressed_button.and_then(button),
             },
         );
         crate::rt::flush(cx);
@@ -308,6 +318,7 @@ pub(crate) fn install(
                 time: s.clock(),
                 modifiers: crate::keys::modifiers(&e.modifiers),
                 clicks: 0,
+                pressed_button: e.pressed_button.and_then(button),
             },
         );
         crate::rt::flush(cx);
@@ -425,12 +436,15 @@ pub(crate) fn install(
         }
         crate::rt::flush(cx);
     });
-    // The keymap's held key (see `crate::keymap::forget_held`), and Alt
-    // alone showing a menu bar that hides itself.
+    // The keymap's held key (see `crate::keymap::forget_held`), Alt alone
+    // showing a menu bar that hides itself, and the views under a resting
+    // mouse told of the new modifiers (`onMouseMove`).
     let s = surface.clone();
     window.on_modifiers_changed(move |e, _, cx| {
         crate::keymap::forget_held(&s);
-        crate::chrome::modifiers_changed(&s, &crate::keys::modifiers(&e.modifiers));
+        let modifiers = crate::keys::modifiers(&e.modifiers);
+        crate::chrome::modifiers_changed(&s, &modifiers);
+        crate::input::modifiers_changed(&s, modifiers);
         crate::rt::flush(cx);
     });
 }

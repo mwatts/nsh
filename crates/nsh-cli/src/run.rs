@@ -34,6 +34,8 @@ pub(crate) enum Target {
     /// The GPUI development host, in a window on this machine (macOS,
     /// Windows or Linux): the app as GPUI apps that embed it show it.
     Gpui,
+    /// The development host in this terminal.
+    Tui,
 }
 
 impl Target {
@@ -58,6 +60,7 @@ impl Target {
             Target::Macos => crate::runtime::Platform::MacOs,
             Target::Windows => crate::runtime::Platform::Windows,
             Target::Gpui => crate::runtime::Platform::Gpui,
+            Target::Tui => crate::runtime::Platform::Tui,
             Target::Ios | Target::Android | Target::Web => {
                 crate::runtime::Platform::IphoneSimulator
             }
@@ -66,25 +69,29 @@ impl Target {
 }
 
 /// How the development host runs the app and what it shows besides it.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(crate) struct HostFlags {
     /// The VM limits an embedding app would set (`--limits`); `None`: none,
     /// as an app on its own.
     pub(crate) limits: Option<HostLimits>,
     /// Log per-commit timings.
     pub(crate) trace: bool,
-    /// The performance monitor (the macOS host's).
+    /// The selected host's performance monitor.
     pub(crate) fps: bool,
+    /// Terminal Cell dimensions, overriding nsh.json.
+    pub(crate) points_per_cell: Option<String>,
 }
 
 /// The host window's own options: the desktop hosts take the size
-/// ([`HostWindow::check`]), the macOS host the name too.
+/// ([`HostWindow::check`]), the macOS host the name and the display too.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct HostWindow<'a> {
     /// The app's name in the host (the menu bar, the window title).
     pub(crate) name: Option<&'a str>,
     /// The window's initial size, `WxH` in points.
     pub(crate) size: Option<&'a str>,
+    /// The display the window opens on, from 1 (the primary display).
+    pub(crate) display: Option<usize>,
 }
 
 impl HostWindow<'_> {
@@ -108,6 +115,11 @@ impl HostWindow<'_> {
                 "--name needs --target macos and a TSX entry (the other hosts do not take it yet)"
             );
         }
+        if self.display.is_some() && (target != Target::Macos || rust_root) {
+            bail!(
+                "--display needs --target macos and a TSX entry (the other hosts do not take it yet)"
+            );
+        }
         if self.size.is_some() && (!desktop || rust_root) {
             bail!(
                 "--window-size needs a desktop host (--target macos, linux, windows or gpui) and a TSX entry"
@@ -116,12 +128,16 @@ impl HostWindow<'_> {
         Ok(())
     }
 
-    /// The arguments of the size, for a desktop host.
-    fn args(&self) -> Vec<&str> {
+    /// The arguments of the size and the display, for a desktop host.
+    fn args(&self) -> Vec<String> {
         let mut args = Vec::new();
         if let Some(size) = self.size {
             // `WxH` in points; the host opens the window at this size.
-            args.extend(["--window-size", size]);
+            args.extend(["--window-size".to_owned(), size.to_owned()]);
+        }
+        if let Some(display) = self.display {
+            // One-based, as the host counts them.
+            args.extend(["--display".to_owned(), display.to_string()]);
         }
         args
     }
@@ -138,15 +154,44 @@ pub(crate) fn run(
     device: Option<&str>,
     window: HostWindow<'_>,
 ) -> anyhow::Result<()> {
-    let HostFlags { limits, trace, fps } = flags;
-    if fps && target != Target::Macos {
-        bail!("--fps needs --target macos (the other hosts have no performance monitor yet)");
+    let HostFlags {
+        limits,
+        trace,
+        fps,
+        points_per_cell,
+    } = flags;
+    if points_per_cell.is_some() && target != Target::Tui {
+        bail!("--points-per-cell needs --target tui");
+    }
+    if fps
+        && !matches!(
+            target,
+            Target::Macos | Target::Linux | Target::Ios | Target::Windows | Target::Tui
+        )
+    {
+        bail!(
+            "--fps needs --target macos, linux, windows, ios or tui (the other hosts have no performance monitor yet)"
+        );
     }
     window.check(target, crate::rust_app::is_root(entry))?;
     let work = dunce::canonicalize(entry)?
         .parent()
         .context("entry has no directory")?
         .join(".nsh");
+    if target == Target::Tui {
+        return run_tui(
+            entry,
+            port,
+            release,
+            HostFlags {
+                limits,
+                trace,
+                fps,
+                points_per_cell,
+            },
+            &work,
+        );
+    }
     if crate::rust_app::is_root(entry) {
         return run_rust_app(entry, port, target, device, &work);
     }
@@ -170,7 +215,8 @@ pub(crate) fn run(
         | Target::Macos
         | Target::Windows
         | Target::Web
-        | Target::Gpui => None,
+        | Target::Gpui
+        | Target::Tui => None,
     };
     // The host it starts connects by itself: no addresses to show.
     let session = DevSession::start(entry, port, release, limits)?;
@@ -266,7 +312,7 @@ pub(crate) fn run(
             drop(stoppable);
             result
         }
-        Target::Android | Target::Web => unreachable!("handled above"),
+        Target::Android | Target::Web | Target::Tui => unreachable!("handled above"),
     }
 }
 
@@ -368,6 +414,7 @@ fn run_rust_app(
                 crate::package::PackageTarget::IosSimulator,
                 &out,
                 config,
+                &[],
             )?;
             let bundle = out.join(format!("{name}.app"));
             let step = ui::Step::start(format!("installing {id} in the simulator"));
@@ -393,7 +440,18 @@ fn run_rust_app(
             let sdk = android::Sdk::find()?;
             let serial = android::device(&sdk)?;
             let out = run.join("android");
-            package_for_run(&entry, crate::package::PackageTarget::Android, &out, config)?;
+            // The device's ABI alone: each one is a build of the app's crate.
+            let abi = android::device_abis(&sdk, &serial)?
+                .into_iter()
+                .find(|abi| android::ABIS.contains(&abi.as_str()))
+                .with_context(|| format!("{serial} runs none of {}", android::ABIS.join(", ")))?;
+            package_for_run(
+                &entry,
+                crate::package::PackageTarget::Android,
+                &out,
+                config,
+                std::slice::from_ref(&abi),
+            )?;
             let apk = out.join(format!("{name}.apk"));
             let step = ui::Step::start(format!("installing {id} on {serial}"));
             android::adb(&sdk, &serial, &["install", "-r", &apk.to_string_lossy()])?;
@@ -421,17 +479,18 @@ fn run_rust_app(
             session.print_web_url();
             session.watch(|| Ok(false))
         }
-        Target::Gpui => unreachable!("refused by HostWindow::check"),
+        Target::Gpui | Target::Tui => unreachable!("handled before Rust runner selection"),
     }
 }
 
 /// Packages the Rust app at `entry` for `target` into `out` (as `nsh
-/// package` does), for `nsh run` to install.
+/// package` does), for `nsh run` to install; Android: for `abis`.
 fn package_for_run(
     entry: &Path,
     target: crate::package::PackageTarget,
     out: &Path,
     config: crate::package::AppConfig,
+    abis: &[String],
 ) -> anyhow::Result<()> {
     crate::package::package(crate::package::PackageOptions {
         entry,
@@ -441,6 +500,7 @@ fn package_for_run(
         sign: None,
         profile: None,
         keystore: None,
+        abis,
         run: false,
     })
 }
@@ -468,6 +528,113 @@ fn run_rust_local(app: &crate::rust_app::RustApp, command: &mut Command) -> anyh
     let _ = child.kill();
     let _ = child.wait();
     drop(stoppable);
+    result
+}
+
+/// Checks the terminal scale at the CLI/configuration boundary.
+pub(crate) fn parse_points_per_cell(value: &str) -> Result<String, String> {
+    let valid = value.split_once('x').is_some_and(|(width, height)| {
+        [width, height]
+            .into_iter()
+            .all(|part| part.parse::<f32>().is_ok_and(|n| n.is_finite() && n > 0.0))
+    });
+    if !valid {
+        return Err("points per Cell must be WIDTHxHEIGHT with finite, positive dimensions".into());
+    }
+    Ok(value.to_owned())
+}
+
+fn run_tui(
+    entry: &Path,
+    port: u16,
+    release: bool,
+    flags: HostFlags,
+    work: &Path,
+) -> anyhow::Result<()> {
+    let HostFlags {
+        limits,
+        trace,
+        fps,
+        points_per_cell,
+    } = flags;
+    let config = crate::package::read_config(entry)?;
+    let cells = points_per_cell
+        .as_deref()
+        .or(config.tui.points_per_cell.as_deref())
+        .unwrap_or("8x16");
+    parse_points_per_cell(cells).map_err(anyhow::Error::msg)?;
+    fs::create_dir_all(work)?;
+    let path = work.join("tui.log");
+    let session = DevSession::start(entry, port, release, limits)?;
+    // A Rust root also uses the development host, which receives the Root event.
+    let host = crate::runtime::test_host(Platform::Tui)?;
+    let diagnostics = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    let mut command = Command::new(host);
+    command
+        .env("NSH_DEV_APP_DIR", work.parent().context("app directory")?)
+        .args([
+            "--dev-server",
+            &session.local_url(),
+            "--points-per-cell",
+            cells,
+        ])
+        .arg("--log-file")
+        .arg(&path)
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(diagnostics);
+    if fps {
+        command.arg("--fps");
+    }
+    if trace {
+        command.arg("--trace");
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        command.creation_flags(windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP);
+    }
+    let _stoppable = ui::Stoppable::new();
+    let mut child = command
+        .spawn()
+        .context("launch the terminal development host")?;
+    #[cfg(windows)]
+    let _job = KillOnClose::assign(&child);
+    let result = session.watch(|| match child.try_wait()? {
+        Some(status) if status.success() => Ok(true),
+        Some(status) => bail!(
+            "the terminal host exited with {status}; see {}",
+            path.display()
+        ),
+        None => Ok(false),
+    });
+    if !matches!(child.try_wait(), Ok(Some(_))) {
+        // Let the host leave raw mode and the alternate screen before ending it.
+        #[cfg(unix)]
+        // SAFETY: this is the live child owned by this invocation.
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGTERM);
+        }
+        #[cfg(windows)]
+        // SAFETY: the child was started in its own console process group.
+        unsafe {
+            windows_sys::Win32::System::Console::GenerateConsoleCtrlEvent(
+                windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+                child.id(),
+            );
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while matches!(child.try_wait(), Ok(None)) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            let _ = child.kill();
+        }
+    }
+    let _ = child.wait();
     result
 }
 
@@ -574,7 +741,7 @@ fn run_android(
     // As on iOS: the host of a previous session must not connect first.
     let _ = android::adb(&sdk, &serial, &["shell", "am", "force-stop", BUNDLE_ID]);
     let session = DevSession::start(entry, port, release, limits)?;
-    install_android_host(&sdk, &serial, work, &crate::runtime::android(true)?)?;
+    install_android_host(&sdk, &serial, work, &crate::runtime::android(true, &[])?)?;
     // The device reaches the dev server on its own 127.0.0.1, until the
     // run ends.
     let _reverse = android::Reverse::add(&sdk, &serial, session.port())?;
@@ -633,9 +800,11 @@ pub(crate) fn install_android_host(
                 version_code: 1,
                 activity: "com.longbridge.nsh.DevActivity",
                 dev: true,
+                notifications: true,
                 rust: false,
                 dark: false,
                 runtime,
+                abis: &[],
                 icon: None,
                 assets: Vec::new(),
                 signing: Signing::Debug,
@@ -869,14 +1038,22 @@ fn info_plist(target: Target) -> String {
         | Target::Macos
         | Target::Windows
         | Target::Web
-        | Target::Gpui => {
+        | Target::Gpui
+        | Target::Tui => {
             "<key>UIDeviceFamily</key><array><integer>1</integer><integer>2</integer></array>\n    \
              <key>MinimumOSVersion</key><string>15.0</string>\n    \
              <key>CFBundleSupportedPlatforms</key><array><string>iPhoneSimulator</string></array>\n    \
              <key>UILaunchScreen</key><dict/>\n    \
+             <key>CADisableMinimumFrameDurationOnPhone</key><true/>\n    \
              <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>"
         }
     };
+    // The host runs any app: it may recognize speech.
+    let usage = crate::package::USAGE_DESCRIPTIONS
+        .iter()
+        .map(|(key, text)| format!("<key>{key}</key><string>{text}</string>"))
+        .collect::<Vec<_>>()
+        .join("\n    ");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -889,6 +1066,7 @@ fn info_plist(target: Target) -> String {
     <key>CFBundleShortVersionString</key><string>0.1.0</string>
     <key>CFBundleVersion</key><string>1</string>
     <key>UIApplicationSupportsMultipleScenes</key><false/>
+    {usage}
     {platform}
 </dict>
 </plist>
@@ -930,6 +1108,21 @@ mod tests {
         };
         assert!(named.check(Target::Macos, false).is_ok());
         assert!(named.check(Target::Linux, false).is_err());
+    }
+
+    /// `--display` reaches the macOS host only, for a TSX entry.
+    #[test]
+    fn the_macos_host_takes_a_display() {
+        let placed = HostWindow {
+            display: Some(2),
+            ..HostWindow::default()
+        };
+        assert!(placed.check(Target::Macos, false).is_ok());
+        assert!(placed.check(Target::Macos, true).is_err());
+        for target in [Target::Linux, Target::Windows, Target::Gpui, Target::Ios] {
+            assert!(placed.check(target, false).is_err(), "{target:?}");
+        }
+        assert_eq!(placed.args(), ["--display", "2"]);
     }
 
     /// The desktop hosts get each app's own id, so each keeps its own data.

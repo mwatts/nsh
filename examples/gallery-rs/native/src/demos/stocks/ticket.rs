@@ -4,14 +4,13 @@
 //! placing reports [`TicketEvent::Placed`]. Nothing is sent anywhere.
 
 use nsh_core::{
-    LayoutAnimation, LayoutCurve, LayoutProperty, LayoutTransition,
-    ui::{PropEnum, prelude::*},
+    LayoutAnimation, LayoutCurve, LayoutProperty, LayoutTransition, element::PropEnum, prelude::*,
 };
 
 use super::market::{grouped, price};
 use crate::ui::{
     Button, ButtonVariant, Finish, Finished, IconName, Segment, colors, icon, press, radius,
-    segmented, tints,
+    segmented, terminal, tints,
 };
 
 /// Buying or selling.
@@ -85,7 +84,15 @@ fn step(plus: bool, label: &'static str, on_press: impl Into<Listener<()>>) -> i
             .border_1()
             .map(|v| {
                 if plus {
-                    v.child(icon().name(IconName::Plus).size(18.0).tint(colors::TEXT))
+                    v.child(
+                        icon()
+                            .name(IconName::Plus)
+                            .size(18.0)
+                            .tint(colors::TEXT)
+                            .label(Some(SharedString::from("+"))),
+                    )
+                } else if terminal() {
+                    v.child(text("−").text_color(colors::TEXT))
                 } else {
                     v.child(
                         view()

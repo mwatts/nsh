@@ -1,12 +1,13 @@
 import { type JSX, Text, View } from "nsh";
 import { isAvailable as hasWindow, titleBar } from "nsh/desktop";
-import { colors, Logo } from "./ui";
+import { colors, Logo, terminal } from "./ui";
 
 /** App-drawn window chrome; the platform keeps its native window controls.
- * `leading` goes right after the logo (the sidebar's toggle). */
+ * `leading` goes right after the logo (the sidebar's toggle). A terminal
+ * program has no window chrome: none there. */
 export function TitleBar(props: { leading?: JSX.Element }) {
   return (
-    <If when={hasWindow}>
+    <If when={hasWindow && !terminal}>
       <View
         desktop={{ windowDrag: true }}
         style={{
@@ -24,7 +25,7 @@ export function TitleBar(props: { leading?: JSX.Element }) {
       >
         <Logo size={20} />
         {props.leading}
-        <Text numberOfLines={1} style={{ flex: 1, fontSize: 13, fontWeight: "600", color: colors.text }}>Gallery</Text>
+        <Text style={{ numberOfLines: 1, flex: 1, fontSize: 13, fontWeight: "600", color: colors.text }}>Gallery</Text>
         <Text style={{ fontSize: 11, color: colors.muted }}>NSH</Text>
       </View>
     </If>

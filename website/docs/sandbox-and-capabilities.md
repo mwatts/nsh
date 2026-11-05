@@ -113,10 +113,12 @@ An app declares what it may reach outside its VM in `nsh.json`:
       "http": [{ "host": "quotes.example.com", "methods": ["GET"], "pathPrefix": "/v1/" }],
       "sockets": ["feed.example.com:7000"]
     },
-    "webview": { "hosts": ["*.example.com"] },
+    "webview": { "hosts": ["*.example.com"], "input": true },
     "statusBar": true,
     "clipboard": true,
     "picker": true,
+    "speech": true,
+    "notifications": true,
     "host": ["getUserInfo", "bridge.*"],
     "openUrl": { "schemes": ["https", "mailto"] }
   }
@@ -165,11 +167,16 @@ paths.
 | Key | Type | Description |
 |---|---|---|
 | `hosts` | `string[]` | Hosts a [web view](./web-view-and-video.md) may show and navigate to (`http` and `https`). Without `webview`, the app may not show web pages at all. |
+| `input` | `boolean` | A web view's ref may give its page trusted input ([`sendInput`](./web-view-and-video.md#input-as-the-users-own)). Never granted unless declared, also for an app without `"capabilities"`. |
 
 Top-level navigations inside the web view are checked too, by the platform's navigation delegate, before they load.
 The page's own subresources (its scripts, images, XHRs) are the web content's business and are not checked.
 `about:blank` and inline HTML (`html`) need only web views to be granted at all: `"webview": { "hosts": [] }`
 allows them without allowing any remote page.
+
+`input` is separate from `hosts` because trusted input carries user activation, which `injectJavaScript` never gets:
+the page may then open windows, write the clipboard, open the system's file panel, start WebAuthn or permission prompts
+and press any button that checks `isTrusted`. Without it the core drops `sendInput` and logs which key to add.
 
 ### `statusBar`
 
@@ -178,57 +185,95 @@ allows them without allowing any remote page.
 
 ### `clipboard`
 
-`"clipboard": true` lets the app read and write the system clipboard ([`nsh/clipboard`](../modules/nsh-clipboard.md)). Copying from a selectable text's edit menu is the user's own act and needs no capability.
+`"clipboard": true` lets the app read and write the system clipboard ([`Clipboard`](../modules/nsh.md#clipboard)). Copying from a selectable text's edit menu is the user's own act and needs no capability.
 
 ### `picker`
 
-`"picker": true` lets the app show the system's picker for photos ([`nsh/picker`](../modules/nsh-picker.md)): the user
+`"picker": true` lets the app show the system's picker for photos ([`Picker`](../modules/nsh.md#picker)): the user
 picks what reaches the app.
+
+### `speech`
+
+`"speech": true` lets the app recognize what the user says ([`Speech`](../modules/nsh.md#speech)): the microphone and
+the system's speech recognizer, whose transcript reaches the app. The system still asks the user once.
+
+### `notifications`
+
+`"notifications": true` lets the app show system notifications and set its icon's badge
+([`Notifications`](../modules/nsh.md#notifications)). The system still asks the user once, where it asks.
 
 ### `openUrl`
 
-Lets the app open URLs outside it ([`openUrl`](../modules/nsh-device.md#openurl), a `TextView`'s links with
+Lets the app open URLs outside it ([`openUrl`](../modules/nsh.md#openurl), a `TextView`'s links with
 `links="open"`): `"openUrl": true` for every scheme, `"openUrl": { "schemes": ["https", "mailto"] }` for the schemes
-listed. A URL whose scheme is not granted throws a `TypeError`. URLs that would run code or reach the app's own data
+listed. A URL whose scheme is not granted rejects with `ERR_ACCESS_DENIED` (`permission` `"openUrl"`, `resource` the
+URL). URLs that would run code or reach the app's own data
 (`javascript:`, `data:`, `file:`, ...) are never opened, whatever the capability.
 
 ### Storage
 
-Every app may keep its own data on the device with [`nsh/storage`](../modules/nsh-storage.md), with no capability: the storage holds only that app's data, and the embedding app decides where it is kept.
+Every app may keep its own data on the device with [`Storage`](../modules/nsh.md#storage), with no capability: the storage holds only that app's data, and the embedding app decides where it is kept.
 
 ### `host`
 
-`host` lists the functions of the app embedding NSH that `nsh/host`'s `host.call(name, args)` may call: exact names
+`host` lists the functions of the app embedding NSH that `nsh`'s `host.call(name, args)` may call: exact names
 (`"getUserInfo"`) or prefixes ending in `*` (`"bridge.*"` matches `bridge.call` and `bridge.share`). `"host": true`
 allows every function. A function not listed is refused, also in an app without `"capabilities"`: the host's
-functions are never granted by default, and building an app that imports `nsh/host` without `host` warns that every
+functions are never granted by default, and building an app that imports `host` from `nsh` without `host` warns that every
 call will be refused. Names are 1 to 128 characters from `A`–`Z`, `a`–`z`, `0`–`9`, `_`, `.`, `:` and `-`, without `..`;
 the call of any other name is refused before the grants are read. End a prefix with a separator (`"bridge.*"`):
 `"bridge*"` matches `bridgeAdmin` too. The host's events (`host.on(event, listener)`) reach the app's listeners as the host sends them.
 
 ```ts
-import { host } from "nsh/host";
+import { host } from "nsh";
 
 if (host.available()) {
   const user = await host.call("getUserInfo");
-  const sub = host.on("loginChanged", (payload) => console.log(payload));
-  sub.remove();
+  const stop = host.on("loginChanged", (payload) => console.log(payload));
+  stop();
 }
 ```
 
-`host.available()` is true on platforms that embed a host; elsewhere `host.call` rejects with
-`nsh/host: this platform has no host`.
+`host.available()` is true on platforms that embed a host; elsewhere `host.call` rejects with `code`
+`"ERR_FEATURE_UNAVAILABLE_ON_PLATFORM"`.
 
 ### What a refusal looks like
 
 | Request | Result |
 |---|---|
-| `fetch` | The promise rejects; the request never reaches the network. |
-| Remote image | The image fails with `onError`. |
-| Video source, web view source, status bar change | Nothing is shown or changed. |
-| Clipboard | `writeText` and `writeImage` do nothing; `readText` resolves `""`, `readImage` `null`, `readFiles` `[]`, and `hasText` and `hasImage` `false`. |
-| Picker | `pickImages` shows nothing and resolves `[]`. |
-| Host call | The promise rejects, saying to add the function to `capabilities.host`; the call never reaches the host. |
+| `fetch` | The promise rejects with a `TypeError`, as every failed request, whose `code` is `ERR_ACCESS_DENIED`, `permission` `"network"` and `resource` the URL (the request's, or the redirect's); the request never reaches the network. |
+| `Image.getSize`, `Image.prefetch` | The promise rejects with `ERR_ACCESS_DENIED`, `permission` `"network"` and `resource` the URL; the image is never requested. |
+| Remote image, video source, web view source or `html` | Nothing is shown, and the element's `onError` reports it with `code` `"ERR_ACCESS_DENIED"`. A web view's navigation to a host not granted is cancelled and reported the same way. |
+| Status bar change, canvas image | Nothing changes or is drawn; the refusal is logged. |
+| Clipboard | Every function of `Clipboard` rejects with `ERR_ACCESS_DENIED`, `permission` `"clipboard"` and `resource` `""`; the system clipboard is never touched. |
+| Picker | `pickImages` shows nothing and rejects with `ERR_ACCESS_DENIED`, `permission` `"picker"` and `resource` `""`. |
+| Speech | `Speech.start` throws `ERR_ACCESS_DENIED`, `permission` `"speech"` and `resource` `""`; the microphone stays off. |
+| Notifications | Each function of `Notifications` rejects or throws `ERR_ACCESS_DENIED`, `permission` `"notifications"` and `resource` `""`; nothing shows. |
+| `openUrl` | The promise rejects with `ERR_ACCESS_DENIED`, `permission` `"openUrl"` and `resource` the URL; nothing opens. |
+| Host call | `host.call` rejects with `ERR_ACCESS_DENIED`, `permission` `"host"` and `resource` the function's name (`host.post` throws it); the call never reaches the host. |
+| Files (`fs/promises`) | The promise rejects with `ERR_ACCESS_DENIED`, `permission` `"fs"` and `resource` the path; the disk is never touched. |
+| Processes (`process`) | `run` rejects, and `spawn` and `exit` throw, with `ERR_ACCESS_DENIED`, `permission` `"process"` and `resource` the command (`"exit"` for `exit`); no child starts. |
+| TCP socket (`net.connect`) | The promise rejects with `ERR_ACCESS_DENIED`, `permission` `"network"` and `resource` the `"host:port"`, before any DNS lookup. |
+| WebSocket | The `websocket` module's `connect` rejects with `ERR_ACCESS_DENIED`, `permission` `"network"` and `resource` the URL; the global `WebSocket` fires `error` and then `close` (code 1006), as a connection that fails does. |
+
+The errors of the [standard modules](../modules/standard-modules.md#failures) carry `code` `"ERR_ACCESS_DENIED"`, so an
+app tells a refusal apart from a failed operation, and their `permission` and `resource` name the capability and what
+was asked for. The modules of [`nsh`](../modules/nsh.md) refuse the same way: their promises reject with
+`ERR_ACCESS_DENIED`, `permission` and `resource` (`fetch` with a `TypeError`, the class of every failed request).
+
+```ts
+import { Clipboard } from "nsh";
+
+try {
+  await Clipboard.writeText(link);
+} catch (error) {
+  if (error.code !== "ERR_ACCESS_DENIED") throw error;
+  console.warn(`${error.permission} is not granted`); // "clipboard"
+}
+```
+
+Rust components get the same refusals in Rust's terms: a refused clipboard read answers what an empty clipboard does, a
+refused pick no files, a refused `open_url` `false` and a refused `fetch` an `Err` with the message.
 
 Each refusal is logged once, saying which key to add:
 
@@ -288,7 +333,7 @@ them.
 |---|---|---|
 | Limits (heap, stack, time, nodes) | the runtime, per VM | the host app per view (embedded apps) |
 | Hardening | the runtime, on load | always on outside development |
-| Capabilities | the runtime (fetch, images, video, web views, status bar) | the app (`nsh.json`) and the host app (grant) |
+| Capabilities | the runtime (fetch, images, video, web views, status bar, files, processes, sockets) | the app (`nsh.json`) and the host app (grant) |
 | Code integrity | signature verification | `nsh publish`; the host app's trusted roots |
 
 ## See also

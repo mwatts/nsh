@@ -7,12 +7,12 @@ group: ui
 
 # 网络
 
-NSH 应用用 `fetch` 发起 HTTP 请求：在 Rust 中是 `nsh_core::ui::prelude` 的函数，在任务中 await；在 TSX 中是标准的全局函数。两者都运行在平台的网络栈上（iOS 上是 NSURLSession，Android 上是 HttpURLConnection，[在 Web 上](./web.md#带-rust-组件的应用)是浏览器的），因此请求使用系统的 TLS、代理和 HTTP/2，并经过相同的[能力检查](#能力声明应用可以访问哪些主机)。Rust 的 `fetch` 接受 URL 或 `HttpRequest`，返回完整的响应（`HttpResponse`：`status()`、`ok()`、`header(name)`、`text()`、`body`）。TSX 的 `fetch` 双向流式传输：响应体随网络栈的交付以流的形式到达，请求体也可以是一个边生成边发送的流。TSX 还具备 Fetch API 的配套对象：`Headers`、`Request`、`Response`、`AbortController`、`FormData`、`Blob`、`File`、`URL`、`URLSearchParams`、`TextEncoder` / `TextDecoder` 以及 Web Streams。
+NSH 应用用 `fetch` 发起 HTTP 请求：在 Rust 中是 `nsh_core::prelude` 的函数，在任务中 await；在 TSX 中是标准的全局函数。两者都运行在平台的网络栈上（iOS 上是 NSURLSession，Android 上是 HttpURLConnection，[在 Web 上](./web.md#带-rust-组件的应用)是浏览器的），因此请求使用系统的 TLS、代理和 HTTP/2，并经过相同的[能力检查](#能力声明应用可以访问哪些主机)。Rust 的 `fetch` 接受 URL 或 `HttpRequest`，返回完整的响应（`HttpResponse`：`status()`、`ok()`、`header(name)`、`text()`、`body`）。TSX 的 `fetch` 双向流式传输：响应体随网络栈的交付以流的形式到达，请求体也可以是一个边生成边发送的流。TSX 还具备 Fetch API 的配套对象：`Headers`、`Request`、`Response`、`AbortController`、`FormData`、`Blob`、`File`、`URL`、`URLSearchParams`、`TextEncoder` / `TextDecoder` 以及 Web Streams。
 
 ## 获取 JSON
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 #[derive(Clone, PartialEq)]
 struct Post {
@@ -79,7 +79,7 @@ function App() {
     <Scroll style={{ flex: 1 }}>
       <View style={{ padding: 16, paddingTop: 60, gap: 8 }}>
         <Text style={{ color: "#57606a" }}>{posts.loading() ? "loading…" : String(posts.error() ?? "")}</Text>
-        <Each of={posts() ?? []}>{(post) => <Text numberOfLines={1}>{post().title}</Text>}</Each>
+        <Each of={posts() ?? []}>{(post) => <Text style={{ numberOfLines: 1 }}>{post().title}</Text>}</Each>
       </View>
     </Scroll>
   );
@@ -95,7 +95,7 @@ mount(App);
 ## 发送数据
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 // JSON
 let body = serde_json::json!({ "title": "Groceries", "items": ["milk", "eggs"] });
@@ -154,13 +154,13 @@ const response = await fetch("https://api.example.com/photos", { method: "POST",
 
 ### 上传用户选中的照片
 
-[`nsh/picker`](../modules/nsh-picker.md) 把用户选中的照片交给应用，它们是字节留在原生侧的文件，已经缩小并转成服务器认的格式；
+[`Picker`](../modules/nsh.md#picker) 把用户选中的照片交给应用，它们是字节留在原生侧的文件，已经缩小并转成服务器认的格式；
 Rust 直接发送字节，TSX 把 `File` 加进 `FormData`：
 
 ```rust tabs
 use nsh_core::geometry::DevicePixels;
 use nsh_core::picker::PickRequest;
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 let mut request = PickRequest::new(false, 1);
 request.max_dimension = Some(DevicePixels(2048));
@@ -175,7 +175,7 @@ spawn(async move {
 ```
 
 ```tsx tabs
-import { Picker } from "nsh/picker";
+import { Picker } from "nsh";
 
 const [photo] = await Picker.pickImages({ maxDimension: 2048 });
 if (photo) {
@@ -278,7 +278,7 @@ const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
 加载数据的组件应该在销毁时取消请求：Rust 任务会自动取消，TSX 在 [`cleanup`](./reactivity.md) 中中止：
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn weather(city: String) -> impl IntoElement {
     let data = signal(String::new());
@@ -358,7 +358,16 @@ Rust 组件、`#[module]` 函数和 `#[class]` 成员在任务中调用 `fetch`�
 
 这些检查在 NSH 的运行时中、在应用代码之外执行，请求到达网络之前就已完成：
 
-- 被拒绝的 `fetch` 会失败（TSX 中为 `TypeError`），消息中指出需要添加的键，例如 ``Network request failed: fetch GET https://evil.io/ is not granted: add `evil.io` to capabilities.network in nsh.json``。
+- 被拒绝的 `fetch` 会失败（TSX 中与每个失败的请求一样为 `TypeError`），消息中指出需要添加的键，例如 ``Network request failed: fetch GET https://evil.io/ is not granted: add `evil.io` to capabilities.network in nsh.json``。TSX 中错误的 `code` 为 `"ERR_ACCESS_DENIED"`，`permission` 为 `"network"`，`resource` 为被拒绝的 URL（请求的或重定向的），应用借此区分被拒绝与连接中断：
+
+  ```ts
+  try {
+    await fetch(url);
+  } catch (error) {
+    if (error.code === "ERR_ACCESS_DENIED") console.warn(`not granted: ${error.resource}`);
+    else throw error;
+  }
+  ```
 - **每次重定向都会再次检查。** NSH 自己跟随重定向（最多 20 次），而不交给平台处理，所以获准的主机无法把应用重定向到未获准的主机。
 - 同样的 `network` 授权也适用于远程图片（包括画布中的图片和 `Image.getSize` / `prefetch`）和视频来源。应用自身包中的 `asset:` URI 始终允许。
 - 主机取最后一个 `@` 之后的部分，所以 `https://ok.com@evil.io` 被视为 `evil.io`。
@@ -373,6 +382,7 @@ TSX 的 `fetch` 遵循 Fetch 标准，但在对应用（而不是网页）有意
 - **没有禁止的请求头。** 应用可以设置 `Cookie`、`User-Agent`、`Origin` 等。
 - **`redirect: "manual"`** 返回 3xx 响应本身（带有 `Location` 头），而不是不透明重定向。`redirect: "error"` 遇到重定向时拒绝。
 - **`data:` 和 `blob:` URL** 在本地应答。`URL.createObjectURL(blob)` 生成一个 `blob:` URL，在撤销之前 `fetch` 都可以读取它。
+- **`asset:/` URL** 指应用随附的文件，从应用自身的文件中读取，无需任何能力授权（[运行时读取文件](./images-and-assets.md#运行时读取文件)）。
 - 浏览器专用的选项（`mode`、`credentials`、`cache`、`referrer`、`integrity`、`keepalive`、`priority`）为兼容各种库而被接受。
 
 基于 `fetch`（以及 `AbortController`、`FormData` 和流）构建的库通常无需修改即可使用。没有 `XMLHttpRequest`；原生宿主提供全局 `WebSocket` 和 [`websocket` 模块](../modules/standard-modules.md)，按与 `fetch` 相同的授权检查。

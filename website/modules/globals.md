@@ -8,7 +8,7 @@ order: 15
 
 Besides the ECMAScript standard library, an NSH app's JS environment has a set of standard globals: `fetch` with `Headers`, `Request` and `Response`; the Streams Standard; `URL` and `URLSearchParams`; `TextEncoder` / `TextDecoder`; `Blob`, `File` and `FormData`; `EventTarget`, `Event` and `AbortController`; timers, `requestAnimationFrame` and `console`; and `Intl` for number and date formatting. They are implemented natively in Rust, follow the WHATWG standards, and need no import, so the many JavaScript libraries built on these standards (HTTP clients, URL and encoding helpers, stream utilities) work unchanged.
 
-This page lists every global an app has. These are the TSX environment's: Rust code uses Rust's standard library, crates.io and NSH's services of `nsh_core::ui::prelude` instead (`fetch`, timers, tasks; see [Building with Rust](../docs/rust.md)), named in the table's Rust column. UI is built with [elements](../elements/index.md) and the app's own components, and everything else an app uses comes from the [modules](./index.md) it imports.
+This page lists every global an app has. These are the TSX environment's: Rust code uses Rust's standard library, crates.io and NSH's services of `nsh_core::prelude` instead (`fetch`, timers, tasks; see [Building with Rust](../docs/rust.md)), named in the table's Rust column. UI is built with [elements](../elements/index.md) and the app's own components, and everything else an app uses comes from the [modules](./index.md) it imports.
 
 The TypeScript declarations of all of these are generated into `.nsh/types/nsh/globals.d.ts` (see [Project structure](../docs/project-structure.md)).
 
@@ -98,7 +98,7 @@ requestAnimationFrame(tick);
 ```
 
 > [!TIP]
-> Driving an animation from JS frame by frame runs your code on every frame in QuickJS. For animations of styles and transforms, prefer [nsh/animated](./nsh-animated.md), whose drivers run natively without calling back into JS (see [Animation](../docs/animation.md)).
+> Driving an animation from JS frame by frame runs your code on every frame in QuickJS. For animations of styles and transforms, prefer [`nsh`'s animation API](./nsh.md#animation), whose drivers run natively without calling back into JS (see [Animation](../docs/animation.md)).
 
 ## Base64 and errors
 
@@ -357,7 +357,7 @@ await fetch("https://api.example.com/upload", { method: "POST", body: form });
 /**
  * HTTP through the platform's network stack (NSURLSession,
  * HttpURLConnection), streaming both ways; `data:` and `blob:` URLs are
- * answered locally.
+ * answered locally, and `asset:/` URLs with the app's bundled files.
  */
 function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 
@@ -514,7 +514,7 @@ await fetch("https://api.example.com/upload", {
 - **`redirect: "manual"` delivers the 3xx response itself**, with its status and `Location` header, instead of an opaque filtered response. `"follow"` follows redirects (each hop is checked against the capabilities); `"error"` rejects when the response is a redirect.
 - **A `FormData` body always gets `Content-Type: multipart/form-data; boundary=…`**, even when a `Content-Type` header was set. HTTP libraries often set a default content type and clear it only where they detect a browser; without the boundary the server cannot parse the body.
 - **`credentials`, `cache`, `referrer`, `referrerPolicy`, `integrity`, `keepalive` and `priority`** are validated and kept on the `Request` object, but are not passed to the network stack: caching and cookie handling are those of the platform's stack.
-- **Capabilities.** When the app declares `network` capabilities in `nsh.json` (or the embedding app grants fewer), a request to a host that is not allowed never reaches the network and `fetch` rejects with a `TypeError`. See [Sandbox and capabilities](../docs/sandbox-and-capabilities.md).
+- **Capabilities.** When the app declares `network` capabilities in `nsh.json` (or the embedding app grants fewer), a request to a host that is not allowed never reaches the network and `fetch` rejects with a `TypeError` whose `code` is `"ERR_ACCESS_DENIED"`, `permission` `"network"` and `resource` the URL refused. See [Sandbox and capabilities](../docs/sandbox-and-capabilities.md).
 - **Errors.** Network failures reject with a `TypeError` whose message starts with `Network request failed:`; aborts reject with the signal's `reason`.
 
 See [Networking](../docs/networking.md) for a guide to loading data in components.

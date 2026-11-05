@@ -17,11 +17,19 @@
 //!
 //! On a manual clock (`EngineConfig::clock`) the app's time moves only as
 //! the driver moves it: display frames come at once, one frame's time
-//! apart, while the app asks for them or a native animation runs (so steps
-//! finish animations without waiting for them), [`Headless::wait`] and a
-//! long press move the clock by their time, and [`Headless::run_for`] /
-//! [`Headless::fast_forward`] move it as a test says. What the driver
-//! waits for (a step's quiet, a `waitFor`'s timeout) stays real time.
+//! apart, while the app asks for them or a native animation that ends by
+//! itself runs (so steps finish animations without waiting for them),
+//! [`Headless::wait`] and a long press move the clock by their time, and
+//! [`Headless::run_for`] / [`Headless::fast_forward`] move it as a test
+//! says. A step there settles as soon as the engine says it is idle
+//! ([`EngineControl::flush`]), without waiting for a quiet window unless a
+//! request is in flight or work keeps coming. A wait for what the app shows
+//! ([`Headless::wait_until`], [`Headless::wait_for`]) moves the clock a
+//! display frame at a time, looking after each frame, by its timeout at
+//! most; it also waits that long in real time for work from outside the app.
+//! Native animations that loop forever (a spinner) run in the background on
+//! either clock: their values move with the app's time, and no step or wait
+//! waits for them (nor moves a manual clock for them).
 //!
 //! `nsh test` runs apps this way (feature `js`: [`crate::run_file`]),
 //! printing the batches under their steps with `--trace`; so do Rust tests
@@ -35,6 +43,7 @@ mod live;
 mod menus;
 mod net;
 mod pointer;
+mod speech;
 mod stub;
 
 use std::{
@@ -66,7 +75,8 @@ pub use self::{
     stub::{RecordingNetwork, StubHandler, StubNetwork, StubReply, StubResponse, StubRoute},
 };
 use crate::{
-    screen::{self, Back, Pick, Screen},
+    failure,
+    screen::{Back, Pick, Screen},
     selector::Selector,
 };
 
@@ -82,6 +92,10 @@ const SETTLE: Duration = Duration::from_secs(2);
 const MAX_IDLE: Duration = Duration::from_secs(10);
 /// How far a scroll moves per display frame, in points.
 const SCROLL_STEP: Points = Points(10.0);
+/// On a manual clock: how long a wait looks in real time for batches
+/// between two of its frames, for what the app's clock does not bring (a
+/// response a test's function gives).
+const FRAME_LOOK: Duration = Duration::from_millis(1);
 
 struct ChannelSink {
     batches: Sender<MountBatch>,
@@ -213,6 +227,10 @@ enum Pumped {
     Exited,
 }
 
+/// How soon a press follows the last on the same view to count as its next
+/// click: the platforms' default double-click time.
+const CLICK_INTERVAL: Duration = Duration::from_millis(500);
+
 /// An app on a headless engine ([`start`]) and what it shows ([`Screen`]),
 /// driven by steps: press views, type into inputs, scroll, go back, wait
 /// for what it shows.
@@ -227,8 +245,9 @@ enum Pumped {
 /// A step takes the batches that came since the last one first (they
 /// belong to it), then names itself the step of the batches that follow:
 /// what [`Headless::observe`] sees. Steps that act on the app return once
-/// it rendered nothing for 100 ms and no native animation runs (2 s at
-/// most), and fail when the app threw meanwhile (an exception that
+/// it rendered nothing for 100 ms and no native animation runs that ends
+/// by itself (2 s at most; on a manual clock, once the engine is idle,
+/// [`Headless::settle`]), and fail when the app threw meanwhile (an exception that
 /// escaped a callback, a bundle that did not load, a VM that was stopped)
 /// or asked what only a real platform answers (an image from the
 /// clipboard).
@@ -246,11 +265,27 @@ pub struct Headless {
     errors: Receiver<AppError>,
     /// The app's errors seen while waiting, for the next check.
     seen: Vec<AppError>,
+    /// The modifier keys held down (`keyboard.down`), which presses,
+    /// drags and hovers carry.
+    held: nsh_core::keymap::Modifiers,
+    /// The finger a `dragAndHold` left down, until `drop()`.
+    finger: Option<pointer::Finger>,
     screen: Screen,
     animator: Animator,
     dialogs: Dialogs,
     /// Who answers the picks.
     picks: Picks,
+    /// The color the user picks on the screen ([`Headless::on_screen_color`]).
+    screen_color: Option<nsh_core::Hsla>,
+    /// The paths the user picks in the open dialog
+    /// ([`Headless::on_pick_paths`]).
+    picked_paths: Vec<std::path::PathBuf>,
+    /// The path the user chooses in the save dialog
+    /// ([`Headless::on_pick_save_path`]).
+    save_path: Option<std::path::PathBuf>,
+    /// The recognizer the test speaks into; `None` when the config gave
+    /// its own (`EngineConfig::speech`).
+    speech: Option<speech::FakeSpeech>,
     step: String,
     applied: u64,
     /// The app left (`process.exit`, `Command::ExitApp`): no more batches
@@ -274,6 +309,9 @@ pub struct Headless {
     /// The embedding app's channel with the app (`EngineConfig::host`),
     /// which the test plays.
     host: nsh_engine::HostChannel,
+    /// The last press: its view and when, for counting a double press as
+    /// the platforms do ([`CLICK_INTERVAL`]).
+    last_press: Option<(NodeId, nsh_core::time::Instant, u32)>,
     /// Where the app's `nsh/host` calls go (the web page's host).
     #[cfg(feature = "js")]
     host_calls: Option<HostCalls>,
@@ -281,9 +319,17 @@ pub struct Headless {
 
 impl Headless {
     /// Starts `config`'s app ([`start`]).
-    pub fn start(config: EngineConfig) -> std::io::Result<Headless> {
-        let environment = config.environment;
+    pub fn start(mut config: EngineConfig) -> std::io::Result<Headless> {
+        let speech = config.speech.is_none().then(speech::FakeSpeech::default);
+        if let Some(speech) = &speech {
+            config.speech = Some(Arc::new(speech.clone()));
+        }
         let viewport = config.viewport;
+        // The engine reports this same window (`environment.window = viewport`
+        // at launch). A later `set_environment` has to keep it: the config's
+        // window is still the default, and a zero window collapses a sheet.
+        let mut environment = config.environment;
+        environment.window = viewport;
         let clock = config.clock.clone();
         let host = config.host.clone();
         let Launched {
@@ -299,10 +345,16 @@ impl Headless {
             batches,
             errors,
             seen: Vec::new(),
+            held: nsh_core::keymap::Modifiers::default(),
+            finger: None,
             screen,
             animator: Animator::new(clock.clone()),
             dialogs: Dialogs::Default,
             picks: Picks::Default,
+            screen_color: None,
+            picked_paths: Vec::new(),
+            save_path: None,
+            speech,
             step: "open".to_owned(),
             applied: 0,
             exited: false,
@@ -314,6 +366,7 @@ impl Headless {
             hold: nsh_core::text_hold::TextHold::default(),
             software_keyboard: inset::SoftwareKeyboard::default(),
             host,
+            last_press: None,
             #[cfg(feature = "js")]
             host_calls: None,
         })
@@ -397,7 +450,27 @@ impl Headless {
         self.engine.control().advance_clock(by, move || {
             let _ = tx.send(());
         });
-        let _ = rx.recv_timeout(MAX_IDLE);
+        // A gone engine never moves the clock: the steps that wait for it
+        // to move would wait for good.
+        if let Err(crossbeam_channel::RecvTimeoutError::Disconnected) = rx.recv_timeout(MAX_IDLE) {
+            panic!("the engine stopped (its thread panicked?): the manual clock cannot move");
+        }
+    }
+
+    /// Has the engine run everything sent to it and due now, its batches
+    /// sent ([`EngineControl::flush`]): whether it is idle, nothing left to
+    /// run and no request in flight. False if it took until `deadline`.
+    fn flush(&self, deadline: Instant) -> bool {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        self.engine.control().flush(move |idle| {
+            let _ = tx.send(idle);
+        });
+        match rx.recv_deadline(deadline) {
+            Ok(idle) => idle,
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => false,
+            // A gone engine sends nothing more.
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => true,
+        }
     }
 
     /// One display frame on the manual clock, `by` after the last: the
@@ -418,12 +491,13 @@ impl Headless {
     }
 
     /// Whether, on a manual clock, the app wants frames: it asked for one,
-    /// or a native animation runs.
+    /// or a native animation that ends by itself runs (one looping forever
+    /// would move the clock for as long as the driver waits).
     fn wants_frames(&self) -> bool {
         self.wanted
             .as_ref()
             .is_some_and(|w| w.load(Ordering::Relaxed))
-            || (self.clock.is_manual() && self.animator.running())
+            || (self.clock.is_manual() && self.animator.finishing())
     }
 
     /// Lets the app's time pass by `time`: real time on the system's clock,
@@ -546,6 +620,33 @@ impl Headless {
         self.picks = Picks::Handler(Box::new(handler));
     }
 
+    /// The platform picks colors from the screen
+    /// ([`nsh_core::platform::Environment::screen_color`]), and the user
+    /// picks `color` whenever the app asks (`pick_screen_color`, a
+    /// `ColorEyeDropper`); `None` cancels.
+    pub fn on_screen_color(&mut self, color: Option<nsh_core::Hsla>) -> Result<(), String> {
+        self.screen_color = color;
+        self.set_environment("onScreenColor", |env| env.screen_color = true)
+    }
+
+    /// The platform has file dialogs, a file manager and a trash
+    /// ([`nsh_core::platform::Environment::file_requests`]), and the user
+    /// picks `paths` whenever the app shows the open dialog (`pick_paths`;
+    /// none cancels). Opening, revealing and trashing paths then succeed
+    /// without touching them (trashing says nowhere they went); every
+    /// request is in [`Screen::file_requests`].
+    pub fn on_pick_paths(&mut self, paths: Vec<std::path::PathBuf>) -> Result<(), String> {
+        self.picked_paths = paths;
+        self.set_environment("onPickPaths", |env| env.file_requests = true)
+    }
+
+    /// As [`Headless::on_pick_paths`], for the save dialog
+    /// (`pick_save_path`): the user chooses `path`; `None` cancels.
+    pub fn on_pick_save_path(&mut self, path: Option<std::path::PathBuf>) -> Result<(), String> {
+        self.save_path = path;
+        self.set_environment("onPickSavePath", |env| env.file_requests = true)
+    }
+
     /// Leaves the picks steps ask for to the caller: a step returns with
     /// one asked ([`Headless::pending_pick`]) until [`Headless::answer_pick`]
     /// answers it.
@@ -582,6 +683,44 @@ impl Headless {
         Ok(())
     }
 
+    /// What the app's speech recognition sessions (`Speech.start`) asked
+    /// for so far, in order. Headless apps recognize speech: a session
+    /// listens at once (its `start`), and the test speaks for the user
+    /// ([`Headless::hear`]).
+    pub fn speech_requests(&self) -> Vec<nsh_core::speech::SpeechRequest> {
+        self.speech
+            .as_ref()
+            .map(speech::FakeSpeech::requests)
+            .unwrap_or_default()
+    }
+
+    /// The user says `text` (the whole transcript so far) to the session
+    /// listening, which reports it as a result that is not final; then
+    /// waits until the app is quiet. Fails when no session listens.
+    pub fn hear(&mut self, text: &str) -> Result<(), String> {
+        self.fake_speech()?.hear(text)?;
+        self.done()
+    }
+
+    /// Ends the session listening: with `error` (`no-speech`,
+    /// `not-allowed`, ...), or (`None`) as when the user stops talking: the
+    /// transcript as the final result, then the end (`no-speech` when
+    /// nothing was heard). Then waits until the app is quiet. The app's
+    /// `stop()` ends it the same way.
+    pub fn end_speech(
+        &mut self,
+        error: Option<nsh_core::speech::SpeechError>,
+    ) -> Result<(), String> {
+        self.fake_speech()?.end(error)?;
+        self.done()
+    }
+
+    fn fake_speech(&self) -> Result<speech::FakeSpeech, String> {
+        self.speech
+            .clone()
+            .ok_or_else(|| "the app recognizes speech with EngineConfig::speech".to_owned())
+    }
+
     /// Sends the app's `nsh/host` calls (the root's `Command::HostCall`) to
     /// `calls` as their batches are applied; the environment must say the
     /// platform has a host (`Environment::host`), else the core rejects
@@ -612,7 +751,9 @@ impl Headless {
     }
 
     fn apply(&mut self, batch: &MountBatch) {
+        let focused = self.screen.focused();
         self.screen.apply(batch);
+        self.focus_calls(batch, focused);
         self.exited |= batch.items.iter().any(|item| {
             matches!(
                 item,
@@ -690,6 +831,27 @@ impl Headless {
                 ("opened", PayloadValue::Bool(true)),
             ];
             control.dispatch_event(ROOT_ID, EventKind::OpenUrl, EventPayload::Map(fields));
+        }
+        for id in self.screen.take_screen_colors() {
+            let mut fields = vec![("id", PayloadValue::Number(f64::from(id)))];
+            if let Some(color) = self.screen_color {
+                let packed = nsh_core::Color::from(color).0;
+                fields.push(("color", PayloadValue::Number(f64::from(packed))));
+            }
+            control.dispatch_event(ROOT_ID, EventKind::ScreenColor, EventPayload::Map(fields));
+        }
+        for (id, request) in self.screen.take_file_answers() {
+            use nsh_core::file_dialog::FileRequest;
+            let paths = match request {
+                FileRequest::OpenDialog(_) => self.picked_paths.clone(),
+                FileRequest::SaveDialog(_) => self.save_path.clone().into_iter().collect(),
+                _ => Vec::new(),
+            };
+            control.dispatch_event(
+                ROOT_ID,
+                EventKind::FileRequest,
+                EventPayload::file_answer(id, paths),
+            );
         }
         if self.screen.take_back_asked() {
             self.go_back(false);
@@ -782,7 +944,8 @@ impl Headless {
     }
 
     /// Applies batches until none comes for `quiet` and no native
-    /// animation runs, or for `limit` at most: false if the limit ended it.
+    /// animation that ends by itself runs, or for `limit` at most: false if
+    /// the limit ended it.
     fn quiet(&mut self, quiet: Duration, limit: Duration) -> bool {
         let end = Instant::now() + limit;
         // Frames on a manual clock come at once: the limit is its time too.
@@ -797,7 +960,7 @@ impl Headless {
                 Pumped::Error | Pumped::Exited => return true,
                 Pumped::Timeout => {
                     let now = Instant::now();
-                    if !self.animator.running() && now >= last + quiet {
+                    if !self.animator.finishing() && now >= last + quiet {
                         return true;
                     }
                     if now >= end {
@@ -808,17 +971,66 @@ impl Headless {
         }
     }
 
-    /// Applies batches until none comes for 100 ms and no native animation
-    /// runs, or for 2 s at most (an app updating all the time never goes
-    /// quiet): false if the limit ended it.
+    /// On a manual clock: applies batches until the app is idle, or for
+    /// `limit` at most (of real time, and of the clock's while frames move
+    /// it): false if the limit ended it. Idle is asked, not waited for:
+    /// the engine ran everything sent to it and due now, its batches came
+    /// and were applied, it wants no frame and no native animation that
+    /// ends by itself runs. While a request is in flight (its answer comes
+    /// from elsewhere) or work keeps coming, it waits for the batches to
+    /// stop for [`QUIET`], as on the system's clock.
+    fn idle_on_manual_clock(&mut self, limit: Duration) -> bool {
+        let end = Instant::now() + limit;
+        let clock_end = self.clock.now() + limit;
+        loop {
+            if self.exited || !self.errors.is_empty() {
+                return true;
+            }
+            if self.clock.now() >= clock_end || Instant::now() >= end {
+                return false;
+            }
+            if self.wants_frames() {
+                self.frame(FRAME);
+                self.drain();
+                continue;
+            }
+            let applied = self.applied;
+            let idle = self.flush(end);
+            self.drain();
+            if self.applied != applied || self.wants_frames() || !self.errors.is_empty() {
+                continue;
+            }
+            if idle {
+                return true;
+            }
+            // What comes from elsewhere comes in real time.
+            match self.pump((Instant::now() + QUIET).min(end)) {
+                Pumped::Batch => {}
+                Pumped::Error | Pumped::Exited => return true,
+                // Nothing came for `QUIET` (no frame was wanted).
+                Pumped::Timeout => return Instant::now() < end,
+            }
+        }
+    }
+
+    /// Applies batches until the app is done with a step, or for 2 s at
+    /// most (an app updating all the time never is): false if the limit
+    /// ended it. On the system's clock it is done when no batch came for
+    /// 100 ms and no native animation that ends by itself runs; on a
+    /// manual clock, as soon as the engine says it is idle
+    /// ([`EngineControl::flush`]), without waiting.
     pub fn settle(&mut self) -> bool {
-        self.quiet(QUIET, SETTLE)
+        if self.clock.is_manual() {
+            self.idle_on_manual_clock(SETTLE)
+        } else {
+            self.quiet(QUIET, SETTLE)
+        }
     }
 
     /// The step `idle`: applies batches until none comes for `quiet`, or
     /// for 10 s at most (false then). Long enough, it lets the engine's
-    /// idle collection run (every second at most), so what the app keeps
-    /// alive shows.
+    /// idle collection run (every second at most, after 0.3 s without
+    /// work), so what the app keeps alive shows.
     pub fn idle(&mut self, quiet: Duration) -> Result<bool, String> {
         self.step("idle");
         let quiet = self.quiet(quiet, MAX_IDLE);
@@ -920,7 +1132,11 @@ impl Headless {
     pub fn back(&mut self) -> Result<(), String> {
         self.step("back");
         if !self.go_back(true) {
-            return Err(format!("nothing to go back from; {}", self.on_screen()));
+            return Err(format!(
+                "{}; {}",
+                failure::NOTHING_TO_GO_BACK_FROM,
+                self.on_screen()
+            ));
         }
         self.done()
     }
@@ -985,7 +1201,7 @@ impl Headless {
                 Pumped::Timeout => {
                     if Instant::now() >= deadline {
                         self.check()?;
-                        return Err(format!("the app rendered nothing in {} s", WAIT.as_secs()));
+                        return Err(failure::rendered_nothing(WAIT));
                     }
                 }
             }
@@ -1002,7 +1218,12 @@ impl Headless {
     }
 
     /// Applies batches until `done` holds for the screen, `timeout` at
-    /// most; the error names `what` and the texts on screen.
+    /// most; the error names `what` and the texts on screen. On a manual
+    /// clock the wait moves it, a display frame at a time (the timers due
+    /// run on the way, as [`Headless::run_for`] runs them), looking after
+    /// each frame, by `timeout` at most; it fails once the clock moved that
+    /// far and `timeout` of real time passed too, so what comes from
+    /// outside the app (a route's function, the network) has that long.
     pub fn wait_until(
         &mut self,
         what: &str,
@@ -1010,10 +1231,21 @@ impl Headless {
         done: impl Fn(&Screen) -> bool,
     ) -> Result<(), String> {
         let deadline = Instant::now() + timeout;
+        let clock_end = self.clock.is_manual().then(|| self.clock.now() + timeout);
         self.drain();
         self.check()?;
         while !done(&self.screen) {
-            match self.pump(deadline) {
+            // The clock moves by the timeout at most; then the wait goes on
+            // for what comes from outside the app, until as much real time
+            // passed.
+            let pumped = match clock_end {
+                Some(end) if self.clock.now() < end => {
+                    let left = end.saturating_duration_since(self.clock.now());
+                    self.wait_frame(left.min(FRAME))
+                }
+                _ => self.pump(deadline),
+            };
+            match pumped {
                 Pumped::Batch => {}
                 Pumped::Error => self.check()?,
                 Pumped::Exited => {
@@ -1023,10 +1255,12 @@ impl Headless {
                     ));
                 }
                 Pumped::Timeout => {
-                    if Instant::now() >= deadline {
+                    let over = Instant::now() >= deadline
+                        && clock_end.is_none_or(|end| self.clock.now() >= end);
+                    if over {
                         return Err(format!(
-                            "{what} never happened in {} ms; {}",
-                            timeout.as_millis(),
+                            "{}; {}",
+                            failure::never_happened(what, timeout),
                             self.on_screen()
                         ));
                     }
@@ -1071,13 +1305,59 @@ impl Headless {
         self.check()
     }
 
+    /// What a test polling a condition waits for between looks, as
+    /// [`Headless::wait_until`] waits: on a manual clock, moves it by a
+    /// display frame (`timeout` of the app's time at most) and applies what
+    /// came, giving how far the clock moved; on the system's clock,
+    /// [`Headless::next_change`] (and zero).
+    pub fn next_frame(&mut self, timeout: Duration) -> Result<Duration, String> {
+        if !self.clock.is_manual() {
+            return self.next_change(timeout).map(|()| Duration::ZERO);
+        }
+        // An app that left takes no frame, but the wait's time runs out.
+        let by = timeout.min(FRAME);
+        if !by.is_zero() {
+            self.wait_frame(by);
+        }
+        self.check().map(|()| by)
+    }
+
+    /// On a manual clock: a frame of a wait, `by` after the last, and what
+    /// it brought; then a batch or an error that comes within
+    /// [`FRAME_LOOK`] of real time.
+    fn wait_frame(&mut self, by: Duration) -> Pumped {
+        if self.exited {
+            return Pumped::Exited;
+        }
+        self.frame(by);
+        self.drain();
+        crossbeam_channel::select_biased! {
+            recv(self.errors) -> error => match error {
+                Ok(error) => {
+                    self.seen.push(error);
+                    Pumped::Error
+                }
+                Err(_) => Pumped::Timeout,
+            },
+            recv(self.batches) -> batch => match batch {
+                Ok(batch) => {
+                    self.apply(&batch);
+                    Pumped::Batch
+                }
+                Err(_) => Pumped::Timeout,
+            },
+            default(FRAME_LOOK) => Pumped::Timeout,
+        }
+    }
+
     /// The one view `pick` gave for `selector`, or the error a step on
     /// `what` fails with.
     fn picked(&self, pick: Pick, selector: &str, what: &str) -> Result<NodeId, String> {
         match pick {
             Pick::One(id) => Ok(id),
             Pick::None => Err(format!(
-                "no {what} matches `{selector}`; {}",
+                "{}; {}",
+                failure::not_found(what, selector),
                 self.on_screen()
             )),
             Pick::Many(n) => Err(format!(
@@ -1085,8 +1365,8 @@ impl Headless {
                  a view around it (`id:list >> {selector}`)"
             )),
             Pick::Disabled => Err(format!(
-                "`{selector}` {}; {}",
-                screen::disabled(what),
+                "{}; {}",
+                failure::disabled(selector, what),
                 self.on_screen()
             )),
         }
@@ -1147,6 +1427,9 @@ impl Headless {
                 let view = self.picked(self.screen.view(&parsed), selector, "view")?;
                 self.screen.bounds_in_root(view).map(|b| b.origin + at)
             }
+            // A canvas node's center, else the center of the view the
+            // selector names inside the pressable (a cell's text, a line
+            // number), else the pressable's own center.
             None => self
                 .screen
                 .canvas_node(&parsed)
@@ -1155,9 +1438,22 @@ impl Headless {
                         .bounds_in_root(canvas)
                         .map(|b| b.origin + center)
                 })
+                .or_else(|| {
+                    let local = self.screen.press_point(&parsed, id)?;
+                    self.screen.bounds_in_root(id).map(|b| b.origin + local)
+                })
                 .or_else(|| self.screen.bounds_in_root(id).map(|b| b.center())),
         };
-        let payload = self.press_payload(id, page, modifiers, 1);
+        // A text field that listens to presses takes the focus as a tap does.
+        if self
+            .screen
+            .input(id)
+            .is_some_and(|input| input.config.editable)
+            && self.screen.focused() != Some(id)
+        {
+            self.move_focus(Some(id));
+        }
+        let payload = self.press_payload(id, page, modifiers);
         // The finger, as platforms report it to the views around it that
         // listen to touches (an overlay's `onPressOutside` among them).
         let path = self.screen.touch_path(id);
@@ -1189,18 +1485,36 @@ impl Headless {
     }
 
     /// A press at `page` (in the root) in `view`, else at the view's
-    /// center, in that view and in the root, with `modifiers` held and
-    /// `clicks` its click count. `None` when the view has no bounds.
+    /// center, in that view and in the root, with `modifiers` held.
+    /// Presses on one view within [`CLICK_INTERVAL`] of each other count
+    /// up (`clicks` 2 is a double press), as the platforms count them.
+    /// In a terminal a press gives the stop it is on the focus. `None`
+    /// when the view has no bounds.
     fn press_payload(
-        &self,
+        &mut self,
         view: NodeId,
         page: Option<Point<Points>>,
         modifiers: Modifiers,
-        clicks: u32,
     ) -> EventPayload {
+        let stop = (self.environment.idiom == nsh_core::platform::Idiom::Terminal)
+            .then(|| self.screen.stop_around(view))
+            .flatten();
+        if let Some(stop) = stop {
+            self.move_focus(Some(stop));
+        } else if self.screen.key_focus().is_some_and(|id| id != view) {
+            self.move_focus(None);
+        }
         let Some(bounds) = self.screen.bounds_in_root(view) else {
             return EventPayload::None;
         };
+        let now = self.clock.now();
+        let clicks = match self.last_press {
+            Some((last, at, clicks)) if last == view && now.duration_since(at) < CLICK_INTERVAL => {
+                clicks + 1
+            }
+            _ => 1,
+        };
+        self.last_press = Some((view, now, clicks));
         let page = page.unwrap_or_else(|| bounds.center());
         EventPayload::Press(PressEvent {
             position: page - bounds.origin,
@@ -1232,7 +1546,7 @@ impl Headless {
             Some(_) => id,
             None => span.view,
         };
-        let payload = self.press_payload(holder, page, Modifiers::default(), 1);
+        let payload = self.press_payload(holder, page, Modifiers::default());
         for kind in [EventKind::PressDown, EventKind::PressUp, EventKind::Press] {
             self.send(id, kind, payload.clone());
         }
@@ -1251,7 +1565,7 @@ impl Headless {
         let id = self.picked(pick, selector, "pressable view")?;
         let delay = self.screen.long_press_delay(id).unwrap_or(500.0).max(0.0);
         let page = self.screen.bounds_in_root(id).map(|b| b.center());
-        let payload = self.press_payload(id, page, Modifiers::default(), 1);
+        let payload = self.press_payload(id, page, Modifiers::default());
         let path = self.screen.touch_path(id);
         if !path.is_empty() {
             self.send_touch(id, nsh_core::TouchPhase::Start, path.clone(), None);
@@ -1294,7 +1608,7 @@ impl Headless {
     /// the input `selector` names (the matching view, or the first input
     /// in it; `text:` also matches what an input holds or its
     /// placeholder), over its selection: the end of its text unless the
-    /// app ([`nsh_core::ui::Input::selected_range`], `setSelection`) or a
+    /// app ([`nsh_core::element::Input::selected_range`], `setSelection`) or a
     /// [`Headless::select`] step moved it. As a keyboard does: the input
     /// takes the focus, then each character is a key (`onKeyPress`), an
     /// edit (`onChange`) and the caret after it (`onSelectionChange`); a
@@ -1382,9 +1696,11 @@ impl Headless {
         }
         if self.screen.focused() != Some(id) {
             if let Some(old) = self.screen.focused() {
+                self.set_focused_state(old, false);
                 self.send(old, EventKind::Blur, EventPayload::None);
             }
             self.screen.set_focused(Some(id));
+            self.set_focused_state(id, true);
             self.send(id, EventKind::Focus, EventPayload::None);
             self.sync_keyboard();
         }
@@ -1434,6 +1750,68 @@ impl Headless {
             EventKind::KeyPress,
             EventPayload::Map(vec![("key", PayloadValue::Str(key.to_owned()))]),
         );
+    }
+
+    /// `onKeyPress` of `key` with `m` held.
+    fn key_press_with(&self, id: NodeId, key: &str, m: nsh_core::keymap::Modifiers) {
+        self.send(
+            id,
+            EventKind::KeyPress,
+            EventPayload::Map(vec![
+                ("key", PayloadValue::Str(key.to_owned())),
+                ("altKey", PayloadValue::Bool(m.alt)),
+                ("ctrlKey", PayloadValue::Bool(m.ctrl)),
+                ("metaKey", PayloadValue::Bool(m.cmd)),
+                ("shiftKey", PayloadValue::Bool(m.shift)),
+            ]),
+        );
+    }
+
+    /// The user's edit of input `id`: `from..to` (UTF-16) becomes `text`,
+    /// the caret after it; reported as the text (`onChange`) and the
+    /// caret.
+    fn edit(&mut self, id: NodeId, from: u32, to: u32, text: &str) {
+        let Some(input) = self.screen.input_mut(id) else {
+            return;
+        };
+        input.replace(from, to, text);
+        input.count += 1;
+        let payload = EventPayload::Text {
+            text: input.text.clone(),
+            count: input.count,
+        };
+        // Always reported: the engine keeps the text for layout and for
+        // dropping stale values, whether JS listens or not.
+        self.engine
+            .control()
+            .dispatch_event(id, EventKind::ChangeText, payload);
+        self.report_selection(id);
+    }
+
+    /// The key `c` in input `id`: it replaces the selection (at the caret),
+    /// within `maxLength`.
+    fn key(&mut self, id: NodeId, c: char) {
+        self.key_press(
+            id,
+            &if c == '\n' {
+                "Enter".into()
+            } else {
+                c.to_string()
+            },
+        );
+        let Some(input) = self.screen.input(id) else {
+            return;
+        };
+        let (start, end) = input.selection();
+        let length = (input.len() - (end - start)) as usize + c.len_utf16();
+        if input
+            .config
+            .max_length
+            .is_some_and(|max| length > max as usize)
+        {
+            return;
+        }
+        self.edit(id, start, end, c.encode_utf8(&mut [0; 4]));
     }
 
     /// The step `select(<selector>, <start>, <end>)`: the user selects
@@ -1551,68 +1929,6 @@ impl Headless {
         self.send(id, EventKind::CaretMove, EventPayload::caret(caret));
     }
 
-    /// `onKeyPress` of `key` with `m` held.
-    fn key_press_with(&self, id: NodeId, key: &str, m: nsh_core::keymap::Modifiers) {
-        self.send(
-            id,
-            EventKind::KeyPress,
-            EventPayload::Map(vec![
-                ("key", PayloadValue::Str(key.to_owned())),
-                ("altKey", PayloadValue::Bool(m.alt)),
-                ("ctrlKey", PayloadValue::Bool(m.ctrl)),
-                ("metaKey", PayloadValue::Bool(m.cmd)),
-                ("shiftKey", PayloadValue::Bool(m.shift)),
-            ]),
-        );
-    }
-
-    /// The user's edit of input `id`: `from..to` (UTF-16) becomes `text`,
-    /// the caret after it; reported as the text (`onChange`) and the
-    /// caret.
-    fn edit(&mut self, id: NodeId, from: u32, to: u32, text: &str) {
-        let Some(input) = self.screen.input_mut(id) else {
-            return;
-        };
-        input.replace(from, to, text);
-        input.count += 1;
-        let payload = EventPayload::Text {
-            text: input.text.clone(),
-            count: input.count,
-        };
-        // Always reported: the engine keeps the text for layout and for
-        // dropping stale values, whether JS listens or not.
-        self.engine
-            .control()
-            .dispatch_event(id, EventKind::ChangeText, payload);
-        self.report_selection(id);
-    }
-
-    /// The key `c` in input `id`: it replaces the selection (at the caret),
-    /// within `maxLength`.
-    fn key(&mut self, id: NodeId, c: char) {
-        self.key_press(
-            id,
-            &if c == '\n' {
-                "Enter".into()
-            } else {
-                c.to_string()
-            },
-        );
-        let Some(input) = self.screen.input(id) else {
-            return;
-        };
-        let (start, end) = input.selection();
-        let length = (input.len() - (end - start)) as usize + c.len_utf16();
-        if input
-            .config
-            .max_length
-            .is_some_and(|max| length > max as usize)
-        {
-            return;
-        }
-        self.edit(id, start, end, c.encode_utf8(&mut [0; 4]));
-    }
-
     /// The return key in input `id`.
     fn return_key(&mut self, id: NodeId) {
         let Some(input) = self.screen.input(id) else {
@@ -1631,6 +1947,7 @@ impl Headless {
         self.send(id, EventKind::SubmitEditing, payload);
         if behavior == SubmitBehavior::BlurAndSubmit {
             self.screen.set_focused(None);
+            self.set_focused_state(id, false);
             self.send(id, EventKind::Blur, EventPayload::None);
             self.sync_keyboard();
         }
@@ -1711,6 +2028,7 @@ impl Headless {
             self.display_frame();
         }
         self.send(id, EventKind::ScrollDragEnd, offset(&self.screen));
+        self.animator.scroll_ended(id);
         self.send(id, EventKind::ScrollEnd, offset(&self.screen));
         self.done()
     }
@@ -1766,9 +2084,64 @@ pub fn print_batch(out: &mut dyn Write, step: &str, batch: &MountBatch) {
 
 #[cfg(test)]
 mod tests {
-    use nsh_core::ui::{Root, prelude::*};
+    use nsh_core::{
+        TextLine,
+        element::{Root, input},
+        prelude::*,
+    };
 
     use super::*;
+
+    /// A paragraph with a link and a marked word.
+    #[component]
+    fn Linked() -> impl IntoElement {
+        text("See ")
+            .child(text("the guide").test_id("guide").underline())
+            .child(" or ")
+            .child(text("this").test_id("marked").bg(rgb(0xfde68a)))
+    }
+
+    #[test]
+    fn span_styles_are_read_by_test_id_or_text() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<Linked>())).unwrap();
+        app.first_render().unwrap();
+        let screen = app.screen();
+        assert!(screen.span_style("id:guide").unwrap().decoration.underline);
+        assert_eq!(screen.span_style("id:guide").unwrap().background, None);
+        let marked = screen.span_style("id:marked").unwrap().background.unwrap();
+        assert_eq!(marked.color, nsh_core::Color(0xfde6_8aff));
+        assert_eq!(
+            screen
+                .span_style("text:this")
+                .unwrap()
+                .background
+                .map(|b| b.color),
+            Some(marked.color)
+        );
+    }
+
+    #[component]
+    fn EmptySpans() -> impl IntoElement {
+        text("before ")
+            .child(text("").test_id("middle").underline())
+            .child(text("after").italic())
+            .child(text("").test_id("end").underline())
+            .child(text("").test_id("after"))
+    }
+
+    #[test]
+    fn empty_span_styles_do_not_read_neighbouring_characters() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<EmptySpans>())).unwrap();
+        app.first_render().unwrap();
+        let screen = app.screen();
+        for name in ["id:middle", "id:end", "middle", "end", "id:after", "after"] {
+            assert!(
+                screen.span_style(name).is_err(),
+                "empty span {name} has no first character"
+            );
+        }
+        assert!(screen.span_style("text:after").unwrap().italic);
+    }
 
     /// A count and a button that adds one.
     #[component]
@@ -1811,9 +2184,123 @@ mod tests {
         let mut app = Headless::start(EngineConfig::new(Root::of::<PressPoint>())).unwrap();
         app.first_render().unwrap();
         app.press_at("id:pad", point(px(10.0), px(12.0))).unwrap();
-        app.wait_for("seen: at 10 12 in 10 22").unwrap();
+        app.wait_for("text:seen: at 10 12 in 10 22").unwrap();
         app.press("id:pad").unwrap();
-        app.wait_for("seen: at 40 20 in 40 30").unwrap();
+        app.wait_for("text:seen: at 40 20 in 40 30").unwrap();
+    }
+
+    #[component]
+    fn RetainedLayout() -> impl IntoElement {
+        let count = signal(0_u32);
+        let listener: nsh_core::element::Listener<Bounds<Points>> =
+            (move |_: &Bounds<Points>| count.update(|n| *n += 1)).into();
+        view().child(dynamic(move || {
+            let current = count.get();
+            let width = signal(0.0_f32);
+            view()
+                .w(px(100.0))
+                .h(px(40.0))
+                .on_layout(listener.clone())
+                .on_layout(move |frame: &Bounds<Points>| width.set(frame.size.width.0))
+                .child(text(move || {
+                    format!("count {current} width {}", width.get())
+                }))
+        }))
+    }
+
+    #[test]
+    fn retained_layout_listeners_settle_while_new_runs_learn_the_frame() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<RetainedLayout>())).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("count 1 width 100").unwrap();
+        assert!(!app.shows("count 2 width 100"));
+    }
+
+    /// A box whose layout flips a region in it, whose node keeps its width
+    /// in a signal of the region's run (#448).
+    #[component]
+    fn GrowingBox() -> impl IntoElement {
+        let width = signal(100.0_f32);
+        let wide = signal(false);
+        view()
+            .child(
+                view()
+                    .on_press(move || width.update(|w| *w += 100.0))
+                    .child(text("Grow")),
+            )
+            .child(
+                view()
+                    .w(move || px(width.get()))
+                    .h(px(40.0))
+                    .on_layout(move |b: &Bounds<Points>| wide.set(b.size.width.0 > 150.0))
+                    .child(dynamic(move || {
+                        let is_wide = wide.get();
+                        let size = signal(0.0_f32);
+                        view()
+                            .w_full()
+                            .h(px(20.0))
+                            .on_layout(move |b: &Bounds<Points>| size.set(b.size.width.0))
+                            .child(text(move || format!("wide {is_wide} inner {}", size.get())))
+                    })),
+            )
+    }
+
+    #[test]
+    fn a_region_run_replaced_in_a_layout_pass_misses_its_nodes_layout() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<GrowingBox>())).unwrap();
+        app.first_render().unwrap();
+        app.wait_for("wide false inner 100").unwrap();
+        // The box's layout flips the region before the old node's, from the
+        // same pass, is handed out: its listener, whose `size` went with its
+        // run, no longer runs, and the new run's learns the width.
+        app.press("Grow").unwrap();
+        app.wait_for("wide true inner 200").unwrap();
+    }
+
+    /// A press whose task finishes a turn later, with no time passing.
+    #[component]
+    fn Deferred() -> impl IntoElement {
+        let presses = signal(0_u32);
+        let done = signal(0_u32);
+        view()
+            .child(text(move || format!("Done: {}", done.get())))
+            .child(
+                view()
+                    .on_press(move || presses.update(|p| *p += 1))
+                    .child(text("Go")),
+            )
+            .child(dynamic(move || {
+                let pressed = presses.get();
+                spawn(async move {
+                    timer(Duration::ZERO).await;
+                    done.set(pressed);
+                });
+                view()
+            }))
+    }
+
+    #[test]
+    fn on_a_manual_clock_a_step_returns_once_the_app_is_idle() {
+        const STEPS: u32 = 20;
+        let mut config = EngineConfig::new(Root::of::<Deferred>());
+        config.clock = Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).unwrap();
+        app.first_render().unwrap();
+        assert!(app.shows("Done: 0"));
+        let started = Instant::now();
+        for step in 1..=STEPS {
+            app.press("Go").unwrap();
+            // The task the press started ran before the step returned.
+            assert!(
+                app.shows(&format!("Done: {step}")),
+                "{:?}",
+                app.screen().texts()
+            );
+        }
+        // No step waited for a quiet window: with one each, the steps take
+        // `QUIET` each at least.
+        let took = started.elapsed();
+        assert!(took < QUIET * STEPS, "{took:?}");
     }
 
     #[test]
@@ -1876,9 +2363,9 @@ mod tests {
             ..Default::default()
         };
         app.press_with("Probe", ctrl).unwrap();
-        app.wait_for("ctrl: Some(true)").unwrap();
+        app.wait_for("text:ctrl: Some(true)").unwrap();
         app.press("Probe").unwrap();
-        app.wait_for("ctrl: Some(false)").unwrap();
+        app.wait_for("text:ctrl: Some(false)").unwrap();
     }
 
     /// A paragraph 40 points square under a 10-point strip that shows,
@@ -1926,9 +2413,10 @@ mod tests {
         app.first_render().unwrap();
         app.press_at("id:paragraph", point(px(16.0), px(5.0)))
             .unwrap();
-        app.wait_for("seen: 16 5 in 16 15 at Some(2)").unwrap();
+        app.wait_for("text:seen: 16 5 in 16 15 at Some(2)").unwrap();
         app.press("id:paragraph").unwrap();
-        app.wait_for("seen: 20 20 in 20 30 at Some(8)").unwrap();
+        app.wait_for("text:seen: 20 20 in 20 30 at Some(8)")
+            .unwrap();
     }
 
     /// A paragraph narrower than its text, which shows the lines it was
@@ -1977,10 +2465,10 @@ mod tests {
     fn a_paragraph_reports_its_lines_and_the_offsets_at_points() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<Paragraph>())).unwrap();
         app.first_render().unwrap();
-        app.wait_for("lines: 0..5 abcde y 0.0, 5..10 fghij y 16.8")
+        app.wait_for("text:lines: 0..5 abcde y 0.0, 5..10 fghij y 16.8")
             .unwrap();
         app.press("Find").unwrap();
-        app.wait_for("at: [Some(2), Some(7), Some(10), Some(0)]")
+        app.wait_for("text:at: [Some(2), Some(7), Some(10), Some(0)]")
             .unwrap();
     }
 
@@ -2022,23 +2510,23 @@ mod tests {
         config.environment.os = nsh_core::platform::Os::Linux;
         let mut app = Headless::start(config).unwrap();
         app.first_render().unwrap();
-        app.wait_for("value: abcd").unwrap();
+        app.wait_for("text:value: abcd").unwrap();
         // Typing goes in at the selection, which replaces it.
         app.select("id:field", 1, 3).unwrap();
         app.type_text("id:field", "X").unwrap();
-        app.wait_for("value: aXd").unwrap();
+        app.wait_for("text:value: aXd").unwrap();
         // A Left binding that does not fire in text fields leaves the key
         // to the field: reported, then the caret moves; Shift extends.
         app.press_key("left").unwrap();
         app.press_key("shift+left").unwrap();
         app.press_key("delete").unwrap();
-        app.wait_for("value: Xd").unwrap();
+        app.wait_for("text:value: Xd").unwrap();
         // The undo binding fires in the field, which never sees the key.
         app.press_key("mod+z").unwrap();
         app.press_key("shift+y").unwrap();
-        app.wait_for("value: YXd").unwrap();
+        app.wait_for("text:value: YXd").unwrap();
         app.wait_for(
-            "log: sel 1-3|X|sel 2-2|ArrowLeft|sel 1-1|ArrowLeft+shift|sel 0-1|Delete|Backspace|sel 0-0|undo|Y|sel 1-1",
+            "text:log: sel 1-3|X|sel 2-2|ArrowLeft|sel 1-1|ArrowLeft+shift|sel 0-1|Delete|Backspace|sel 0-0|undo|Y|sel 1-1",
         )
         .unwrap();
     }
@@ -2104,19 +2592,92 @@ mod tests {
         assert_eq!(app.screen().selected("id:cell-b1"), Ok(true));
         assert_eq!(app.screen().selected("id:cell-a1"), Ok(false));
         app.press("id:cell-b1").unwrap();
-        app.wait_for("pressed: 1").unwrap();
+        app.wait_for("text:pressed: 1").unwrap();
         assert!(
             app.shows("touch x: 150 local x: 150"),
             "{:?}",
             app.screen().texts()
         );
         app.press("text:12").unwrap();
-        app.wait_for("pressed: 2").unwrap();
+        app.wait_for("text:pressed: 2").unwrap();
         assert!(
             app.shows("touch x: 50 local x: 50"),
             "{:?}",
             app.screen().texts()
         );
+    }
+
+    /// A toolbar's group of a toggle button, a heading with its level and
+    /// a pagination's current page.
+    #[component]
+    fn Formatting() -> impl IntoElement {
+        let bold = signal(false);
+        view()
+            .child(
+                view()
+                    .role(AccessibilityRole::Group)
+                    .label("Text style")
+                    .child(
+                        view()
+                            .test_id("bold")
+                            .role(AccessibilityRole::Button)
+                            .label("Bold")
+                            .accessibility_state(move || AccessibilityState {
+                                pressed: Some(if bold.get() {
+                                    nsh_core::Checked::True
+                                } else {
+                                    nsh_core::Checked::False
+                                }),
+                                ..AccessibilityState::default()
+                            })
+                            .on_press(move || bold.update(|b| *b = !*b))
+                            .child(text("B")),
+                    ),
+            )
+            .child(
+                text("Details")
+                    .test_id("details")
+                    .role(AccessibilityRole::Header)
+                    .accessibility_level(2_u32),
+            )
+            .child(
+                view()
+                    .role(AccessibilityRole::Navigation)
+                    .label("Pages")
+                    .child(
+                        view()
+                            .test_id("page-2")
+                            .role(AccessibilityRole::Link)
+                            .accessibility_state(AccessibilityState {
+                                current: Some(nsh_core::AccessibilityCurrent::Page),
+                                ..AccessibilityState::default()
+                            })
+                            .child(text("2")),
+                    ),
+            )
+    }
+
+    #[test]
+    fn roles_find_groups_and_states_follow_a_toggle() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<Formatting>())).unwrap();
+        app.first_render().unwrap();
+        let screen = app.screen();
+        assert_eq!(screen.count("role:group[Text style]"), Ok(1));
+        assert_eq!(screen.count("role:navigation[Pages] >> role:link"), Ok(1));
+        assert_eq!(screen.accessibility_level("id:details"), Ok(Some(2)));
+        assert_eq!(
+            screen.accessibility_state("id:page-2").map(|s| s.current),
+            Ok(Some(nsh_core::AccessibilityCurrent::Page))
+        );
+        let pressed = |app: &Headless| {
+            app.screen()
+                .accessibility_state("role:button[Bold]")
+                .map(|s| s.pressed)
+        };
+        assert_eq!(pressed(&app), Ok(Some(nsh_core::Checked::False)));
+        app.press("role:button[Bold]").unwrap();
+        app.wait(Duration::from_millis(50)).unwrap();
+        assert_eq!(pressed(&app), Ok(Some(nsh_core::Checked::True)));
     }
 
     /// The metrics of a line of text in a canvas font.
@@ -2268,7 +2829,7 @@ mod tests {
                 view()
                     .test_id("button")
                     .h(px(40.0))
-                    .on_press(move |_: &()| presses.update(|p| *p += 1))
+                    .on_press(move || presses.update(|p| *p += 1))
                     .on_press_up(move |_: &()| ups.update(|u| *u += 1))
                     .child(text("Button")),
             )
@@ -2323,6 +2884,34 @@ mod tests {
         assert!(app.shows("Refreshes 1"));
         let error = app.drag("Nothing", point(px(1.0), px(1.0))).unwrap_err();
         assert!(error.starts_with("no view matches `Nothing`"), "{error}");
+    }
+
+    /// A list with a refresh indicator of its own, 100 tall.
+    #[component]
+    fn FarPull() -> impl IntoElement {
+        let refreshes = signal(0_u32);
+        view()
+            .flex_1()
+            .child(text(move || format!("Refreshes {}", refreshes.get())))
+            .child(
+                scroll()
+                    .test_id("list")
+                    .flex_1()
+                    .refresh_indicator(Some(px(100.0)))
+                    .on_refresh(move |_: &()| refreshes.update(|r| *r += 1))
+                    .children((0..30).map(|i| view().h(px(50.0)).child(text(format!("Row {i}"))))),
+            )
+    }
+
+    #[test]
+    fn a_pull_refreshes_at_its_threshold() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<FarPull>())).unwrap();
+        app.first_render().unwrap();
+        // 150 points of finger rubber-band to less than 100 (past 64).
+        app.drag("Row 2", point(px(0.0), px(150.0))).unwrap();
+        assert!(app.shows("Refreshes 0"));
+        app.drag("Row 2", point(px(0.0), px(1000.0))).unwrap();
+        app.wait_for("Refreshes 1").unwrap();
     }
 
     /// A shortcut counting its presses, and a field.
@@ -2383,6 +2972,100 @@ mod tests {
         android.wait_for("Palette 1").unwrap();
     }
 
+    /// A card that opens something when pressed, a chart in it that is a
+    /// stop of Tab without taking presses (its arrow key steps while it
+    /// has the focus), and a button.
+    #[component]
+    fn FocusStops() -> impl IntoElement {
+        let opens = signal(0_u32);
+        let presses = signal(0_u32);
+        let steps = signal(0_u32);
+        let focused = signal(false);
+        effect(move || {
+            if focused.get() {
+                on_key("right", move |_| steps.update(|s| *s += 1));
+            }
+        });
+        view()
+            .flex_1()
+            .child(
+                view()
+                    .test_id("card")
+                    .on_press(move || opens.update(|o| *o += 1))
+                    .child(
+                        view()
+                            .test_id("chart")
+                            .h(px(40.0))
+                            .focusable(true)
+                            .on_focus(move || focused.set(true))
+                            .on_blur(move || focused.set(false)),
+                    ),
+            )
+            .child(
+                view()
+                    .test_id("button")
+                    .on_press(move || presses.update(|p| *p += 1))
+                    .child(text("Button")),
+            )
+            .child(text(move || {
+                format!(
+                    "Opens {} presses {} steps {} focused {}",
+                    opens.get(),
+                    presses.get(),
+                    steps.get(),
+                    focused.get()
+                )
+            }))
+    }
+
+    #[test]
+    fn tab_stops_at_a_focusable_view_that_takes_no_presses() {
+        let mut config = EngineConfig::new(Root::of::<FocusStops>());
+        config.environment.os = nsh_core::platform::Os::MacOs;
+        config.environment.idiom = nsh_core::platform::Idiom::Desktop;
+        let mut app = Headless::start(config).unwrap();
+        app.first_render().unwrap();
+        let id = |app: &Headless, s: &str| match app.screen().view(&Selector::parse(s).unwrap()) {
+            crate::screen::Pick::One(id) => id,
+            _ => panic!("{s} is shown"),
+        };
+        let (card, chart, button) = (
+            id(&app, "id:card"),
+            id(&app, "id:chart"),
+            id(&app, "id:button"),
+        );
+        assert_eq!(app.screen().tab_stops(), [card, chart, button]);
+        // In tree order: the card, then the chart inside it.
+        app.press_key("tab").unwrap();
+        assert_eq!(app.screen().key_focus(), Some(card));
+        app.press_key("tab").unwrap();
+        assert_eq!(app.screen().key_focus(), Some(chart));
+        app.wait_for("Opens 0 presses 0 steps 0 focused true")
+            .unwrap();
+        // Return presses nothing there; its keys reach it through the
+        // keymap while it has the focus.
+        app.press_key("enter").unwrap();
+        app.press_key("right").unwrap();
+        app.wait_for("Opens 0 presses 0 steps 1 focused true")
+            .unwrap();
+        app.press_key("tab").unwrap();
+        assert_eq!(app.screen().key_focus(), Some(button));
+        app.wait_for("Opens 0 presses 0 steps 1 focused false")
+            .unwrap();
+        app.press_key("right").unwrap();
+        app.press_key("enter").unwrap();
+        app.wait_for("Opens 0 presses 1 steps 1 focused false")
+            .unwrap();
+        app.press_key("shift+tab").unwrap();
+        assert_eq!(app.screen().key_focus(), Some(chart));
+        app.wait_for("Opens 0 presses 1 steps 1 focused true")
+            .unwrap();
+        // A press on the chart is the card's: being focusable takes none.
+        app.press("id:chart").unwrap();
+        app.wait_for("Opens 1 presses 1 steps 1 focused false")
+            .unwrap();
+    }
+
     #[cfg(feature = "js")]
     #[test]
     fn a_step_fails_when_the_app_throws() {
@@ -2409,6 +3092,51 @@ mod tests {
         app.wait(Duration::from_secs(5)).unwrap();
         assert!(app.screen().sent(&Command::ExitApp));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// Saves to the path the user chooses and shows it in the file manager.
+    #[component]
+    fn SaveAs() -> impl IntoElement {
+        let saved = signal(String::from("none"));
+        view()
+            .child(text(move || format!("Saved {}", saved.get())))
+            .child(text("Save").on_press(move |_: &()| {
+                let dialog = nsh_core::file_dialog::SaveDialog::new().file_name("Untitled.md");
+                let path = pick_save_path(dialog);
+                spawn(async move {
+                    let path = match path.await {
+                        Ok(Some(path)) => path,
+                        Ok(None) => return saved.set("cancelled".into()),
+                        Err(_) => return saved.set("unavailable".into()),
+                    };
+                    let shown = reveal_path(path.clone()).await.is_ok();
+                    saved.set(format!("{} {shown}", path.display()));
+                });
+            }))
+    }
+
+    #[test]
+    fn the_save_dialog_answers_with_the_path_the_test_chose() {
+        use nsh_core::file_dialog::FileRequest;
+        let mut app = Headless::start(EngineConfig::new(Root::of::<SaveAs>())).unwrap();
+        app.first_render().unwrap();
+        // No file dialogs on this platform: unavailable at once.
+        app.press("Save").unwrap();
+        app.wait_for("Saved unavailable").unwrap();
+        assert!(app.screen().file_requests().is_empty());
+        app.on_pick_save_path(None).unwrap();
+        app.press("Save").unwrap();
+        app.wait_for("Saved cancelled").unwrap();
+        app.on_pick_save_path(Some("/docs/a.md".into())).unwrap();
+        app.press("Save").unwrap();
+        app.wait_for("Saved /docs/a.md true").unwrap();
+        let requests = app.screen().file_requests();
+        assert_eq!(requests.len(), 3);
+        assert!(matches!(
+            &requests[1],
+            FileRequest::SaveDialog(save) if save.file_name.as_deref() == Some("Untitled.md")
+        ));
+        assert_eq!(requests[2], FileRequest::RevealPath("/docs/a.md".into()));
     }
 
     /// A read-only field that logs its keys, and an editable field beside it.
@@ -2460,12 +3188,12 @@ mod tests {
         app.press_key("end").unwrap();
         app.press_key("enter").unwrap();
         app.press_key("a").unwrap();
-        app.wait_for("log: ArrowDown|Delete|Home|End|Enter")
+        app.wait_for("text:log: ArrowDown|Delete|Home|End|Enter")
             .unwrap();
         assert_eq!(app.screen().input_text("id:keys"), Ok(Some("")));
         assert_eq!(app.screen().input_text("id:name"), Ok(Some("")));
         app.type_text("id:name", "").unwrap();
-        app.wait_for("name: a").unwrap();
+        app.wait_for("text:name: a").unwrap();
     }
 
     /// Shows the software keyboard's height, an editable field, a read-only
@@ -2493,15 +3221,15 @@ mod tests {
     fn an_editable_field_on_ios_lifts_the_software_keyboard() {
         let mut app = Headless::start(EngineConfig::new(Root::of::<PhoneKeyboard>())).unwrap();
         app.first_render().unwrap();
-        app.wait_for("kb: 0").unwrap();
+        app.wait_for("text:kb: 0").unwrap();
         app.type_text("id:note", "a").unwrap();
-        app.wait_for("kb: 336").unwrap();
+        app.wait_for("text:kb: 336").unwrap();
         app.press("Lock").unwrap();
-        app.wait_for("kb: 0").unwrap();
+        app.wait_for("text:kb: 0").unwrap();
         app.type_text("id:note", "b").unwrap();
-        app.wait_for("kb: 336").unwrap();
+        app.wait_for("text:kb: 336").unwrap();
         app.press("Done").unwrap();
-        app.wait_for("kb: 0").unwrap();
+        app.wait_for("text:kb: 0").unwrap();
     }
 
     #[test]
@@ -2510,9 +3238,9 @@ mod tests {
         config.environment.os = nsh_core::platform::Os::Android;
         let mut app = Headless::start(config).unwrap();
         app.first_render().unwrap();
-        app.wait_for("kb: 0").unwrap();
+        app.wait_for("text:kb: 0").unwrap();
         app.type_text("id:note", "a").unwrap();
-        app.wait_for("kb: 336").unwrap();
+        app.wait_for("text:kb: 336").unwrap();
     }
 
     #[test]
@@ -2523,7 +3251,7 @@ mod tests {
         let mut app = Headless::start(config).unwrap();
         app.first_render().unwrap();
         app.type_text("id:note", "a").unwrap();
-        app.wait_for("kb: 0").unwrap();
+        app.wait_for("text:kb: 0").unwrap();
     }
 
     #[test]
@@ -2532,9 +3260,9 @@ mod tests {
         app.set_software_keyboard(px(280.0));
         app.first_render().unwrap();
         app.type_text("id:note", "a").unwrap();
-        app.wait_for("kb: 280").unwrap();
+        app.wait_for("text:kb: 280").unwrap();
         app.press("Done").unwrap();
-        app.wait_for("kb: 0").unwrap();
+        app.wait_for("text:kb: 0").unwrap();
     }
 
     /// An editable field and a press that focuses nothing.
@@ -2568,7 +3296,7 @@ mod tests {
         app.arm_text();
         app.press_key("a").unwrap();
         app.type_text("id:name", "").unwrap();
-        app.wait_for("name: a").unwrap();
+        app.wait_for("text:name: a").unwrap();
         assert_eq!(app.screen().input_text("id:name"), Ok(Some("a")));
 
         let mut dropped = open_held();
@@ -2577,7 +3305,7 @@ mod tests {
         dropped.press_key("a").unwrap();
         dropped.press_key("escape").unwrap();
         dropped.type_text("id:name", "z").unwrap();
-        dropped.wait_for("name: z").unwrap();
+        dropped.wait_for("text:name: z").unwrap();
         assert_eq!(dropped.screen().input_text("id:name"), Ok(Some("z")));
 
         let mut pressed = open_held();
@@ -2586,7 +3314,7 @@ mod tests {
         pressed.press_key("a").unwrap();
         pressed.press("Drop").unwrap();
         pressed.type_text("id:name", "z").unwrap();
-        pressed.wait_for("name: z").unwrap();
+        pressed.wait_for("text:name: z").unwrap();
         assert_eq!(pressed.screen().input_text("id:name"), Ok(Some("z")));
 
         let mut inactive = open_held();
@@ -2595,7 +3323,7 @@ mod tests {
         inactive.press_key("a").unwrap();
         inactive.deactivate();
         inactive.type_text("id:name", "z").unwrap();
-        inactive.wait_for("name: z").unwrap();
+        inactive.wait_for("text:name: z").unwrap();
         assert_eq!(inactive.screen().input_text("id:name"), Ok(Some("z")));
     }
 
@@ -2610,7 +3338,7 @@ mod tests {
         app.press_key("a").unwrap();
         app.fast_forward(std::time::Duration::from_secs(3)).unwrap();
         app.type_text("id:name", "z").unwrap();
-        app.wait_for("name: z").unwrap();
+        app.wait_for("text:name: z").unwrap();
         assert_eq!(app.screen().input_text("id:name"), Ok(Some("z")));
     }
 }

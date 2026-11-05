@@ -1,21 +1,23 @@
 import { cleanup, mount, signal, Text, View } from "nsh";
-import { reduceMotion } from "nsh/accessibility";
+import { reduceMotion } from "nsh";
 import { Button, Progress, Switch } from "nsh/base";
-import { desktop, focusRing, hoverFill, Log, Panel, size, Split, ui } from "./palette";
+import { button, buttonText, desktop, focusRing, hoverFill, Log, Panel, size, Split, ui } from "./palette";
 
 // The parts: geometry and motion in classes, colors from the palette. The
 // label row comes first (`flex-col-reverse`: the children follow the track),
 // its value tabular and at the trailing edge. An indeterminate indicator is a
 // third of the track that sweeps from end to end (the app flips its
 // translation, a transition moves it), and rests in the middle with reduced
-// motion; the pointer's hover and the keyboard's focus ring come from the
-// palette. Buttons are as wide as their labels with a pointer.
+// motion. A determinate one is the whole track, slid back by what is left to
+// do, so a new value glides there (the track clips it). The pointer's hover
+// and the keyboard's focus ring come from the palette. Buttons are as wide as
+// their labels with a pointer.
 const pad = desktop ? "px-3 py-3" : "px-4 py-4";
 const track = "h-1.5 overflow-hidden rounded-full";
 const SWEEP = 800;
 const indicator = (indeterminate: boolean, end: boolean) =>
   !indeterminate
-    ? "h-full rounded-full"
+    ? "h-full w-full rounded-full transition-transform duration-180 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none"
     : reduceMotion()
       ? "h-full w-1/3 rounded-full translate-x-full"
       : `h-full w-1/3 rounded-full transition-transform duration-700 ease-in-out ${end ? "translate-x-[200%]" : "translate-x-0"}`;
@@ -29,7 +31,7 @@ function Transfer(props: { label: string; detail: string; value: number; indeter
       trackClass={track}
       trackStyle={ui().inset}
       indicatorClass={indicator(!!props.indeterminate, props.end)}
-      indicatorStyle={{ backgroundColor: ui().accent }}
+      indicatorStyle={{ backgroundColor: ui().accent, translate: props.indeterminate ? undefined : `${props.value - 100}% 0` }}
     >
       <View class="flex-row items-baseline gap-3">
         <View style={{ flex: 1, gap: 2 }}>
@@ -49,12 +51,9 @@ function Action(props: { label: string; disabled?: boolean; onPress: () => void 
     <Button
       onPress={props.onPress}
       disabled={props.disabled}
-      class="items-center justify-center rounded-lg border px-3 active:opacity-70 disabled:opacity-40"
-      style={{ height: size.control, flex: desktop ? undefined : 1, borderColor: ui().border }}
-      hoverStyle={props.disabled ? undefined : hoverFill()}
-      focusStyle={focusRing()}
+      {...button("secondary", { style: desktop ? {} : { flex: 1 } })}
     >
-      <Text style={{ fontSize: desktop ? 13 : 15, fontWeight: "600", color: ui().text }}>{props.label}</Text>
+      <Text style={buttonText()}>{props.label}</Text>
     </Button>
   );
 }
@@ -117,10 +116,10 @@ function App() {
               </View>
               <Switch
                 checked={unknown()}
-                onChange={(next) => {
-                  unknown.set(next);
-                  if (next) stop();
-                  log(next ? "Size unknown: indeterminate" : "Size known: value " + sent());
+                onChange={({ checked }) => {
+                  unknown.set(checked);
+                  if (checked) stop();
+                  log(checked ? "Size unknown: indeterminate" : "Size known: value " + sent());
                 }}
                 class={`-mx-2 flex-row-reverse items-center justify-between gap-3 rounded-lg px-2 ${desktop ? "py-1" : "py-2"} active:opacity-70`}
                 hoverStyle={hoverFill()}

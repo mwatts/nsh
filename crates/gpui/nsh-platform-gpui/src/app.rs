@@ -11,7 +11,7 @@ use std::{
 
 use gpui::{
     App as GpuiApp, AppContext, Context, Entity, FocusHandle, Focusable, InteractiveElement,
-    IntoElement, ParentElement, Render, Styled, Window,
+    IntoElement, ParentElement, Render, Styled, Window, prelude::FluentBuilder as _,
 };
 use nsh_base::{Theme, ThemeError};
 use nsh_core::platform::{Appearance, Locale};
@@ -59,11 +59,11 @@ fn bind_keys(cx: &mut GpuiApp) {
     ]);
 }
 
-static UI_SETS: RwLock<Option<Vec<nsh_core::ui::Registry>>> = RwLock::new(None);
+static UI_SETS: RwLock<Option<Vec<nsh_core::element::Registry>>> = RwLock::new(None);
 
 /// Sets the UI sets every engine serves (default: `nsh/base`); an app
 /// with Rust components of its own calls this before [`run_app`].
-pub fn set_ui_sets(sets: Vec<nsh_core::ui::Registry>) {
+pub fn set_ui_sets(sets: Vec<nsh_core::element::Registry>) {
     *UI_SETS.write().unwrap_or_else(|e| e.into_inner()) = Some(sets);
 }
 
@@ -88,7 +88,7 @@ pub(crate) fn root() -> Option<Root> {
 }
 
 /// The UI sets engines serve.
-pub(crate) fn ui_sets() -> Vec<nsh_core::ui::Registry> {
+pub(crate) fn ui_sets() -> Vec<nsh_core::element::Registry> {
     UI_SETS
         .read()
         .unwrap_or_else(|e| e.into_inner())
@@ -151,7 +151,7 @@ pub struct AppOptions {
     pub storage: Option<Arc<dyn nsh_engine::StorageBackend>>,
     /// What the embedding app gives the engines of the views made with
     /// these options ([`nsh_engine::EngineConfig::context`]): its UI sets'
-    /// functions read it with `nsh_core::ui::engine_context`, so each view
+    /// functions read it with `nsh_core::element::engine_context`, so each view
     /// reaches its own part of the embedding app.
     pub context: nsh_engine::EngineContext,
     /// The UI sets the engines of the views made with these options serve,
@@ -159,12 +159,17 @@ pub struct AppOptions {
     /// a view it trusts less (a preview of a module someone else wrote,
     /// say) only the sets that view may reach. A set that is not here does
     /// not exist for the app the view runs. `None` serves the process's.
-    pub ui_sets: Option<Vec<nsh_core::ui::Registry>>,
+    pub ui_sets: Option<Vec<nsh_core::element::Registry>>,
     /// The embedding app's channel with the apps the view runs
     /// (`nsh/host`): their launch parameters, events to them and handlers of
     /// their calls and posts ([`AppView::host`]). One for every app the view
     /// loads; a new one by default.
     pub host: nsh_engine::HostChannel,
+    /// A see-through window: the view draws no window background and
+    /// [`open_app_window`] asks for a transparent one, so what the app
+    /// leaves unpainted shows what is behind the window (desktop widgets,
+    /// overlays). False by default.
+    pub transparent: bool,
 }
 
 impl Default for AppOptions {
@@ -185,6 +190,7 @@ impl Default for AppOptions {
             context: Default::default(),
             ui_sets: None,
             host: nsh_engine::HostChannel::default(),
+            transparent: false,
         }
     }
 }
@@ -286,6 +292,7 @@ impl AppView {
         bind_keys(cx);
         let surface = Surface::new(initial_environment());
         surface.appearance.set(options.appearance);
+        surface.transparent.set(options.transparent);
         if options.fps {
             *surface.stats.borrow_mut() = Some(Default::default());
         }
@@ -337,6 +344,7 @@ impl AppView {
             trace: options.trace,
             network: Some(nsh_engine::net::network()),
             websocket: None,
+            refuse_connections: None,
             filesystem: None,
             assets: Some(Arc::new(AssetReader(options.asset_base.clone()))),
             environment: self.surface.environment.get(),
@@ -354,6 +362,7 @@ impl AppView {
             clipboard: None,
             host: options.host.clone(),
             picker: self.picker.borrow().clone(),
+            speech: None,
         };
         crate::image::set_asset_base(&self.surface, options.asset_base.clone());
         self.surface
@@ -527,7 +536,7 @@ impl AppView {
 
     /// The embedding app's text size relative to the default (1.0), which
     /// stands in for the user's: every text that allows font scaling (texts,
-    /// inputs, the components' labels, alerts and toasts) is laid out again
+    /// inputs, the components' labels and alerts) is laid out again
     /// at it, and `fontScale()` reads it, at once and for every app loaded
     /// later. Lengths stay as they are (spacing, sizes, radii, `rem`):
     /// boxes sized by their text grow with it. `None` follows the system's
@@ -567,6 +576,37 @@ impl AppView {
 
     pub(crate) fn surface(&self) -> &Rc<Surface> {
         &self.surface
+    }
+
+    /// Files dragged in from another application moved over the window
+    /// (`render`'s drop layer, [`crate::file_drop`]).
+    fn drag_files(
+        &mut self,
+        event: &gpui::DragMoveEvent<gpui::ExternalPaths>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (x, y) = self.root_point(event.event.position);
+        crate::file_drop::update(&self.surface, x, y);
+        crate::rt::flush(cx);
+    }
+
+    /// Files dragged in from another application were dropped.
+    fn drop_files(
+        &mut self,
+        paths: &gpui::ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (x, y) = self.root_point(window.mouse_position());
+        crate::file_drop::perform(&self.surface, x, y, paths.paths());
+        crate::rt::flush(cx);
+    }
+
+    /// A window point in the surface's root points.
+    fn root_point(&self, position: gpui::Point<gpui::Pixels>) -> (f32, f32) {
+        let (ox, oy) = self.surface.origin.get();
+        (f32::from(position.x) - ox, f32::from(position.y) - oy)
     }
 
     /// Tab: the surface's next text field; past its last one, the window's
@@ -798,6 +838,16 @@ impl Render for AppView {
         let surface = crate::dev::wrap(self, surface.into_any_element(), cx);
         // The window's chrome (title bar, menu bar) goes around the surface.
         let content = crate::chrome::render(&self.surface, surface, window, cx);
+        let dragging = cx.has_active_drag();
+        // A file drag that left the window, or ended without a drop, leaves
+        // its destination (GPUI redraws the window as it ends).
+        if !dragging && crate::file_drop::take_needs_clear(&self.surface) {
+            let surface = self.surface.clone();
+            cx.defer(move |cx| {
+                crate::file_drop::clear(&surface);
+                crate::rt::flush(cx);
+            });
+        }
         // The div registers the view's tab stop, which only GPUI's own
         // elements can.
         gpui::div()
@@ -807,6 +857,21 @@ impl Render for AppView {
             .on_action(cx.listener(Self::focus_prev))
             .size_full()
             .child(content)
+            // While something is dragged, a layer over the surface follows
+            // and takes files from other applications: the surface's hitbox
+            // blocks the mouse for the elements behind it, this div included.
+            // GPUI does not tell what is dragged, so the layer comes with any
+            // drag; it listens only to `ExternalPaths`, and its hitbox does
+            // not block the mouse, so the surface under it stays hovered.
+            .when(dragging, |div| {
+                div.child(
+                    gpui::div()
+                        .absolute()
+                        .inset_0()
+                        .on_drag_move(cx.listener(Self::drag_files))
+                        .on_drop(cx.listener(Self::drop_files)),
+                )
+            })
     }
 }
 
@@ -822,6 +887,7 @@ fn initial_environment() -> Environment {
             Os::Linux
         },
         idiom: Idiom::Desktop,
+        file_requests: true,
         ..Environment::default()
     }
 }
@@ -849,6 +915,11 @@ pub fn open_app_window(
         // run at the display's rate wherever the keyboard is, as in the
         // other backends.
         inactive_frame_interval: None,
+        window_background: if options.transparent {
+            gpui::WindowBackgroundAppearance::Transparent
+        } else {
+            gpui::WindowBackgroundAppearance::Opaque
+        },
         ..Default::default()
     };
     let handle = cx.open_window(window_options, move |window, cx| {

@@ -1,7 +1,7 @@
 ---
 title: Overlay
 description: "The Overlay element: content shown on top of the screen whatever clips its parent, laid out as a fixed box or placed against an anchor that it follows, with presses outside and Escape reported."
-order: 10.5
+order: 100
 group: primitives
 demo: el-overlay
 ---
@@ -16,7 +16,7 @@ menus, tooltips and sheets are built on it; [`nsh/base`](../modules/nsh-base.md)
 use to build your own.
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn more_button() -> impl IntoElement {
     let open = signal(false);
@@ -49,11 +49,11 @@ fn more_button() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { Overlay, signal, Text, View, type YNode } from "nsh";
+import { Overlay, signal, Text, View, type ViewRef } from "nsh";
 
 function MoreButton() {
   const open = signal(false);
-  let anchor: YNode | undefined;
+  let anchor: ViewRef | undefined;
   return (
     <View>
       <View ref={anchor} onPress={() => open.set(!open())} class="px-3 py-2">
@@ -78,7 +78,7 @@ function MoreButton() {
 }
 ```
 
-`Overlay` comes from `nsh` in TSX and `overlay()` from `nsh_core::ui::prelude` in Rust. It is shown while it is in the
+`Overlay` comes from `nsh` in TSX and `overlay()` from `nsh_core::prelude` in Rust. It is shown while it is in the
 view: put it in an `If` (Rust: `when(..)`) to open and close it. Overlays shown later are on top of earlier ones, and
 an overlay inside another is on top of it.
 
@@ -130,7 +130,7 @@ both: that is how [Sheet](./sheet.md) and the phone presentation of [Popover](./
 
 | Prop | Rust | Type | Default | Description |
 |---|---|---|---|---|
-| `anchor` | `.anchor(&element_ref)`, `.anchor_point(point)`, `.anchor_bounds(bounds)` | `YNode \| Point \| Bounds \| null` | none | The view, the point or the box it is placed against. Without one it is a fixed box of its root view. |
+| `anchor` | `.anchor(&element_ref)`, `.anchor_point(point)`, `.anchor_bounds(bounds)` | `ViewRef \| Point \| Bounds \| null` | none | The view, the point or the box it is placed against. Without one it is a fixed box of its root view. |
 | `placement` | `.placement(..)` | `"top" \| "bottom" \| "left" \| "right"` | `"bottom"` | The side of the anchor it goes on. |
 | `align` | `.align(..)` | `"start" \| "center" \| "end"` | `"center"` | How it lines up with the anchor along that side. |
 | `offset` | `.offset(px(..))` | `number` | `0` | The gap between the anchor and the overlay. |

@@ -6,10 +6,7 @@
 use std::{sync::LazyLock, time::Duration};
 
 use crossbeam_channel::Receiver;
-use nsh_core::{
-    ApproxTextEngine, MountBatch, Size,
-    ui::{Registry, prelude::*},
-};
+use nsh_core::{ApproxTextEngine, MountBatch, Size, element::Registry, prelude::*};
 use nsh_engine::{Bundle, Engine, EngineConfig, EngineContext, Environment};
 use tokio::sync::watch;
 
@@ -44,15 +41,32 @@ impl Host {
         NOTE.send_replace(note);
     }
 
-    /// Calls `on` with the host's note now and on every change.
-    pub(crate) async fn subscribe(on: Callback<String>) {
-        let mut notes = NOTE.subscribe();
-        loop {
-            on.post(notes.borrow_and_update().clone());
-            if notes.changed().await.is_err() {
-                return;
-            }
+    /// Calls `listener` with the host's note now and on every change
+    /// (`change`), until the returned function is called or what called
+    /// `on` goes.
+    pub(crate) fn on(
+        event: String,
+        listener: Callback<String>,
+        cx: CallCx<'_>,
+    ) -> Result<Stop, String> {
+        if event != "change" {
+            return Err(format!("no Host event `{event}`"));
         }
+        let listener = std::rc::Rc::new(std::cell::RefCell::new(Some(listener)));
+        let held = listener.clone();
+        cx.start(async move {
+            let mut notes = NOTE.subscribe();
+            loop {
+                let Some(listener) = held.borrow().clone() else {
+                    return;
+                };
+                listener.post(notes.borrow_and_update().clone());
+                if notes.changed().await.is_err() {
+                    return;
+                }
+            }
+        });
+        Ok(Stop::new(move || drop(listener.take())))
     }
 }
 
@@ -131,6 +145,7 @@ fn start(
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Environment::default(),
@@ -147,6 +162,7 @@ fn start(
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -155,7 +171,7 @@ fn start(
 }
 
 const CALLS: &str = r#"import { mount, signal, Text } from "nsh";
-import { nativeModule } from "nsh/native";
+import { nativeModule } from "nsh";
 
 interface HostApi {
   quote(symbol: string): number;
@@ -171,7 +187,7 @@ setTimeout(async () => {
   lines.push(String(await Host.later(21)));
   lines.push(String(nativeModule("host/test") === nativeModule("host/test")));
   try { nativeModule("host/none"); } catch (e) { lines.push(`${e.name}: ${e.message}`); }
-  try { nativeModule("nsh/device"); } catch (e) { lines.push(e.name); }
+  try { nativeModule("nsh/mobile"); } catch (e) { lines.push(e.name); }
   shown.set(`done ${lines.join("|")}`);
 }, 0);
 
@@ -190,7 +206,7 @@ fn an_app_calls_the_functions_its_host_registered_by_name() {
 }
 
 const ALONE: &str = r#"import { mount, Text } from "nsh";
-import { nativeModule } from "nsh/native";
+import { nativeModule } from "nsh";
 
 let shown = "done";
 try { nativeModule("host/test"); } catch (e) { shown = `done ${e.message}`; }
@@ -208,16 +224,16 @@ fn an_app_whose_host_registered_nothing_hears_which_specifier_is_missing() {
 }
 
 const SYNC: &str = r#"import { mount, signal, Text } from "nsh";
-import { nativeModule } from "nsh/native";
+import { nativeModule } from "nsh";
 
 interface HostApi {
   publish(note: string): void;
-  subscribe(on: (note: string) => void): Promise<void>;
+  on(event: "change", listener: (note: string) => void): () => void;
 }
 const { Host } = nativeModule<{ Host: HostApi }>("host/test");
 
 const note = signal("");
-Host.subscribe((n) => note.set(n));
+Host.on("change", (n) => note.set(n));
 // The first engine publishes; both hear it, as they hear the host's own.
 if (globalThis.publisher) setTimeout(() => Host.publish("from A"), 20);
 
@@ -225,7 +241,7 @@ mount(() => <Text>{`note ${note()}`}</Text>);
 "#;
 
 #[test]
-fn the_host_pushes_its_data_to_every_app_that_subscribed() {
+fn the_host_pushes_its_data_to_every_app_that_listens() {
     let (_a, a) = start(
         &SYNC.replace("globalThis.publisher", "true"),
         vec![registry()],
@@ -246,7 +262,7 @@ fn the_host_pushes_its_data_to_every_app_that_subscribed() {
 }
 
 const WHOSE: &str = r#"import { mount, signal, Text } from "nsh";
-import { nativeModule } from "nsh/native";
+import { nativeModule } from "nsh";
 
 interface WhoseApi {
   now(): string;

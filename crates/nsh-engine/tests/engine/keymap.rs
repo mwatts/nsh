@@ -48,6 +48,7 @@ fn start(app: &str) -> (Engine, Receiver<MountBatch>) {
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Environment {
@@ -67,6 +68,7 @@ fn start(app: &str) -> (Engine, Receiver<MountBatch>) {
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -111,7 +113,7 @@ fn press(engine: &Engine, keymap: &Keymap, keystroke: &str, editing: bool) {
 }
 
 const APP: &str = r#"import { mount, signal, Text } from "nsh";
-import { keymap } from "nsh/keymap";
+import { keymap } from "nsh";
 
 const log = signal("");
 const say = (s: string) => log.set(s);
@@ -122,11 +124,11 @@ for (const k of ["cmd+kk", "mod+q"]) {
 }
 say(errors.join(" | "));
 
-keymap.bind("mod+k", (k) => say(`k ${k}`));
-keymap.bind({ "mod+s": (k) => say(`saved ${k}`), "escape": (k) => say(`esc ${k}`) }, { when: "always" });
+keymap.bind("mod+k", ({ keystroke: k }) => say(`k ${k}`));
+keymap.bind({ "mod+s": ({ keystroke: k }) => say(`saved ${k}`), "escape": ({ keystroke: k }) => say(`esc ${k}`) }, { when: "always" });
 keymap.bind("alt+down", () => {}, { repeat: true });
 // Any case; the handler gets the keystroke as written.
-keymap.bind("Mod+Shift+J", (k) => say(`written ${k}`));
+keymap.bind("Mod+Shift+J", ({ keystroke: k }) => say(`written ${k}`));
 
 function Panel() {
   keymap.bind("mod+p", () => say("panel"));
@@ -183,7 +185,7 @@ fn key_commands_run_their_handlers() {
 }
 
 const UNBIND: &str = r#"import { mount, signal, Text } from "nsh";
-import { keymap } from "nsh/keymap";
+import { keymap } from "nsh";
 
 const panel = signal(true);
 const off = keymap.bind("mod+k", () => {});
@@ -224,7 +226,7 @@ fn bindings_go_when_unbound_and_with_their_component() {
 fn js_and_view(view_first: bool) -> String {
     format!(
         r#"import {{ mount, signal, Text }} from "nsh";
-import {{ keymap }} from "nsh/keymap";
+import {{ keymap }} from "nsh";
 import {{ Shortcut }} from "test/ui";
 
 const VIEW_FIRST = {view_first};

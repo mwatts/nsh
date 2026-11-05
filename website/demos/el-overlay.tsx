@@ -1,5 +1,5 @@
-import { mount, Overlay, signal, Text, View, type YNode } from "nsh";
-import { desktop, Inspector, Panel, Segmented, size, Stage, ui, wide } from "./palette";
+import { mount, Overlay, signal, Text, View, type ViewRef } from "nsh";
+import { button, buttonText, desktop, Inspector, Panel, Segmented, Stage, ui, wide } from "./palette";
 
 type Placement = "top" | "bottom" | "left" | "right";
 type Align = "start" | "center" | "end";
@@ -10,7 +10,7 @@ function App() {
   const align = signal<Align>("center");
   const position = signal("—");
   const closed = signal("—");
-  let anchor: YNode | undefined;
+  let anchor: ViewRef | undefined;
 
   const placements = () => (
     <Segmented
@@ -41,16 +41,9 @@ function App() {
         <View
           ref={anchor}
           onPress={() => open.set(!open())}
-          activeStyle={{ opacity: 0.7 }}
-          style={{
-            ...ui().accentFill,
-            borderRadius: desktop ? 8 : 10,
-            paddingHorizontal: desktop ? 14 : 18,
-            height: desktop ? size.control : 40,
-            justifyContent: "center",
-          }}
+          {...button("accent", { align: "center" })}
         >
-          <Text style={{ fontSize: desktop ? 14 : 15, fontWeight: "600", color: ui().onAccent }}>{open() ? "Close" : "Open"}</Text>
+          <Text style={buttonText("accent")}>{open() ? "Close" : "Open"}</Text>
         </View>
         <If when={open()}>
           <Overlay

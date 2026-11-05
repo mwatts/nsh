@@ -11,7 +11,7 @@ demo: guide-tailwind
 NSH's styles follow Tailwind CSS 4. In Rust, Tailwind's utilities are typed style methods with the same names and values (`.p_4()` is `p-4`, `.rounded_2xl()` is `rounded-2xl`, `ZINC.shade(900)` is `zinc-900`); in TSX, every element accepts the classes themselves in `class`, resolved natively against Tailwind 4's default theme. Each example below shows the typed methods first and the classes second:
 
 ```rust tabs
-use nsh_core::ui::palette::ZINC;
+use nsh_core::element::palette::ZINC;
 
 view()
     .flex_row()
@@ -67,10 +67,10 @@ How conflicts resolve:
 
 1. **Later classes win** over earlier ones in the same string: `"p-2 p-4"` is `p-4`. There is no need for `tailwind-merge`: a component can append the `class` its caller passes. Later methods win in Rust too.
 2. **Variant classes apply after plain ones**, ordered by Tailwind's variant order (`hover:` before `active:`, `max-*:` widest first, breakpoints ascending, `dark:` last), whatever their position in the string. As in Tailwind, a class's highest variant decides, then its next highest, and a class with one more variant comes later: `dark:hover:bg-a dark:bg-b` is `bg-a` while hovered in dark mode, and `max-md:p-2 max-lg:p-4` is `p-2` below `md`. As in CSS, `odd:bg-a last:bg-b` gives an odd last row `bg-a`, because Tailwind sorts `odd` after `last`.
-3. **`style` wins over classes.**
+3. **`style` wins over classes.** A style key is the CSS property of its name, the one the classes set, so it replaces only that property: `style={{ paddingLeft: 8 }}` replaces `pl-4` and keeps `pr-4`.
 4. `!` makes a class important: `!p-0`.
 
-Rust components (`SafeAreaView`, `KeyboardAvoidingView` and those of an app's own crate) accept `class` and `classList` from TSX too; your classes are merged after the component's own styles and win at equal rank.
+Rust components (`nsh/base`'s and those of an app's own crate) accept `class` and `classList` from TSX too; your classes are merged after the component's own styles and win at equal rank.
 
 ## Variants
 
@@ -79,12 +79,16 @@ Rust components (`SafeAreaView`, `KeyboardAvoidingView` and those of an app's ow
 | `active:` | The view is pressed | `.active(\|s\| ..)` |
 | `hover:` | A pointer is over the view (iPad and Mac pointers) | `.hover(\|s\| ..)` |
 | `focus:`, `focus-visible:` | An input has focus | `.focus(\|s\| ..)` |
-| `focus-within:` | The view or a descendant has focus | |
+| `focus-within:` | The view or a descendant has focus (the content of an `Overlay` is a descendant of the view it is in) | `.focus_within(..)` |
 | `disabled:`, `enabled:` | The element's `disabled` prop is true / false | `.disabled_style(\|s\| ..)` |
 | `selected:` | The element is selected (a `Button`'s `selected`, `accessibilityState.selected`) | `.selected_style(..)` |
 | `checked:` | The element is checked (`accessibilityState.checked` is `true`; `"mixed"` is not checked) | `.checked_style(..)` |
 | `indeterminate:` | The element is indeterminate (`accessibilityState.checked` is `"mixed"`) | `.indeterminate_style(..)` |
-| `group-active:`, `group-hover:`, `group-focus:`, `group-focus-within:`, `group-disabled:`, `group-selected:`, `group-checked:`, `group-indeterminate:` | The nearest ancestor with the `group` class is in that state | `.group()` on the ancestor; `.group_active(..)`, `.group_hover(..)`, `.group_focus_within(..)` inside |
+| `aria-expanded:` | The element is expanded (`accessibilityState.expanded` is `true`): a `Popover`'s or `Menu`'s trigger while its popup is open | `.expanded_style(..)` |
+| `aria-pressed:` | The element is a toggle button that is on (`accessibilityState.pressed` is `true`; `"mixed"` is not pressed). Not `active:`, a press in progress | `.aria_pressed(..)`, `.pressed_style(..)` |
+| `aria-busy:`, `aria-checked:`, `aria-selected:` | `accessibilityState.busy`, `checked` (`true`, not `"mixed"`) or `selected` is `true`, as Tailwind's `aria-*` variants: after the pseudo-classes, in the order of their names | |
+| `data-<name>:` | The element has the `data-*` attribute `name`, as Tailwind's boolean `data-*` variants (`&[data-range-start]`): what a component's part shows beyond its states, a calendar's day at the start of a range (`data-range-start:`). After the `aria-*` variants, in the order of their names | `Interactive::project_data(name, ..)` sets one on a component's part |
+| `group-active:`, `group-hover:`, `group-focus:`, `group-focus-within:`, `group-disabled:`, `group-selected:`, `group-checked:`, `group-indeterminate:`, `group-aria-expanded:`, `group-aria-pressed:`, `group-aria-busy:`, `group-aria-checked:`, `group-aria-selected:`, `group-data-<name>:` | The nearest ancestor with the `group` class is in that state, or has that `data-*` attribute | `.group()` on the ancestor; `.group_active(..)`, `.group_hover(..)`, `.group_focus_within(..)` inside |
 | `group-active/name:` ... | The same, for an ancestor marked `group/name` | `.group_named("name")`; `.group_active_named("name", ..)`, ... |
 | `first:`, `last:`, `odd:`, `even:`, `only:` | The element's own position among its siblings. To color a row's label by the row's position, put `last:text-*` on the row: the label inherits it | Plain Rust from the row's index (`at.is_first()`, `at.is_last()`, `at.index() % 2`) |
 | `placeholder:` | Styles an input's placeholder (`placeholder:text-zinc-400`) | `.placeholder_color(..)` |
@@ -152,17 +156,17 @@ Breakpoints compare against the window (the surface NSH renders into), not the d
 ## What differs from Tailwind on the web
 
 - **Units are points.** `p-4` (`.p_4()`) is 16 points (1 spacing step = 4pt, 1rem = 16pt). Arbitrary values in `px` are points too: `p-[13px]` (`.p(px(13.0))`) is 13pt.
-- **`flex` is a row**, as in CSS: `class="flex"` lays out its children in a row unless a direction class says otherwise (anywhere in the string: `flex-col flex` is a column). A view without `flex` or `inline-flex` keeps NSH's default column. `block` and `flow-root` use block layout, and so do `inline` and `inline-block`, as a browser lays them out in a flex or grid parent. In Rust, `.flex_row()` and `.flex_col()` set the direction.
+- **`flex` is a row**, as in CSS: `class="flex"` lays out its children in a row unless a direction class says otherwise (anywhere in the string: `flex-col flex` is a column). A style's `display: "flex"` and Rust's `.flex()` are rows the same way, and a view that sets no display keeps NSH's default column. `block` and `flow-root` use block layout, and so do `inline` and `inline-block`, as a browser lays them out in a flex or grid parent. In Rust, `.flex_row()` and `.flex_col()` set the direction.
 - **Text classes on views are inherited.** `text-*`, `font-*`, `leading-*`, `tracking-*` and the other text utilities on a view (`.text_color(..)`, `.font_weight(..)`, ... in Rust) pass to the text and input elements inside it, as CSS inheritance does: `<View class="text-white">` makes its labels white.
 - **Every view is a box of its own.** `overflow-x-hidden` and `overflow-y-hidden` clip both axes, as `overflow-hidden` does (scrolling is the [scroll](../elements/scroll.md) element's); `invisible` hides the view and everything in it; `mix-blend-*` blends a view with everything drawn behind it; `block` boxes keep their own margins and their children's apart; an `absolute` view is placed in its nearest positioned ancestor, as in CSS; `fixed` lays a view out in its root view (other elements are placed as `absolute`).
 - **Text keeps its whitespace.** Spaces and line breaks in a string are drawn as written, and `whitespace-*` sets the wrapping; the JSX compiler collapses the whitespace of literal JSX text, as JSX does.
 - **Transitions animate property groups**: `transition` animates colors, opacity, shadows and transforms, `transition-all` also corner radii and border widths; filters, backdrop filters, gradients and layout take their new values at once.
 - **`focus-visible:` is `focus:`**: it applies whenever the element has focus.
 - **State backgrounds show over gradients.** In CSS a gradient covers `background-color`, so `active:bg-*` on a `bg-linear-*` surface would never be seen; in NSH a background color from `active:`, `hover:`, `focus:` or `group-*:` replaces the gradient while that state holds (unless the state sets a gradient of its own, such as `active:from-*`). So do `activeStyle` and the other state styles, and animated background colors.
-- **Classes for settings that are props in NSH**: `line-clamp-*`, `truncate`, `whitespace-nowrap`, `pointer-events-*`, `object-*` (image resize mode), `select-text`, `caret-*` and `placeholder:text-*` work, and lose to the explicit props (`numberOfLines`, `pointerEvents`, `resizeMode`, ...) when both are set. In Rust these are the element's methods (`.number_of_lines(..)`, `.resize_mode(..)`, ...).
+- **Text and touch settings are style keys**: `line-clamp-*` sets `numberOfLines`, `text-ellipsis` and `text-clip` set `textOverflow`, `truncate` both, `select-*` sets `userSelect` and `pointer-events-*` sets `pointerEvents`, so they work in state variants and lose to the inline `style` as every class does; `caret-*`, `placeholder:text-*` and `selection:bg-*` set the `caretColor`, `placeholderColor` and `selectionColor` styles the same way. In Rust these are `Styled` methods (`.number_of_lines(..)`, `.truncate()`, `.text_overflow(..)`, `.select_text()`, `.pointer_events(..)`, ...). `whitespace-nowrap` keeps a text on one line as a class. `object-*` set the `objectFit` and `objectPosition` styles of images and videos, which a style's keys replace as any other.
 - **The supported set**: utilities and variants of Tailwind 4 that have a native meaning. `peer-*` variants, pseudo-elements (`before:`, `after:`) and arbitrary properties (`[mask-type:luminance]`) are reported as unknown classes, and so is every utility NSH has no native meaning for, so a class never means something else than in a browser. Rendering hints (`antialiased`, `will-change-transform`, `appearance-none`, `box-border`, ...) are accepted and change nothing.
 
-Everything else works as documented by Tailwind 4: the color palette, opacity modifiers (`bg-black/40`), arbitrary values (`bg-[#34c759]`, `w-[72px]`, `grid-cols-[1fr_2fr]`), fractions (`w-1/2`, `translate-x-1/2`), shadows and rings, gradients (`bg-linear-to-r`, `bg-radial`, `bg-conic` with `from-` / `via-` / `to-`), filters, `backdrop-blur-*`, `mix-blend-*`, transforms, `transition-*` and `duration-*`, `animate-spin` / `ping` / `pulse` / `bounce`, and grid, each with its typed method in Rust. The platform limits of [filters and blending](./styling.md#filters-and-blending) apply to classes too.
+Everything else works as documented by Tailwind 4: the color palette, opacity modifiers (`bg-black/40`), arbitrary values (`bg-[#34c759]`, `w-[72px]`, `grid-cols-[1fr_2fr]`; on `p`, `px`, `py`, `pt`, `pr`, `pb`, `pl` and the `m` utilities also the environment variables, `pt-[env(safe-area-inset-top)]`, `pb-[calc(env(keyboard-inset-height)+49px)]`, see [Safe area](../elements/safe-area.md) and [Keyboard](../elements/keyboard.md)), fractions (`w-1/2`, `translate-x-1/2`), shadows and rings, gradients (`bg-linear-to-r`, `bg-radial`, `bg-conic` with `from-` / `via-` / `to-`), filters, `backdrop-blur-*`, `mix-blend-*`, transforms, `transition-*` and `duration-*`, `animate-spin` / `ping` / `pulse` / `bounce`, and grid, each with its typed method in Rust. The platform limits of [filters and blending](./styling.md#filters-and-blending) apply to classes too.
 
 ## Theme
 
@@ -295,7 +299,7 @@ Warnings do not fail the build. Classes built at run time (``bg-${color()}-500``
 
 ## Classes or styles?
 
-Both are resolved natively and cost about the same. Classes are shorter and give you variants (pressed states, dark mode, breakpoints) without code. Inline styles take values computed in JavaScript and accept [native animated values](./animation.md) (`opacity: fade`, `transform: [{ translateX: x }]`). Most TSX apps use classes for the static look and `style` for what is computed or animated. Rust components use typed methods for both, and bind animated values with `.bind_opacity(..)`, `.bind_translate_x(..)` and the other bindings.
+Both are resolved natively and cost about the same. Classes are shorter and give you variants (pressed states, dark mode, breakpoints) without code. Inline styles take values computed in JavaScript and accept [native animated values](./animation.md) (`opacity: fade`, `translate: [x, 0]`). Most TSX apps use classes for the static look and `style` for what is computed or animated. Rust components use typed methods for both, and bind animated values with `.bind_opacity(..)`, `.bind_translate_x(..)` and the other bindings.
 
 ## Related
 

@@ -2,9 +2,10 @@
 //!
 //! - Each node is an [`view::NshView`] (a flipped, layer-backed `NSView`
 //!   subclass) at the frame the core laid out; Core Animation draws its
-//!   background, borders, shadows and images, `drawRect:` its text and
-//!   canvas drawings; text fields, web views and videos are AppKit views
-//!   hosted in their node's view.
+//!   background, borders, shadows and images, and its text and canvas
+//!   drawings go into a content layer of its own (`drawLayer:inContext:`);
+//!   text fields, web views and videos are AppKit views hosted in their
+//!   node's view.
 //! - The engine runs on its own thread ([`nsh_engine::Engine`]); each
 //!   commit is one hop to the main queue ([`surface`]).
 //! - Text is typeset by CoreText on the engine thread; the main thread
@@ -32,6 +33,7 @@ mod decor;
 #[cfg(feature = "dev")]
 pub mod dev;
 mod file_drop;
+mod file_requests;
 mod fps;
 mod gpu;
 mod image;
@@ -41,9 +43,14 @@ mod mount;
 mod native;
 mod navigation;
 mod net;
+mod notifications;
 mod picker;
+mod screen_color;
 mod scroll;
-mod selection_area;
+mod selectable_view;
+mod shader;
+mod sight;
+mod speech;
 mod surface;
 #[cfg(feature = "dev")]
 mod synth;
@@ -65,7 +72,10 @@ pub use objc2_foundation;
 #[cfg(feature = "dev")]
 pub use crate::app::set_root;
 pub use crate::{
-    app::{AppOptions, AppSource, AppView, quit_app, run_app, set_ui_sets},
+    app::{
+        AppOptions, AppSource, AppView, WindowDisplay, quit_app, run_app, set_components,
+        set_ui_sets,
+    },
     image::AssetBase,
     native::{ComponentContext, ComponentFactory, Components, NativeComponent},
     text::CoreTextEngine,

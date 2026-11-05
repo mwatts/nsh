@@ -1,7 +1,6 @@
 ---
 title: Resizable
 description: ResizablePanelGroup 与 ResizablePanel：并排或上下排列的面板，每两个面板之间有一个手柄，用户拖动它来分配空间。分组负责拖动、面板的尺寸限制、调整大小的光标以及手柄面向屏幕阅读器的角色；尺寸、手柄的外观和面板的内容都属于应用。
-order: 29.5
 group: base
 demo: el-resizable
 ---
@@ -12,7 +11,7 @@ demo: el-resizable
 
 ```rust tabs
 use nsh_base::{h_resizable, resizable_panel, theme};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn workspace() -> impl IntoElement {
     h_resizable()
@@ -46,7 +45,7 @@ function App() {
       handleClass="bg-border group-hover:bg-ring group-active:bg-primary"
       handleAccessibilityLabel="Resize the sidebar"
     >
-      <ResizablePanel size={sidebar()} minSize={160} maxSize={480} onResize={(v) => sidebar.set(v)} class="p-4">
+      <ResizablePanel size={sidebar()} minSize={160} maxSize={480} onResize={({ size }) => sidebar.set(size)} class="p-4">
         <Text class="text-muted-foreground">Files</Text>
       </ResizablePanel>
       <ResizablePanel class="p-4">
@@ -71,7 +70,7 @@ mount(App);
 - 把它缩到 `minSize` 以下，会从它前面的面板取得空间。
 - 任何面板都不会超过它的 `maxSize`，所有面板加起来也不会超过分组。
 
-拖动结束且尺寸发生了变化时，分组按布局顺序报告每个可见面板的尺寸（分组上的 `onResize`），尺寸有变化的面板报告自己的尺寸（面板上的 `onResize`）。被拖动过的面板保持用户给出的尺寸，直到应用传入新的 `size`；应用把报告的尺寸作为 `size` 传回，就能在分组的生命周期之外保留它们，于是从[存储](../modules/nsh-storage.md)恢复的布局会以用户离开时的尺寸打开。只有拖动和屏幕阅读器的调整才会报告：窗口调整大小、显示或隐藏面板都不会报告。
+拖动结束且尺寸发生了变化时，分组按布局顺序报告每个可见面板的尺寸（分组上的 `onResize`），尺寸有变化的面板报告自己的尺寸（面板上的 `onResize`）。被拖动过的面板保持用户给出的尺寸，直到应用传入新的 `size`；应用把报告的尺寸作为 `size` 传回，就能在分组的生命周期之外保留它们，于是从[存储](../modules/nsh.md#storage)恢复的布局会以用户离开时的尺寸打开。只有拖动和屏幕阅读器的调整才会报告：窗口调整大小、显示或隐藏面板都不会报告。
 
 分组变大或变小时（窗口调整大小），有尺寸的面板保持尺寸，没有尺寸的面板承担差值。分组小到放不下这些尺寸时，面板会缩小（`fixed` 面板，如侧边栏、检查器，除外），空间恢复后再回到各自的尺寸。`visible={false}` 的面板不占空间：其他面板分摊它的空间，它重新显示时回到自己的尺寸。
 
@@ -148,8 +147,8 @@ mount(App);
 
 | 事件 | Rust | 说明 |
 |---|---|---|
-| `onResize`（`ResizablePanelGroup`） | `.on_resize(\|sizes: &Vec<Points>\| ..)` | 一次拖动结束并移动了手柄，或屏幕阅读器调整了手柄：按布局顺序（从左到右、从上到下）给出每个可见面板的尺寸。 |
-| `onResize`（`ResizablePanel`） | `.on_resize(\|size: &Points\| ..)` | 一次拖动结束并改变了这个面板的尺寸：新的尺寸，作为它的 `size` 传回。 |
+| `onResize`（`ResizablePanelGroup`） | `.on_resize(\|sizes: &Vec<Points>\| ..)` | 一次拖动结束并移动了手柄，或屏幕阅读器调整了手柄：`sizes` 按布局顺序（从左到右、从上到下）给出每个可见面板的尺寸。 |
+| `onResize`（`ResizablePanel`） | `.on_resize(\|size: &Points\| ..)` | 一次拖动结束并改变了这个面板的尺寸：`size` 是新的尺寸，作为它的 `size` 传回。 |
 
 <a id="parts"></a>
 

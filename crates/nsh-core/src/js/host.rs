@@ -5,12 +5,18 @@
 //! writes the [`HostPropSpec`]s the element types are generated from. The
 //! decoders read JS values through [`HostInput`], which `nsh-js` implements
 //! for QuickJS values: no JSON in between.
+//!
+//! A few props are not [`HostProps`]: the state styles and a page's header
+//! style, whose values each renderer decodes with its own style decoder, and
+//! the class lists of an element's parts. [`style_patch_prop`] and
+//! [`part_class_prop`] name them for both renderers (QuickJS' and the
+//! browser runtime's).
 
 use std::sync::Arc;
 
 pub use nsh_macros::HostProps;
 
-use crate::{EdgeInsets, EventKind, geometry::Points, style::Color, ui::TsTypes};
+use crate::{EdgeInsets, EventKind, element::TsTypes, geometry::Points, style::Color};
 
 /// A JS value as host props read it.
 pub trait HostInput: Sized {
@@ -115,14 +121,61 @@ pub fn element_bits(tag: crate::Tag) -> u32 {
             Tag::WebView => on::WEBVIEW,
             Tag::Video => on::VIDEO,
             Tag::InputAccessory => on::INPUT_ACCESSORY,
-            Tag::View
-            | Tag::Cell
-            | Tag::Stack
-            | Tag::HeaderItem
-            | Tag::Canvas
-            | Tag::Native
-            | Tag::Overlay => 0,
+            Tag::View => on::VIEW,
+            Tag::Shader => on::VIEW | on::SHADER,
+            Tag::ShaderEffect => on::VIEW | on::SHADER | on::EFFECT,
+            Tag::ShaderTransition => on::VIEW | on::SHADER | on::TRANSITION,
+            Tag::ScreenEffect => on::SHADER | on::EFFECT,
+            Tag::ScreenTransition => on::SHADER | on::TRANSITION,
+            Tag::Cell | Tag::Stack | Tag::HeaderItem | Tag::Canvas | Tag::Native | Tag::Overlay => {
+                0
+            }
         }
+}
+
+/// A prop whose value is a style over the element's own: the style patch
+/// the renderer decodes from it as from a `style` (`None` when empty).
+pub type StylePatchProp = fn(Option<std::rc::Rc<crate::StylePatch>>) -> crate::Prop;
+
+/// The prop a state style or a page's header style sets (`activeStyle`,
+/// `hoverStyle`, ..., `headerStyle`). They are not [`HostProps`]: each
+/// renderer decodes their style with its own style decoder, then makes the
+/// prop with this, so QuickJS' and the browser's take the same names.
+#[inline]
+pub fn style_patch_prop(name: &str) -> Option<StylePatchProp> {
+    use crate::Prop;
+    Some(match name {
+        "activeStyle" => Prop::ActiveStyle,
+        "hoverStyle" => Prop::HoverStyle,
+        "focusStyle" => Prop::FocusStyle,
+        "disabledStyle" => Prop::DisabledStyle,
+        "selectedStyle" => Prop::SelectedStyle,
+        "checkedStyle" => Prop::CheckedStyle,
+        "indeterminateStyle" => Prop::IndeterminateStyle,
+        "expandedStyle" => Prop::ExpandedStyle,
+        "pressedStyle" => Prop::PressedStyle,
+        "focusWithinStyle" => Prop::FocusWithinStyle,
+        "headerStyle" => Prop::HeaderStyle,
+        _ => return None,
+    })
+}
+
+/// A prop whose value is a class list of a part of an element: the class
+/// names as the renderer reads them from the JS string.
+pub type PartClassProp = fn(Box<str>) -> crate::Prop;
+
+/// The prop a class list of a part of element `tag` sets: a page's header
+/// (`headerClass`) or a list's content (`contentClass`). A scroll view's
+/// `contentClass` is not one: it styles the scroll view's content container,
+/// which a renderer makes itself rather than the core.
+#[inline]
+pub fn part_class_prop(name: &str, tag: Option<crate::Tag>) -> Option<PartClassProp> {
+    use crate::{Prop, Tag};
+    match name {
+        "headerClass" => Some(Prop::HeaderClass),
+        "contentClass" if tag != Some(Tag::Scroll) => Some(Prop::ListContentClass),
+        _ => None,
+    }
 }
 
 /// A prop's value: how it comes out of a JS value and its TypeScript type.
@@ -163,6 +216,14 @@ pub mod on {
     pub const INPUT_ACCESSORY: u32 = 1 << 11;
     /// `<overlay>`.
     pub const OVERLAY: u32 = 1 << 12;
+    /// `<view>`.
+    pub const VIEW: u32 = 1 << 13;
+    /// `<shader>` and the shader effects and transitions.
+    pub const SHADER: u32 = 1 << 14;
+    /// Shader effects (`ShaderEffect`, `ScreenEffect`).
+    pub const EFFECT: u32 = 1 << 15;
+    /// Shader transitions (`ShaderTransition`, `ScreenTransition`).
+    pub const TRANSITION: u32 = 1 << 16;
     /// Set by the runtime itself, not part of the elements' types.
     pub const INTERNAL: u32 = 1 << 31;
 }
@@ -395,6 +456,13 @@ export interface Size {
   height: number;
 }
 
+/** An image's or a video's own extent, in pixels as decoded
+ * (`nsh_core::geometry::Size<DevicePixels>`), not the points it is drawn at. */
+export interface PixelSize {
+  width: number;
+  height: number;
+}
+
 /** A position and an extent, in points (`nsh_core::geometry::Bounds`). */
 export interface Bounds {
   /** The top left corner. */
@@ -432,14 +500,14 @@ export interface OverlayPosition {
 
 /** A drag: translation since the start and velocity (points / second). */
 export interface PanEvent {
-  translationX: number;
-  translationY: number;
-  velocityX: number;
-  velocityY: number;
-  /** The `pan.x` value now (with one). */
-  valueX?: number;
-  /** The `pan.y` value now (with one). */
-  valueY?: number;
+  /** The system cancelled the drag rather than releasing it. */
+  cancelled: boolean;
+  /** How far the finger moved since the drag started. */
+  translation: Point;
+  /** How fast it moves, in points per second. */
+  velocity: Point;
+  /** The values `pan` binds now, those of the axes it binds (`pan.x`, `pan.y`). */
+  value?: Partial<Point>;
 }
 
 /** Where the pointer was at a press, the modifier keys held when it began and its click count: the payload of `onPress`, `onLongPress`, `onPressDown` and `onPressUp` on backends that know it. */
@@ -453,14 +521,19 @@ export interface PressEvent {
   clickCount: number;
 }
 
-/** Where the mouse is over a hovered view: the payload of `onHoverMove` (GPUI's `MouseMoveEvent`). */
-export interface HoverEvent {
+/** Where the mouse is over a view: the payload of `onMouseEnter`, `onMouseMove` and `onMouseLeave` (GPUI's `MouseMoveEvent`). */
+export interface MouseEvent {
   /** Position in the view (its transforms undone). */
   position: Point;
   /** Position in the root view the view is in (the surface or its modal), as touches' `pageX` / `pageY`. */
   pagePosition: Point;
   modifiers: Modifiers;
+  /** The button held down (a drag), or `null`. */
+  pressedButton: MouseButton | null;
 }
+
+/** A mouse button (GPUI's `MouseButton`). */
+export type MouseButton = "left" | "right" | "middle" | "back" | "forward";
 
 /** Where a context menu was asked for: the payload of `onContextMenu`. */
 export interface ContextMenuEvent {
@@ -503,6 +576,8 @@ export interface CaretEvent {
 export interface PasteEvent {
   /** The plain text, `""` when there was none. */
   text: string;
+  /** The same content as HTML (`text/html`), with its formatting: what a browser, an office suite or a rich text editor copied; `""` when there was none. */
+  html: string;
   /** Files with their bytes: images (a screenshot, an image copied from a page or an app), as `File`s an app can upload. */
   files: File[];
   /** `file:` URLs of local files copied in a file manager (as `onFileDrop`'s). */
@@ -527,6 +602,19 @@ export interface WebViewNavigation {
   canGoBack: boolean;
   canGoForward: boolean;
 }
+
+/** A web view's download (`onDownload`): where it is saved, in the app's data directory's `downloads`. */
+export interface WebViewDownload {
+  state: "started" | "finished" | "failed";
+  id: string;
+  url: string;
+  filename: string;
+  path: string;
+  /** Once finished: the file's size in bytes. */
+  bytes?: number;
+  /** When it failed: why. */
+  message?: string;
+}
 "#;
 
 /// The events of the host elements, as their handler props: the event, the
@@ -537,56 +625,50 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::Press,
         on::ALL,
-        "(e?: PressEvent) => void",
-        "A tap. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
+        "(e: PressEvent) => void",
+        "A tap. `e` is where the pointer was, with the modifier keys and the click count (at the view's origin, with no keys and one click, on backends that do not know the pointer).",
     ),
     (
         EventKind::LongPress,
         on::ALL,
-        "(e?: PressEvent) => void",
-        "A press held for about half a second. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
+        "(e: PressEvent) => void",
+        "A press held for about half a second. `e` is where the pointer was, with the modifier keys and the click count (at the view's origin, with no keys and one click, on backends that do not know the pointer).",
     ),
     (
         EventKind::PressDown,
         on::ALL,
-        "(e?: PressEvent) => void",
-        "A press went down. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
+        "(e: PressEvent) => void",
+        "A press went down. `e` is where the pointer was, with the modifier keys and the click count (at the view's origin, with no keys and one click, on backends that do not know the pointer).",
     ),
     (
         EventKind::PressUp,
         on::ALL,
-        "(e?: PressEvent) => void",
-        "The press ended. `e` is where the pointer was, with the modifier keys and the click count, on backends that know it.",
+        "(e: PressEvent) => void",
+        "The press ended. `e` is where the pointer was, with the modifier keys and the click count (at the view's origin, with no keys and one click, on backends that do not know the pointer).",
     ),
     (
-        EventKind::HoverIn,
+        EventKind::MouseEnter,
         on::ALL,
-        "() => void",
-        "The mouse came over the view or a view inside it (never on touches).",
+        "(e: MouseEvent) => void",
+        "The mouse came over the view or a view inside it (never on touches; the DOM's `mouseenter`).",
     ),
     (
-        EventKind::HoverOut,
+        EventKind::MouseLeave,
         on::ALL,
-        "() => void",
-        "The mouse left the view and the views inside it, or the window.",
+        "(e: MouseEvent) => void",
+        "The mouse left the view and the views inside it, or the window, from where `e` says (the DOM's `mouseleave`).",
     ),
     (
-        EventKind::HoverMove,
+        EventKind::MouseMove,
         on::ALL,
-        "(e: HoverEvent) => void",
-        "The mouse moved over the view (or a view inside it) with no button down, at most once per frame.",
+        "(e: MouseEvent) => void",
+        "The mouse moved over the view (or a view inside it), with or without a button down (`e.pressedButton`), or a modifier key changed while it rests there with none down; at most once per frame.",
     ),
     (
         EventKind::ContextMenu,
         on::ALL,
         "(e: ContextMenuEvent) => void",
         "The secondary button (a right click, Control-click on Apple platforms) was pressed over the view: open a menu with `Menu.popup(items, e.pagePosition)`. The nearest listener hears it; a text input or selectable text nearer shows its own menu instead.",
-    ),
-    (
-        EventKind::MouseMove,
-        on::ALL,
-        "(e: Point) => void",
-        "The mouse moved inside the view, including with a button down (desktops and web); `x`/`y` are local coordinates in points, delivered at most once per frame.",
     ),
     (
         EventKind::FileDragEnter,
@@ -603,13 +685,13 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::FileDrop,
         on::ALL,
-        "(e: { uris: string[] }) => void",
-        "Local file URLs dropped on this desktop destination.",
+        "(e: { uris: string[]; pagePosition?: { x: number; y: number } }) => void",
+        "Local file URLs dropped on this desktop destination; `pagePosition`: where, in the window's coordinates, on backends that know it (Linux).",
     ),
     (
         EventKind::Layout,
         on::ALL,
-        "(bounds: Bounds) => void",
+        "(e: { bounds: Bounds }) => void",
         "The frame changed: its bounds in the parent.",
     ),
     (EventKind::PanStart, on::ALL, "(e: PanEvent) => void", ""),
@@ -682,7 +764,7 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::Load,
         on::IMAGE,
-        "(e: Size) => void",
+        "(e: { size: PixelSize }) => void",
         "The source image's size in pixels (not the decoded, downsampled one).",
     ),
     (
@@ -694,14 +776,14 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::Load,
         on::VIDEO,
-        "(e: { duration: number; size: Size }) => void",
+        "(e: { duration: number; size: PixelSize }) => void",
         "",
     ),
     (
         EventKind::Error,
         on::IMAGE | on::WEBVIEW | on::VIDEO,
-        "(e: { message: string }) => void",
-        "",
+        "(e: { message: string; code?: string }) => void",
+        "The source failed to load. `code` is `\"ERR_ACCESS_DENIED\"` when the app's capabilities do not grant it (an image's or video's URL: `network`; a web view's page or `html`: `webview`).",
     ),
     (
         EventKind::LoadEnd,
@@ -718,31 +800,31 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::ScrollDragStart,
         on::SCROLLING,
-        "(e: Point) => void",
+        "(e: { offset: Point }) => void",
         "",
     ),
     (
         EventKind::ScrollDragEnd,
         on::SCROLLING,
-        "(e: Point) => void",
+        "(e: { offset: Point }) => void",
         "",
     ),
     (
         EventKind::MomentumStart,
         on::SCROLLING,
-        "(e: Point) => void",
+        "(e: { offset: Point }) => void",
         "",
     ),
     (
         EventKind::MomentumEnd,
         on::SCROLLING,
-        "(e: Point) => void",
+        "(e: { offset: Point }) => void",
         "",
     ),
     (
         EventKind::ScrollEnd,
         on::SCROLL | on::LIST,
-        "(e: Point) => void",
+        "(e: { offset: Point }) => void",
         "",
     ),
     (EventKind::Refresh, on::SCROLL | on::LIST, "() => void", ""),
@@ -756,8 +838,8 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::ChangeText,
         on::INPUT,
-        "(text: string) => void",
-        "",
+        "(e: { value: string }) => void",
+        "The user edited the text: `value` is the text now.",
     ),
     (
         EventKind::SubmitEditing,
@@ -765,8 +847,18 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
         "(e: { text: string }) => void",
         "",
     ),
-    (EventKind::Focus, on::INPUT, "() => void", ""),
-    (EventKind::Blur, on::INPUT, "() => void", ""),
+    (
+        EventKind::Focus,
+        on::ALL,
+        "() => void",
+        "It took the keyboard focus: an input, or a view that takes presses reached by Tab on the platforms that move the focus between pressables (macOS, the web).",
+    ),
+    (
+        EventKind::Blur,
+        on::ALL,
+        "() => void",
+        "It lost the keyboard focus.",
+    ),
     (
         EventKind::SelectionChange,
         on::INPUT,
@@ -800,7 +892,7 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
     (
         EventKind::ContentSizeChange,
         on::INPUT,
-        "(e: Size) => void",
+        "(e: { size: Size }) => void",
         "The size of the text (at the input's width when `multiline`; one empty line's while it is empty, whatever its placeholder): grow a multiline input with it.",
     ),
     (
@@ -814,6 +906,12 @@ pub const EVENTS: &[(EventKind, u32, &str, &str)] = &[
         on::WEBVIEW,
         "(e: WebViewNavigation) => void",
         "",
+    ),
+    (
+        EventKind::Download,
+        on::WEBVIEW,
+        "(e: WebViewDownload) => void",
+        "With a listener, what the page downloads (an attachment, a type the web view cannot show, a `download` link) is saved as a file in the app's data directory, `downloads/<id>/<filename>`: reported as it starts, finishes and fails. Without one, those navigations behave as before.",
     ),
     (EventKind::End, on::VIDEO, "() => void", ""),
     (
@@ -857,6 +955,10 @@ pub const INTERNAL_EVENTS: &[EventKind] = &[
     EventKind::Host,
     EventKind::Pick,
     EventKind::OpenUrl,
+    EventKind::ScreenColor,
+    EventKind::FileRequest,
+    EventKind::Speech,
+    EventKind::Notification,
     EventKind::KeyCommand,
     EventKind::Menu,
     EventKind::ViewableItemsChange,
@@ -873,6 +975,7 @@ pub const INTERNAL_EVENTS: &[EventKind] = &[
 /// to: `HostProps` for every element, `TextHostProps` for `<text>`, ...
 const GROUPS: &[(u32, &str, &str)] = &[
     (on::ALL, "", "every element"),
+    (on::VIEW, "View", "`<View>`"),
     (on::TEXT, "Text", "`<Text>`"),
     (on::IMAGE, "Image", "`<Image>`"),
     (
@@ -887,6 +990,9 @@ const GROUPS: &[(u32, &str, &str)] = &[
     (on::MODAL, "Dialog", "dialogs"),
     (on::WEBVIEW, "WebView", "web views"),
     (on::VIDEO, "Video", "videos"),
+    (on::SHADER, "Shader", "shaders"),
+    (on::EFFECT, "ShaderEffect", "shader effects"),
+    (on::TRANSITION, "ShaderTransition", "shader transitions"),
     (on::INPUT_ACCESSORY, "InputAccessory", "input accessories"),
     (on::OVERLAY, "Overlay", "`<Overlay>`"),
 ];
@@ -894,7 +1000,7 @@ const GROUPS: &[(u32, &str, &str)] = &[
 /// The declarations of the host elements' props: the named types they use
 /// and one interface per element group and platform (`InputHostProps`,
 /// `IOSInputHostProps`, ...), which the element types and the components
-/// of `nsh/webview`, `nsh/video`, ... extend.
+/// of `nsh` (`WebView`, `Video`, ...) extend.
 pub fn declarations() -> String {
     use std::fmt::Write as _;
     let mut types = TsTypes::default();

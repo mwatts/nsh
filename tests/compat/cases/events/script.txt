@@ -17,6 +17,7 @@ event id:drag onPanStart translationX=2 translationY=-3 velocityX=10 velocityY=0
 expect Pan: start 2,-3 v 10,0
 event id:drag onPanEnd translationX=40 translationY=5 velocityX=250.5 velocityY=-12
 expect Pan: start 2,-3 v 10,0; end 40,5 v 250.5,-12
+expect Cancelled: false
 event id:pinch onPinchStart scale=1.1 velocity=0.5
 expect Pinch: start 1.1 v 0.5
 event id:pinch onPinchEnd scale=2 velocity=-0.25
@@ -77,15 +78,17 @@ prop id:fixed readonly true
 noprop id:field readonly
 style id:secret placeholderColor #888888ff
 style id:secret selectionColor #ff6600ff
+style id:secret caretColor #0066ffff
 style id:pick selectionColor #00aa00ff
 # The selection the app sets.
 prop id:secret selectedRange start=0 end=2
-covers [nsh] Input
+covers [nsh/base] Input
 covers [props] multiline
 covers [props] masked
 covers [props] readonly
 covers [styles] placeholderColor
 covers [styles] selectionColor
+covers [styles] caretColor
 covers [events] onFocus
 covers [events] onBlur
 covers [events] onKeyPress
@@ -94,10 +97,12 @@ covers [events] onSubmit
 covers [events] onSelectionChange
 covers [events] onCaretMove
 # What the user pasted, reported; the input inserts nothing itself.
+prop id:paste pasteBehavior report
 expect Pasted: none
 event id:paste onPaste text=hello
-expect Pasted: hello files 0 uris 0
+expect Pasted: hello html 0 files 0 uris 0
 covers [events] onPaste
+prop id:paste pasteBehavior report
 covers [props] pasteBehavior
 covers [events] onContentSizeChange
 covers [props] selectedRange
@@ -145,9 +150,14 @@ event id:web onLoad url=https://example.com/a title="Page A" loading=false canGo
 event id:web onMessage data="hello there"
 event id:web onError message="offline"
 expect Web: start https://example.com/ "" loading true back false forward false | nav https://example.com/a "Page A" loading false back true forward false | load https://example.com/a "Page A" loading false back true forward false | message hello there | error offline
-covers [nsh/image] Image
-covers [nsh/video] Video
-covers [nsh/webview] WebView
+# It downloads a file, and another download fails.
+event id:web onDownload state=started id=d1 url=https://example.com/r.pdf filename=r.pdf path=/data/downloads/d1/r.pdf
+event id:web onDownload state=finished id=d1 url=https://example.com/r.pdf filename=r.pdf path=/data/downloads/d1/r.pdf bytes=2048
+event id:web onDownload state=failed id=d2 url=https://example.com/x.csv filename=x.csv path=/data/downloads/d2/x.csv message="network lost"
+expect Web: start https://example.com/ "" loading true back false forward false | nav https://example.com/a "Page A" loading false back true forward false | load https://example.com/a "Page A" loading false back true forward false | message hello there | error offline | download started r.pdf - - | download finished r.pdf 2048 - | download failed x.csv - network lost
+covers [nsh] Image
+covers [nsh] Video
+covers [nsh] WebView
 covers [events] onLoadStart
 covers [events] onProgress
 covers [events] onLoad
@@ -157,6 +167,7 @@ covers [events] onBuffer
 covers [events] onEnd
 covers [events] onMessage
 covers [events] onNavigationStateChange
+covers [events] onDownload
 # events-pointer
 tap id:case-events-pointer
 expect Press: none
@@ -165,16 +176,22 @@ event id:press onPressDown
 expect Press: in
 event id:press onPressUp
 expect Press: in out
-# The mouse comes over, moves with Shift and Command held, and leaves.
-listens id:hover onHoverIn
-event id:hover onHoverIn
-expect Hover: in
-event id:hover onHoverMove position.x=5 position.y=7 modifiers.shift=true modifiers.platform=true
+# The mouse comes over, moves with Shift and Command held, then with
+# Option and Control, drags with the left button down (positions in the
+# view, fractions and outside it too), and leaves from where it was.
+listens id:hover onMouseEnter
+event id:hover onMouseEnter position.x=0 position.y=3
+expect Hover: in 0,3
+event id:hover onMouseMove position.x=5 position.y=7 modifiers.shift=true modifiers.platform=true
 expect Hover: move 5,7 page 25,128 meta shift
-event id:hover onHoverMove position.x=6 position.y=1 modifiers.alt=true modifiers.control=true
+event id:hover onMouseMove position.x=6 position.y=1 modifiers.alt=true modifiers.control=true
 expect Hover: move 6,1 page 26,122 alt ctrl
-event id:hover onHoverOut
-expect Hover: move 6,1 page 26,122 alt ctrl out
+event id:hover onMouseMove position.x=5.5 position.y=7.25 pressedButton=left
+expect Hover: move 5.5,7.25 page 25.5,128.25 left down
+event id:hover onMouseMove position.x=-2 position.y=0 pressedButton=left
+expect Hover: move -2,0 page 18,121 left down
+event id:hover onMouseLeave position.x=-2 position.y=0
+expect Hover: move -2,0 page 18,121 left down out -2,0
 # Files dragged over, away, back and dropped.
 event id:drop onFileDragEnter
 expect Drop: enter
@@ -187,11 +204,18 @@ event id:action onAccessibilityAction actionName=increment
 expect Action: increment
 event id:action onAccessibilityAction actionName=activate
 expect Action: activate
+# Tab reaches a view that takes presses, then moves on.
+listens id:key-focus onFocus
+listens id:key-focus onBlur
+event id:key-focus onFocus
+expect Key focus: focused
+event id:key-focus onBlur
+expect Key focus: focused blurred
 covers [events] onPressDown
 covers [events] onPressUp
-covers [events] onHoverIn
-covers [events] onHoverMove
-covers [events] onHoverOut
+covers [events] onMouseEnter
+covers [events] onMouseMove
+covers [events] onMouseLeave
 covers [events] onFileDragEnter
 covers [events] onFileDragLeave
 covers [events] onFileDrop
@@ -284,12 +308,3 @@ expect Committed: 腾
 event id:compose onCompositionChange composing=false text=""
 expect Composition: ended []
 covers [events] onCompositionChange
-
-# Mouse motion uses view-local coordinates, including negative positions.
-tap id:case-events-pointer
-listens id:hover onMouseMove
-event id:hover onMouseMove x=5.5 y=7.25
-expect Mouse: 5.5,7.25
-event id:hover onMouseMove x=-2 y=0
-expect Mouse: -2,0
-covers [events] onMouseMove

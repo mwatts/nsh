@@ -3,7 +3,10 @@
 
 use std::rc::Rc;
 
-use nsh_core::ui::{JsHost, JsIn, JsOwned, PropError, Style, StyleRefinement, TsTypes, prelude::*};
+use nsh_core::{
+    element::{JsHost, JsIn, JsOwned, PropError, Style, StyleRefinement, TsTypes},
+    prelude::*,
+};
 
 /// Declares the parts once: the classes' object, the styles' object and
 /// [`Part`], each field documented alike.
@@ -145,10 +148,11 @@ parts! {
     /// in a line of text, the size they ask for, else three quarters of a
     /// line tall.
     image => Image,
-    /// Formulas in text, without a `renderMath` (their TeX, monospace).
+    /// Formulas in text, without a `renderMath` (typeset; TeX it cannot
+    /// read monospace).
     math => Math,
-    /// Formula blocks, without a `renderMath` (their TeX, monospace, in a
-    /// box as a code block's).
+    /// Formula blocks, without a `renderMath` (typeset and centered; TeX it
+    /// cannot read monospace, in a box as a code block's).
     math_block => MathBlock,
     /// Tables (a column: the app's `renderTableActions`, then the
     /// scroll view of the cells).

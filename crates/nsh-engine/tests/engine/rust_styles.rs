@@ -9,12 +9,12 @@ use crossbeam_channel::Receiver;
 use nsh_core::{
     ApproxTextEngine, AttributedText, EventKind, EventPayload, MountBatch, MountItem, Size,
     ViewStyle,
-    tailwind::state,
-    ui::{
+    element::{
         Root,
         palette::{SKY, VIOLET, ZINC},
-        prelude::*,
     },
+    prelude::*,
+    tailwind::state,
 };
 use nsh_engine::{App, Engine, EngineConfig, Environment};
 
@@ -73,6 +73,7 @@ fn start_root(root: Root) -> (Engine, Receiver<MountBatch>) {
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Environment::default(),
@@ -89,6 +90,7 @@ fn start_root(root: Root) -> (Engine, Receiver<MountBatch>) {
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),

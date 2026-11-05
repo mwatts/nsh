@@ -1,7 +1,7 @@
 import { Canvas, mount, signal, Text, View } from "nsh";
-import { createAnimatedValue, Easing } from "nsh/animated";
-import { platform, windowSize } from "nsh/device";
-import { tint, ui } from "./palette";
+import { createAnimatedValue, Easing } from "nsh";
+import { platform, windowSize } from "nsh";
+import { button, buttonText, tint, ui } from "./palette";
 
 const TAU = Math.PI * 2;
 
@@ -11,12 +11,8 @@ const months = "JFMAMJJASOND";
 
 function Button(props: { label: string; onPress: () => void }) {
   return (
-    <View
-      onPress={props.onPress}
-      activeStyle={{ opacity: 0.6 }}
-      style={{ ...ui().raised, paddingHorizontal: 14, paddingVertical: 9, borderRadius: 10, alignItems: "center" }}
-    >
-      <Text style={{ color: ui().text, fontWeight: "600" }}>{props.label}</Text>
+    <View onPress={props.onPress} {...button()}>
+      <Text style={buttonText()}>{props.label}</Text>
     </View>
   );
 }
@@ -42,14 +38,14 @@ function App() {
     <View style={{ flex: 1, backgroundColor: ui().page, padding: 20, paddingTop: 24, gap: 14 }}>
       <Text style={{ fontSize: 22, fontWeight: "700", color: ui().text }}>canvas</Text>
       <Text style={{ color: ui().muted }}>
-        {platform.idiom === "desktop" ? "Drag across the chart with the mouse" : "Drag your finger across the chart"} · {months[picked()]}{" "}
+        {platform.desktop ? "Drag across the chart with the mouse" : "Drag your finger across the chart"} · {months[picked()]}{" "}
         = {values[picked()]}
       </Text>
 
       <View style={{ flex: 1, flexDirection: wide() ? "row" : "column", gap: 14 }}>
         <Canvas
           style={{ ...ui().inset, flex: 1, minHeight: 200, borderRadius: 14 }}
-          onLayout={(e) => (chartWidth = e.size.width)}
+          onLayout={({ bounds }) => (chartWidth = bounds.size.width)}
           onStartShouldSetResponder={() => true}
           onResponderGrant={(e) => {
             pick(e.locationX, chartWidth);

@@ -1,5 +1,5 @@
-import { Image, type JSX, List, Scroll, signal, Text, View, type ViewStyle } from "nsh";
-import { Animated, createAnimatedValue, Easing } from "nsh/animated";
+import { cleanup, Image, type JSX, List, Scroll, signal, Text, View, type ViewStyle } from "nsh";
+import { Animated, createAnimatedValue, Easing, platform } from "nsh";
 import { alpha, Badge, Button, Caption, Card, colors, DemoPage, finish, hint, isDark, mono, Press, radius, Segmented, tints, Toggle } from "../ui";
 
 /** The stage every specimen stands on: the card's light, without its drop shadow. */
@@ -43,12 +43,12 @@ function Tile(props: { label: string; code?: string; note?: string; onPress?: ()
       <View style={{ gap: 3, paddingHorizontal: 2 }}>
         <Text style={{ fontSize: 13, fontWeight: "500", color: colors.text }}>{props.label}</Text>
         <If when={props.code}>
-          <Text numberOfLines={1} style={{ fontSize: 12, color: colors.muted, fontFamily: mono }}>
+          <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.muted, fontFamily: mono }}>
             {props.code}
           </Text>
         </If>
         <If when={props.note}>
-          <Text numberOfLines={1} style={{ fontSize: 12, color: colors.faint, fontVariant: ["tabular-nums"] }}>
+          <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.faint, fontVariant: ["tabular-nums"] }}>
             {props.note}
           </Text>
         </If>
@@ -113,6 +113,41 @@ function Corners() {
   );
 }
 
+/** A blur growing toward the bottom: layers of `backdropFilter`, each masked in further along. */
+function ProgressiveBlur() {
+  const layers = [1.5, 3, 6, 12, 24];
+  return (
+    <Card icon="styles" title="Progressive blur" subtitle="backdropFilter · maskImage">
+      <View style={{ height: 160, borderRadius: radius.control, borderCurve: "continuous", overflow: "hidden", backgroundColor: colors.surface }}>
+        <Each of={Array.from({ length: 8 }, (_, i) => i)}>
+          {(i) => (
+            <View style={{ height: 20, paddingLeft: 12, justifyContent: "center", backgroundColor: i() % 2 ? colors.info : colors.surface }}>
+              <Text style={{ fontSize: 12, color: i() % 2 ? "#fff" : colors.text }}>The quick brown fox {i()}</Text>
+            </View>
+          )}
+        </Each>
+        <View style={{ pointerEvents: "none", position: "absolute", left: 0, right: 0, bottom: 0, height: 120 }}>
+          <Each of={layers}>
+            {(r, i) => (
+              <View
+                style={{
+                  position: "absolute",
+                  left: 0,
+                  right: 0,
+                  top: 0,
+                  bottom: 0,
+                  backdropFilter: `blur(${r()}px)`,
+                  maskImage: `linear-gradient(to bottom, transparent ${(i() / layers.length) * 100}%, black ${((i() + 1) / layers.length) * 100}%)`,
+                }}
+              />
+            )}
+          </Each>
+        </View>
+      </View>
+    </Card>
+  );
+}
+
 function Borders() {
   return (
     <Card icon="components" title="Borders" subtitle="per side · dashed · dotted">
@@ -146,25 +181,22 @@ function Borders() {
 /** Shadows that read on a dark page: colored glows rather than black. */
 function Shadows() {
   return (
-    <Card icon="spark" title="Shadows and glow" subtitle="shadowColor · elevation · text shadow">
+    <Card icon="spark" title="Shadows and glow" subtitle="boxShadow · elevation · text shadow">
       <Grid>
-        <Tile label="Glow" code="shadowColor" note="A colored shadow">
+        <Tile label="Glow" code="boxShadow" note="A colored shadow">
           <View
             style={{
               ...box(),
               borderRadius: 16,
               borderCurve: "continuous",
               backgroundColor: colors.accentFill,
-              shadowColor: colors.accentFill,
-              shadowOpacity: 0.55,
-              shadowRadius: 18,
-              shadowOffset: { width: 0, height: 6 },
+              boxShadow: `0 6px 18px ${alpha(colors.accentFill, 0.55)}`,
             }}
           >
             <Label color={colors.onAccent}>Glow</Label>
           </View>
         </Tile>
-        <Tile label="Offset shadow" code="shadowOffset" note="4, 8 pt · radius 10">
+        <Tile label="Offset shadow" code="boxShadow" note="4, 8 pt · blur 10">
           <View
             style={{
               ...box(),
@@ -173,10 +205,7 @@ function Shadows() {
               borderBottomRightRadius: 30,
               borderWidth: 1,
               borderColor: colors.info,
-              shadowColor: colors.info,
-              shadowOpacity: 0.45,
-              shadowRadius: 10,
-              shadowOffset: { width: 4, height: 8 },
+              boxShadow: `4px 8px 10px ${alpha(colors.info, 0.45)}`,
             }}
           >
             <Label color={colors.info}>Offset</Label>
@@ -184,23 +213,30 @@ function Shadows() {
         </Tile>
         <Tile label="Image corners" note="Two radii and a shadow">
           <Image
-            src="https://picsum.photos/seed/nsh/300/220"
+            src="https://pbs.twimg.com/media/HS8AFH2WsAASxLk?format=jpg&name=small"
             style={{
               width: 112,
               height: 76,
               borderTopLeftRadius: 28,
               borderBottomRightRadius: 28,
               backgroundColor: colors.raised,
-              shadowColor: "#000000",
-              shadowOpacity: isDark() ? 0.6 : 0.22,
-              shadowRadius: 12,
-              shadowOffset: { width: 0, height: 8 },
+              boxShadow: isDark() ? "0 8px 12px rgb(0 0 0 / 0.6)" : "0 8px 12px rgb(0 0 0 / 0.22)",
             }}
           />
         </Tile>
-        <Tile label="Text shadow" note="Shadow of the content">
-          <View style={{ ...box(), backgroundColor: "transparent", shadowColor: colors.danger, shadowOpacity: 0.9, shadowRadius: 8, shadowOffset: { width: 0, height: 0 } }}>
-            <Text style={{ fontSize: 24, fontWeight: "800", color: colors.text, letterSpacing: -0.5 }}>Shadow</Text>
+        <Tile label="Text shadow" note="Shadow of the glyphs">
+          <View style={{ ...box(), backgroundColor: "transparent" }}>
+            <Text
+              style={{
+                fontSize: 24,
+                fontWeight: "800",
+                color: colors.text,
+                letterSpacing: -0.5,
+                textShadow: `0 0 8px ${alpha(colors.danger, 0.9)}`,
+              }}
+            >
+              Shadow
+            </Text>
           </View>
         </Tile>
         <Tile label="Text corners" note="Radii on a Text">
@@ -220,7 +256,7 @@ function Shadows() {
           </Text>
         </Tile>
         <Tile label="Elevation" code="elevation: 10" note="Android">
-          <View android={{ elevation: 10 }} style={{ ...box(), borderRadius: 16, backgroundColor: colors.raised, shadowOpacity: 0.5, shadowRadius: 10, shadowOffset: { width: 0, height: 6 } }}>
+          <View android={{ elevation: 10 }} style={{ ...box(), borderRadius: 16, backgroundColor: colors.raised, boxShadow: "0 6px 10px rgb(0 0 0 / 0.5)" }}>
             <Label>Elevation</Label>
           </View>
         </Tile>
@@ -237,7 +273,18 @@ function Layers() {
   const level = signal<"0.2" | "0.45" | "1">("0.45");
   const stack = ["danger", "info", "up"] as const;
   return (
-    <Card icon="lists" title="Clipping and layers" subtitle="overflow · zIndex · opacity" right={<Toggle value={clip()} onChange={(v) => clip.set(v)} label="Clip" />}>
+    <Card icon="lists" title="Clipping and layers" subtitle="overflow · zIndex · opacity" right={
+        // The terminal's switch is a glyph: its label beside it says what it turns on.
+        platform.idiom === "terminal" ? (
+          <View style={{ flexDirection: "row", gap: 8 }}>
+            <Text style={{ fontSize: 12, color: colors.muted }}>Clip</Text>
+            <Toggle value={clip()} onChange={(v) => clip.set(v)} label="Clip" />
+          </View>
+        ) : (
+          <Toggle value={clip()} onChange={(v) => clip.set(v)} label="Clip" />
+        )
+      }
+    >
       <Grid>
         <Tile label={clip() ? "Clipped" : "Visible"} code={`overflow: ${clip() ? "hidden" : "visible"}`} note={hint("Tap to switch", "Click to switch")} onPress={() => clip.set(!clip())}>
           <View
@@ -271,10 +318,7 @@ function Layers() {
                     borderWidth: front() === i() ? 2 : 0,
                     borderColor: colors.text,
                     zIndex: front() === i() ? 10 : 0,
-                    shadowColor: "#000000",
-                    shadowOpacity: isDark() ? 0.5 : 0.18,
-                    shadowRadius: 6,
-                    shadowOffset: { width: 0, height: 3 },
+                    boxShadow: isDark() ? "0 3px 6px rgb(0 0 0 / 0.5)" : "0 3px 6px rgb(0 0 0 / 0.18)",
                   }}
                 />
               )}
@@ -394,12 +438,14 @@ function FlipCard() {
 function Transforms() {
   // A slow native sway, so the perspective reads as depth.
   const sway = createAnimatedValue(-30);
-  Animated.loop(
+  const loop = Animated.loop(
     Animated.sequence([
       Animated.timing(sway, { toValue: 30, duration: 2200, easing: Easing.inOut(Easing.sin) }),
       Animated.timing(sway, { toValue: -30, duration: 2200, easing: Easing.inOut(Easing.sin) }),
     ]),
-  ).start();
+  );
+  loop.start();
+  cleanup(() => loop.stop());
   return (
     <Card icon="physics" title="3D transforms" subtitle="perspective · rotateX/Y · skew · origin">
       <FlipCard />
@@ -409,13 +455,13 @@ function Transforms() {
             <Label color={colors.info}>Y axis</Label>
           </View>
         </Tile>
-        <Tile label="Tilt" code="rotateX: 40deg">
-          <View style={{ ...box(), borderRadius: 14, backgroundColor: tints.accent, borderWidth: 1, borderColor: colors.accent, transform: [{ perspective: 400 }, { rotateX: "40deg" }] }}>
+        <Tile label="Tilt" code="rotateX(40deg)">
+          <View style={{ ...box(), borderRadius: 14, backgroundColor: tints.accent, borderWidth: 1, borderColor: colors.accent, transform: "perspective(400px) rotateX(40deg)" }}>
             <Label color={colors.accent}>X axis</Label>
           </View>
         </Tile>
-        <Tile label="Skew" code="skewX: -12deg" note="iOS">
-          <View style={{ ...box(), borderRadius: 10, backgroundColor: tints.warn, borderWidth: 1, borderColor: colors.warn, transform: [{ skewX: "-12deg" }] }}>
+        <Tile label="Skew" code="skewX(-12deg)" note="iOS">
+          <View style={{ ...box(), borderRadius: 10, backgroundColor: tints.warn, borderWidth: 1, borderColor: colors.warn, transform: "skewX(-12deg)" }}>
             <Label color={colors.warn}>Skew</Label>
           </View>
         </Tile>
@@ -432,7 +478,7 @@ function Transforms() {
                 borderRadius: 6,
                 backgroundColor: alpha(colors.danger, 0.55),
                 transformOrigin: "top left",
-                transform: [{ rotate: "30deg" }],
+                transform: "rotate(30deg)",
               }}
             />
             <View style={{ position: "absolute", left: 26, top: 10, width: 8, height: 8, borderRadius: 4, backgroundColor: colors.text }} />
@@ -525,7 +571,7 @@ function RightToLeft() {
         )}
       </List>
       <View style={{ height: 1, backgroundColor: colors.line }} />
-      <Text style={{ fontSize: 13, textAlign: "left", color: colors.muted }}>textAlign left (the start side right to left)</Text>
+      <Text style={{ fontSize: 13, textAlign: "start", color: colors.muted }}>textAlign start (the right side right to left)</Text>
       <Text style={{ fontSize: 13, writingDirection: "rtl", color: colors.muted }}>مرحبا بالعالم — writingDirection rtl</Text>
       </View>
     </Card>
@@ -533,6 +579,10 @@ function RightToLeft() {
 }
 
 export function Styles() {
-  const sections = [Corners, Borders, Shadows, Layers, Transforms, Numerals, RightToLeft];
+  // A terminal's Cells draw no curves, shadows or depth: it shows the
+  // cards its Cells hold (borders, clipping and layers, numerals, the
+  // writing direction) and leaves the others out.
+  const sections =
+    platform.idiom === "terminal" ? [Borders, Layers, Numerals, RightToLeft] : [Corners, ProgressiveBlur, Borders, Shadows, Layers, Transforms, Numerals, RightToLeft];
   return <DemoPage cards={sections} />;
 }

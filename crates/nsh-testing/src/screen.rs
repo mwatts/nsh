@@ -13,9 +13,9 @@ use std::{
 };
 
 use nsh_core::{
-    AccessibilityRole, Bounds, Command, Dialog, EventKind, EventMask, GestureValues, InputConfig,
-    MountBatch, MountItem, NodeId, PanActivation, Point, PointerEvents, Points, Size, ViewKind,
-    ui::PropEnum,
+    AccessibilityRole, AccessibilityState, Bounds, Command, Dialog, EventKind, EventMask,
+    GestureValues, InputConfig, MountBatch, MountItem, NodeId, PanActivation, Point, PointerEvents,
+    Points, Size, ViewKind, element::PropEnum,
 };
 
 use crate::selector::{Matcher, Selector, TextMatch};
@@ -24,6 +24,28 @@ mod spans;
 
 /// The surface's root view: every app view hangs below it.
 const ROOT: NodeId = 1;
+
+/// The UTF-16 offset of byte `at` of `text`.
+fn utf16_at(text: &str, at: usize) -> u32 {
+    text[..at].encode_utf16().count() as u32
+}
+
+/// Where `want` reads in `text`, as the UTF-16 offset of each match.
+fn char_starts(text: &str, want: &TextMatch) -> Vec<u32> {
+    let ranges: Vec<usize> = match want {
+        TextMatch::Exact(want) if want.is_empty() => Vec::new(),
+        TextMatch::Exact(want) => text
+            .match_indices(want.as_str())
+            .map(|(at, _)| at)
+            .collect(),
+        TextMatch::Regex(re) => re
+            .find_iter(text)
+            .filter(|m| !m.is_empty())
+            .map(|m| m.start())
+            .collect(),
+    };
+    ranges.into_iter().map(|at| utf16_at(text, at)).collect()
+}
 
 /// The ids the model gives a canvas's nodes ([`nsh_core::canvas::CanvasNode`]),
 /// counting down from the top of the id space, where the core and JS
@@ -50,16 +72,6 @@ fn utf16_slice(text: &str, start: u32, end: u32) -> String {
             here >= start && at <= end
         })
         .collect()
-}
-
-/// Why a [`Pick::Disabled`] match takes no step on `what` (the kind of
-/// view the step looks for).
-pub(crate) fn disabled(what: &str) -> &'static str {
-    if what == "scroll view" {
-        "does not scroll: the user cannot scroll it (`scrollable` is false)"
-    } else {
-        "is disabled"
-    }
 }
 
 /// What a back does ([`Screen::back_target`]).
@@ -91,6 +103,9 @@ pub struct Screen {
     commands: Vec<(NodeId, Command)>,
     /// The input that has the focus.
     focused: Option<NodeId>,
+    /// The view that takes presses Tab gave the keyboard focus to (macOS,
+    /// the web).
+    key_focus: Option<NodeId>,
     /// Scroll views a command moved, whose offset the engine is told
     /// ([`Screen::take_scrolled`]), as a platform reports it.
     scrolled: Vec<NodeId>,
@@ -118,6 +133,13 @@ pub struct Screen {
     opened_urls: Vec<String>,
     /// The `openUrl` requests to answer.
     url_opens: Vec<u32>,
+    /// The screen colors asked for (`pick_screen_color`), to answer.
+    screen_colors: Vec<u32>,
+    /// The requests on local paths that reached the platform
+    /// (`pick_paths`, `open_path`, ...), in order.
+    file_requests: Vec<nsh_core::file_dialog::FileRequest>,
+    /// Those to answer.
+    file_answers: Vec<(u32, nsh_core::file_dialog::FileRequest)>,
     /// What the app asked that only a real platform answers, since the
     /// last call.
     unsupported: Vec<&'static str>,
@@ -167,19 +189,26 @@ struct View {
     role: AccessibilityRole,
     /// It takes no presses (`disabled`, its accessibility state).
     disabled: bool,
+    /// `focusable`: `Some(true)` makes it a stop of Tab, `Some(false)` keeps
+    /// a pressable out ([`nsh_core::ViewProps::focus_stop`]).
+    focusable: Option<bool>,
     /// It is selected (`selected`, its accessibility state; a canvas node's
     /// `selected`).
     selected: bool,
+    /// Its `accessibilityState`.
+    accessibility_state: AccessibilityState,
+    /// Its `accessibilityLevel`.
+    level: Option<u32>,
     /// How long a press must last to be a long one (`delayLongPress`), in
     /// milliseconds.
     long_press_delay: Option<f32>,
-    /// A selection area (`SelectionArea` of `nsh/base`): its texts share
+    /// A selectable view (a `View` with `selectable`): its texts share
     /// one selection.
-    selection_area: bool,
+    selectable_view: bool,
     /// The interaction states it tracks (`TrackStates`: pressed, hovered).
-    tracked: u8,
+    tracked: u16,
     /// The interaction states it is in (of those it tracks).
-    states: u8,
+    states: u16,
     /// The values its drags, pinches and rotations drive natively.
     gestures: GestureValues,
     /// When a drag on it activates its JS responder (`panActivation`).
@@ -329,6 +358,8 @@ pub(crate) struct Scroll {
     content: Option<Size<Points>>,
     /// The user cannot scroll it (`scrollable={false}`).
     pub(crate) locked: bool,
+    /// How it scrolls (where a pull refreshes).
+    pub(crate) behavior: nsh_core::ScrollBehavior,
 }
 
 impl Screen {
@@ -398,6 +429,7 @@ impl Screen {
             MountItem::ScrollBehavior { id, behavior } => {
                 if let Some(scroll) = self.scroll_mut(*id) {
                     scroll.locked = !behavior.enabled;
+                    scroll.behavior = (**behavior).clone();
                 }
             }
             MountItem::Events { id, events } => self.nodes.entry(*id).or_default().events = *events,
@@ -407,9 +439,12 @@ impl Screen {
                 view.label = props.accessibility.label.clone();
                 view.role = props.accessibility.role;
                 view.disabled = props.accessibility.state.disabled;
+                view.focusable = props.focusable;
                 view.selected = props.accessibility.state.selected;
+                view.accessibility_state = props.accessibility.state;
+                view.level = props.accessibility.level;
                 view.long_press_delay = props.long_press_delay;
-                view.selection_area = props.selection_area;
+                view.selectable_view = props.selectable_view;
                 view.pan_activation = props.pan_activation;
                 view.pointer_events = props.pointer_events;
             }
@@ -427,7 +462,7 @@ impl Screen {
                 {
                     let view = self.nodes.entry(*id).or_default();
                     view.text = Some(text.text.clone());
-                    view.attributed = Some(text.clone());
+                    view.attributed = Some(Arc::clone(text));
                 }
                 self.set_spans(*id, text);
             }
@@ -549,6 +584,13 @@ impl Screen {
                 self.opened_urls.push(url.clone());
                 self.url_opens.push(*id);
             }
+            Command::PickScreenColor { id } => self.screen_colors.push(*id),
+            // Recorded, never carried out: a test's machine opens, shows
+            // and trashes nothing.
+            Command::FileRequest { id, request } => {
+                self.file_requests.push((**request).clone());
+                self.file_answers.push((*id, (**request).clone()));
+            }
             Command::Back => self.back_asked = true,
             Command::SetSelection { start, end } => {
                 if let Some(input) = self.input_mut(id) {
@@ -616,6 +658,7 @@ impl Screen {
                 View {
                     parent: Some(parent),
                     events: link.events,
+                    focusable: Some(link.focus_stop),
                     span: Some(Span {
                         view: id,
                         text: utf16_slice(&text.text, link.start, link.end),
@@ -939,6 +982,24 @@ impl Screen {
         &self.opened_urls
     }
 
+    /// The requests on local paths that reached the platform, in order
+    /// (`pick_paths`, `pick_save_path`, `open_path`, `reveal_path`,
+    /// `move_to_trash`; only once the environment has
+    /// [`nsh_core::platform::Environment::file_requests`]).
+    pub fn file_requests(&self) -> &[nsh_core::file_dialog::FileRequest] {
+        &self.file_requests
+    }
+
+    /// The requests on local paths to answer since the last call.
+    pub(crate) fn take_file_answers(&mut self) -> Vec<(u32, nsh_core::file_dialog::FileRequest)> {
+        std::mem::take(&mut self.file_answers)
+    }
+
+    /// The screen color requests to answer since the last call.
+    pub(crate) fn take_screen_colors(&mut self) -> Vec<u32> {
+        std::mem::take(&mut self.screen_colors)
+    }
+
     /// The `openUrl` requests to answer since the last call.
     pub(crate) fn take_url_opens(&mut self) -> Vec<u32> {
         std::mem::take(&mut self.url_opens)
@@ -965,6 +1026,26 @@ impl Screen {
             .partition(|id| *id == *top || self.is_inside(*id, *top));
         first.extend(rest);
         first
+    }
+
+    /// The view `selector` matches inside `target` (a text in the button
+    /// a press goes to); `None` when the match is `target` itself.
+    pub(crate) fn match_inside(&self, selector: &Selector, target: NodeId) -> Option<NodeId> {
+        self.resolve(selector)
+            .into_iter()
+            .find(|id| self.is_inside(*id, target))
+    }
+
+    /// Where in `target` a press of what `selector` names lands: the
+    /// center of the view it matches inside `target`, as a finger taps the
+    /// text it reads. `None` when the match is `target` itself.
+    pub(crate) fn press_point(&self, selector: &Selector, target: NodeId) -> Option<Point<Points>> {
+        let inner = self.bounds_in_root(self.match_inside(selector, target)?)?;
+        let outer = self.bounds_in_root(target)?;
+        Some(nsh_core::geometry::point(
+            inner.origin.x - outer.origin.x + inner.size.width / 2.0,
+            inner.origin.y - outer.origin.y + inner.size.height / 2.0,
+        ))
     }
 
     fn is_inside(&self, mut id: NodeId, ancestor: NodeId) -> bool {
@@ -1066,22 +1147,22 @@ impl Screen {
                 Ok(!self.disabled_from(id, None)
                     && self.input(id).is_none_or(|i| i.config.editable))
             }
-            [] => Err(format!("no view matches `{selector}`")),
+            [] => Err(crate::failure::not_found("view", selector)),
             ref all => Err(format!("`{selector}` matches {} views", all.len())),
         }
     }
 
-    /// Whether the view `selector` names is in a selection area (it or a
-    /// view around it is one: `SelectionArea` of `nsh/base`, a selectable
+    /// Whether the view `selector` names is in a selectable view (it or a
+    /// view around it is one: a `View` with `selectable`, a selectable
     /// `TextView`); an error when none or several match.
-    pub fn in_selection_area(&self, selector: &str) -> Result<bool, String> {
+    pub fn in_selectable_view(&self, selector: &str) -> Result<bool, String> {
         let parsed = Selector::parse(selector)?;
         match self.resolve(&parsed)[..] {
             [mut id] => loop {
                 let Some(view) = self.nodes.get(&id) else {
                     return Ok(false);
                 };
-                if view.selection_area {
+                if view.selectable_view {
                     return Ok(true);
                 }
                 match view.parent {
@@ -1089,7 +1170,7 @@ impl Screen {
                     None => return Ok(false),
                 }
             },
-            [] => Err(format!("no view matches `{selector}`")),
+            [] => Err(crate::failure::not_found("view", selector)),
             ref all => Err(format!("`{selector}` matches {} views", all.len())),
         }
     }
@@ -1101,7 +1182,35 @@ impl Screen {
         let parsed = Selector::parse(selector)?;
         match self.resolve(&parsed)[..] {
             [id] => Ok(self.nodes.get(&id).is_some_and(|v| v.selected)),
-            [] => Err(format!("no view matches `{selector}`")),
+            [] => Err(crate::failure::not_found("view", selector)),
+            ref all => Err(format!("`{selector}` matches {} views", all.len())),
+        }
+    }
+
+    /// The accessibility state of the view `selector` names (its
+    /// `accessibilityState`: a toggle button's `pressed`, a page's
+    /// `current`, ...); an error when none or several match.
+    pub fn accessibility_state(&self, selector: &str) -> Result<AccessibilityState, String> {
+        let parsed = Selector::parse(selector)?;
+        match self.resolve(&parsed)[..] {
+            [id] => Ok(self
+                .nodes
+                .get(&id)
+                .map(|v| v.accessibility_state)
+                .unwrap_or_default()),
+            [] => Err(crate::failure::not_found("view", selector)),
+            ref all => Err(format!("`{selector}` matches {} views", all.len())),
+        }
+    }
+
+    /// The level of the view `selector` names (its `accessibilityLevel`:
+    /// a heading's, a tree item's depth); an error when none or several
+    /// match.
+    pub fn accessibility_level(&self, selector: &str) -> Result<Option<u32>, String> {
+        let parsed = Selector::parse(selector)?;
+        match self.resolve(&parsed)[..] {
+            [id] => Ok(self.nodes.get(&id).and_then(|v| v.level)),
+            [] => Err(crate::failure::not_found("view", selector)),
             ref all => Err(format!("`{selector}` matches {} views", all.len())),
         }
     }
@@ -1376,6 +1485,47 @@ impl Screen {
         out
     }
 
+    /// The views inside scroll view `id` that take a finger's drag
+    /// themselves: they hear touches (a responder, JS's or a component's,
+    /// which may keep them from the scroll view) or pan natively. A finger
+    /// that lands on one to scroll may move it instead, or the scroll view
+    /// only until the app's answer comes, so a step's scrolling lands
+    /// elsewhere. What one holds lands on it, and is not listed.
+    #[cfg(feature = "agent")]
+    pub(crate) fn drag_takers(&self, id: NodeId) -> Vec<NodeId> {
+        let attached: HashSet<NodeId> = self.attached().into_iter().collect();
+        let mut out = Vec::new();
+        let mut stack: Vec<NodeId> = self.children.get(&id).cloned().unwrap_or_default();
+        while let Some(id) = stack.pop() {
+            let Some(view) = self.nodes.get(&id) else {
+                continue;
+            };
+            let receives = view.pointer_events;
+            if !attached.contains(&id)
+                || view.canvas_node
+                || view.hidden
+                || receives == PointerEvents::None
+            {
+                continue;
+            }
+            let takes = view.events.contains(EventKind::Touch)
+                || view.events.contains(EventKind::PanStart)
+                || view.events.contains(EventKind::PanEnd)
+                || view.gestures.pan_x.is_some()
+                || view.gestures.pan_y.is_some();
+            if takes && receives != PointerEvents::BoxNone {
+                out.push(id);
+                continue;
+            }
+            if receives != PointerEvents::BoxOnly
+                && let Some(children) = self.children.get(&id)
+            {
+                stack.extend(children.iter().copied());
+            }
+        }
+        out
+    }
+
     fn up_to(&self, mut id: NodeId, test: impl Fn(&View) -> bool) -> Option<NodeId> {
         loop {
             let view = self.nodes.get(&id)?;
@@ -1509,7 +1659,7 @@ impl Screen {
     /// View `id`'s interaction states with `bit` set (or cleared), when it
     /// tracks it and they change.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn set_state(&mut self, id: NodeId, bit: u8, on: bool) -> Option<u8> {
+    pub(crate) fn set_state(&mut self, id: NodeId, bit: u16, on: bool) -> Option<u16> {
         let view = self.nodes.get_mut(&id)?;
         let next = nsh_core::input::next_states(view.tracked, view.states, bit, on)?;
         view.states = next;
@@ -1632,6 +1782,66 @@ impl Screen {
         self.focused = id;
     }
 
+    /// The view (not an input) with the keyboard focus, while it is
+    /// mounted: a pressable or a `focusable` view Tab moved it to.
+    pub(crate) fn key_focus(&self) -> Option<NodeId> {
+        self.key_focus.filter(|id| self.nodes.contains_key(id))
+    }
+
+    pub(crate) fn set_key_focus(&mut self, id: Option<NodeId>) {
+        self.key_focus = id;
+    }
+
+    /// Tab's stops, in tree order, as macOS and the web have them: the
+    /// inputs that edit and the views [`nsh_core::ViewProps::focus_stop`]
+    /// takes (those that take presses unless `focusable={false}`, and
+    /// `focusable={true}` ones whether or not they do), shown and enabled.
+    pub(crate) fn tab_stops(&self) -> Vec<NodeId> {
+        self.shown()
+            .into_iter()
+            .filter(|&id| {
+                let Some(v) = self.nodes.get(&id) else {
+                    return false;
+                };
+                if let Some(input) = &v.input {
+                    return input.config.editable && !self.disabled_from(id, None);
+                }
+                // A link in a text view is a stop after it, in text order
+                // (`TextLink::focus_stop`).
+                if v.span.is_some() {
+                    return v.focusable == Some(true) && !self.disabled_from(id, None);
+                }
+                // Disabled is the ancestors' too here (`disabled_from`).
+                let props = nsh_core::ViewProps {
+                    focusable: v.focusable,
+                    ..Default::default()
+                };
+                props.focus_stop(v.events.contains(EventKind::Press))
+                    && !self.disabled_from(id, None)
+            })
+            .collect()
+    }
+
+    /// The stop a press on `id` gives the focus to in a terminal: `id` or
+    /// its nearest ancestor that Tab stops at (`tab_stops`), else the
+    /// topmost stop over the press's point (a table's hit layer over its
+    /// rows), as a terminal finds what is under the pointer.
+    pub(crate) fn stop_around(&self, id: NodeId) -> Option<NodeId> {
+        let stops = self.tab_stops();
+        let mut at = Some(id);
+        while let Some(id) = at {
+            if stops.contains(&id) {
+                return Some(id);
+            }
+            at = self.nodes.get(&id).and_then(|v| v.parent);
+        }
+        let point = self.bounds_in_root(id)?.center();
+        stops.iter().rev().copied().find(|&stop| {
+            self.bounds_in_root(stop)
+                .is_some_and(|bounds| bounds.contains(&point))
+        })
+    }
+
     pub(crate) fn scroll(&self, id: NodeId) -> Option<&Scroll> {
         self.nodes.get(&id)?.scroll.as_ref()
     }
@@ -1741,6 +1951,49 @@ mod tests {
         screen.nodes.get_mut(&2).unwrap().clips = false;
         screen.nodes.get_mut(&2).unwrap().pointer_events = PointerEvents::BoxOnly;
         assert_eq!(screen.pressable(&selector), Pick::None);
+    }
+
+    #[test]
+    #[cfg(feature = "agent")]
+    fn a_scroll_views_drag_takers_are_the_views_that_take_touches_or_pan() {
+        let mut screen = Screen::default();
+        let mut items = vec![create(2, ViewKind::Scroll), insert(1, 2)];
+        for id in [4, 6, 8, 10, 12, 14, 16] {
+            items.extend([create(id, ViewKind::View), insert(2, id)]);
+        }
+        // Inside the responder at 4, and inside the view at 12 that keeps
+        // touches from what it holds.
+        items.extend([
+            create(18, ViewKind::View),
+            insert(4, 18),
+            create(20, ViewKind::View),
+            insert(12, 20),
+        ]);
+        screen.apply(&batch(items));
+        let events = |screen: &mut Screen, id: NodeId, kind: EventKind| {
+            screen.nodes.get_mut(&id).unwrap().events.set(kind, true);
+        };
+        // A responder, a native pan, a button, a responder no touch
+        // reaches, a responder only what it holds hears, and a drag that
+        // moves a value.
+        for (id, kind) in [
+            (4, EventKind::Touch),
+            (6, EventKind::PanStart),
+            (8, EventKind::Press),
+            (10, EventKind::Touch),
+            (14, EventKind::Touch),
+            (18, EventKind::Touch),
+            (20, EventKind::Touch),
+        ] {
+            events(&mut screen, id, kind);
+        }
+        screen.nodes.get_mut(&10).unwrap().pointer_events = PointerEvents::None;
+        screen.nodes.get_mut(&12).unwrap().pointer_events = PointerEvents::BoxOnly;
+        screen.nodes.get_mut(&14).unwrap().pointer_events = PointerEvents::BoxNone;
+        screen.nodes.get_mut(&16).unwrap().gestures.pan_y = Some(1);
+        let mut takers = screen.drag_takers(2);
+        takers.sort_unstable();
+        assert_eq!(takers, [4, 6, 16]);
     }
 
     fn batch(items: Vec<MountItem>) -> MountBatch {
@@ -1941,6 +2194,7 @@ mod tests {
             end,
             node,
             events,
+            focus_stop: true,
         };
         let linked = |links: Vec<nsh_core::TextLink>| MountItem::Text {
             id: 4,

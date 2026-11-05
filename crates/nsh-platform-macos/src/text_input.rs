@@ -9,7 +9,11 @@
 //! are borderless, without a background or focus ring, with the config's
 //! font, colors and alignment. A single-line field shows its own
 //! placeholder (an attributed one); a text view has none, so a label under
-//! it shows the placeholder while the text is empty.
+//! it shows the placeholder while the text is empty, an input method's
+//! composition counting as text. Single-line text and placeholders share
+//! the field editor's natural font metrics; multiline paragraphs use the
+//! configured line height, its extra space split above and below the text
+//! ([`LineBox`]), as the caret is as tall as a line fragment.
 //!
 //! The fields are subclasses ([`define_field!`]) only to hear what AppKit
 //! tells a field's delegate's delegate: AppKit edits a field with the
@@ -28,8 +32,9 @@
 //!
 //! An input method's composition (the editor's marked text) is followed
 //! natively and reported as `onCompositionChange`: as it starts and
-//! changes, and as it ends, after the `onChangeText` of the committed
-//! text. A value from JS that comes during a composition waits for its
+//! changes (AppKit tells only of the selection then: marking text sends no
+//! `textDidChange:`), and as it ends, after the `onChangeText` of the
+//! committed text. A value from JS that comes during a composition waits for its
 //! end: setting the text then would end the input method's session and
 //! commit what it composes.
 //!
@@ -335,6 +340,13 @@ impl Ctx {
         }
     }
 
+    /// A text view's text scrolled, or its size or the viewport's changed.
+    fn scrolled(&self) {
+        if let Some((surface, view, input)) = self.get() {
+            report_scroll(&surface, &view, &input);
+        }
+    }
+
     fn key_press(&self, key: &str) {
         self.send(EventKind::KeyPress, || {
             EventPayload::Map(vec![("key", PayloadValue::Str(key.to_owned()))])
@@ -383,15 +395,23 @@ impl Ctx {
         let Some(input) = self.input.upgrade() else {
             return;
         };
-        if input.applying.get() || input.editing.get() {
+        // Marked text is in the editor's text, though no change is told.
+        input.update_placeholder();
+        if input.applying.get() {
             return;
         }
         let editor = input.editor.borrow().clone();
+        let marked = editor.marked_text();
+        let reported = *input.known.borrow() == editor.text();
+        // Marking text, or dropping it, is an edit `changed` never hears of.
+        if marked.is_some() || (reported && input.composition.borrow().is_some()) {
+            input.editing.set(false);
+        }
         // An edit not reported yet: `changed` reports it, then comes here.
-        if *input.known.borrow() != editor.text() {
+        if input.editing.get() || (marked.is_none() && !reported) {
             return;
         }
-        self.compose(&input, editor.marked_text());
+        self.compose(&input, marked);
     }
 
     /// Records the composition `marked` (`None`: none) and reports it if
@@ -767,7 +787,7 @@ pub(crate) fn tab(surface: &Surface, from: &NSView, backward: bool) -> bool {
         // gives the focus back to it: skip the views around `from`.
         if next.isDescendantOf(&scope)
             && (!crate::view::is_ours(&next)
-                || NshView::from_ns(&next).is_some_and(|view| crate::input::is_key_control(&view)))
+                || NshView::from_ns(&next).is_some_and(|view| crate::input::is_key_stop(&view)))
             && !from.isDescendantOf(&next)
         {
             return window.makeFirstResponder(Some(&next));
@@ -1034,12 +1054,21 @@ pub(crate) fn test_paste(
     board.clearContents();
     let mut items: Vec<Retained<ProtocolObject<dyn NSPasteboardWriting>>> = Vec::new();
     let item = || NSPasteboardItem::new();
-    if !content.text.is_empty() {
+    // Text and its HTML are one item, as a browser copies them.
+    if !content.text.is_empty() || !content.html.is_empty() {
         let text = item();
-        // SAFETY: an immutable AppKit constant.
-        text.setString_forType(&NSString::from_str(&content.text), unsafe {
-            NSPasteboardTypeString
-        });
+        if !content.text.is_empty() {
+            // SAFETY: an immutable AppKit constant.
+            text.setString_forType(&NSString::from_str(&content.text), unsafe {
+                NSPasteboardTypeString
+            });
+        }
+        if !content.html.is_empty() {
+            text.setString_forType(
+                &NSString::from_str(&content.html),
+                &NSString::from_str("public.html"),
+            );
+        }
         items.push(ProtocolObject::from_retained(text));
     }
     for file in &content.files {
@@ -1317,6 +1346,14 @@ define_class!(
         #[unsafe(method(clipBoundsChanged:))]
         fn clip_bounds_changed(&self, _notification: &NSNotification) {
             self.ivars().caret_moved();
+            self.ivars().scrolled();
+        }
+
+        /// A text view or its clip view changed size: the content or the
+        /// viewport a built-in bar shows.
+        #[unsafe(method(textFrameChanged:))]
+        fn text_frame_changed(&self, _notification: &NSNotification) {
+            self.ivars().scrolled();
         }
     }
 
@@ -1434,7 +1471,7 @@ impl InputState {
             NSColor::clearColor()
         } else {
             config
-                .selection_color
+                .caret_color
                 .map_or_else(|| self.text_color(), ns_color)
         };
         view.setInsertionPointColor(Some(&caret));
@@ -1558,6 +1595,23 @@ fn new_editor(
                     Some(&clip),
                 );
         }
+        // A built-in bar also follows the text's height and the viewport's
+        // (`InputConfig::replaced`).
+        view.setPostsFrameChangedNotifications(true);
+        clip.setPostsFrameChangedNotifications(true);
+        for object in [&***view as &NSView, &*clip] {
+            // SAFETY: the delegate answers the selector (`textFrameChanged:`);
+            // a selector-based observer goes away with it.
+            unsafe {
+                objc2_foundation::NSNotificationCenter::defaultCenter()
+                    .addObserver_selector_name_object(
+                        delegate,
+                        sel!(textFrameChanged:),
+                        Some(objc2_app_kit::NSViewFrameDidChangeNotification),
+                        Some(object),
+                    );
+            }
+        }
         Editor::Area { scroller, view }
     } else {
         let field = if secure {
@@ -1643,7 +1697,13 @@ pub(crate) fn config(surface: &Rc<Surface>, view: &NshView, config: &InputConfig
                 editor.setAlignment(align);
             }
         }
-        Editor::Area { view: text, .. } => {
+        Editor::Area {
+            scroller,
+            view: text,
+        } => {
+            // A built-in bar of the app's takes the indicator's place; the
+            // text still scrolls with the wheel, the keys and the caret.
+            scroller.setHasVerticalScroller(config.scrollbar_visible);
             text.setFont(Some(&font));
             text.setTextColor(Some(&color));
             text.setAlignment(align);
@@ -1652,7 +1712,10 @@ pub(crate) fn config(surface: &Rc<Surface>, view: &NshView, config: &InputConfig
             text.setSelectable(true);
             text.setContinuousSpellCheckingEnabled(config.auto_correct);
             text.setAutomaticSpellingCorrectionEnabled(config.auto_correct);
-            text.setDefaultParagraphStyle(Some(&paragraph(config, align)));
+            let line = LineBox::new(config.style.line_height.0 as CGFloat, natural_height(&font));
+            text.setDefaultParagraphStyle(Some(&paragraph(line, align)));
+            // The space above the first line and below the last.
+            text.setTextContainerInset(CGSize::new(0.0, line.inset));
             let label = &input.placeholder;
             label.setFont(Some(&font));
             label.setTextColor(Some(&placeholder_color(config)));
@@ -1671,6 +1734,80 @@ pub(crate) fn config(surface: &Rc<Surface>, view: &NshView, config: &InputConfig
         auto_focus(surface, &input);
     }
     place(view, &input);
+    report_scroll(surface, view, &input);
+}
+
+/// Reports how far a multiline input's text scrolled while a built-in bar
+/// takes the place of its indicator (`InputConfig::replaced`).
+fn report_scroll(surface: &Surface, view: &NshView, input: &InputState) {
+    if !input.config.borrow().replaced {
+        return;
+    }
+    let Editor::Area {
+        scroller,
+        view: text,
+    } = &*input.editor.borrow()
+    else {
+        return;
+    };
+    // SAFETY: a scroll view's clip view (an `NSView`), always present.
+    let clip: Retained<NSView> = unsafe { msg_send![&**scroller, contentView] };
+    // The clip view is flipped as the text view is: its bounds origin is
+    // the offset from the top.
+    let bounds = clip.bounds();
+    let width = bounds.size.width as f32;
+    let page = bounds.size.height as f32;
+    let height = (text.frame().size.height as f32).max(page);
+    let id = view.state().id;
+    surface.control(|c| {
+        c.input_scroll(
+            id,
+            Point {
+                x: Points(0.0),
+                y: px(bounds.origin.y as f32),
+            },
+            Size {
+                width: px(width),
+                height: px(height),
+            },
+            Size {
+                width: px(width),
+                height: px(page),
+            },
+        );
+    });
+}
+
+/// `Command::ScrollTo` for a multiline input: scrolls its text (a built-in
+/// bar's drags).
+pub(crate) fn scroll_to(view: &NshView, y: Points, animated: bool) {
+    let Some(input) = view.state().input.clone() else {
+        return;
+    };
+    let Editor::Area {
+        scroller,
+        view: text,
+    } = &*input.editor.borrow()
+    else {
+        return;
+    };
+    // SAFETY: a scroll view's clip view (an `NSView`), always present.
+    let clip: Retained<NSView> = unsafe { msg_send![&**scroller, contentView] };
+    let bounds = clip.bounds();
+    let max = (text.frame().size.height - bounds.size.height).max(0.0);
+    let origin = NSPoint::new(bounds.origin.x, (y.0 as CGFloat).clamp(0.0, max));
+    if animated {
+        // SAFETY: every view has an animator proxy, which answers the
+        // view's setters with an animation.
+        unsafe {
+            let animator: Retained<AnyObject> = msg_send![&clip, animator];
+            let _: () = msg_send![&animator, setBoundsOrigin: origin];
+        }
+    } else {
+        clip.setBoundsOrigin(origin);
+    }
+    // SAFETY: the scroll view's own clip view.
+    let _: () = unsafe { msg_send![&**scroller, reflectScrolledClipView: &*clip] };
 }
 
 /// The horizontal alignment of the text; natural follows the writing
@@ -1685,14 +1822,58 @@ fn alignment(align: TextAlign) -> NSTextAlignment {
     }
 }
 
-/// A text view's paragraph style: alignment and line height.
-fn paragraph(config: &InputConfig, align: NSTextAlignment) -> Retained<NSMutableParagraphStyle> {
+/// The height the text system gives a line of `font`.
+fn natural_height(font: &objc2_app_kit::NSFont) -> CGFloat {
+    objc2_app_kit::NSLayoutManager::new().defaultLineHeightForFont(font)
+}
+
+/// How a text view's lines take a configured line height. AppKit's caret
+/// is as tall as a line fragment, and a fragment with a minimum line height
+/// holds its extra space above the text: a caret that reaches well above
+/// the text, and text low in its line. So a fragment holds only the text
+/// (`fragment`), the next line starts `spacing` below it, and the text
+/// container's `inset` puts half of that above the first line and below the
+/// last, which AppKit leaves out: lines of the configured height with their
+/// text in the middle, as CSS's half-leading and the core's measure have it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LineBox {
+    /// A line fragment's height (0: the font's).
+    fragment: CGFloat,
+    /// The space between line fragments.
+    spacing: CGFloat,
+    /// The space above the first line and below the last.
+    inset: CGFloat,
+}
+
+impl LineBox {
+    /// Lines of `line_height` (0: the font's) in a font whose lines are
+    /// `natural` tall. A line height below the font's clips the fragment.
+    fn new(line_height: CGFloat, natural: CGFloat) -> LineBox {
+        if line_height <= 0.0 {
+            return LineBox {
+                fragment: 0.0,
+                spacing: 0.0,
+                inset: 0.0,
+            };
+        }
+        let fragment = line_height.min(natural);
+        let spacing = line_height - fragment;
+        LineBox {
+            fragment,
+            spacing,
+            inset: spacing / 2.0,
+        }
+    }
+}
+
+/// A text view's paragraph style: alignment and lines.
+fn paragraph(line: LineBox, align: NSTextAlignment) -> Retained<NSMutableParagraphStyle> {
     let style = NSMutableParagraphStyle::new();
     style.setAlignment(align);
-    let line_height = config.style.line_height;
-    if line_height > Points::ZERO {
-        style.setMinimumLineHeight(line_height.0 as CGFloat);
-        style.setMaximumLineHeight(line_height.0 as CGFloat);
+    if line.fragment > 0.0 {
+        style.setMinimumLineHeight(line.fragment);
+        style.setMaximumLineHeight(line.fragment);
+        style.setLineSpacing(line.spacing);
     }
     style
 }
@@ -1711,7 +1892,11 @@ fn placeholder(
     align: NSTextAlignment,
 ) -> Retained<NSAttributedString> {
     let color = placeholder_color(config);
-    let paragraph = paragraph(config, align);
+    // AppKit's single-line field editor uses the font's natural line
+    // height. A fixed paragraph height here would move only the
+    // placeholder's baseline, away from the text and caret.
+    let paragraph = NSMutableParagraphStyle::new();
+    paragraph.setAlignment(align);
     // SAFETY: immutable AppKit attribute keys with values of their
     // documented types (NSFont, NSColor, NSParagraphStyle).
     let keys = unsafe {
@@ -1813,14 +1998,16 @@ fn place(view: &NshView, input: &InputState) {
             };
             host(field, rect);
         }
-        Editor::Area { scroller, .. } => {
+        Editor::Area { scroller, view } => {
             // The placeholder goes first: hosted views stack in order. A
-            // label insets its text as a field does.
+            // label insets its text as a field does; it starts where the
+            // editor's first line of text does.
+            let top = px(view.textContainerInset().height as f32);
             let label = Bounds {
-                origin: Point::new(content.origin.x - px(FIELD_PADDING), content.origin.y),
+                origin: Point::new(content.origin.x - px(FIELD_PADDING), content.origin.y + top),
                 size: Size::new(
                     content.size.width + px(2.0 * FIELD_PADDING),
-                    content.size.height,
+                    content.size.height - top,
                 ),
             };
             host(&input.placeholder, label);
@@ -1952,21 +2139,15 @@ pub(crate) fn set_selection(view: &NshView, start: u32, end: u32) {
     }
 }
 
-/// Sets the `focused` interaction state of `view`, if JS tracks it.
+/// Sets the `focused` interaction state of `view`, which the core hears
+/// whatever the view tracks (`nsh_core::input::reported_states`).
 fn set_focused(surface: &Surface, view: &NshView, on: bool) {
     let (id, next) = {
         let mut s = view.state_mut();
-        if s.tracked & state::FOCUSED == 0 {
+        let Some(next) = nsh_core::input::next_states(s.tracked, s.states, state::FOCUSED, on)
+        else {
             return;
-        }
-        let next = if on {
-            s.states | state::FOCUSED
-        } else {
-            s.states & !state::FOCUSED
         };
-        if next == s.states {
-            return;
-        }
         s.states = next;
         (s.id, next)
     };
@@ -2009,6 +2190,71 @@ fn clip_utf16(s: &str, max: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_line_placeholder_matches_native_editor_metrics() {
+        let font = objc2_app_kit::NSFont::systemFontOfSize(16.0);
+        for line_height in [0.0, 16.0, 24.0, 32.0] {
+            let mut config = InputConfig::default();
+            config.placeholder.push_str("Placeholder");
+            config.style.line_height = px(line_height);
+            for align in [
+                NSTextAlignment::Left,
+                NSTextAlignment::Center,
+                NSTextAlignment::Right,
+            ] {
+                let text = placeholder(&config, &font, align);
+                // SAFETY: index zero is in the nonempty attributed string;
+                // no effective range is requested.
+                let style = unsafe {
+                    text.attribute_atIndex_effectiveRange(
+                        NSParagraphStyleAttributeName,
+                        0,
+                        std::ptr::null_mut(),
+                    )
+                }
+                .unwrap()
+                .downcast::<objc2_app_kit::NSParagraphStyle>()
+                .unwrap();
+                assert_eq!(style.alignment(), align);
+                assert_eq!(style.minimumLineHeight(), 0.0);
+                assert_eq!(style.maximumLineHeight(), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_line_height_above_the_fonts_goes_around_the_text() {
+        let line = LineBox::new(24.0, 18.0);
+        assert_eq!(
+            line,
+            LineBox {
+                fragment: 18.0,
+                spacing: 6.0,
+                inset: 3.0,
+            }
+        );
+        let style = paragraph(line, NSTextAlignment::Left);
+        assert_eq!(style.minimumLineHeight(), 18.0);
+        assert_eq!(style.maximumLineHeight(), 18.0);
+        assert_eq!(style.lineSpacing(), 6.0);
+    }
+
+    #[test]
+    fn a_line_height_below_the_fonts_clips_the_lines() {
+        let line = LineBox::new(16.0, 18.0);
+        assert_eq!(line.fragment, 16.0);
+        assert_eq!(line.spacing, 0.0);
+        assert_eq!(line.inset, 0.0);
+    }
+
+    #[test]
+    fn no_line_height_leaves_the_fonts_lines() {
+        let style = paragraph(LineBox::new(0.0, 18.0), NSTextAlignment::Left);
+        assert_eq!(style.minimumLineHeight(), 0.0);
+        assert_eq!(style.maximumLineHeight(), 0.0);
+        assert_eq!(style.lineSpacing(), 0.0);
+    }
 
     #[test]
     fn max_length_clipping() {

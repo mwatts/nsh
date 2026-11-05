@@ -82,7 +82,7 @@ pub(crate) fn verbose() -> bool {
 
 /// Whether output is colored.
 pub(crate) fn color() -> bool {
-    term().color
+    term().color && !LOGGING.load(Ordering::Acquire)
 }
 
 /// Mirrors [`Out::drawn`] for the signal handler, which cannot lock.
@@ -115,7 +115,7 @@ impl Drop for Stoppable {
 
 /// Whether a signal asked the command to stop ([`Stoppable`]).
 pub(crate) fn stop_requested() -> bool {
-    STOP_SIGNAL.load(Ordering::SeqCst) != 0
+    STOP_SIGNAL.load(Ordering::SeqCst) != 0 || crate::dev_port::stop_requested()
 }
 
 /// After a requested stop: ends the process as the signal would have
@@ -354,6 +354,7 @@ struct Out {
     /// The spinner line is on screen.
     drawn: bool,
     frame: usize,
+    log: Option<std::fs::File>,
 }
 
 struct Spinner {
@@ -367,7 +368,36 @@ static OUT: Mutex<Out> = Mutex::new(Out {
     spinners: Vec::new(),
     drawn: false,
     frame: 0,
+    log: None,
 });
+
+static LOGGING: AtomicBool = AtomicBool::new(false);
+
+/// Routes CLI diagnostics and tool output away from the terminal until dropped.
+pub(crate) struct LogFile;
+
+impl LogFile {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        let mut out = out();
+        out.clear(&mut std::io::stderr().lock());
+        out.log = Some(file);
+        LOGGING.store(true, Ordering::Release);
+        Ok(Self)
+    }
+}
+
+impl Drop for LogFile {
+    fn drop(&mut self) {
+        let mut out = out();
+        out.log = None;
+        out.spinners.clear();
+        LOGGING.store(false, Ordering::Release);
+    }
+}
 
 const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
@@ -385,6 +415,9 @@ impl Out {
     }
 
     fn draw(&mut self, err: &mut impl std::io::Write) {
+        if self.log.is_some() {
+            return;
+        }
         let Some(spinner) = self.spinners.last() else {
             return self.clear(err);
         };
@@ -418,6 +451,10 @@ impl Out {
 /// Prints `text` (whole lines) above the spinner.
 fn print(text: &str) {
     let mut out = out();
+    if let Some(log) = &mut out.log {
+        let _ = writeln!(log, "{text}");
+        return;
+    }
     let mut err = std::io::stderr().lock();
     out.clear(&mut err);
     let _ = err.write_all(text.as_bytes());
@@ -610,7 +647,7 @@ impl Step {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         let id = NEXT.fetch_add(1, Ordering::Relaxed);
         let start = Instant::now();
-        if term().tty && !verbose() {
+        if term().tty && !verbose() && !LOGGING.load(Ordering::Acquire) {
             spin();
             let mut out = out();
             out.spinners.push(Spinner {
@@ -745,11 +782,20 @@ pub(crate) fn report(error: &anyhow::Error) {
 /// Verbose runs let the output through instead (and return none).
 pub(crate) fn capture(
     cmd: &mut Command,
-    mut on_line: impl FnMut(&str),
+    on_line: impl FnMut(&str),
 ) -> std::io::Result<(ExitStatus, String)> {
-    if verbose() {
+    if verbose() && !LOGGING.load(Ordering::Acquire) {
         return Ok((cmd.status()?, String::new()));
     }
+    capture_all(cmd, on_line)
+}
+
+/// [`capture`] for output the caller reads (`cargo test`'s results):
+/// verbose runs get it too, and show each line as it comes.
+pub(crate) fn capture_all(
+    cmd: &mut Command,
+    mut on_line: impl FnMut(&str),
+) -> std::io::Result<(ExitStatus, String)> {
     let (reader, writer) = std::io::pipe()?;
     cmd.stdin(Stdio::null())
         .stdout(writer.try_clone()?)
@@ -764,7 +810,11 @@ pub(crate) fn capture(
     let mut line = Vec::new();
     while reader.read_until(b'\n', &mut line)? > 0 {
         let text = String::from_utf8_lossy(&line);
-        on_line(text.trim_end_matches(['\n', '\r']));
+        let text_line = text.trim_end_matches(['\n', '\r']);
+        if verbose() {
+            plain(text_line);
+        }
+        on_line(text_line);
         output.push_str(&text);
         line.clear();
     }
@@ -775,7 +825,14 @@ pub(crate) fn capture(
 /// shows the crate it compiles, the output is shown only if it fails, and
 /// warnings are counted (`-v` shows them).
 pub(crate) fn cargo(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
-    let step = Step::start(format!("building {what}"));
+    cargo_as(cmd, ["building", "built"], what)
+}
+
+/// [`cargo`] for another cargo command (`cargo check`): `doing` names the
+/// step while it runs and once it ends (`["checking", "checked"]`).
+pub(crate) fn cargo_as(cmd: &mut Command, doing: [&str; 2], what: &str) -> anyhow::Result<()> {
+    let [doing, done] = doing;
+    let step = Step::start(format!("{doing} {what}"));
     if !verbose() {
         cmd.env("CARGO_TERM_COLOR", if color() { "always" } else { "never" });
     }
@@ -790,14 +847,14 @@ pub(crate) fn cargo(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
     })
     .context("run cargo")?;
     if !status.success() {
-        return Err(failure(format!("building {what} failed"), output));
+        return Err(failure(format!("{doing} {what} failed"), output));
     }
     let note = match warnings {
         0 => None,
         1 => Some("1 warning: -v shows it".to_owned()),
         n => Some(format!("{n} warnings: -v shows them")),
     };
-    step.done_with(format!("built {what}"), note.as_deref());
+    step.done_with(format!("{done} {what}"), note.as_deref());
     Ok(())
 }
 
@@ -838,7 +895,7 @@ impl Tail {
 pub(crate) fn quiet(cmd: &mut Command) -> std::io::Result<(std::process::Child, Tail)> {
     const KEEP: usize = 200;
     let tail = Tail::default();
-    if verbose() {
+    if verbose() && !LOGGING.load(Ordering::Acquire) {
         return Ok((cmd.spawn()?, tail));
     }
     let (reader, writer) = std::io::pipe()?;
@@ -852,6 +909,9 @@ pub(crate) fn quiet(cmd: &mut Command) -> std::io::Result<(std::process::Child, 
         .spawn(move || {
             for line in BufReader::new(reader).lines() {
                 let Ok(line) = line else { break };
+                if verbose() {
+                    plain(&line);
+                }
                 let mut lines = lines.0.lock().unwrap_or_else(|e| e.into_inner());
                 if lines.len() == KEEP {
                     lines.pop_front();

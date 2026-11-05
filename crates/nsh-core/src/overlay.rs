@@ -1,4 +1,4 @@
-//! Overlays (`<Overlay>` of `nsh`, [`crate::ui::overlay`]): views shown on
+//! Overlays (`<Overlay>` of `nsh`, [`crate::element::overlay`]): views shown on
 //! top of the root view they are in (the surface, or the dialog around
 //! them), outside their parent's layout and clipping, while staying where
 //! the app put them for everything else (reactive context, events,
@@ -18,7 +18,7 @@
 //! anchor or presses it, as GPUI's tooltips are. An element's `tooltip`
 //! ([`TooltipContent`]) is one the core makes.
 
-use std::{sync::Arc, time::Duration};
+use std::time::Duration;
 
 use crate::{
     geometry::{Bounds, Point, Points, Size, point, rect, size},
@@ -42,10 +42,35 @@ pub enum OverlayAnchor {
     /// (`onCaretMove`'s `pageBounds`), where an `@` mention's
     /// suggestions open.
     Bounds(Bounds<Points>),
-    /// What a view draws: the box around its children (the view itself
-    /// while it has none). A trigger wrapped in a view its parent
+    /// What a view draws: the box around its children with the view's
+    /// padding and border around them (the view itself while it has no
+    /// children). A trigger wrapped in a view its parent
     /// stretches is placed against what shows, not the stretched wrapper.
+    /// The element that takes a component's slot (the app's, from TSX or
+    /// Rust) goes by its own box: the slot's holder around it is that
+    /// wrapper.
     Content(NodeId),
+    /// Beside a view inside another, as a submenu beside its row: lined
+    /// up with `node` along the side it goes on, and outside `edges` (the
+    /// menu around the row) across it, so the gap is measured from the
+    /// menu's edge, not from the row inside its padding.
+    Beside {
+        /// The view it lines up with.
+        node: NodeId,
+        /// The view whose edges it goes outside of.
+        edges: NodeId,
+    },
+}
+
+/// The resolved anchor and side delivered to native renderers for grid projection.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlacedAnchor {
+    /// The anchor's frame in its root view's point coordinates.
+    pub bounds: Bounds<Points>,
+    /// The anchored view, when the anchor is its whole frame.
+    pub node: Option<NodeId>,
+    /// The final side, including a placement flipped to fit the viewport.
+    pub placement: Placement,
 }
 
 /// The side of the anchor an overlay goes on (`placement`), as
@@ -129,20 +154,25 @@ pub struct OverlayConfig {
     /// (`EventKind::Show` / `EventKind::Dismiss`). `None`: the pointer
     /// decides.
     pub open: Option<bool>,
+    /// A view inside it laid over the anchor, as a select's list opens
+    /// with the selected item over the trigger: the overlay starts where
+    /// the anchor does, with that view's middle on the anchor's, kept
+    /// inside the area, instead of on a side. Where the view is in the
+    /// overlay is kept while the overlay keeps its size, so scrolling its
+    /// content does not move it. `None`: on a side, as `placement` says.
+    pub cover: Option<NodeId>,
 }
 
 /// The delay of a hint before it shows (500 ms, as the desktops' tooltips).
 pub const HINT_DELAY: Duration = Duration::from_millis(500);
 
 /// What an element's `tooltip` shows, in a hint overlay the core makes
-/// above the element ([`OverlayConfig::hint`]).
+/// above the element (or the element itself when it is a hint overlay) ([`OverlayConfig::hint`]).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum TooltipContent {
     /// No tooltip.
     #[default]
     None,
-    /// A text, in a minimal bubble drawn with the theme's `popover` tokens.
-    Text(Arc<str>),
     /// An element (JS's: a node it made), shown as it is.
     Node(NodeId),
 }

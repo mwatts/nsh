@@ -11,7 +11,8 @@ use crossbeam_channel::Receiver;
 use nsh_core::{
     ApproxTextEngine, EventKind, EventPayload, MountBatch, MountItem, NodeId, Size,
     animation::{AnimationOp, AnimationProp, Driver, Finished, Graph},
-    ui::{Root, prelude::*},
+    element::Root,
+    prelude::*,
 };
 use nsh_engine::{App, Engine, EngineConfig, Environment};
 
@@ -55,7 +56,7 @@ fn Jumper() -> impl IntoElement {
     view()
         .flex_1()
         .bind_translate_x(&x)
-        .bind_shadow_radius(&x)
+        .bind_opacity(&x)
         .child(text(state))
         .child(text("Jump").on_press(move |_: &()| run("jump", &jump)))
         .child(text("Pulse").on_press(move |_: &()| run("pulse", &pulse)))
@@ -98,6 +99,7 @@ impl Platform {
             trace: false,
             network: None,
             websocket: None,
+            refuse_connections: None,
             filesystem: None,
             assets: None,
             environment: Environment::default(),
@@ -114,6 +116,7 @@ impl Platform {
             clipboard: None,
             host: Default::default(),
             picker: None,
+            speech: None,
         };
         let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
         let mut platform = Self {
@@ -210,7 +213,7 @@ fn rust_composites_run_natively_and_report_their_ends() {
     assert!(p.x.is_some(), "the value is bound");
     assert_eq!(
         p.bound,
-        [AnimationProp::Transform(0), AnimationProp::ShadowRadius]
+        [AnimationProp::Transform(0), AnimationProp::Opacity]
     );
 
     p.ops.clear();

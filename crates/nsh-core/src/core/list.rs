@@ -29,11 +29,13 @@
 //!
 //! Row-local state travels with recycled cells, so
 //! apps keep it outside, keyed by id. Unbound cells keep their last content:
-//! the core moves them out of sight (never with a NaN frame; cells never
-//! placed are skipped). The header, footer and empty placeholder are cells
-//! with a role (`slot="header"`, ...) and are never recycled. Each cell is a
-//! Taffy root of its own (its width follows the list's cross axis), so
-//! scrolling relays out dirty cells only.
+//! the core moves those in the render window out of sight (never with a NaN
+//! frame; cells never placed are skipped) and hides them from touches and
+//! screen readers until they are placed again (`Core::set_spare`). The
+//! header, footer and empty placeholder are cells with a role
+//! (`slot="header"`, ...) and are never recycled. Each cell is a Taffy root
+//! of its own (its width follows the list's cross axis), so scrolling
+//! relays out dirty cells only.
 //!
 //! # Scroll commands
 //!
@@ -280,6 +282,9 @@ pub(super) struct ListState {
     /// What `contentClass` sets.
     content_class: ListContentStyle,
     pub(super) horizontal: bool,
+    /// Shown mirrored (a horizontal list right to left): laid out left to
+    /// right, so the content's left padding is its main axis' end.
+    mirrored: bool,
     pub(super) inverted: bool,
     /// `maintainVisibleContentPosition`'s `autoscrollToBottomThreshold`:
     /// a list that is not inverted follows the end of its content while
@@ -287,6 +292,9 @@ pub(super) struct ListState {
     pub(super) follow_end: Option<f32>,
     /// `stickyHeaderIndices`, sorted.
     pub(super) sticky: Vec<u32>,
+    /// Items kept rendered wherever they are (`Core::set_kept`): the ends
+    /// of a text selection, whose texts must outlive scrolling away.
+    kept: Vec<u32>,
     /// `stickyHeaderOffset`: sticky items stick this far from the
     /// viewport's start.
     sticky_offset: f32,
@@ -334,6 +342,9 @@ pub(super) struct ListState {
     /// Cells whose item moved to another index (a splice): the runtime
     /// learns their new index with the next bindings.
     moved: Vec<(u32, u32)>,
+    /// The items changed (a splice, a new count) since the core last
+    /// hid the cells without an item: the rows those show may be gone.
+    pub(super) items_changed: bool,
     /// Binds of overscan cells wait for the engine's budget
     /// ([`Self::take_paced`]); the rest bind with the window.
     pub(super) paced: bool,
@@ -341,11 +352,16 @@ pub(super) struct ListState {
     /// (its sign is the scroll direction). The core's own moves (anchoring
     /// a splice, measured rows, following a pin) are not steps.
     lead: f32,
-    /// Scroll that keeps the visible content in place after a splice.
+    /// Scroll that keeps the visible content in place after a splice or a
+    /// change of columns.
     splice_anchor: f32,
     /// The target of the last scroll command, until it is reached with
     /// measured cells or the user scrolls away.
     pin: Option<Pin>,
+    /// The item the last change of columns kept at the top: while its row
+    /// is still the first visible one, the next change keeps it rather than
+    /// the row's first item, so resizing back and forth does not drift.
+    columns_anchor: Option<u32>,
     /// `viewport="parent"`: virtualized against the view around it.
     pub(super) parent: bool,
     /// The parent mode's view, once found.
@@ -378,6 +394,7 @@ impl ListState {
             by_index: FxHashMap::default(),
             free: Vec::new(),
             extras: [Extra::NONE; 3],
+            mirrored: false,
             content: ListContentStyle::default(),
             content_style: ListContentStyle::default(),
             content_class: ListContentStyle::default(),
@@ -385,6 +402,7 @@ impl ListState {
             inverted: false,
             follow_end: None,
             sticky: Vec::new(),
+            kept: Vec::new(),
             sticky_offset: 0.0,
             sticky_node: None,
             sent_sticky: Vec::new(),
@@ -404,10 +422,12 @@ impl ListState {
             issued: 0,
             pending: Vec::new(),
             moved: Vec::new(),
+            items_changed: false,
             paced: false,
             lead: 0.0,
             splice_anchor: 0.0,
             pin: None,
+            columns_anchor: None,
             parent: false,
             outer: None,
             outer_start: f32::NAN,
@@ -509,24 +529,10 @@ impl ListState {
         if removed == 0 && inserted == 0 {
             return;
         }
+        self.items_changed = true;
         // The visible content keeps its place instead.
         self.pin = None;
-        // The first visible item and where it is in the viewport. An
-        // inverted list at its start (item 0 in view at the bottom) keeps
-        // its distance from the end instead, so what arrives there shows.
-        // In its parent's viewport, only while the list's start is scrolled
-        // past (when it shows, the content below it moves instead).
-        let anchor = (self.count > 0
-            && self.viewport > 0.0
-            && self.keeps_visible_rows()
-            && (!self.parent || self.offset > 0.0))
-            .then(|| {
-                let top = self.natural_offset();
-                let body = self.blocks().body;
-                let row = self.rows.find((top - body).max(0.0) as f64) as u32;
-                let index = (row * self.columns).min(self.count - 1);
-                (index, self.item_at(index) - top)
-            });
+        let anchor = self.visible_anchor();
         let natural_before = self.natural_offset();
         let end = (at + removed) as usize;
         self.sizes.splice(
@@ -543,6 +549,7 @@ impl ListState {
                 None
             }
         };
+        self.kept = self.kept.iter().filter_map(|&i| shift(i)).collect();
         self.by_index.clear();
         for (slot, s) in self.slots.iter_mut().enumerate() {
             let index = s.index.and_then(shift);
@@ -592,11 +599,37 @@ impl ListState {
                 self.offset -= delta;
                 self.splice_anchor -= delta;
             } else {
-                let delta = self.item_at(moved_to) - from_top - self.natural_offset();
-                self.offset += delta;
-                self.splice_anchor += delta;
+                self.keep_in_place(moved_to, from_top);
             }
         }
+    }
+
+    /// The first visible item and where it is in the viewport, for a
+    /// change that should keep it in place. An inverted list at its start
+    /// (item 0 in view at the bottom) keeps its distance from the end
+    /// instead, so what arrives there shows. In its parent's viewport, only
+    /// while the list's start is scrolled past (when it shows, the content
+    /// below it moves instead).
+    fn visible_anchor(&self) -> Option<(u32, f32)> {
+        (self.count > 0
+            && self.viewport > 0.0
+            && self.keeps_visible_rows()
+            && (!self.parent || self.offset > 0.0))
+            .then(|| {
+                let top = self.natural_offset();
+                let body = self.blocks().body;
+                let row = self.rows.find((top - body).max(0.0) as f64) as u32;
+                let index = (row * self.columns).min(self.count - 1);
+                (index, self.item_at(index) - top)
+            })
+    }
+
+    /// Scrolls so item `index` starts `from_top` below the viewport's start
+    /// again (a list that is not inverted).
+    fn keep_in_place(&mut self, index: u32, from_top: f32) {
+        let delta = self.item_at(index) - from_top - self.natural_offset();
+        self.offset += delta;
+        self.splice_anchor += delta;
     }
 
     /// Whether changes before the viewport keep the visible rows in place:
@@ -796,7 +829,9 @@ impl ListState {
     /// Padding at the start / end of the main axis and of the cross axis.
     fn main_padding(&self) -> (f32, f32) {
         let p = &self.content.padding;
-        if self.horizontal {
+        if self.horizontal && self.mirrored {
+            (p.right.0, p.left.0)
+        } else if self.horizontal {
             (p.left.0, p.right.0)
         } else {
             (p.top.0, p.bottom.0)
@@ -902,12 +937,18 @@ impl ListState {
     }
 
     /// Size and position of each cell across the main axis: `(offset,
-    /// size)` of column `col`.
-    pub(super) fn column(&self, cross: f32, col: u32) -> (f32, f32) {
+    /// size)` of column `col`. On a terminal's grid of `cell` points
+    /// across, every column is as many whole Cells (the share rounded
+    /// down, the Cells left over after the last column): rounded each on
+    /// its own, they would run into the padding at the end.
+    pub(super) fn column(&self, cross: f32, col: u32, cell: Option<f32>) -> (f32, f32) {
         let (start, end) = self.cross_padding();
         let gap = self.cross_gap();
         let n = self.columns as f32;
-        let width = ((cross - start - end - gap * (n - 1.0)) / n).max(0.0);
+        let mut width = ((cross - start - end - gap * (n - 1.0)) / n).max(0.0);
+        if let Some(cell) = cell.filter(|&c| c > 0.0) {
+            width = (width / cell + 1e-3).floor() * cell;
+        }
         (start + col as f32 * (width + gap), width)
     }
 
@@ -933,6 +974,7 @@ impl ListState {
             return;
         }
         self.count = count;
+        self.items_changed = true;
         self.sizes.resize(count as usize, f32::NAN);
         self.rebuild_offsets();
         if self.load_more_at.is_some_and(|c| c != count) {
@@ -942,19 +984,40 @@ impl ListState {
 
     pub(super) fn set_estimated(&mut self, estimated: f32) {
         if estimated > 0.0 && estimated != self.estimated {
+            // Rows not measured above the viewport change length: what is
+            // visible stays where it is.
+            let anchor = self.visible_anchor().filter(|_| !self.inverted);
             self.estimated = estimated;
             self.rebuild_offsets();
+            if let Some((index, from_top)) = anchor {
+                self.keep_in_place(index, from_top);
+            }
         }
     }
 
     pub(super) fn set_columns(&mut self, columns: u32) {
         let columns = columns.max(1);
         if columns != self.columns {
+            // The first visible item stays where it is (a window resized to
+            // fit more or fewer columns), not the offset: at the old offset
+            // the rows show other items.
+            let anchor = self.visible_anchor().filter(|_| !self.inverted).map(
+                |(index, from_top)| match self.columns_anchor {
+                    Some(kept) if kept < self.count && self.row_of(kept) == self.row_of(index) => {
+                        (kept, from_top)
+                    }
+                    _ => (index, from_top),
+                },
+            );
+            self.columns_anchor = anchor.map(|(index, _)| index);
             self.columns = columns;
             // Cells change width: their sizes are measured again.
             self.sizes.fill(f32::NAN);
             self.cells_cross = f32::NAN;
             self.rebuild_offsets();
+            if let Some((index, from_top)) = anchor {
+                self.keep_in_place(index, from_top);
+            }
         }
     }
 
@@ -1006,6 +1069,18 @@ impl ListState {
         }
     }
 
+    /// Whether it shows mirrored (horizontal, right to left): its left and
+    /// right content padding keep their sides on screen.
+    pub(super) fn set_mirrored(&mut self, mirrored: bool) {
+        if mirrored != self.mirrored {
+            self.mirrored = mirrored;
+            let p = &self.content.padding;
+            if self.horizontal && p.left != p.right {
+                self.rebuild_offsets();
+            }
+        }
+    }
+
     pub(super) fn set_inverted(&mut self, inverted: bool) {
         if self.parent {
             self.ignored |= if inverted { ignored::INVERTED } else { 0 };
@@ -1030,6 +1105,16 @@ impl ListState {
         if threshold != self.follow_end {
             self.follow_end = threshold;
             self.anchored_end = f32::NAN;
+            self.dirty = true;
+        }
+    }
+
+    /// Keeps `items` rendered outside the window (none: only the window's).
+    pub(super) fn set_kept(&mut self, mut items: Vec<u32>) {
+        items.sort_unstable();
+        items.dedup();
+        if items != self.kept {
+            self.kept = items;
             self.dirty = true;
         }
     }
@@ -1224,6 +1309,14 @@ impl ListState {
         self.dirty = true;
     }
 
+    /// Whether cell `cell` is a slot's the list freed: bound to no item, it
+    /// still holds what it showed last until the list binds it again.
+    pub(super) fn frees(&self, cell: u32) -> bool {
+        self.slots
+            .iter()
+            .any(|s| s.cell == cell && s.index.is_none())
+    }
+
     pub(super) fn remove_cell(&mut self, cell: u32) {
         for slot in &mut self.slots {
             if slot.cell == cell {
@@ -1358,10 +1451,12 @@ impl ListState {
         // And the one before it: scrolled back, it shows at once, pushed by
         // the pinned one, before a round of binding could render it.
         let before = sticky.and_then(|s| self.sticky.iter().rev().find(|&&p| p < s).copied());
+        let kept = std::mem::take(&mut self.kept);
         let wanted = |i: u32| {
             range.is_some_and(|(f, l)| (f..=l).contains(&i))
                 || sticky == Some(i)
                 || before == Some(i)
+                || kept.contains(&i)
         };
 
         for slot in 0..self.slots.len() as u32 {
@@ -1398,6 +1493,10 @@ impl ListState {
         for s in [before, sticky].into_iter().flatten() {
             bind(self, s);
         }
+        let count = self.count;
+        for &i in kept.iter().filter(|&&i| i < count) {
+            bind(self, i);
+        }
         let (start, end) = self.urgent_span(at);
         let new = binds.len();
         for slot in 0..self.slots.len() {
@@ -1409,6 +1508,7 @@ impl ListState {
             if !self.paced
                 || sticky == Some(i)
                 || before == Some(i)
+                || kept.contains(&i)
                 || self.item_overlaps(i, start, end)
             {
                 self.slots[slot].requested = Some(i);
@@ -1416,6 +1516,7 @@ impl ListState {
             }
         }
         binds[new..].sort_unstable_by_key(|b| b.1);
+        self.kept = kept;
 
         let total = self.blocks().total;
         let near_end = at + self.viewport >= total - self.viewport * self.end_threshold;
@@ -1538,16 +1639,16 @@ impl ListState {
                 return true;
             }
             let pixels = (end.min(bottom) - start.max(top)).max(0.0);
-            let (percent, threshold) = match (
-                self.viewability.view_area_percent,
-                self.viewability.item_visible_percent,
+            let (share, threshold) = match (
+                self.viewability.view_area_coverage_threshold,
+                self.viewability.item_visible_threshold,
             ) {
-                (Some(t), _) => (100.0 * pixels / self.viewport, t),
-                (None, Some(t)) => (100.0 * pixels / size.max(f32::EPSILON), t),
+                (Some(t), _) => (pixels / self.viewport, t.0),
+                (None, Some(t)) => (pixels / size.max(f32::EPSILON), t.0),
                 (None, None) => return pixels > 0.0,
             };
             if threshold > 0.0 {
-                percent >= threshold
+                share >= threshold
             } else {
                 pixels > 0.0
             }
@@ -1574,7 +1675,10 @@ impl ListState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{geometry::px, props::EdgeInsets};
+    use crate::{
+        geometry::{Percentage, px},
+        props::EdgeInsets,
+    };
 
     fn list(count: u32, estimated: f32, viewport: f32) -> ListState {
         let mut l = ListState::new();
@@ -1740,6 +1844,21 @@ mod tests {
     }
 
     #[test]
+    fn a_terminal_s_columns_are_whole_equal_cells() {
+        // 9 columns in 1360pt (170 Cells) padded a Cell each side, 2 Cells
+        // apart: 16.9 Cells each, rounded down. Each rounded on its own,
+        // the last would end in the padding.
+        let mut l = list(90, 50.0, 1000.0);
+        l.set_columns(9);
+        l.content.padding.left = crate::Points(8.0);
+        l.content.padding.right = crate::Points(8.0);
+        l.content.column_gap = crate::Points(16.0);
+        assert_eq!(l.column(1360.0, 1, Some(8.0)), (8.0 + 128.0 + 16.0, 128.0));
+        let (x, width) = l.column(1360.0, 8, Some(8.0));
+        assert!(x + width <= 1360.0 - 8.0, "the last inside the padding");
+    }
+
+    #[test]
     fn columns_share_rows() {
         let mut l = list(10, 50.0, 1000.0);
         l.set_columns(3);
@@ -1750,10 +1869,29 @@ mod tests {
         // A row is as tall as its tallest item.
         l.measured(4, 80.0);
         assert_eq!(l.item_at(6), 130.0);
-        assert_eq!(l.column(320.0, 2), (320.0 * 2.0 / 3.0, 320.0 / 3.0));
+        assert_eq!(l.column(320.0, 2, None), (320.0 * 2.0 / 3.0, 320.0 / 3.0));
         let mut binds = Vec::new();
         l.update_window(&mut binds);
         assert_eq!(binds.len(), 10);
+    }
+
+    #[test]
+    fn a_mirrored_horizontal_list_keeps_its_left_padding_on_the_left() {
+        // Laid out left to right and shown mirrored: the left padding is the
+        // end of its main axis, so it shows on the left.
+        let mut l = list(3, 50.0, 1000.0);
+        l.set_horizontal(true);
+        l.set_content(ListContentStyle {
+            padding: EdgeInsets {
+                left: px(16.0),
+                ..EdgeInsets::default()
+            },
+            ..ListContentStyle::default()
+        });
+        assert_eq!(l.blocks().body, 16.0);
+        l.set_mirrored(true);
+        assert_eq!(l.blocks().body, 0.0);
+        assert_eq!(l.blocks().total, 3.0 * 50.0 + 16.0);
     }
 
     #[test]
@@ -1916,9 +2054,9 @@ mod tests {
         l.offset = 50.0;
         // Any visible pixel: items 0..=4.
         assert_eq!(l.viewable_items(), Some((0, 4)));
-        l.viewability.item_visible_percent = Some(60.0);
+        l.viewability.item_visible_threshold = Some(Percentage(0.6));
         assert_eq!(l.viewable_items(), Some((1, 3)));
-        l.viewability.item_visible_percent = Some(50.0);
+        l.viewability.item_visible_threshold = Some(Percentage(0.5));
         assert_eq!(l.viewable_items(), Some((0, 4)));
     }
 
@@ -1983,6 +2121,41 @@ mod tests {
         l.splice(90, 2, 0);
         assert_eq!(l.offset, offset);
         assert_eq!(l.count, 101);
+    }
+
+    #[test]
+    fn a_change_of_columns_keeps_the_first_visible_item_in_place() {
+        let mut l = list(90, 50.0, 400.0);
+        l.set_columns(9);
+        // Row 4 (items 36 to 44) at the top.
+        l.offset = 200.0;
+        assert_eq!(l.item_at(36) - l.offset, 0.0);
+        // Five columns: item 36 is in row 7, and still at the top.
+        l.set_columns(5);
+        assert_eq!(l.item_at(36), 350.0);
+        assert_eq!(l.offset, 350.0);
+        assert_eq!(l.take_splice_anchor(), 150.0);
+        // Back to nine: item 36 again, not the first of the row it was in
+        // (35), so resizing back and forth does not drift.
+        l.set_columns(9);
+        assert_eq!(l.offset, 200.0);
+        l.set_columns(7);
+        l.set_columns(4);
+        l.set_columns(9);
+        assert_eq!(l.offset, 200.0);
+        // A new estimate for the rows not measured keeps it too.
+        l.set_estimated(60.0);
+        assert_eq!(l.offset, 240.0);
+        l.set_estimated(50.0);
+        // Scrolled to another row, its first item is kept.
+        l.offset = 100.0;
+        l.set_columns(5);
+        assert_eq!(l.offset, 50.0 * (18 / 5) as f32);
+        // At the top it stays at the top.
+        let mut l = list(90, 50.0, 400.0);
+        l.set_columns(9);
+        l.set_columns(5);
+        assert_eq!(l.offset, 0.0);
     }
 
     #[test]
@@ -2244,5 +2417,26 @@ mod tests {
         l.set_inverted(true);
         // Item 0 at the bottom of the viewport.
         assert_eq!(l.offset_for_index(0, 0.0, 0.0), 4600.0);
+    }
+
+    #[test]
+    fn kept_items_stay_rendered_out_of_the_window() {
+        let mut l = list(100, 50.0, 400.0);
+        l.set_kept(vec![2]);
+        l.offset = 3000.0;
+        let mut binds = Vec::new();
+        l.update_window(&mut binds);
+        let bound = |l: &ListState, i: u32| l.slots.iter().any(|s| s.index == Some(i));
+        assert!(bound(&l, 2), "{binds:?}");
+        assert!(!bound(&l, 3));
+        // An item inserted before it moves it along.
+        l.splice(0, 0, 1);
+        binds.clear();
+        l.update_window(&mut binds);
+        assert!(bound(&l, 3) && !bound(&l, 2), "{binds:?}");
+        l.set_kept(Vec::new());
+        binds.clear();
+        l.update_window(&mut binds);
+        assert!(!bound(&l, 3));
     }
 }

@@ -155,20 +155,24 @@ impl Screen {
     /// none or several match.
     pub fn span_style(&self, selector: &str) -> Result<ResolvedTextStyle, String> {
         let span = self.span_hit(&Selector::parse(selector)?)?;
-        let style = self
-            .nodes
+        // An empty span has no first character. Reading the offset would
+        // report the style of the character next to it.
+        if span.start == span.end {
+            return Err(format!("span `{selector}` has no characters"));
+        }
+        self.nodes
             .get(&span.view)
             .and_then(|v| v.attributed.as_deref())
             .and_then(|text| text.span_at(span.start))
             .map(|s| s.style)
-            .expect("a span is in a text view");
-        Ok(style)
+            .ok_or_else(|| format!("span `{selector}` has no characters"))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nsh_core::ui::{Root, prelude::*};
+    use nsh_core::element::Root;
+    use nsh_core::prelude::*;
     use nsh_engine::EngineConfig;
 
     use crate::headless::Headless;

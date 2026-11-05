@@ -1,5 +1,6 @@
-import { type JSX, mount, Scroll, signal, Text, View } from "nsh";
-import { createNavStack, NavPage, NavStack, safeAreaInsets } from "nsh/base";
+import { type JSX, mount, platform, Scroll, signal, Text, View } from "nsh";
+import { createNavStack, NavPage, NavStack } from "nsh/base";
+import { safeAreaInsets } from "nsh";
 import { FlightPlan } from "./cards/FlightPlan";
 import { HopLog } from "./cards/HopLog";
 import { Mass } from "./cards/Mass";
@@ -33,7 +34,9 @@ function Header(props: { title: string; back?: boolean }) {
         height: 52,
         flexDirection: "row",
         alignItems: "center",
-        gap: 6,
+        // A terminal rounds a small gap to one Cell: Back and the title
+        // keep two between them there.
+        gap: platform.idiom === "terminal" ? 24 : 6,
         paddingHorizontal: 12,
         backgroundColor: color.page,
         borderBottomWidth: 1,
@@ -53,7 +56,7 @@ function Header(props: { title: string; back?: boolean }) {
           <Text style={{ fontSize: 15, color: color.accent }}>Back</Text>
         </View>
       </If>
-      <Text numberOfLines={1} style={{ flex: 1, fontSize: 17, fontWeight: "600", color: color.text }}>
+      <Text style={{ numberOfLines: 1, flex: 1, fontSize: 17, fontWeight: "600", color: color.text }}>
         {props.title}
       </Text>
     </View>
@@ -65,7 +68,7 @@ function Header(props: { title: string; back?: boolean }) {
 function Section(props: { visible: boolean; children: JSX.Element }) {
   return (
     <Scroll
-      style={{ flex: 1, backgroundColor: color.page, display: props.visible ? "flex" : "none" }}
+      style={{ flex: 1, backgroundColor: color.page, flexDirection: "column", display: props.visible ? "flex" : "none" }}
       keyboardDismissMode="on-drag"
       keyboardShouldPersistTaps="handled"
     >

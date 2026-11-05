@@ -1,9 +1,10 @@
-import { batch, cleanup, computed, effect, Input, List, Scroll, signal, Text, View, type ViewStyle, type YNode } from "nsh";
-import { createAnimatedValue, LayoutAnimation } from "nsh/animated";
-import { Clipboard } from "nsh/clipboard";
-import { platform } from "nsh/device";
-import { Picker } from "nsh/picker";
-import { keyboardFrame, KeyboardAvoidingView, safeAreaInsets, SelectionArea } from "nsh/base";
+import { batch, cleanup, computed, effect, List, type ListRef, Scroll, signal, Text, View, type ViewStyle } from "nsh";
+import { createAnimatedValue, LayoutAnimation } from "nsh";
+import { Clipboard } from "nsh";
+import { platform } from "nsh";
+import { Picker } from "nsh";
+import { Input } from "nsh/base";
+import { keyboardFrame, safeAreaInsets } from "nsh";
 import { Icon, type IconName } from "../icons";
 import { alpha, Appear, Badge, colors, desktop, finish, IconTile, motion, Press, radius, RoundButton, Segmented, toneTint } from "../ui";
 import { localReply, type Provider } from "./chat/local";
@@ -51,7 +52,8 @@ export function Chat() {
 
   const messages = signal<Msg[]>([]);
   const model = signal<Model>("Swift");
-  const native = platform.idiom === "desktop" && platform.os !== "web";
+  const native = platform.desktop && platform.os !== "web";
+  const terminal = platform.idiom === "terminal";
   const provider = signal<Provider>("Codex");
   let cancelLocal: (() => void) | undefined;
   const draft = signal("");
@@ -74,7 +76,7 @@ export function Chat() {
   /** Whether the user is at the bottom (the list then follows the stream
    * natively, `maintainVisibleContentPosition`); scrolling up clears it. */
   const following = signal(true);
-  let list: YNode | undefined;
+  let list: ListRef | undefined;
   let dragging = false;
 
   type Run = { id: string; model: Model; script: string; cancelled: boolean; md: string; reason: string; thinkStart: number; thinkSeconds: number | null };
@@ -372,7 +374,7 @@ export function Chat() {
             borderColor: colors.border,
           }}
         >
-          <Text selectable style={{ fontSize: 15, lineHeight: 21, color: colors.text }}>{m().text}</Text>
+          <Text style={{ userSelect: "text", fontSize: 15, lineHeight: 21, color: colors.text }}>{m().text}</Text>
         </View>
       </If>
       <If when={m().waiting}>
@@ -426,7 +428,7 @@ export function Chat() {
                 <Text style={{ fontSize: 14, color: colors.muted, fontVariant: ["tabular-nums"] }}>{thinkingLabel()}</Text>
                 <View
                   style={{
-                    transform: [{ rotate: reasoning()?.open ? "0deg" : "-90deg" }],
+                    transform: reasoning()?.open ? "rotate(0deg)" : "rotate(-90deg)",
                     transitionProperty: "transform",
                     transitionDuration: 220,
                     transitionTimingFunction: "ease-out",
@@ -439,7 +441,7 @@ export function Chat() {
             <If when={reasoning()?.open}>
               <View style={{ flexDirection: "row", gap: 12, paddingLeft: 7 }}>
                 <View style={{ width: 2, borderRadius: 1, backgroundColor: colors.border }} />
-                <Text selectable style={{ flex: 1, fontSize: 14, lineHeight: 20, color: colors.muted }}>{reasoning()?.text}</Text>
+                <Text style={{ userSelect: "text", flex: 1, fontSize: 14, lineHeight: 20, color: colors.muted }}>{reasoning()?.text}</Text>
               </View>
             </If>
           </View>
@@ -485,6 +487,12 @@ export function Chat() {
     );
   };
 
+  // A terminal Cell is 8 pt wide.
+  const titleColumn = Math.max(...featured.map((f) => scenarios.find((x) => x.id === f.id)!.chip.length)) * 8 + 8;
+  /** The list's width: the titles' column, the gap and the longest note, so
+   * the list centers as a block and its notes keep their lines. */
+  const listWidth = titleColumn + 16 + Math.max(...featured.map((f) => f.note.length)) * 8;
+
   const empty = (
     <View style={{ ...column, flex: 1, justifyContent: "center", paddingHorizontal: 16, paddingVertical: 24, gap: 24 }}>
         <Appear>
@@ -496,7 +504,30 @@ export function Chat() {
             </Text>
           </View>
         </Appear>
-        <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 12 }}>
+        {/* The terminal lists the suggestions, a line each: four cards of
+            a quarter's width would wrap their titles unevenly. */}
+        <If when={terminal}>
+          {/* The notes in a column of their own, two Cells after the
+              longest title; with less than 16 Cells left beside it, a
+              note goes under its title. Centered as a block under the
+              centered heading, its rows still aligned with each other. */}
+          <View style={{ alignSelf: "center", width: listWidth, maxWidth: "100%" }}>
+            <Each of={featured}>
+              {(f) => {
+                const s = scenarios.find((x) => x.id === f().id)!;
+                return (
+                  <Press onPress={() => play(s.id)} accessibilityLabel={s.chip}>
+                    <View style={{ flexDirection: "row", flexWrap: "wrap", columnGap: 16 }}>
+                      <Text style={{ width: titleColumn, flexShrink: 0, fontWeight: "600", color: colors.text }}>{s.chip}</Text>
+                      <Text style={{ flexGrow: 1, flexShrink: 1, flexBasis: 16 * 8, color: colors.muted }}>{f().note}</Text>
+                    </View>
+                  </Press>
+                );
+              }}
+            </Each>
+          </View>
+        </If>
+        <View style={{ display: terminal ? "none" : "flex", flexDirection: "row", flexWrap: "wrap", gap: 12 }}>
           <Each of={featured}>
             {(f, i) => {
               const s = scenarios.find((x) => x.id === f().id)!;
@@ -541,11 +572,11 @@ export function Chat() {
 
   const pane = (
     <View style={{ flex: 1, backgroundColor: colors.background }}>
-      <KeyboardAvoidingView style={{ flex: 1 }}>
+      <View style={{ flex: 1, paddingBottom: "env(keyboard-inset-height)" }}>
         <View style={{ flex: 1 }}>
           <If when={messages().length} else={empty}>
             {/* One selection across messages: in the List, over the rows that are mounted. */}
-            <SelectionArea style={{ flex: 1 }}>
+            <View selectable style={{ flex: 1 }}>
               <List
                 ref={list}
                 each={messages()}
@@ -582,18 +613,18 @@ export function Chat() {
                   );
                 }}
               </List>
-            </SelectionArea>
+            </View>
           </If>
 
           {/* Jump to the latest message: shown while scrolled up. */}
           <View
-            pointerEvents={following() ? "none" : "auto"}
             style={{
+              pointerEvents: following() ? "none" : "auto",
               position: "absolute",
               right: 16,
               bottom: 12,
               opacity: jump,
-              transform: [{ scale: jump.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1] }) }],
+              scale: jump.interpolate({ inputRange: [0, 1], outputRange: [0.7, 1] }),
             }}
           >
             <RoundButton icon="arrow-down" label="Jump to the latest message" variant="secondary" onPress={jumpToLatest} />
@@ -604,14 +635,14 @@ export function Chat() {
 
           {/* Connection banner. */}
           <View
-            pointerEvents="none"
             style={{
+              pointerEvents: "none",
               position: "absolute",
               top: 8,
               left: 16,
               right: 16,
               opacity: bannerValue,
-              transform: [{ translateY: bannerValue.interpolate({ inputRange: [0, 1], outputRange: [-64, 0] }) }],
+              translate: [0, bannerValue.interpolate({ inputRange: [0, 1], outputRange: [-64, 0] })],
             }}
           >
             <View
@@ -651,22 +682,19 @@ export function Chat() {
 
           {/* The "+" menu: attachments and the scenarios, to replay them. */}
           <View
-            pointerEvents={menu() ? "auto" : "none"}
             onPress={() => menu.set(false)}
-            style={{ position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.45)", opacity: menuValue }}
+            style={{ pointerEvents: menu() ? "auto" : "none", position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.45)", opacity: menuValue }}
           />
           <View
-            pointerEvents={menu() ? "auto" : "none"}
             style={{
+              pointerEvents: menu() ? "auto" : "none",
               position: "absolute",
               left: 16,
               right: 16,
               bottom: 8,
               opacity: menuValue,
-              transform: [
-                { translateY: menuValue.interpolate({ inputRange: [0, 1], outputRange: [24, 0] }) },
-                { scale: menuValue.interpolate({ inputRange: [0, 1], outputRange: [0.97, 1] }) },
-              ],
+              translate: [0, menuValue.interpolate({ inputRange: [0, 1], outputRange: [24, 0] })],
+              scale: menuValue.interpolate({ inputRange: [0, 1], outputRange: [0.97, 1] }),
             }}
           >
             <View
@@ -706,8 +734,9 @@ export function Chat() {
           </View>
         </View>
 
-        {/* Suggestions while the conversation is empty. */}
-        <If when={!messages().length}>
+        {/* Suggestions while the conversation is empty (a terminal lists
+            them in the empty state instead, one per row). */}
+        <If when={!messages().length && !terminal}>
           <Scroll horizontal scrollbar={false} keyboardShouldPersistTaps="handled" style={{ flexGrow: 0 }}>
             <View style={{ flexDirection: "row", gap: 8, paddingHorizontal: 16, paddingVertical: 8 }}>
               <Each of={chips}>
@@ -746,7 +775,8 @@ export function Chat() {
           </If>
           <View
             style={{
-              borderRadius: 24,
+              // Square in the terminal, framed as its cards are.
+              borderRadius: terminal ? 0 : 24,
               borderCurve: "continuous",
               // Glass like the menu above it, without the blur: nothing scrolls under it.
               ...finish.menu,
@@ -758,23 +788,23 @@ export function Chat() {
           >
             <Input
               value={draft()}
-              onChange={(v) => draft.set(v)}
+              onChange={({ value }) => draft.set(value)}
               multiline
               // Return sends on desktops, as in chat apps there (Shift+Return
               // adds a line); phones keep return for line breaks.
-              submitBehavior={platform.idiom === "desktop" ? "submit" : "newline"}
+              submitBehavior={platform.desktop ? "submit" : "newline"}
               onSubmit={() => {
                 if (!streaming()) send();
               }}
               placeholder={`Message ${native ? provider() : model()}`}
               onFocus={() => menu.set(false)}
-              onContentSizeChange={(e) => inputHeight.set(Math.min(100, Math.max(20, e.height)))}
-              style={{ placeholderColor: colors.faint, selectionColor: colors.accent, height: inputHeight() + 20, fontSize: 15, lineHeight: 20, color: colors.text, paddingHorizontal: 10, paddingVertical: 10 }}
+              onContentSizeChange={({ size }) => inputHeight.set(Math.min(100, Math.max(20, size.height)))}
+              style={{ placeholderColor: colors.faint, caretColor: colors.accent, selectionColor: colors.accent, height: inputHeight() + 20, fontSize: 15, lineHeight: 20, color: colors.text, paddingHorizontal: 10, paddingVertical: 10 }}
             />
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
               <View
                 style={{
-                  transform: [{ rotate: menu() ? "45deg" : "0deg" }],
+                  transform: menu() ? "rotate(45deg)" : "rotate(0deg)",
                   transitionProperty: "transform",
                   transitionDuration: 200,
                   transitionTimingFunction: "ease-out",
@@ -790,7 +820,7 @@ export function Chat() {
               <If
                 when={streaming()}
                 else={
-                  <View style={{ opacity: canSend() ? 1 : 0.35 }} pointerEvents={canSend() ? "auto" : "none"}>
+                  <View style={{ pointerEvents: canSend() ? "auto" : "none", opacity: canSend() ? 1 : 0.35 }}>
                     <RoundButton icon="arrow-up" label="Send" onPress={send} />
                   </View>
                 }
@@ -804,7 +834,7 @@ export function Chat() {
             </View>
           </View>
         </View>
-      </KeyboardAvoidingView>
+      </View>
     </View>
   );
   if (!wide) return pane;
@@ -862,10 +892,10 @@ export function Chat() {
               class={current() === chip().id ? "bg-accent" : "hover:bg-card active:bg-accent"}
               style={{ paddingHorizontal: 12, paddingVertical: 9, borderRadius: radius.control, gap: 2, cursor: "pointer" }}
             >
-              <Text numberOfLines={1} style={{ fontSize: 14, fontWeight: current() === chip().id ? "600" : "400", color: colors.text }}>
+              <Text style={{ numberOfLines: 1, fontSize: 14, fontWeight: current() === chip().id ? "600" : "400", color: colors.text }}>
                 {chip().label}
               </Text>
-              <Text numberOfLines={1} style={{ fontSize: 12, color: colors.muted }}>
+              <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.muted }}>
                 {scenarios.find((x) => x.id === chip().id)?.prompt ?? "Weeks of messages, loaded at once"}
               </Text>
             </View>

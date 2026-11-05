@@ -17,7 +17,7 @@ import { WebView, type WebViewNavigation, type WebViewProps } from "nsh";
 ## WebView
 
 ```ts
-const WebView: (props: WebViewProps) => YNode;
+const WebView: (props: WebViewProps) => JSX.Element;
 
 interface WebViewProps extends Omit<ViewProps, "children" | "ios" | "desktop">, WebViewHostProps {
   ios?: IOSWebViewHostProps;
@@ -26,17 +26,17 @@ interface WebViewProps extends Omit<ViewProps, "children" | "ios" | "desktop">, 
 ```
 
 ```tsx
-import { mount, signal, Text, View, WebView, type WebViewNavigation, type YNode } from "nsh";
+import { mount, signal, Text, View, WebView, type WebViewNavigation, type WebViewRef } from "nsh";
 
 function Browser() {
   const nav = signal<WebViewNavigation | null>(null);
-  let web!: YNode;
+  let web!: WebViewRef;
   return (
     <View style={{ flex: 1 }}>
       <View style={{ flexDirection: "row", gap: 16, padding: 12 }}>
         <Text onPress={() => web.goBack()} style={{ opacity: nav()?.canGoBack ? 1 : 0.4 }}>Back</Text>
         <Text onPress={() => web.reload()}>Reload</Text>
-        <Text numberOfLines={1} style={{ flex: 1 }}>{nav()?.title ?? ""}</Text>
+        <Text style={{ numberOfLines: 1, flex: 1 }}>{nav()?.title ?? ""}</Text>
       </View>
       <WebView ref={web} src="https://example.com" style={{ flex: 1 }} onNavigationStateChange={(n) => nav.set(n)} />
     </View>
@@ -108,7 +108,7 @@ const page = `<!doctype html><html><head><meta name="viewport" content="width=de
   </script>
 </body></html>`;
 
-let web!: YNode;
+let web!: WebViewRef;
 const message = signal("");
 
 <WebView ref={web} html={page} style={{ height: 200 }} onMessage={(e) => message.set(e.data)} />

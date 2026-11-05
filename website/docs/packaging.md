@@ -56,7 +56,7 @@ TSX app adds its entry (`nsh package App.tsx --target …`).
 | Key | Type | Default | Used for |
 |---|---|---|---|
 | `name` | string | the entry's directory name | The display name under the icon (`CFBundleDisplayName`, Android `android:label`) and the output file name. |
-| `id` | string | required | The bundle identifier / Android package name, in reverse-DNS form under a domain you own. It also names where the app keeps its [storage](../modules/nsh-storage.md), so each app has its own. `nsh package` and `nsh publish` warn about the `com.example.` placeholder. |
+| `id` | string | required | The bundle identifier / Android package name, in reverse-DNS form under a domain you own. It also names where the app keeps its [storage](../modules/nsh.md#storage), so each app has its own. `nsh package` and `nsh publish` warn about the `com.example.` placeholder. |
 | `version` | string | `"1.0.0"` | The user-visible version (`CFBundleShortVersionString`, `versionName`). |
 | `build` | number | `1` | The build number (`CFBundleVersion`, `versionCode`). Raise it for every release you upload. |
 | `icon` | string | none | A square PNG, ideally 1024×1024, relative to `nsh.json`. |
@@ -88,6 +88,7 @@ nsh package --target android --app-version 1.4.0 --build 42
 | `--keystore <file>` | Android: a release keystore (default: the debug key). |
 | `--key-alias <alias>` | Android: the key alias in the keystore. |
 | `--keystore-password <password>` | Android: the keystore password; also read from `NSH_KEYSTORE_PASSWORD`. |
+| `--abi <abi>` | Android: the ABIs of the APK, repeated or separated by commas (default: `arm64-v8a` and `armeabi-v7a`). |
 | `--run` | Install and launch afterwards: in the iOS simulator, or on the Android device or emulator `adb` sees; macOS, Linux and Windows apps are launched on this machine; a web site is served on this machine and opened in the browser. Not for `--target ios`. |
 
 ## iOS simulator
@@ -142,7 +143,13 @@ without Gradle. Requirements:
 - For a Rust app, the Android NDK (`sdkmanager "ndk;<version>"`, or `ANDROID_NDK_HOME`), which builds its
   `libnsh.so`.
 
-The app targets API 35 and needs API 28 (Android 9) or newer; it contains native code for `arm64-v8a`, `armeabi-v7a` and `x86_64`.
+The app targets API 35 and needs API 28 (Android 9) or newer. It contains native code for the ABIs of phones,
+`arm64-v8a` and `armeabi-v7a`; with `--run`, also the device's, such as an emulator's `x86_64`. `--abi` picks them
+yourself, for example `--abi arm64-v8a` for 64-bit phones only, the smallest APK:
+
+```sh
+nsh package --target android --abi arm64-v8a
+```
 
 ### Signing for release
 
@@ -199,8 +206,8 @@ nsh package --target web --run
 ```
 
 Writes `.nsh/out/<Name>/`, a static site: `index.html`, `manifest.webmanifest`, the page script (`nsh.<digest>.js`)
-and `nsh.<digest>.wasm` (a Rust app's engine and crate; for a TSX app the runtime, next to the app's bytecode
-`app.<digest>.nshc`), its assets and icons, each named after its content
+and `nsh.<digest>.wasm` (a Rust app's engine and crate; for a TSX app the runtime, next to the app's ES module
+`app.<digest>.js`), its assets and icons, each named after its content
 so hosts can cache them for good. Deploy the directory to any web server or CDN; `--run` serves it on
 `http://127.0.0.1:4173/` for you to open. Cache headers and embedding: [Web](./web.md#publish-an-app).
 
@@ -219,6 +226,20 @@ Give one square PNG, ideally 1024×1024, in `nsh.json` (`"icon": "icon.png"`) or
 
 Without an icon, the system shows its default.
 
+## Camera, Bluetooth and other hardware
+
+NSH has no API for the camera, video recording, Bluetooth or location, and `nsh package` cannot make an app that uses
+them: NSH writes the app's `Info.plist` and Android manifest, `nsh.json` has no key that adds to them, and a packaged
+Android app cannot add Java code. Its own [Rust crate](./rust.md) does not change this. iOS ends an app that reaches
+protected hardware without a usage description in `Info.plist`, and the Android manifest of a packaged app declares
+only `INTERNET`.
+
+An app that needs them embeds NSH in its own Xcode or Gradle project ([iOS](./ios.md#embedding-in-an-ios-app),
+[Android](./android.md#embedding-in-an-android-app)). That project owns `Info.plist` and `AndroidManifest.xml`, so it
+declares what it uses there and writes the platform code itself: a camera preview is a
+[native component](./native-components.md), and the app reaches everything else through
+[`host.call`](./ios.md#talking-to-the-app) ([on Android](./android.md#talking-to-the-app)).
+
 ## What is inside
 
 A Rust app's package is its runner, built with your crate and its root mounted, and the assets its crates register
@@ -228,11 +249,11 @@ assets it imports, next to the prebuilt runtime:
 | Target | Runtime | A TSX app |
 |---|---|---|
 | iOS | the `nsh-ios-app` executable | `<Name>.app/nsh/bundle.nshc`, `nsh/assets/…` |
-| Android | `classes.dex`, `lib/<abi>/libnsh.so` (stored uncompressed, 16 KB aligned) | `assets/nsh/bundle.nshc`, `assets/nsh/assets/…` |
+| Android | `classes.dex`, `lib/<abi>/libnsh.so` (without symbols, stored uncompressed, 16 KB aligned) | `assets/nsh/bundle.nshc`, `assets/nsh/assets/…` |
 | macOS | the `nsh-macos-app` executable, renamed `<Name>` | `<Name>.app/Contents/Resources/nsh/bundle.nshc`, `nsh/assets/…` |
 | Linux | the `nsh-linux-app` executable, renamed `<Name>` | `<Name>/nsh/bundle.nshc`, `nsh/assets/…` |
 | Windows | the `nsh-windows-app.exe` executable, renamed `<Name>.exe` | `<Name>\nsh\bundle.nshc`, `nsh\assets\…` |
-| Web | `nsh.<digest>.wasm`, `nsh.<digest>.js` | `<Name>/app.<digest>.nshc`, `assets/…`, `index.html` |
+| Web | `nsh.<digest>.wasm`, `nsh.<digest>.js` | `<Name>/app.<digest>.js`, `assets/…`, `index.html` |
 
 A packaged app registers no [native components](./native-components.md); for those, embed NSH in your own app.
 
@@ -251,3 +272,4 @@ points the CLI at another directory laid out like the distribution's `runtime/` 
 - [CLI](./cli.md): every command
 - [Signed packages](./signed-packages.md): updates apps download
 - [Project structure](./project-structure.md): `nsh.json` and the files of an app
+- [Native components](./native-components.md): views of the host app inside an NSH app

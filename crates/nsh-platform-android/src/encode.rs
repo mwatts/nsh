@@ -18,12 +18,12 @@
 
 use jni::objects::GlobalRef;
 use nsh_core::{
-    AccessibilityRole, AudioSession, AutoCapitalize, AutoFill, BorderStyle, Checked, Color,
-    Command, DialogButtonStyle, InputConfig, KeyboardDismissMode, KeyboardTaps, KeyboardType,
-    LayoutCurve, LayoutProperty, LayoutTransition, LiveRegion, ModalAnimation, ModalPresentation,
-    MountBatch, MountItem, NativeProps, PointerEvents, ResizeMode, ReturnKeyType, ScreenAnimation,
-    ScreenConfig, SnapAlignment, StatusBarStyle, SubmitBehavior, TextAlign, ViewKind, ViewProps,
-    ViewStyle, WebSource,
+    AccessibilityCurrent, AccessibilityRole, AudioSession, AutoCapitalize, AutoFill, BorderStyle,
+    Checked, Color, Command, DialogButtonStyle, InputConfig, KeyboardDismissMode, KeyboardTaps,
+    KeyboardType, LayoutCurve, LayoutProperty, LayoutTransition, LiveRegion, ModalAnimation,
+    ModalPresentation, MountBatch, MountItem, NativeProps, PointerEvents, ResizeMode,
+    ReturnKeyType, ScreenAnimation, ScreenConfig, SnapAlignment, StatusBarStyle, SubmitBehavior,
+    TextAlign, ViewKind, ViewProps, ViewStyle, WebSource,
     geometry::{DefiniteLength, REM_SIZE},
 };
 
@@ -66,6 +66,11 @@ const COMPONENT_PROPS: i32 = 30;
 const OVERFLOW: i32 = 31;
 const ACCESSIBILITY_LABEL: i32 = 32;
 const APPEARANCE: i32 = 33;
+const COMPONENT_PROP_SLOTS: i32 = 34;
+const SHADER: i32 = 35;
+const SHADER_TRANSITION: i32 = 36;
+const SHADER_INPUT: i32 = 37;
+const NAV_SHADER: i32 = 38;
 
 /// An entry of the object table.
 pub(crate) enum Obj {
@@ -123,6 +128,7 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
     };
     for item in batch.items {
         match item {
+            MountItem::TreeOrder(_) | MountItem::ProjectStates { .. } => {}
             MountItem::Create { id, kind } => {
                 e.int(CREATE);
                 e.int(id as i32);
@@ -215,13 +221,16 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                     mask(&mut e, l.events);
                 }
                 // `selectable`: 1 asked for, 0 refused (`false`: out of
-                // selection areas too), 2 unset.
+                // selectable views too), 2 unset.
                 e.int(match text.selectable {
                     Some(true) => 1,
                     Some(false) => 0,
                     None => 2,
                 });
                 opt_color(&mut e, text.selection_color);
+                // The one color all of it is drawn in, if there is one: a
+                // change of it transitions (`transition-colors`, `TextBox`).
+                opt_color(&mut e, text.uniform_color());
             }
             MountItem::Events { id, events } => {
                 e.int(EVENTS);
@@ -266,7 +275,9 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                 id,
                 horizontal,
                 scrollbar_visible,
+                replaced,
                 scroll_value,
+                pull_value,
                 keyboard_dismiss,
                 mirrored,
             } => {
@@ -284,7 +295,9 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                     id,
                     horizontal,
                     scrollbar_visible,
+                    replaced,
                     scroll_value,
+                    pull_value,
                     keyboard_dismiss,
                     mirrored,
                 });
@@ -320,6 +333,41 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                 e.int(CANVAS);
                 e.int(id as i32);
                 canvas(&mut e, &drawing);
+            }
+            MountItem::Shader { id, layer } => {
+                // Java learns what the view shows (whether a shader, its
+                // role, how far it overflows, which pictures it reads); the
+                // layer goes to the UI-thread renderer (`crate::shader`).
+                e.int(SHADER);
+                e.int(id as i32);
+                e.bool(layer.is_some());
+                let l = layer.as_deref();
+                e.int(l.map_or(0, |l| l.role as i32));
+                e.float(l.map_or(0.0, |l| l.overflow.0));
+                e.int(l.map_or(0, |l| {
+                    l.shader
+                        .inputs()
+                        .iter()
+                        .fold(0, |bits, i| bits | 1 << i.index())
+                }));
+                e.animation.push(MountItem::Shader { id, layer });
+            }
+            MountItem::ShaderTransition { id, duration } => {
+                e.int(SHADER_TRANSITION);
+                e.int(id as i32);
+                e.float(duration.as_secs_f32() * 1000.0);
+            }
+            MountItem::ShaderInput { id } => {
+                e.int(SHADER_INPUT);
+                e.int(id as i32);
+            }
+            MountItem::NavShader { id, shader } => {
+                // Java learns whether the page or dialog has one; the layer
+                // waits in the renderer until it comes or goes.
+                e.int(NAV_SHADER);
+                e.int(id as i32);
+                e.bool(shader.is_some());
+                e.animation.push(MountItem::NavShader { id, shader });
             }
             MountItem::Overflow { id, extent } => {
                 e.int(OVERFLOW);
@@ -371,6 +419,8 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                 e.bool(b.bounces_zoom);
                 e.bool(b.pinch);
                 e.bool(b.center_content);
+                e.bool(b.refresh_indicator.is_some());
+                e.float(b.refresh_indicator.map_or(0.0, |h| h.0));
             }
             MountItem::ScrollBy { id, dx, dy } => {
                 e.int(SCROLL_BY);
@@ -478,6 +528,14 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                 e.int(id as i32);
                 e.string(name.to_string());
             }
+            MountItem::ComponentPropSlots { id, names } => {
+                e.int(COMPONENT_PROP_SLOTS);
+                e.int(id as i32);
+                e.int(names.len() as i32);
+                for name in names {
+                    e.string(name.to_string());
+                }
+            }
             MountItem::ComponentProps { id, props } => {
                 e.int(COMPONENT_PROPS);
                 e.int(id as i32);
@@ -543,11 +601,6 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                                 DialogButtonStyle::Destructive => 2,
                             });
                         }
-                    }
-                    Command::Toast { text, long } => {
-                        e.int(13);
-                        e.string(text);
-                        e.bool(long);
                     }
                     Command::SetJsResponder { block } => {
                         e.int(14);
@@ -626,13 +679,77 @@ pub(crate) fn encode(batch: MountBatch) -> Encoded {
                     | Command::Desktop(_)
                     // No host answers `nsh/host` here (`Environment::host`):
                     // the core rejects the calls first.
-                    | Command::HostCall { .. } => e.int(-1),
+                    | Command::HostCall { .. }
+                    // No eyedropper (`Environment::screen_color`): the core
+                    // answers no color first.
+                    | Command::PickScreenColor { .. }
+                    // No file dialogs (`Environment::file_requests`): the
+                    // core answers first.
+                    | Command::FileRequest { .. }
+                    // No speech recognizer (`Environment::speech`): the core
+                    // ends the sessions first.
+                    | Command::Speech(_)
+                    // Trusted web view input is macOS's for now.
+                    | Command::SendInput(_) => e.int(-1),
+                    Command::Notification(command) => {
+                        use nsh_core::notifications::NotificationCommand as N;
+                        e.int(44);
+                        match command {
+                            N::Permission { id, ask } => {
+                                e.int(0);
+                                e.int(id as i32);
+                                e.bool(ask);
+                            }
+                            N::Show { id, notification } => {
+                                e.int(1);
+                                e.int(id as i32);
+                                e.string(notification.id);
+                                e.string(notification.title);
+                                e.string(notification.body);
+                            }
+                            N::Close(id) => {
+                                e.int(2);
+                                e.string(id);
+                            }
+                            N::Listen => e.int(3),
+                            N::SetBadge(count) => {
+                                e.int(4);
+                                e.int(count as i32);
+                            }
+                            _ => e.int(-1),
+                        }
+                    }
+                    // `SystemUi.dialog` draws alerts and action sheets in
+                    // them: each of `DIALOG_TOKENS`, light then dark (0: the
+                    // system's). An app without a theme of its own (its
+                    // tokens the default theme's) keeps the system's colors.
+                    Command::Tokens(tokens) => {
+                        e.int(27);
+                        let themed = nsh_base::tokens_of(None).is_ok_and(|d| *tokens != d);
+                        for name in DIALOG_TOKENS {
+                            let color = tokens.color(name).filter(|_| themed);
+                            for c in [color.map(|c| c.light), color.map(|c| c.dark)] {
+                                e.int(c.map_or(0, |c| argb(c.into())));
+                            }
+                        }
+                    }
                 }
             }
         }
     }
     e
 }
+
+/// The tokens alerts and action sheets are drawn in (`SystemUi.java`'s
+/// order): the dialog, its title, its message, its buttons and a
+/// destructive action.
+const DIALOG_TOKENS: [&str; 5] = [
+    "popover",
+    "popover-foreground",
+    "muted-foreground",
+    "primary",
+    "destructive",
+];
 
 /// The event kind with index `index` (`EventKind as u8`, the order of the
 /// constants in `Native.java`).
@@ -663,16 +780,6 @@ fn view_style(e: &mut Encoded, s: &ViewStyle) {
     });
     e.float(s.opacity);
     e.bool(s.overflow_hidden);
-    let shadow = s.shadow;
-    e.int(argb(shadow.color));
-    e.float(shadow.offset_x.0);
-    e.float(shadow.offset_y.0);
-    e.float(if shadow.is_visible() {
-        shadow.opacity
-    } else {
-        0.0
-    });
-    e.float(shadow.radius.0);
     for v in view_transform(&s.transform, |_| None) {
         e.float(v);
     }
@@ -703,24 +810,13 @@ fn degrees(a: nsh_core::geometry::Radians) -> f32 {
     (a.to_degrees() * 1e4).round() / 1e4
 }
 
-/// The effects of `Mounter.java` `style`: shadows, gradients, filters,
-/// blend mode, outline, visibility, cursor, transition, animation.
-fn effects(e: &mut Encoded, s: &ViewStyle) {
+/// A list of gradients, as `Effects.java`'s `gradients` reads it.
+fn gradients(e: &mut Encoded, gradients: &[nsh_core::Gradient]) {
     use nsh_core::{
-        BlendMode, Cursor, Filter, GradientKind, GradientSize, Keyframes,
+        GradientKind, GradientSize,
         geometry::{DefiniteLength, REM_SIZE, Size},
     };
-    let fx = s.effects.as_deref();
-    let shadows = fx.map_or(&[][..], |f| &f.box_shadows[..]);
-    e.int(shadows.len() as i32);
-    for sh in shadows {
-        for v in [sh.offset_x, sh.offset_y, sh.blur, sh.spread] {
-            e.float(v.0);
-        }
-        e.int(argb(sh.color));
-        e.bool(sh.inset);
-    }
-    let gradients = fx.map_or(&[][..], |f| &f.background_images[..]);
+
     e.int(gradients.len() as i32);
     for g in gradients {
         match g.kind {
@@ -755,11 +851,13 @@ fn effects(e: &mut Encoded, s: &ViewStyle) {
                 e.float(y.0);
             }
         }
+        // Repeated by `Decor.Gradient.place`, over the box it knows.
+        e.bool(g.repeating);
         if g.has_lengths() {
             // Stops placed in points depend on the box, which `Decor`
             // knows when it draws: they go as written, their count
             // negated, each with its unit (0 spread, 1 fraction, 2
-            // points), and `Decor.Gradient.resolve` places them.
+            // points), and `Decor.Gradient.place` places them.
             e.int(-(g.stops.len() as i32));
             for s in &g.stops {
                 e.int(argb(s.color));
@@ -781,6 +879,24 @@ fn effects(e: &mut Encoded, s: &ViewStyle) {
             }
         }
     }
+}
+
+/// The effects of `Mounter.java` `style`: shadows, gradients, filters,
+/// blend mode, outline, visibility, cursor, transition, animation.
+fn effects(e: &mut Encoded, s: &ViewStyle) {
+    use nsh_core::{BlendMode, Cursor, Filter, Keyframes};
+    let fx = s.effects.as_deref();
+    let shadows = fx.map_or(&[][..], |f| &f.box_shadows[..]);
+    e.int(shadows.len() as i32);
+    for sh in shadows {
+        for v in [sh.offset_x, sh.offset_y, sh.blur, sh.spread] {
+            e.float(v.0);
+        }
+        e.int(argb(sh.color));
+        e.bool(sh.inset);
+    }
+    gradients(e, fx.map_or(&[][..], |f| &f.background_images[..]));
+    gradients(e, fx.map_or(&[][..], |f| &f.mask_images[..]));
     let filter_list = |e: &mut Encoded, list: &[Filter]| {
         // Color filters as one composed matrix, then blur, then the drop
         // shadow (what Android's render effects take): the widest of the
@@ -860,6 +976,8 @@ fn effects(e: &mut Encoded, s: &ViewStyle) {
         Cursor::ColResize => 14,
         Cursor::RowResize => 15,
         Cursor::None => 16,
+        Cursor::NwseResize => 17,
+        Cursor::NeswResize => 18,
     });
     match s.transition.filter(|t| t.duration > 0.0) {
         Some(t) => {
@@ -1028,6 +1146,23 @@ fn view_props(e: &mut Encoded, p: &ViewProps) {
         Some(true) => flags |= 64 | 128,
         None => {}
     }
+    match s.pressed {
+        Some(Checked::False) => flags |= 256,
+        Some(Checked::True) => flags |= 256 | 512,
+        Some(Checked::Mixed) => flags |= 256 | 1024,
+        None => {}
+    }
+    // The current item's kind, in bits 11 to 13 (`A11y.java`
+    // `CURRENT_DESCRIPTIONS`).
+    flags |= match s.current {
+        None => 0,
+        Some(AccessibilityCurrent::True) => 1,
+        Some(AccessibilityCurrent::Page) => 2,
+        Some(AccessibilityCurrent::Step) => 3,
+        Some(AccessibilityCurrent::Location) => 4,
+        Some(AccessibilityCurrent::Date) => 5,
+        Some(AccessibilityCurrent::Time) => 6,
+    } << 11;
     e.int(flags);
     match &a.value {
         Some(v) => {
@@ -1074,7 +1209,8 @@ fn view_props(e: &mut Encoded, p: &ViewProps) {
         }
         None => e.int(0),
     }
-    e.bool(p.selection_area);
+    e.bool(p.selectable_view);
+    e.bool(p.continues_text);
 }
 
 /// Index of `role` in `A11y.java`'s class name table.
@@ -1110,6 +1246,20 @@ fn role_index(role: AccessibilityRole) -> i32 {
         Toolbar => 26,
         List => 27,
         Grid => 28,
+        Table => 29,
+        Row => 30,
+        Cell => 31,
+        ColumnHeader => 32,
+        RowGroup => 33,
+        Listbox => 34,
+        Option => 35,
+        Group => 36,
+        Region => 37,
+        Navigation => 38,
+        Tree => 39,
+        TreeItem => 40,
+        MenuItemCheckbox => 41,
+        MenuItemRadio => 42,
     }
 }
 
@@ -1124,6 +1274,7 @@ fn layout_transition(e: &mut Encoded, t: Option<LayoutTransition>) {
         LayoutCurve::EaseOut => (2, 0.0),
         LayoutCurve::EaseInEaseOut => (3, 0.0),
         LayoutCurve::Spring { damping } => (4, damping),
+        LayoutCurve::Keyboard => (5, 0.0),
     };
     e.int(curve);
     e.float(damping);
@@ -1186,6 +1337,8 @@ fn input(e: &mut Encoded, c: &InputConfig) {
     e.bool(c.auto_focus);
     e.bool(c.selection_color.is_some());
     e.int(c.selection_color.map_or(0, argb));
+    e.bool(c.caret_color.is_some());
+    e.int(c.caret_color.map_or(0, argb));
     // What return does: 0 submit, 1 submit and unfocus, 2 a line break.
     e.int(match c.submit() {
         SubmitBehavior::Submit => 0,
@@ -1226,6 +1379,10 @@ fn input(e: &mut Encoded, c: &InputConfig) {
     e.bool(c.caret_hidden);
     // `pasteBehavior`: whether a paste inserts its text.
     e.bool(c.paste_behavior == nsh_core::PasteBehavior::Insert);
+    // A multiline input's own scroll bar shows; a built-in bar replaces it
+    // (the input then reports how far its text scrolled).
+    e.bool(c.scrollbar_visible);
+    e.bool(c.replaced);
 }
 
 // --- Canvas drawings (`CanvasBox.java`) -------------------------------------

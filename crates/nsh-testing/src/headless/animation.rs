@@ -2,7 +2,9 @@
 //! their UI thread (nsh-core's `animation`, platform-free), run here frame by
 //! frame while anything animates, finished animations reported to the
 //! engine as a platform reports them. Nothing is drawn: the values only
-//! move, so what waits for an animation's end goes on.
+//! move, so what waits for an animation's end goes on. Animations that
+//! loop forever (a spinner) run in the background: their values move with
+//! the clock, and nothing waits for them.
 
 use std::time::Duration;
 
@@ -54,6 +56,22 @@ impl Animator {
         }
     }
 
+    /// A vertical scroll view is pulled `distance` past its top: feeds its
+    /// pull value.
+    pub(crate) fn pulled(&mut self, id: NodeId, distance: Points) {
+        if self.graph.pulled(id, distance) {
+            self.wake();
+        }
+    }
+
+    /// Scroll view `id` came to rest: the snapping values that follow it
+    /// settle.
+    pub(crate) fn scroll_ended(&mut self, id: NodeId) {
+        if self.graph.scroll_ended(id) {
+            self.wake();
+        }
+    }
+
     /// A drag of view `id` began: grabbing its animating pan values stops
     /// them where they are.
     pub(crate) fn pan_began(&mut self, id: NodeId) {
@@ -80,9 +98,11 @@ impl Animator {
         }
     }
 
-    /// Whether anything animates.
-    pub(crate) fn running(&self) -> bool {
-        self.next.is_some()
+    /// Whether an animation that ends by itself runs: what steps wait for
+    /// (and, on a manual clock, take frames at once for). Animations that
+    /// loop forever do not count: no step would end.
+    pub(crate) fn finishing(&self) -> bool {
+        self.next.is_some() && self.graph.finishing()
     }
 
     /// When the next frame is due, while anything animates.

@@ -150,8 +150,15 @@ pub(crate) fn began(target: &EventTarget, presses: &AnyObject, editing: bool) ->
             continue;
         }
         // Presses come once: no auto-repeat to match (`KeyMatch::Held`).
-        let KeyMatch::Fire(id) = table.find(stroke, editing, false) else {
-            continue;
+        let id = match table.find(stroke, editing, false) {
+            KeyMatch::Fire(id) => id,
+            // Reported, and the press goes on to the responders (Tab
+            // moves the focus); its release is theirs too.
+            KeyMatch::Notify(id) => {
+                fire(target, id);
+                continue;
+            }
+            KeyMatch::None | KeyMatch::Held => continue,
         };
         fire(target, id);
         let repeats = table.bindings().iter().any(|b| b.id == id && b.repeat);
@@ -279,7 +286,7 @@ pub(crate) fn root_began(target: &EventTarget, presses: &AnyObject) -> bool {
                 .is_some_and(|p| r.class().conforms_to(p));
             // The app's own texts take keys only to select (`TextView`).
             text && r.downcast_ref::<crate::native_view::NshView>().is_none()
-                && r.downcast_ref::<crate::selection_area::AreaResponder>()
+                && r.downcast_ref::<crate::selectable_view::AreaResponder>()
                     .is_none()
         }
         None => false,

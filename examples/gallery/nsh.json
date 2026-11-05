@@ -5,7 +5,7 @@
   "build": 1,
   "icon": "icon.png",
   "appearance": "system",
-  "theme": "theme.json",
+  "theme": "../nsh-gallery-ui/theme.json",
   "capabilities": {
     "network": {
       "hosts": [
@@ -32,7 +32,10 @@
         "claude",
         "codex"
       ],
-      "env": []
+      "env": [
+        "NSH_GALLERY_DEMO",
+        "NSH_GALLERY_SECTION"
+      ]
     },
     "webview": {
       "hosts": [
@@ -41,6 +44,13 @@
     },
     "statusBar": true,
     "clipboard": true,
-    "picker": true
+    "openUrl": {
+      "schemes": [
+        "https"
+      ]
+    },
+    "picker": true,
+    "speech": true,
+    "notifications": true
   }
 }

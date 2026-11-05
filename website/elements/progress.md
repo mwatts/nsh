@@ -1,7 +1,6 @@
 ---
 title: Progress
 description: "The Progress component: a linear progress bar that owns its role, range and value for screen readers and the indicator's width by the value, with a track and an indicator the app styles."
-order: 20.8
 group: base
 demo: el-progress
 ---
@@ -16,7 +15,7 @@ inside it, then its children (a label, the value as text), and the app styles ea
 
 ```rust tabs
 use nsh_base::{progress, theme};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn upload(sent: Signal<f32>) -> impl IntoElement {
     progress()

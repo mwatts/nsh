@@ -12,13 +12,13 @@ use std::{
 };
 
 use nsh_core::{
-    Command, EventKind, Op, ROOT_ID,
+    Command, EventKind, ImageSource, Op, ROOT_ID,
     desktop::{DesktopCommand, MenuAction, MenuItem, MenuRole, Shortcut},
     geometry::{Points, point},
     keymap::When,
     platform::Os,
 };
-use rquickjs::qjs;
+use rquickjs::{Ctx, Value, qjs};
 
 use crate::{
     dom,
@@ -143,9 +143,9 @@ fn string(cx: *mut JsContext, object: JsValue, key: &CStr) -> Option<String> {
 /// The role named `name`, as `MenuRole`'s conversion reads it.
 fn menu_role(cx: *mut JsContext, name: &str) -> Option<MenuRole> {
     let host = crate::classes::host_outside_calls(cx);
-    let value = nsh_core::ui::JsHost::new_string(&host, name).ok()?;
-    let value = nsh_core::ui::JsOwned::new(&host, value);
-    let role = <MenuRole as nsh_core::ui::JsValue>::from_js(value.get()).ok();
+    let value = nsh_core::element::JsHost::new_string(&host, name).ok()?;
+    let value = nsh_core::element::JsOwned::new(&host, value);
+    let role = <MenuRole as nsh_core::element::JsValue>::from_js(value.get()).ok();
     host.clear_pending();
     role
 }
@@ -161,6 +161,36 @@ fn flag(cx: *mut JsContext, object: JsValue, key: &CStr) -> Option<bool> {
     };
     free(cx, v);
     b
+}
+
+/// The source of item `v`'s `icon`, as `<Image>`'s `src` takes it (a `blob:`
+/// URL's bytes, in this VM, go with it); `None` when it has none. Anything
+/// else throws, as a menu's other wrong values do: a failed load only
+/// warns, on the platform.
+fn icon(cx: *mut JsContext, v: JsValue) -> Result<Option<ImageSource>, String> {
+    let icon = get(cx, v, c"icon");
+    if nullish(icon) {
+        return Ok(None);
+    }
+    // SAFETY: a context reference for the decoder, which reads a live
+    // value it owns (its reference given to `Value`).
+    let value =
+        unsafe { Value::from_raw(Ctx::from_raw(std::ptr::NonNull::new_unchecked(cx)), icon) };
+    let empty = value.as_string().is_some_and(|s| {
+        // A string that cannot be read is no empty one.
+        s.to_string().is_ok_and(|s| s.is_empty())
+    });
+    let Some(mut source) = crate::protocol::image_source(value) else {
+        return match empty {
+            true => Ok(None),
+            false => Err("an item's `icon` is a URL or an imported image".into()),
+        };
+    };
+    if let Some((uri, data)) = crate::web::blob::resolve_image_url(cx, &source.uri) {
+        source.uri = uri;
+        source.data = Some(data);
+    }
+    Ok(Some(source.inline()))
 }
 
 /// Decodes menus, keeping their functions.
@@ -212,6 +242,7 @@ impl Decoder {
         }
         let label = string(cx, v, c"label");
         let enabled = !flag(cx, v, c"disabled").unwrap_or(false);
+        let icon = icon(cx, v)?;
         let submenu = get(cx, v, c"submenu");
         if !nullish(submenu) {
             let items = self.items(submenu);
@@ -220,6 +251,7 @@ impl Decoder {
                 label: label.ok_or("a submenu needs a label")?,
                 enabled,
                 items: items?,
+                icon,
             }));
         }
         let role = match string(cx, v, c"role") {
@@ -265,6 +297,7 @@ impl Decoder {
             checked: flag(cx, v, c"checked"),
             role,
             when,
+            icon,
         })))
     }
 
@@ -349,8 +382,19 @@ unsafe extern "C" fn set_application_menu(
     result.err().unwrap_or(UNDEFINED)
 }
 
-/// `Menu.popup(items, at?)`.
+/// `Menu.popup(items, at?)`: a promise, which a wrong item rejects.
 unsafe extern "C" fn popup(
+    cx: *mut JsContext,
+    this: JsValue,
+    argc: c_int,
+    argv: *mut JsValue,
+) -> JsValue {
+    // SAFETY: QuickJS's arguments, passed on.
+    crate::web::js::rejecting(cx, unsafe { popup_menu(cx, this, argc, argv) })
+}
+
+/// [`popup`]'s work: its promise, or the exception of what it refuses.
+unsafe fn popup_menu(
     cx: *mut JsContext,
     _this: JsValue,
     argc: c_int,
@@ -469,13 +513,16 @@ pub(crate) const EXPORTS: &[Item] = &[
                 qjs::JS_FALSE
             }
         }),
-        Ts::value("True on desktops (macOS, Windows, Linux).", "boolean"),
+        Ts::value(
+            "True where this module's window and menu APIs work: macOS, Windows and\nLinux. `platform.desktop` (desktop behavior) also holds in browsers in the\ndesktop idiom, where the browser keeps its own window and menus.",
+            "boolean",
+        ),
     ),
     (
         "titleBar",
         Export::Value(crate::env::title_bar),
         Ts::value(
-            "The title bar's area while the app hides it (`Window.setTitleBar(\"hidden\")`),\nin points (reactive): its `height`, and the widths the system's window\ncontrols take at its `left` and `right` ends (macOS's traffic lights,\nWindows' caption buttons, GTK's window buttons). All 0 while the system\nshows its title bar, and off desktops.",
+            "The title bar's area while the app hides it (`Window.setTitleBar({ style: \"hidden\" })`),\nin points (reactive): its `height`, and the widths the system's window\ncontrols take at its `left` and `right` ends (macOS's traffic lights,\nWindows' caption buttons, GTK's window buttons). All 0 while the system\nshows its title bar, and off desktops.",
             "Accessor<TitleBarArea>",
         ),
     ),
@@ -558,6 +605,21 @@ export type MenuItem =
       checked?: boolean;
       /** Called when it is chosen (by a click or its shortcut). */
       onSelect?: () => void;
+      /** The image beside its label, as `<Image>`'s `src` takes it (an
+       * imported file, or a URL such as a `data:` one), so that an app's menus
+       * show its own icon set on every platform. It is fitted in the menu's
+       * icon size (16 points on macOS, the small icon size at the window's
+       * DPI on Windows) and drawn for the screen. An SVG is a template: only
+       * its shape counts, in the color of the menu's text, whatever that is
+       * (dark mode, a selected or disabled item); a bitmap keeps its colors.
+       * It loads off the main thread, so a menu never blocks on it and the
+       * icon shows once it has loaded (a context menu on Windows gives it
+       * up to 100ms before opening); one that fails to load leaves the item
+       * without an icon and logs a warning. The top-level menus of a
+       * menu bar show their titles alone, and so do GPUI's native menus on
+       * macOS. GTK's menus show no icon beside a label: GTK draws a menu
+       * item's icon only when it has no text. A terminal shows no images. */
+      icon?: ImageAsset | string;
       /** Its items: makes it a submenu (`label` is required). */
       submenu?: readonly (MenuItem | null | undefined | false)[];
     };
@@ -583,7 +645,7 @@ export interface MenuModule {
 
 #[cfg(test)]
 mod tests {
-    use nsh_core::{desktop::MenuRole, ui::JsValue as _};
+    use nsh_core::{desktop::MenuRole, element::JsValue as _};
 
     /// `MenuRole`'s declaration (written here, with the docs of each role)
     /// names the roles the Rust type reads.

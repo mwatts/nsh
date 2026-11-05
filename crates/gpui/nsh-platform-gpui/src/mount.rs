@@ -150,6 +150,7 @@ impl Mounter {
             MountItem::Remove { id } => {
                 if let Some(view) = &self.get(*id) {
                     crate::text_input::removing(surface, view);
+                    crate::file_drop::invalidate(surface, *id);
                     crate::navigation::removing(surface, view);
                     // A removal animation detaches the view when it ends.
                     if !crate::transition::removing(surface, view, self.layout_animation.as_ref()) {
@@ -160,11 +161,13 @@ impl Mounter {
             MountItem::Delete { id } => {
                 if let Some(view) = self.views.remove(*id) {
                     crate::text_input::removing(surface, &view);
+                    crate::file_drop::invalidate(surface, *id);
                     crate::navigation::removing(surface, &view);
                     crate::native::deleted(surface, &view);
                     // A removal animation detaches the view when it ends.
                     if !crate::transition::removing(surface, &view, self.layout_animation.as_ref())
                     {
+                        crate::transition::deleted(&view);
                         self.detach(surface, &view);
                     }
                 }
@@ -203,7 +206,11 @@ impl Mounter {
                     ViewKind::WebView | ViewKind::Video | ViewKind::Native => {
                         crate::native::resized(view)
                     }
-                    _ => {}
+                    ViewKind::Image => {
+                        crate::shader::resized(surface, view);
+                        crate::image::resized(surface, view);
+                    }
+                    _ => crate::shader::resized(surface, view),
                 }
             }
             MountItem::ViewStyle { id, style } => {
@@ -220,7 +227,11 @@ impl Mounter {
                 content,
             } => {
                 if let Some(view) = &self.get(*id) {
+                    let old = view.state().text.as_ref().map(|t| t.text.clone());
                     crate::text::set(view, text, layout, *content);
+                    if let Some(old) = old {
+                        crate::transition::text_changed(surface, view, &old, text);
+                    }
                     crate::access::text_changed(view);
                 }
             }
@@ -229,6 +240,7 @@ impl Mounter {
                     view.state_mut().events = *events;
                     crate::input::events_changed(surface, view);
                     crate::access::events_changed(view);
+                    crate::file_drop::events_changed(surface, view);
                 }
             }
             MountItem::Image {
@@ -245,6 +257,7 @@ impl Mounter {
                 id,
                 horizontal,
                 scrollbar_visible,
+                replaced,
                 mirrored,
                 ..
             } => {
@@ -254,6 +267,7 @@ impl Mounter {
                         view,
                         *horizontal,
                         *scrollbar_visible,
+                        *replaced,
                         *mirrored,
                     );
                 }
@@ -301,6 +315,21 @@ impl Mounter {
             MountItem::Canvas { id, drawing } => {
                 if let Some(view) = &self.get(*id) {
                     crate::canvas::set(surface, view, drawing.clone());
+                }
+            }
+            // Only fills draw: an effect's or a transition's children show as
+            // they are (a transition changes them at once), a screen effect
+            // draws nothing, pages and dialogs come and go as they would
+            // without a shader.
+            MountItem::ShaderTransition { .. }
+            | MountItem::ShaderInput { .. }
+            | MountItem::NavShader { .. } => {}
+            MountItem::Shader { id, layer } => {
+                if let Some(view) = &self.get(*id) {
+                    let fill = layer
+                        .clone()
+                        .filter(|l| l.role == nsh_core::shader::ShaderRole::Fill);
+                    crate::shader::set(surface, view, fill);
                 }
             }
             MountItem::Gestures { id, values } => {
@@ -357,7 +386,11 @@ impl Mounter {
             }
             MountItem::Command { id, command } => self.command(surface, *id, command),
             // The animator's (`Surface::apply`).
-            MountItem::Animation(_) | MountItem::AnimationBindings { .. } => {}
+            MountItem::Animation(_)
+            | MountItem::AnimationBindings { .. }
+            | MountItem::ComponentPropSlots { .. }
+            | MountItem::TreeOrder(_)
+            | MountItem::ProjectStates { .. } => {}
         }
     }
 
@@ -394,6 +427,9 @@ impl Mounter {
                 if let Some(view) = view {
                     crate::text_input::set_selection(view, *start, *end);
                 }
+            }
+            Command::ScrollTo { y, .. } if view.is_some_and(|v| v.kind() == ViewKind::Input) => {
+                crate::text_input::scroll_to(view.expect("an input"), *y);
             }
             Command::ScrollTo { .. }
             | Command::ScrollToEnd { .. }

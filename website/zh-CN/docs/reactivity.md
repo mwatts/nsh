@@ -13,7 +13,7 @@ NSH 用 **signal** 更新界面：signal 是知道谁在读取自己的值。sig
 Rust 组件从 prelude 中取得本页的所有内容；TSX 从 `nsh` 导入：
 
 ```rust tabs
-use nsh_core::ui::prelude::*;   // signal, computed, effect, resource, batch, untracked, cleanup, provide_context, use_context
+use nsh_core::prelude::*;   // signal, computed, effect, resource, batch, untracked, cleanup, provide_context, use_context
 ```
 
 ```tsx tabs
@@ -199,7 +199,7 @@ effect(move || {
 ```
 
 ```tsx tabs
-let input: YNode | undefined;
+let input: InputRef | undefined;
 effect(() => {
   if (editing()) input?.focus();
 });
@@ -488,7 +488,7 @@ function ProfileCard(props: { user: User | undefined }) {
 }
 ```
 
-失败交给发生处上方最近的错误边界，fallback 中的失败交给再上一层的错误边界。没有错误边界时，失败作为未捕获的错误报告（开发时的错误浮层、日志）。TSX 中不带参数的 `fallback` 按原样显示：`fallback={<Text>Unavailable</Text>}`。
+失败交给发生处上方最近的错误边界，fallback 中的失败交给再上一层的错误边界。没有错误边界时，失败作为未捕获的错误报告（开发时的错误浮层、日志）。TSX 中元素形式的 `fallback` 按原样显示（`fallback={<Text>Unavailable</Text>}`），函数形式的则以错误和 `reset` 调用，与它声明了几个参数无关。
 
 ## 什么会运行，何时运行
 
@@ -501,7 +501,7 @@ function ProfileCard(props: { user: User | undefined }) {
 | `when(cond, ..)` / `<If when>` | 创建时 | 条件是否成立发生变化时 |
 | `each(..)` / `<Each of>` 的行 | 它的 key 第一次出现时 | 从不；改为由条目和索引的 signal 变化 |
 
-环境同样是响应式的：Rust 中的 `window()`、`dark()`、`font_scale()`、`safe_area()` 和 `keyboard_height()`，TSX 中 [`nsh/device`](../modules/nsh-device.md) 的 `windowSize()`、`colorScheme()`、`fontScale()` 以及 [`nsh/base`](../modules/nsh-base.md) 的 `safeArea()` 和 `keyboardFrame()`，读取它们的绑定会跟随屏幕旋转、深色模式或键盘变化。
+环境同样是响应式的：Rust 中的 `window()`、`dark()`、`font_scale()`、`safe_area()` 和 `keyboard_height()`，TSX 中 [`nsh` 的设备 API](../modules/nsh.md#device) 的 `windowSize()`、`colorScheme()`、`fontScale()` 以及 [`nsh`](../modules/nsh.md) 的 `safeArea()` 和 `keyboardFrame()`，读取它们的绑定会跟随屏幕旋转、深色模式或键盘变化。
 
 ## 常见错误
 

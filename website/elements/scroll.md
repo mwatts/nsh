@@ -1,7 +1,7 @@
 ---
 title: Scroll
 description: "The native scroll view: vertical and horizontal scrolling, paging and snapping, pull to refresh, zooming and scroll events."
-order: 5
+order: 40
 group: primitives
 demo: el-scroll
 ---
@@ -13,7 +13,7 @@ children as its content and scrolls them natively: scrolling, flinging, bouncing
 the display's rate. Rust makes one with `scroll()`, TSX with `<Scroll>` from `nsh`.
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 scroll().flex_1().child(
     view().p_4().gap_2().child(each(
@@ -49,7 +49,7 @@ are methods of the `Scrollable` trait, which lists share.
 |---|---|---|---|---|
 | `horizontal` | `.horizontal()` | `boolean` | `false` | Scrolls sideways. |
 | `scrollable` | `.scrollable(..)` | `boolean` | `true` | The user can scroll it. |
-| `scrollbar` | `.scrollbar(..)` | `boolean` | `true` | The scroll indicator shows. On the desktop and in desktop browsers a horizontal view keeps it: it is the mouse's scroll bar. |
+| `scrollbar` | `.scrollbar(..)` | `boolean \| ScrollbarTheme` | `true` | The scroll indicator shows: the platform's, or the app's [built-in bar](./scrollbar.md#built-in-bars) once it set a theme; an object is a theme of the view's own. On the desktop and in desktop browsers a horizontal view keeps it: it is the mouse's scroll bar. |
 | `bounces` | `.bounces(..)` | `boolean` | `true` | Overscroll past the edges. |
 | `pagingEnabled` | `.paging(..)` | `boolean` | `false` | Stops at multiples of the viewport. |
 | `snapToInterval` | `.snap_interval(px(..))` | `number` | `0` | Stops at multiples of this length (0: off). |
@@ -72,6 +72,8 @@ are methods of the `Scrollable` trait, which lists share.
 |---|---|---|---|
 | `refreshing` | `.refreshing(..)` | `boolean` | The refresh spinner shows. |
 | `onRefresh` | `.on_refresh(..)` | `() => void` | The user pulled to refresh: start loading and set `refreshing` until it ends. |
+| `refreshIndicator` | `.refresh_indicator(Some(height))` | `{ height: number }` | The app draws its own indicator, `height` points tall: the platform's spinner is hidden, a pull refreshes once it reaches `height`, and refreshing keeps `height` above the content. A height of 0 or less is none. |
+| `pullValue` | `.pull_value(&value)` | `AnimatedValue` | An animated value fed with how far the view is pulled past its top (0 at rest, growing with the pull; the room kept above the content while it refreshes: `height` with `refreshIndicator`), for the app's indicator. |
 
 ```rust tabs
 let refreshing = signal(false);
@@ -134,7 +136,7 @@ scroll()
 ```
 
 ```tsx tabs
-let photo!: YNode;
+let photo!: ScrollRef;
 <Scroll ref={photo} maximumZoomScale={4} centerContent style={{ flex: 1, backgroundColor: "#000" }}>
   <Image src={picture} style={{ width: 390, height: 520 }} onPress={() => photo.zoomTo({ scale: 1, animated: true })} />
 </Scroll>;
@@ -145,9 +147,9 @@ let photo!: YNode;
 | Event | Rust | Payload | When |
 |---|---|---|---|
 | `onScroll` | `.on_scroll` | `ScrollEvent` | The offset changed (at most once per frame, and no more often than `scrollEventThrottle`). |
-| `onScrollDragStart` / `onScrollDragEnd` | `.on_scroll_drag_start` / `.on_scroll_drag_end` | `{ x, y }` (`Point<Points>`) | The user started / stopped dragging. |
-| `onMomentumStart` / `onMomentumEnd` | `.on_momentum_start` / `.on_momentum_end` | `{ x, y }` | A glide after the drag started / stopped. A glide caught by a new drag still ends with `onMomentumEnd`. |
-| `onScrollEnd` | `.on_scroll_end` | `{ x, y }` | Scrolling came to rest. |
+| `onScrollDragStart` / `onScrollDragEnd` | `.on_scroll_drag_start` / `.on_scroll_drag_end` | `{ offset }` (`Point<Points>`) | The user started / stopped dragging. |
+| `onMomentumStart` / `onMomentumEnd` | `.on_momentum_start` / `.on_momentum_end` | `{ offset }` | A glide after the drag started / stopped. A glide caught by a new drag still ends with `onMomentumEnd`. |
+| `onScrollEnd` | `.on_scroll_end` | `{ offset }` | Scrolling came to rest. |
 | `onRefresh` | `.on_refresh` | none | Pulled to refresh. |
 
 `ScrollEvent` is `{ offset: Point; contentSize: Size; size: Size; zoomScale }` (in Rust `offset`, `content_size`,
@@ -174,7 +176,7 @@ scroller.scroll_to(point(px(0.0), px(0.0)), true);
 ```
 
 ```tsx tabs
-let scroller!: YNode;
+let scroller!: ScrollRef;
 <Scroll ref={scroller}>…</Scroll>;
 scroller.scrollTo({ y: 0, animated: true });
 ```
@@ -182,8 +184,8 @@ scroller.scrollTo({ y: 0, animated: true });
 ## Keyboard
 
 Inputs inside a scroll view are kept clear of the keyboard natively: the scroll view gets a bottom inset and scrolls to
-the focused input on its own. For content outside scroll views use [`KeyboardAvoidingView`](./keyboard-avoiding-view.md)
-from `nsh/base`. See [forms and the keyboard](../docs/forms-and-keyboard.md).
+the focused input on its own. For content outside scroll views use [`env(keyboard-inset-height)`](./keyboard.md)
+in a bottom padding or margin. See [forms and the keyboard](../docs/forms-and-keyboard.md).
 
 ## Right to left
 

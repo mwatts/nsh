@@ -14,6 +14,12 @@ use anyhow::{Context as _, bail};
 /// Minimum Android version (API 28, Android 9), as the runtime is built.
 pub(crate) const MIN_SDK: u32 = 28;
 const TARGET_SDK: u32 = 35;
+/// The ABIs the runtime is built for: `nsh package --abi`'s values.
+pub(crate) const ABIS: [&str; 3] = ["arm64-v8a", "armeabi-v7a", "x86_64"];
+/// The ABIs `nsh package` puts into an APK unless `--abi` names others:
+/// the 64-bit and 32-bit processes of phones (`--run` adds the device's,
+/// an emulator's `x86_64`).
+pub(crate) const DEFAULT_ABIS: [&str; 2] = ["arm64-v8a", "armeabi-v7a"];
 
 /// The Android SDK.
 pub(crate) struct Sdk {
@@ -63,20 +69,7 @@ impl Sdk {
     /// (`ANDROID_NDK_HOME`, else the newest NDK of the SDK): an app's own
     /// `libnsh.so` (`rust_app.rs`).
     pub(crate) fn ndk_cargo(&self, triple: &str) -> anyhow::Result<Command> {
-        let ndk = match env::var_os("ANDROID_NDK_HOME") {
-            Some(ndk) => PathBuf::from(ndk),
-            None => newest(&self.root.join("ndk"))
-                .context("no NDK in the SDK: install it with `sdkmanager \"ndk;<version>\"`")?,
-        };
-        // The NDK's "darwin-x86_64" toolchain is universal.
-        let host = if cfg!(target_os = "macos") {
-            "darwin-x86_64"
-        } else if cfg!(windows) {
-            "windows-x86_64"
-        } else {
-            "linux-x86_64"
-        };
-        let toolchain = ndk.join("toolchains/llvm/prebuilt").join(host);
+        let toolchain = self.ndk_toolchain()?;
         let bin = toolchain.join("bin");
         // On Windows the NDK's per-target compilers are batch files.
         let script = if cfg!(windows) { ".cmd" } else { "" };
@@ -109,6 +102,36 @@ impl Sdk {
                 ),
             );
         Ok(cmd)
+    }
+
+    /// The NDK's LLVM toolchain (`ANDROID_NDK_HOME`, else the newest NDK of
+    /// the SDK).
+    fn ndk_toolchain(&self) -> anyhow::Result<PathBuf> {
+        let ndk = match env::var_os("ANDROID_NDK_HOME") {
+            Some(ndk) => PathBuf::from(ndk),
+            None => newest(&self.root.join("ndk"))
+                .context("no NDK in the SDK: install it with `sdkmanager \"ndk;<version>\"`")?,
+        };
+        // The NDK's "darwin-x86_64" toolchain is universal.
+        let host = if cfg!(target_os = "macos") {
+            "darwin-x86_64"
+        } else if cfg!(windows) {
+            "windows-x86_64"
+        } else {
+            "linux-x86_64"
+        };
+        Ok(ndk.join("toolchains/llvm/prebuilt").join(host))
+    }
+
+    /// Writes `library` to `to` without the symbols nothing links against
+    /// (the dynamic ones, `JNI_OnLoad` and the natives, stay): an app's
+    /// release `libnsh.so`, which APKs store uncompressed.
+    pub(crate) fn strip(&self, library: &Path, to: &Path) -> anyhow::Result<()> {
+        run(Command::new(self.ndk_toolchain()?.join("bin/llvm-strip"))
+            .arg("--strip-unneeded")
+            .arg("-o")
+            .arg(to)
+            .arg(library))
     }
 
     fn tool(&self, name: &str) -> PathBuf {
@@ -147,6 +170,8 @@ pub(crate) struct Apk<'a> {
     pub(crate) activity: &'a str,
     /// Development builds: debuggable, cleartext HTTP (the dev server).
     pub(crate) dev: bool,
+    /// The app may show notifications: `POST_NOTIFICATIONS` is declared.
+    pub(crate) notifications: bool,
     /// A Rust app: its `libnsh.so` has the root, which `AppActivity` runs
     /// instead of a bundle (manifest meta-data `com.longbridge.nsh.RUST`).
     pub(crate) rust: bool,
@@ -155,6 +180,9 @@ pub(crate) struct Apk<'a> {
     pub(crate) dark: bool,
     /// `classes.dex` and `lib/<abi>/libnsh.so`.
     pub(crate) runtime: &'a Path,
+    /// The ABIs whose `libnsh.so` goes in, each of which the runtime must
+    /// have (empty: every one it has).
+    pub(crate) abis: &'a [String],
     /// Launcher icon (square PNG).
     pub(crate) icon: Option<&'a Path>,
     /// Files under `assets/` in the APK: (path in the APK, contents).
@@ -256,10 +284,15 @@ fn manifest_xml(apk: &Apk<'_>) -> String {
         .replace('&', "&amp;")
         .replace('"', "&quot;")
         .replace('<', "&lt;");
+    let post_notifications = if apk.notifications {
+        "\n    <uses-permission android:name=\"android.permission.POST_NOTIFICATIONS\" />"
+    } else {
+        ""
+    };
     format!(
         r#"<?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android" package="{package}">
-    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.INTERNET" />{post_notifications}
     <application android:label="{label}"{icon}{cleartext}
         android:extractNativeLibs="false"
         android:enableOnBackInvokedCallback="true"
@@ -300,24 +333,38 @@ fn add_files(base: &Path, out: &Path, apk: &Apk<'_>) -> anyhow::Result<()> {
         .read_to_end(&mut dex)?;
     zip.write_all(&dex)?;
     let libs = apk.runtime.join("lib");
-    let mut abis = 0;
+    let mut available = Vec::new();
     for entry in fs::read_dir(&libs).with_context(|| format!("read {}", libs.display()))? {
         let abi_dir = entry?.path();
-        let so = abi_dir.join("libnsh.so");
-        if !so.exists() {
-            continue;
+        if abi_dir.join("libnsh.so").exists() {
+            available.push(
+                abi_dir
+                    .file_name()
+                    .context("abi")?
+                    .to_string_lossy()
+                    .into_owned(),
+            );
         }
-        let abi = abi_dir
-            .file_name()
-            .context("abi")?
-            .to_string_lossy()
-            .into_owned();
+    }
+    available.sort();
+    if available.is_empty() {
+        bail!("no libnsh.so in {}", libs.display());
+    }
+    let abis = if apk.abis.is_empty() {
+        &available[..]
+    } else {
+        apk.abis
+    };
+    for abi in abis {
+        if !available.contains(abi) {
+            bail!(
+                "the Android runtime has no libnsh.so for {abi} (it has {})",
+                available.join(", ")
+            );
+        }
+        let so = libs.join(abi).join("libnsh.so");
         zip.start_file(format!("lib/{abi}/libnsh.so"), stored)?;
         zip.write_all(&fs::read(&so)?)?;
-        abis += 1;
-    }
-    if abis == 0 {
-        bail!("no libnsh.so in {}", libs.display());
     }
     for (path, bytes) in &apk.assets {
         // Bytecode and images are compressed already or small.
@@ -416,6 +463,17 @@ pub(crate) fn device(sdk: &Sdk) -> anyhow::Result<String> {
         .context("no Android device or emulator connected (see `adb devices`)")
 }
 
+/// The ABIs `serial` runs, preferred first (`ro.product.cpu.abilist`).
+pub(crate) fn device_abis(sdk: &Sdk, serial: &str) -> anyhow::Result<Vec<String>> {
+    let list = adb(sdk, serial, &["shell", "getprop", "ro.product.cpu.abilist"])?;
+    Ok(list
+        .trim()
+        .split(',')
+        .filter(|abi| !abi.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
 /// A port of the device forwarded to this machine (`adb reverse`), removed
 /// when dropped, however the command ends (Ctrl-C too: it is
 /// [`ui::Stoppable`] meanwhile): a dev host left on the device would
@@ -472,30 +530,42 @@ pub(crate) fn adb(sdk: &Sdk, serial: &str, args: &[&str]) -> anyhow::Result<Stri
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn a_rust_app_runs_its_root() {
-        let apk = |rust| super::Apk {
+    fn apk(rust: bool, notifications: bool) -> super::Apk<'static> {
+        super::Apk {
             package: "com.example.app",
             label: "App",
             version_name: "1.0",
             version_code: 1,
             activity: "com.longbridge.nsh.AppActivity",
             dev: false,
+            notifications,
             rust,
             dark: false,
             runtime: std::path::Path::new("."),
+            abis: &[],
             icon: None,
             assets: Vec::new(),
             signing: super::Signing::Debug,
-        };
+        }
+    }
+
+    #[test]
+    fn a_rust_app_runs_its_root() {
         // `AppActivity` reads it from the application's meta-data.
         let flag = r#"<meta-data android:name="com.longbridge.nsh.RUST" android:value="true" />"#;
-        let manifest = super::manifest_xml(&apk(true));
+        let manifest = super::manifest_xml(&apk(true, false));
         assert!(manifest.contains(flag), "{manifest}");
         let application = manifest.find("<application").unwrap();
         let activity = manifest.find("<activity").unwrap();
         let at = manifest.find(flag).unwrap();
         assert!(application < at && at < activity, "{manifest}");
-        assert!(!super::manifest_xml(&apk(false)).contains("com.longbridge.nsh.RUST"));
+        assert!(!super::manifest_xml(&apk(false, false)).contains("com.longbridge.nsh.RUST"));
+    }
+
+    #[test]
+    fn only_an_app_granted_notifications_declares_their_permission() {
+        let permission = "android.permission.POST_NOTIFICATIONS";
+        assert!(super::manifest_xml(&apk(false, true)).contains(permission));
+        assert!(!super::manifest_xml(&apk(false, false)).contains(permission));
     }
 }

@@ -2,7 +2,8 @@
 // `dark:` variants follow the host's light or dark mode
 // (`AppView::set_appearance`).
 
-import { Input, type JSX, Text, View } from "nsh";
+import { type JSX, Text, View } from "nsh";
+import { Input } from "nsh/base";
 
 /** A press target with a label: `primary` (default) or `danger`. */
 export function Button(props: { title: string; variant?: "primary" | "danger"; onPress?: () => void }) {
@@ -42,7 +43,7 @@ export function TextField(props: { label: string; value?: string; placeholder?: 
       <Input
         value={props.value}
         placeholder={props.placeholder}
-        onChange={props.onChange}
+        onChange={({ value }) => props.onChange?.(value)}
         class="min-h-11 rounded-lg border border-zinc-300 px-3 text-base text-zinc-900 focus:border-blue-500 dark:border-zinc-700 dark:text-zinc-100"
       />
     </View>

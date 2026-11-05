@@ -1,6 +1,6 @@
-import { Input, signal, Text, View } from "nsh";
-import { AlertDialog } from "nsh/base";
-import { Storage } from "nsh/storage";
+import { signal, Text, View } from "nsh";
+import { AlertDialog, Input } from "nsh/base";
+import { Storage } from "nsh";
 import { Icon } from "../icons";
 import { Badge, Button, Caption, Card, colors, DemoPage, Figure, finish, mono, radius, Row } from "../ui";
 
@@ -35,7 +35,7 @@ export function StorageDemo() {
     await refresh();
   })();
 
-  const write = (text: string) => {
+  const write = ({ value: text }: { value: string }) => {
     note.set(text);
     saved.set("saving");
     (text ? Storage.setItem(NOTE, text) : Storage.removeItem(NOTE)).then(
@@ -48,17 +48,17 @@ export function StorageDemo() {
   };
 
   const clearAll = async () => {
-    const action = await AlertDialog.show({
+    const { action } = await AlertDialog.show({
       title: "Clear the storage?",
       description: "Removes every key the gallery keeps, the launch count and the note among them.",
       actions: [
-        { label: "Cancel", role: "cancel" },
-        { label: "Clear", role: "destructive" },
+        { label: "Cancel", role: "cancel", id: "cancel" },
+        { label: "Clear", role: "destructive", id: "clear" },
       ],
       closeOnEscape: true,
       closeOnBackdropPress: true,
     });
-    if (action !== "Clear") return;
+    if (action !== "clear") return;
     await Storage.clear();
     launches.set(0);
     note.set("");
@@ -129,7 +129,7 @@ export function StorageDemo() {
             <Each of={entries()}>
               {(entry, i) => (
                 <Row first={i() === 0}>
-                  <Text numberOfLines={1} style={{ flex: 1, fontSize: 14, color: colors.text, fontFamily: mono }}>
+                  <Text style={{ numberOfLines: 1, flex: 1, fontSize: 14, color: colors.text, fontFamily: mono }}>
                     {entry().key}
                   </Text>
                   <Text style={{ fontSize: 13, color: colors.muted, fontVariant: ["tabular-nums"] }}>{`${entry().length} chars`}</Text>

@@ -53,6 +53,9 @@ pub struct AppOptions {
     /// Where the apps keep their caches (the images they downloaded) and
     /// how much each keeps ([`SurfaceOptions::cache`]).
     pub cache: nsh_engine::CacheOptions,
+    /// Logs the performance monitor's readings once a second
+    /// ([`SurfaceOptions::fps`]).
+    pub fps: bool,
 }
 
 /// Whether `path` is inside the app's own bundle (which the system verifies
@@ -89,6 +92,17 @@ define_class!(
     unsafe impl NSObjectProtocol for AppDelegate {}
 
     unsafe impl UIApplicationDelegate for AppDelegate {
+        // Before launching finishes, or a press that starts the app is lost.
+        #[unsafe(method(application:willFinishLaunchingWithOptions:))]
+        fn will_finish_launching(
+            &self,
+            _application: &UIApplication,
+            _options: Option<&objc2::runtime::AnyObject>,
+        ) -> bool {
+            crate::notifications::install();
+            true
+        }
+
         #[unsafe(method_id(application:configurationForConnectingSceneSession:options:))]
         fn configuration_for_scene(
             &self,
@@ -191,6 +205,7 @@ fn connect(mtm: MainThreadMarker, scene: &UIWindowScene) {
         root.bounds(),
         SurfaceOptions {
             trace: options.trace,
+            fps: options.fps,
             asset_base: options.asset_base,
             data_dir: options
                 .data_dir

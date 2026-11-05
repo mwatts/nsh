@@ -1,7 +1,7 @@
 ---
 title: Image
 description: The element that shows a bundled or remote image, with placeholders, blur, fades, tinting and load events.
-order: 4
+order: 30
 group: primitives
 demo: el-image
 ---
@@ -13,7 +13,7 @@ downsampled to the size the view shows them at, and cached in memory. Animated G
 makes one with `image(src)`, TSX with `<Image>` from `nsh`.
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 // assets/logo.png in the app's crate.
 const LOGO: ImageAsset = asset!("logo.png");
@@ -25,7 +25,7 @@ view()
     .child(
         image("https://example.com/avatar.jpg")
             .placeholder(LOGO)
-            .resize_mode(ResizeMode::Cover)
+            .object_fit(ResizeMode::Cover)
             .size(px(64.0))
             .rounded_full(),
     )
@@ -40,7 +40,6 @@ import logo from "./assets/logo.png";
   <Image
     src="https://example.com/avatar.jpg"
     placeholder={logo}
-    resizeMode="cover"
     style={{ width: 64, height: 64, borderRadius: 32 }}
   />
 </View>;
@@ -91,7 +90,7 @@ crate ships its `assets/` directory with `registry.assets(assets!())`). See
 
 > [!NOTE]
 > When the app declares [capabilities](../docs/sandbox-and-capabilities.md), remote images load from the hosts it
-> lists; an image from any other host fails with `onError`. `asset:` URIs, `data:` URIs and `blob:` URLs always load.
+> lists; an image from any other host is not requested and fails with `onError`, whose `code` is `"ERR_ACCESS_DENIED"`. `asset:` URIs, `data:` URIs and `blob:` URLs always load.
 
 ## Props
 
@@ -100,16 +99,16 @@ Besides the [common props](./index.md#common-props) (with `style` typed as `Imag
 | Prop | Rust | Type | Default | Description |
 |---|---|---|---|---|
 | `src` | `image(src)` | `string \| ImageAsset` | | The image. |
-| `resizeMode` | `.resize_mode(ResizeMode::Contain)` | `"cover" \| "contain" \| "stretch" \| "center" \| "scale-down"` | `"cover"` | How the image fits its box: `"center"` shows it at its natural size, centered (CSS's `object-fit: none`); `"scale-down"` the same, shrunk to fit where it is larger. |
 | `placeholder` | `.placeholder(src)` | `string \| ImageAsset` | | Shown until `src` has loaded; best a local asset. |
 | `blurRadius` | `.blur_radius(px(..))` | `number` | | Blurs the image by this radius in points (applied once while decoding, off the main thread). |
 | `fadeDuration` | `.fade_duration(ms)` | `number` | iOS `0`, Android `300` | How long a loaded image fades in, in milliseconds. |
 | `tintColor` (style) | `.tint_color(..)` | `ColorValue` | | Recolors a template image (an icon drawn in one color). |
-| `objectPosition` (style) | `.object_position(..)`, `.object_top()`, ... | `string` | `"center"` | Where the image sits in its box once `resizeMode` has sized it, as CSS's `object-position` (`"top"`, `"25% 75%"`, `"right 10px bottom 20%"`); a covering image is cropped around it. |
+| `objectFit` (style) | `.object_fit(ResizeMode::Contain)` | `"cover" \| "contain" \| "fill" \| "none" \| "scale-down"` | `"cover"` | How the image fits its box, as CSS's `object-fit` (`object-*` classes): `"cover"` fills it and crops, `"contain"` fits inside it, `"fill"` stretches, `"none"` shows it at its natural size, `"scale-down"` the same, shrunk to fit where it is larger. |
+| `objectPosition` (style) | `.object_position(..)`, `.object_top()`, ... | `string` | `"center"` | Where the image sits in its box once `objectFit` has sized it, as CSS's `object-position` (`"top"`, `"25% 75%"`, `"right 10px bottom 20%"`); a covering image is cropped around it. |
 | `onLoadStart` | `.on_load_start(..)` | `() => void` | | Loading began. |
 | `onProgress` | `.on_progress(..)` | `(e: { loaded: number; total: number }) => void` | | Download progress in bytes (`total` is 0 when unknown), at most every 100 ms. |
-| `onLoad` | `.on_load(..)` | `(e: { width: number; height: number }) => void` | | Loaded; the source image's size in pixels (not the decoded, downsampled one; an SVG's size in points, [on the web as the browser measures it](../docs/images-and-assets.md#svg-images)); for an image with variants, the loaded variant's. |
-| `onError` | `.on_error(..)` | `(e: { message: string }) => void` | | Loading failed. |
+| `onLoad` | `.on_load(..)` | `(e: { size: PixelSize }) => void` | | Loaded; the source image's size in pixels (not the decoded, downsampled one; an SVG's size in points, [on the web as the browser measures it](../docs/images-and-assets.md#svg-images)); for an image with variants, the loaded variant's. |
+| `onError` | `.on_error(..)` | `(e: { message: string; code?: string }) => void` | | Loading failed; `code` is `"ERR_ACCESS_DENIED"` for a URL the app's capabilities do not grant. |
 | `onLoadEnd` | `.on_load_end(..)` | `() => void` | | After `onLoad` or `onError`. |
 
 `ImageStyle` adds `tintColor` to the view styles, which recolors a template image (an icon drawn in one color), and `objectPosition`, which places the image in its box ([Image position](../docs/images-and-assets.md#image-position)).
@@ -128,8 +127,8 @@ image(ICON).size(px(24.0)).tint_color(rgb(0x0969da))
 |---|---|---|---|
 | `onLoadStart` | `.on_load_start` | none | Loading began. |
 | `onProgress` | `.on_progress` | `{ loaded, total }` (`ImageProgress`) | Bytes arrived (at most every 100 ms). |
-| `onLoad` | `.on_load` | `{ width, height }` (`Size<Points>`) | The image is shown; its source size in pixels (an SVG's in points, [on the web as the browser measures it](../docs/images-and-assets.md#svg-images)). |
-| `onError` | `.on_error` | `{ message }` (`&str`) | Loading or decoding failed, or the host is outside the app's capabilities. |
+| `onLoad` | `.on_load` | `{ size }` (`Size<DevicePixels>`) | The image is shown; its source size in pixels (an SVG's in points, [on the web as the browser measures it](../docs/images-and-assets.md#svg-images)). |
+| `onError` | `.on_error` | `{ message, code? }` (`&str`, the message) | Loading or decoding failed, or the host is outside the app's capabilities (`code` `"ERR_ACCESS_DENIED"`). |
 | `onLoadEnd` | `.on_load_end` | none | After `onLoad` or `onError`. |
 
 ```rust tabs
@@ -138,7 +137,7 @@ let state = signal(SharedString::from("loading"));
 image(url)
     .w_full()
     .aspect_ratio(16.0 / 9.0)
-    .on_load(move |size: &Size<Points>| state.set(format!("{}×{}", size.width.0, size.height.0).into()))
+    .on_load(move |size: &Size<DevicePixels>| state.set(format!("{}×{}", size.width.0, size.height.0).into()))
     .on_error(move |message: &str| state.set(message.to_string().into()))
 ```
 
@@ -147,7 +146,7 @@ const state = signal("loading");
 <Image
   src={url}
   style={{ width: "100%", aspectRatio: 16 / 9 }}
-  onLoad={(e) => state.set(`${e.width}×${e.height} px`)}
+  onLoad={({ size }) => state.set(`${size.width}×${size.height} px`)}
   onError={(e) => state.set(e.message)}
 />;
 ```

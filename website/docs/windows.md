@@ -11,7 +11,7 @@ NSH apps also run on Windows. The Windows backend draws them in Win32 windows wi
 DirectWrite; the core, the reactive graph, the renderer, Taffy layout and the native modules are the same
 as on iOS and Android, so one app runs everywhere. On Windows, `os()` is `Os::Windows` (`platform.os` is `"windows"`
 in TSX) and TSX's `desktop={{…}}` props apply. The window's title, a title bar of the app's own, the menu bar and
-context menus come from `nsh_core::ui::desktop` in Rust ([Desktop title bars](./rust.md#desktop-title-bars)) and
+context menus come from `nsh_core::element::desktop` in Rust ([Desktop title bars](./rust.md#desktop-title-bars)) and
 [`nsh/desktop`](../modules/nsh-desktop.md) in TSX.
 
 ## Requirements
@@ -53,6 +53,16 @@ dist\nsh\runtime\windows\nsh-windows-host --bundle build\bundle.nshc --window-si
 ```
 
 `--window-size` is the window's size in points (`<width>x<height>`; TSX apps).
+
+### Performance monitor
+
+`--fps` (`nsh run App.tsx --target windows --fps`, `nsh test --target windows --fps`, the host's `--fps`, or
+`AppOptions { fps: true, .. }` in a Rust app's `run_app`) logs the performance monitor's readings once a second
+(target `nsh::perf`): frames shown over the display's rate, the main thread's time per frame and its phases (`tick`,
+`drain`, `paint`, `present`, `canvas`), the engine's commits, CPU and memory, in the shape the other desktops log
+(milliseconds as mean/p50/p95/max). `nsh test --fps -v` shows them and `examples/gallery/tools/perf.py` reads them
+([Performance report](./performance-report.md#windows-win32-direct2d)). Measure release builds; the monitor costs
+nothing while it is off.
 
 ## Packaging
 
@@ -121,7 +131,8 @@ view.load(Bundle::source(code).into());
 ```
 
 The view is a child window: your message loop runs it, and you place it with `MoveWindow` on its `hwnd()` when the
-parent resizes. `AppView::load` replaces whatever ran; `stop` (or destroying the window) ends the app. `asset_base`
+parent resizes. Make it on the thread of the window it is in: its lifecycle follows that window's top-level
+window, the one it was made under. `AppView::load` replaces whatever ran; `stop` (or destroying the window) ends the app. `asset_base`
 tells it where `asset:/` URIs resolve (`AssetBase::Directory` or `AssetBase::Http`). Bytecode bundles (`bundle.nshc`)
 load with `unsafe { Bundle::bytecode(bytes) }` (or `Bundle::read_trusted(path)`, unsafe too): QuickJS bytecode is trusted input, so
 only load it from your own app's files. A standalone window is `nsh_platform_windows::run_app(source, options)`, with
@@ -153,6 +164,10 @@ The environment is a desktop's: the safe area and the keyboard height are 0, `id
 follows Settings > Personalization > Colors live, `fontScale()` the Text size setting, reduce motion the animation
 effects setting and the locale the user's regional format. See [Device and environment](./device-and-environment.md).
 
+The `cursor` style follows updates while the mouse rests over a view. When a batch changes the cursor,
+Windows applies the new shape or `"none"` after the whole batch, using the view under the pointer.
+The title bar and resize borders keep their system cursors.
+
 ### Keyboard
 
 | Keys | Do |
@@ -163,7 +178,7 @@ effects setting and the locale the user's regional format. See [Device and envir
 | Escape | Leaves the focused field; else clears a text selection, then closes the newest dialog or goes back |
 | Alt+Left, Browser Back key, mouse back button | Go back (also from a field) |
 | Ctrl+arrows, Home / End, Ctrl+Home / End, with Shift; Ctrl+Backspace / Delete | Move, select and delete by word and line in a field, as in every Windows app |
-| Ctrl+Z, Ctrl+Y, Ctrl+X / C / V / A; Shift+Delete, Ctrl+Insert, Shift+Insert | Undo, redo, cut, copy, paste, select all (a `masked` field refuses cut and copy); Ctrl+A / Ctrl+C select and copy `selectable` text |
+| Ctrl+Z, Ctrl+Y, Ctrl+X / C / V / A; Shift+Delete, Ctrl+Insert, Shift+Insert | Undo, redo, cut, copy, paste, select all (a `masked` field refuses cut and copy); Ctrl+A / Ctrl+C select and copy selectable text |
 | Arrows; Page Up / Down, Space, Shift+Space; Home / End, Ctrl+Home / End | Scroll the scroll view around the focused view or under the mouse by a line, a page, to the start / end (not while a field has the focus) |
 | F11, Alt+F4 | Full screen, close the window (`nsh package` and `nsh run` apps) |
 | Ctrl+R, F5 | Reload the latest build (`nsh run`) |
@@ -172,7 +187,7 @@ Shortcuts work with any keyboard layout (on a Cyrillic or Greek one, Ctrl+C is t
 A return that commits an input method's composition (Chinese, Japanese, ...) never submits. `onKeyPress` reports
 what React Native reports: the typed text, `"Enter"`, `"Backspace"`, and `"Escape"`; pasted text is not reported.
 
-The app's own shortcuts ([`nsh/keymap`](../modules/nsh-keymap.md)) come before a focused field's keys, navigation
+The app's own shortcuts ([`keymap`](../modules/nsh.md#keymap)) come before a focused field's keys, navigation
 and scrolling; Alt+F4, F11 and Ctrl+Q cannot be bound.
 
 Different, or not supported:

@@ -2,7 +2,7 @@
 //! from what serves it: the declaration ([`Ts`]) next to each export of
 //! nsh's modules (`modules.rs` and the tables it lists), the modules' own
 //! types, the specs of the registries' components and modules
-//! (`nsh_core::ui::declarations`), and the core's tables (styles, host
+//! (`nsh_core::element::declarations`), and the core's tables (styles, host
 //! props and events, easings, canvas operations: `nsh_core::js`). Nothing
 //! is written twice: a test loads every module and checks that what it
 //! exports is what its declarations say.
@@ -12,7 +12,7 @@
 
 use std::{collections::BTreeMap, fmt::Write as _};
 
-use nsh_core::ui::{Registry, description::SetDescription};
+use nsh_core::element::{Registry, description::SetDescription};
 
 use crate::modules::{Item, MODULES, NativeModule, Ts};
 
@@ -30,9 +30,10 @@ export type RecursiveArray<T> = readonly (T | RecursiveArray<T>)[];
  * right; falsy entries are skipped. */
 export type StyleProp<T> = T | RecursiveArray<T | false | null | undefined> | false | null | undefined;
 
-/** Props every host element accepts. */
-export interface CommonProps extends TouchProps, HostProps, StateStyleProps {
-  ref?: YNode | ((node: YNode) => void);
+/** Props every host element accepts; `S`, the style its state styles
+ * take (its `style`'s); `R`, its ref's type. */
+export interface CommonProps<S = ViewStyle, R = ViewRef> extends TouchProps, HostProps, StateStyleProps<S> {
+  ref?: R | ((node: R) => void);
   children?: JSX.Element;
   /** iOS-only props (ignored elsewhere). */
   ios?: IOSProps;
@@ -49,29 +50,42 @@ export interface CommonProps extends TouchProps, HostProps, StateStyleProps {
  * classes, applied natively (no JS runs): as the `<state>:` classes.
  * Later states win (checked, then hover, focus, active); `disabledStyle`
  * wins over all, and the others do not apply while disabled. */
-export interface StateStyleProps {
+export interface StateStyleProps<S = ViewStyle> {
   /** While pressed (`active:`). */
-  activeStyle?: StyleProp<ViewStyle>;
+  activeStyle?: StyleProp<S>;
   /** While a pointer is over it (`hover:`). */
-  hoverStyle?: StyleProp<ViewStyle>;
+  hoverStyle?: StyleProp<S>;
   /** While it has focus (`focus:`). */
-  focusStyle?: StyleProp<ViewStyle>;
+  focusStyle?: StyleProp<S>;
+  /** While it or an element inside it has focus (`focus-within:`); the
+   * content of an `Overlay` counts as inside the element it is in. */
+  focusWithinStyle?: StyleProp<S>;
   /** While `disabled` (`disabled:`). */
-  disabledStyle?: StyleProp<ViewStyle>;
+  disabledStyle?: StyleProp<S>;
+  /** While `accessibilityState.selected` is `true` (`selected:`): a
+   * tab, a segment or a `Button` that is selected. */
+  selectedStyle?: StyleProp<S>;
   /** While `accessibilityState.checked` is `true` (`checked:`; `"mixed"`
    * is not checked): a checkbox, a switch or a radio styled by its
    * value. */
-  checkedStyle?: StyleProp<ViewStyle>;
+  checkedStyle?: StyleProp<S>;
   /** While `accessibilityState.checked` is `"mixed"` (`indeterminate:`):
    * a checkbox that is neither checked nor unchecked. */
-  indeterminateStyle?: StyleProp<ViewStyle>;
+  indeterminateStyle?: StyleProp<S>;
+  /** While `accessibilityState.expanded` is `true` (`aria-expanded:`): a
+   * `Popover`'s or `Menu`'s trigger while its popup is open. */
+  expandedStyle?: StyleProp<S>;
+  /** While `accessibilityState.pressed` is `true` (`aria-pressed:`;
+   * `"mixed"` is not pressed): a toggle button that is on. Not
+   * `activeStyle`, a press in progress. */
+  pressedStyle?: StyleProp<S>;
 }
 
 /** iOS-only props of every element (`ios={{…}}`); elements add their own. */
-export interface IOSProps {}
+export interface IOSProps extends IOSHostProps {}
 
 /** Desktop-only props of every element (`desktop={{…}}`); elements add their own. */
-export interface DesktopProps {}
+export interface DesktopProps extends DesktopHostProps {}
 
 /** Web-only props of every element (`web={{…}}`). */
 export interface WebProps {}
@@ -80,12 +94,12 @@ export interface WebProps {}
 export interface AndroidProps extends AndroidHostProps {}
 
 /** `<View>` */
-export interface ViewProps extends CommonProps {
+export interface ViewProps extends CommonProps, ViewHostProps {
   style?: StyleProp<ViewStyle>;
 }
 
 /** `<Text>`: nested `<Text>` elements are spans of the same paragraph. */
-export interface TextProps extends CommonProps, TextHostProps {
+export interface TextProps extends CommonProps<TextStyle>, TextHostProps {
   style?: StyleProp<TextStyle>;
 }
 
@@ -102,12 +116,56 @@ export interface ImageAsset {
 }
 
 /** `<Image>` */
-export interface ImageProps extends CommonProps, ImageHostProps {
+export interface ImageProps extends CommonProps<ImageStyle>, ImageHostProps {
   style?: StyleProp<ImageStyle>;
 }
 
+/** `<Shader>`: a view whose box a WGSL shader draws, under its children. */
+export interface ShaderProps extends CommonProps, ViewHostProps, ShaderHostProps {
+  /** The WGSL defining `fn shade(uv: vec2f) -> vec4f`. */
+  source: string;
+  style?: StyleProp<ViewStyle>;
+}
+
+/** `<ShaderEffect>`: a view whose children draw through a WGSL shader,
+ * which reads what they draw with `sample_content(uv)`. */
+export interface ShaderEffectProps
+  extends CommonProps, ViewHostProps, ShaderHostProps, ShaderEffectHostProps {
+  /** The WGSL defining `fn shade(uv: vec2f) -> vec4f`; without it the
+   * children draw as they are. */
+  source?: string;
+  style?: StyleProp<ViewStyle>;
+}
+
+/** `<ShaderTransition>`: a view whose children change through a WGSL
+ * shader when its `value` changes: `sample_from(uv)` is a picture of what
+ * they drew, `sample_to(uv)` what they draw now, `nsh.progress` 0 to 1. */
+export interface ShaderTransitionProps
+  extends CommonProps, ViewHostProps, ShaderHostProps, ShaderTransitionHostProps {
+  /** The WGSL defining `fn shade(uv: vec2f) -> vec4f`; without it the
+   * transition runs its `fallback` (a cross-fade). */
+  source?: string;
+  style?: StyleProp<ViewStyle>;
+}
+
+/** `<ScreenEffect>`: the whole surface drawn through a WGSL shader, which
+ * reads it with `sample_content(uv)`. It takes no space and has no
+ * children. */
+export interface ScreenEffectProps extends ShaderHostProps, ShaderEffectHostProps {
+  /** The WGSL defining `fn shade(uv: vec2f) -> vec4f`. */
+  source?: string;
+}
+
+/** `<ScreenTransition>`: the whole surface changing through a WGSL shader
+ * when its `value` changes, as `ShaderTransition` does for its children. */
+export interface ScreenTransitionProps extends ShaderHostProps, ShaderTransitionHostProps {
+  /** The WGSL defining `fn shade(uv: vec2f) -> vec4f`; without it the
+   * transition runs its `fallback`. */
+  source?: string;
+}
+
 /** `<Scroll>` */
-export interface ScrollProps extends CommonProps, ScrollingHostProps, ScrollHostProps {
+export interface ScrollProps extends CommonProps<ViewStyle, ScrollRef>, ScrollingHostProps, ScrollHostProps {
   style?: StyleProp<ViewStyle>;
   /** The style of a view around the content: it scrolls with the
    * content, `flexGrow: 1` makes it at least as tall as the viewport (a
@@ -118,15 +176,6 @@ export interface ScrollProps extends CommonProps, ScrollingHostProps, ScrollHost
    * `"grow justify-center p-4"`. */
   contentClass?: string;
 }
-
-/** `<Input>` */
-export interface InputProps extends CommonProps, InputHostProps {
-  style?: StyleProp<TextStyle>;
-  ios?: IOSInputProps;
-}
-
-/** iOS-only props of `<Input>`. */
-export interface IOSInputProps extends IOSProps, IOSInputHostProps {}
 
 /** `<Overlay>`: its children shown on top of the root view it is in (the
  * surface, or the dialog around it), outside its parent's layout and
@@ -139,14 +188,14 @@ export interface OverlayProps extends CommonProps, OverlayHostProps {
 /** What JS sets on a Rust component's host itself: the app's classes
  * (appended to the component's own), its inline and state styles, its test id, its
  * tooltip, layout events and the ref (`ref.command(name, args)`). */
-export type ComponentHostProps = { [K in "class" | "classList" | "style" | "activeStyle" | "hoverStyle" | "focusStyle" | "disabledStyle" | "testID" | "tooltip" | "onLayout" | "ref"]?: ViewProps[K] };
+export type ComponentHostProps = { [K in "class" | "classList" | "style" | "activeStyle" | "hoverStyle" | "focusStyle" | "focusWithinStyle" | "disabledStyle" | "testID" | "tooltip" | "onLayout" | "ref"]?: ViewProps[K] };
 
 /** An operating system (`platform.os`). */
 export type OS = "ios" | "android" | "macos" | "windows" | "linux" | "web";
 
 export declare namespace JSX {
   /** What components return and children accept. */
-  type Element = YNode | ArrayElement | (() => Element) | string | number | boolean | null | undefined;
+  type Element = ViewRef | ArrayElement | (() => Element) | string | number | boolean | null | undefined;
   interface ArrayElement extends Array<Element> {}
   interface ElementChildrenAttribute {
     children: {};
@@ -180,29 +229,17 @@ fn doc_comment(out: &mut String, doc: &str, indent: &str) {
 
 /// The declaration of export `name`.
 fn export(out: &mut String, name: &str, ts: Ts) {
-    export_moved(out, name, ts, None);
-}
-
-/// The declaration of export `name`, `@deprecated` when it is imported
-/// from module `moved_to` now.
-fn export_moved(out: &mut String, name: &str, ts: Ts, moved_to: Option<&str>) {
-    let doc = |doc: &str| match moved_to {
-        Some(to) => format!("{doc}\n\n@deprecated Import from \"{to}\"."),
-        None => doc.to_owned(),
-    };
     match ts {
         Ts::Function(text, signatures) => {
-            doc_comment(out, &doc(text), "");
+            doc_comment(out, text, "");
             for signature in signatures {
                 let _ = writeln!(out, "export declare function {name}{signature};");
             }
         }
         Ts::Const(text, ty) => {
-            doc_comment(out, &doc(text), "");
+            doc_comment(out, text, "");
             let _ = writeln!(out, "export declare const {name}: {ty};");
         }
-        // One declaration for both modules (a class declared twice is two
-        // types), which `nsh` re-exports: never deprecated.
         Ts::Class(text, body) => {
             doc_comment(out, text, "");
             let _ = writeln!(out, "export declare class {name}{body}");
@@ -212,37 +249,64 @@ fn export_moved(out: &mut String, name: &str, ts: Ts, moved_to: Option<&str>) {
     out.push('\n');
 }
 
-fn exports(out: &mut String, items: &[Item], moved_to: Option<&str>) {
+fn exports(out: &mut String, items: &[Item]) {
     for &(name, _, ts) in items {
-        export_moved(out, name, ts, moved_to);
+        export(out, name, ts);
     }
 }
 
-/// What module `m` serves of module `other` (`nsh` of `nsh/list`): its
-/// values declared again, its classes and types re-exported from its file
-/// (`other_body`, the names it declares).
-fn also_part(out: &mut String, m: &NativeModule, other: &NativeModule, other_body: &str) {
-    let from = relative(&path_of(m.name), &path_of(other.name));
-    for &(name, _, ts) in other.exports {
-        match ts {
-            Ts::Class(..) => {
-                let _ = writeln!(out, "export {{ {name} }} from \"{from}\";");
-            }
-            ts => export(out, name, ts),
-        }
-    }
-    let values: Vec<&str> = other.exports.iter().map(|e| e.0).collect();
-    let mut any = false;
-    for name in exported_names(other_body) {
-        if !values.contains(&name.as_str()) {
-            let _ = writeln!(out, "export type {{ {name} }} from \"{from}\";");
-            any = true;
-        }
-    }
-    if any || other.exports.iter().any(|e| matches!(e.2, Ts::Class(..))) {
-        out.push('\n');
-    }
-}
+/// The refs of the host elements: what `ref` receives, each element's
+/// own type, so a method of one element is on no other's (`AGENTS.md`
+/// "API shapes"). Name, base, documentation, the methods of
+/// [`crate::dom::NODE_METHODS`] it adds. At run time every node has them
+/// all; the types hold each element to its own.
+pub(crate) const REFS: &[(&str, Option<&str>, &str, &[&str])] = &[
+    (
+        "ViewRef",
+        None,
+        "A native node: what `ref` receives, and what an element is. Its methods send commands to its\nview, in order with the changes before them.",
+        &["focus", "blur", "measure"],
+    ),
+    (
+        "InputRef",
+        Some("ViewRef"),
+        "An `<Input>`'s ref.",
+        &["setSelection"],
+    ),
+    (
+        "ScrollRef",
+        Some("ViewRef"),
+        "A `<Scroll>`'s ref.",
+        &["scrollTo", "zoomTo", "scrollToEnd"],
+    ),
+    (
+        "ListRef",
+        Some("ViewRef"),
+        "A `List`'s ref.",
+        &["scrollTo", "scrollToOffset", "scrollToIndex", "scrollToEnd"],
+    ),
+    (
+        "WebViewRef",
+        Some("ViewRef"),
+        "A `<WebView>`'s ref.",
+        &[
+            "reload",
+            "goBack",
+            "goForward",
+            "stopLoading",
+            "injectJavaScript",
+            "postMessage",
+            "sendInput",
+        ],
+    ),
+    ("VideoRef", Some("ViewRef"), "A `<Video>`'s ref.", &["seek"]),
+    (
+        "NativeComponentRef",
+        Some("ViewRef"),
+        "The ref of a native component the embedding app registered (`nativeComponent`).",
+        &["command"],
+    ),
+];
 
 /// `types.d.ts`: the styles, the elements' props and events, the node and
 /// JSX types.
@@ -259,12 +323,29 @@ fn element_types() -> String {
         doc_comment(&mut out, doc, "  ");
         let _ = writeln!(out, "  {name}?: {handler};");
     }
-    out.push_str("}\n\n/** A native node: what `ref` receives. Its methods send commands to its\n * view, in order with the changes before them. */\nexport interface YNode {\n");
-    for (name, _, signature, doc) in crate::dom::NODE_METHODS {
-        doc_comment(&mut out, doc, "  ");
-        let _ = writeln!(out, "  {name}{signature};");
-    }
     out.push_str("}\n");
+    for (name, extends, doc, methods) in REFS {
+        out.push('\n');
+        doc_comment(&mut out, doc, "");
+        match extends {
+            Some(base) => {
+                let _ = writeln!(out, "export interface {name} extends {base} {{");
+            }
+            None => {
+                let _ = writeln!(out, "export interface {name} {{");
+            }
+        }
+        for method in *methods {
+            let Some((_, _, signature, doc)) =
+                crate::dom::NODE_METHODS.iter().find(|(n, ..)| n == method)
+            else {
+                continue;
+            };
+            doc_comment(&mut out, doc, "  ");
+            let _ = writeln!(out, "  {method}{signature};");
+        }
+        out.push_str("}\n");
+    }
     out
 }
 
@@ -289,7 +370,7 @@ fn generated(module: &str) -> String {
 /// declares.
 fn registry_part(out: &mut String, registry: &Registry, own: &[Item]) {
     let omit: Vec<&str> = own.iter().map(|(n, ..)| *n).collect();
-    out.push_str(&nsh_core::ui::declarations(registry, &omit));
+    out.push_str(&nsh_core::element::declarations(registry, &omit));
     let (values, types) = registry.reexports();
     reexports_part(out, values, types, registry.native_value_names());
 }
@@ -308,12 +389,24 @@ fn set_part(out: &mut String, set: &SetDescription) {
     );
 }
 
+/// The props of `Input`, declared beside it (`nsh/base`).
+const INPUT_TYPES: &str = r#"/** `<Input>` */
+export interface InputProps extends CommonProps<InputStyle, InputRef>, InputHostProps {
+  style?: StyleProp<InputStyle>;
+  ios?: IOSInputProps;
+}
+
+/** iOS-only props of `<Input>`. */
+export interface IOSInputProps extends IOSProps, IOSInputHostProps {}
+"#;
+
 /// The declarations of what a set exports as the runtime makes it: the
 /// runtime's `values` and `types`, and the values nsh-js makes for it
-/// (`natives`: navigation's).
+/// (`natives`: `Input` and navigation's).
 fn reexports_part(out: &mut String, values: &[&str], types: &[&str], natives: &[&str]) {
     let made = crate::env::REEXPORTS
         .iter()
+        .chain(crate::env::ELEMENTS)
         .chain(crate::navigation::EXPORTS);
     let mut navigation = false;
     for item in made {
@@ -325,6 +418,9 @@ fn reexports_part(out: &mut String, values: &[&str], types: &[&str], natives: &[
     if navigation {
         out.push_str(crate::navigation::TYPES);
         out.push('\n');
+    }
+    if natives.contains(&"Input") {
+        out.push_str(INPUT_TYPES);
     }
     if !types.is_empty() {
         let _ = writeln!(out, "export type {{ {} }};", types.join(", "));
@@ -342,29 +438,43 @@ fn bodies(ui_sets: &[SetDescription]) -> Vec<(String, String)> {
             body.push('\n');
         }
         body.push_str(&generated(m.name));
+        // What nsh-js declares itself, the sources it serves included.
+        let own: Vec<Item> = m
+            .also
+            .iter()
+            .filter_map(|a| MODULES.iter().find(|o| o.name == *a))
+            .flat_map(|o| o.exports.iter().copied())
+            .chain(m.exports.iter().copied())
+            .collect();
         for registry in registries.iter().filter(|r| r.specifier() == Some(m.name)) {
-            registry_part(&mut body, registry, m.exports);
+            registry_part(&mut body, registry, &own);
         }
         // A UI set is a module of its own (the command line refuses one
         // named as nsh's): nothing of nsh's to leave out.
         for set in ui_sets.iter().filter(|s| s.specifier == m.name) {
             set_part(&mut body, set);
         }
-        exports(&mut body, m.exports, m.moved_to);
+        exports(&mut body, m.exports);
         body
     };
-    for m in MODULES.iter().filter(declared) {
+    // A module `nsh` serves (`moved_to`) is declared in `nsh`'s file.
+    for m in MODULES
+        .iter()
+        .filter(declared)
+        .filter(|m| m.moved_to.is_none())
+    {
         let mut body = body_of(m);
         for other in m
             .also
             .iter()
             .filter_map(|a| MODULES.iter().find(|o| o.name == *a))
         {
-            also_part(&mut body, m, other, &body_of(other));
+            body.push('\n');
+            body.push_str(&body_of(other));
         }
         files.push((path_of(m.name), body));
     }
-    // The registries that are modules of their own (`nsh/base`, `nsh/image`).
+    // The registries that are modules of their own (`nsh/base`, `os`).
     for registry in registries {
         let Some(specifier) = registry.specifier() else {
             continue;
@@ -589,6 +699,52 @@ fn relative(from: &str, to: &str) -> String {
     path.trim_end_matches(".d.ts").to_owned()
 }
 
+/// The types TypeScript declares itself, which a body naming them means:
+/// an import of a module's name would shadow them in that file.
+const TS_GLOBALS: &[&str] = &[
+    "Array",
+    "ArrayBuffer",
+    "ArrayLike",
+    "Awaited",
+    "Capitalize",
+    "ConstructorParameters",
+    "Date",
+    "Error",
+    "Exclude",
+    "Extract",
+    "Function",
+    "InstanceType",
+    "Iterable",
+    "IterableIterator",
+    "Lowercase",
+    "Map",
+    "NoInfer",
+    "NonNullable",
+    "Omit",
+    "OmitThisParameter",
+    "Parameters",
+    "Partial",
+    "Pick",
+    "Promise",
+    "PromiseLike",
+    "Readonly",
+    "ReadonlyArray",
+    "ReadonlyMap",
+    "ReadonlySet",
+    "Record",
+    "RegExp",
+    "Required",
+    "ReturnType",
+    "Set",
+    "ThisParameterType",
+    "ThisType",
+    "Uint8Array",
+    "Uncapitalize",
+    "Uppercase",
+    "WeakMap",
+    "WeakSet",
+];
+
 /// The files of `.nsh/types` for apps whose hosts serve `ui_sets`
 /// (`nsh/base`, an app's own, as data: their declarations come with
 /// them), as (path relative to it, contents): one per
@@ -610,7 +766,9 @@ pub fn type_definitions(ui_sets: &[SetDescription]) -> Vec<(String, String)> {
             let (used, local) = references(body);
             let mut imports: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
             for name in &used {
-                if local.contains(name) {
+                // TypeScript's own (`Pick<T, K>`): never another module's
+                // name, whatever it exports.
+                if local.contains(name) || TS_GLOBALS.contains(&name.as_str()) {
                     continue;
                 }
                 if let Some(&from) = owner.get(name)
@@ -747,15 +905,38 @@ fn member_names(members: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    #[derive(Default, nsh_core::ui::JsObject)]
+    /// Every method a node has is declared on a ref, and each ref names
+    /// only methods nodes have: no element's ref carries every method.
+    #[test]
+    fn each_node_method_is_on_a_ref() {
+        for (name, ..) in crate::dom::NODE_METHODS {
+            assert!(
+                REFS.iter().any(|(.., methods)| methods.contains(name)),
+                "`{name}` is on no ref of `REFS`"
+            );
+        }
+        for (r, _, _, methods) in REFS {
+            for m in *methods {
+                assert!(
+                    crate::dom::NODE_METHODS.iter().any(|(n, ..)| n == m),
+                    "`{r}.{m}` is not a node method"
+                );
+            }
+        }
+        let ts = element_types();
+        assert!(!ts.contains("YNode"));
+        assert!(ts.contains("export interface InputRef extends ViewRef {"));
+    }
+
+    #[derive(Default, nsh_core::element::JsObject)]
     struct Pick {
         value: bool,
     }
 
-    #[nsh_core::ui::module]
+    #[nsh_core::element::module]
     struct PickerTypes;
 
-    #[nsh_core::ui::module]
+    #[nsh_core::element::module]
     impl PickerTypes {
         fn accept(_pick: Pick) {}
     }
@@ -763,7 +944,7 @@ mod tests {
     #[test]
     fn component_host_props_do_not_import_a_modules_pick_type() {
         PickerTypes::accept(Pick::default());
-        let mut registry = nsh_core::ui::Registry::ui_set("test/picker-types");
+        let mut registry = nsh_core::element::Registry::ui_set("test/picker-types");
         registry.module::<PickerTypes>();
         let files = type_definitions(&[registry.into()]);
         let (_, fixture) = files
@@ -831,7 +1012,7 @@ declare const text: "export default ignored";
 
     #[test]
     fn paths_are_relative() {
-        assert_eq!(relative("nsh/list.d.ts", "nsh/types.d.ts"), "./types");
+        assert_eq!(relative("nsh/base.d.ts", "nsh/types.d.ts"), "./types");
         assert_eq!(relative("nsh/acme/ui.d.ts", "nsh/types.d.ts"), "../types");
         assert_eq!(relative("nsh/types.d.ts", "nsh/acme/ui.d.ts"), "./acme/ui");
     }
@@ -849,6 +1030,56 @@ declare const text: "export default ignored";
         assert!(!used.contains(&"Baz".to_owned()));
         assert!(!used.contains(&"Foo".to_owned()));
         assert!(local.contains(&"Bar".to_owned()));
+    }
+
+    /// Every host element's props reach an element or a component: a
+    /// group of them declared but in no element's props (`IOSProps` once
+    /// was `{}`, so `ios={{ anything }}` type-checked) is a typo nobody is
+    /// told of.
+    #[test]
+    fn every_host_props_interface_is_used() {
+        let files = bodies(&[nsh_base::registry().into()]);
+        let all: String = files.iter().map(|(_, body)| body.as_str()).collect();
+        let mut unused = Vec::new();
+        for line in all.lines() {
+            let Some(rest) = line.strip_prefix("export interface ") else {
+                continue;
+            };
+            let name: String = rest.chars().take_while(|c| is_ident(*c)).collect();
+            if !name.ends_with("HostProps") {
+                continue;
+            }
+            let uses = all
+                .match_indices(name.as_str())
+                .filter(|(at, _)| {
+                    let before = all[..*at].chars().next_back();
+                    let after = all[at + name.len()..].chars().next();
+                    !before.is_some_and(is_ident) && !after.is_some_and(is_ident)
+                })
+                .count();
+            // Its declaration, and at least one use.
+            if uses < 2 {
+                unused.push(name);
+            }
+        }
+        assert!(unused.is_empty(), "declared but used nowhere: {unused:?}");
+        assert!(all.contains("export interface IOSProps extends IOSHostProps {}"));
+        assert!(all.contains("export interface DesktopProps extends DesktopHostProps {}"));
+    }
+
+    /// No module exports a name TypeScript declares itself (`Pick`): an
+    /// app importing it would lose TypeScript's in that file.
+    #[test]
+    fn no_module_exports_a_typescript_global() {
+        let files = bodies(&[nsh_base::registry().into()]);
+        for (path, body) in &files {
+            for name in exported_names(body) {
+                assert!(
+                    !TS_GLOBALS.contains(&name.as_str()),
+                    "{path} exports `{name}`, TypeScript's own"
+                );
+            }
+        }
     }
 
     /// A name a file imports is declared in one file only.
@@ -876,6 +1107,40 @@ declare const text: "export default ignored";
                 }
             }
         }
+    }
+
+    /// No module declares a value (a class, function or constant) named as
+    /// a type `types.d.ts` declares: it would shadow the shared type
+    /// everywhere in that module (an extension class `TextStyle` made
+    /// `StyleProp<TextStyle>` mean the class). The same type alias
+    /// generated in both is the same type.
+    #[test]
+    fn no_module_shadows_a_shared_type() {
+        let files = bodies(&[nsh_base::registry().into()]);
+        let (_, types) = files
+            .iter()
+            .find(|(path, _)| path == "nsh/types.d.ts")
+            .expect("types.d.ts");
+        let shared = exported_names(types);
+        let mut clashes = Vec::new();
+        for (path, body) in files.iter().filter(|(path, _)| path != "nsh/types.d.ts") {
+            let (_, local) = references(body);
+            let value = |name: &str| {
+                ["class", "function", "const"].iter().any(|kind| {
+                    body.contains(&format!("declare {kind} {name}<"))
+                        || body.contains(&format!("declare {kind} {name} "))
+                        || body.contains(&format!("declare {kind} {name}("))
+                        || body.contains(&format!("declare {kind} {name}:"))
+                })
+            };
+            clashes.extend(
+                local
+                    .iter()
+                    .filter(|name| shared.contains(name) && value(name))
+                    .map(|name| format!("{path}: {name}")),
+            );
+        }
+        assert!(clashes.is_empty(), "{clashes:?}");
     }
 
     /// Each web class declares the members its spec defines, and no others.

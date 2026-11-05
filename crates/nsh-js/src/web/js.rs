@@ -377,9 +377,19 @@ fn cstr(key: &str) -> CString {
 
 /// `obj[key]`.
 pub(crate) fn get(cx: Ctx, obj: Raw, key: &str) -> R<V> {
-    let k = cstr(key);
-    // SAFETY: a live object (getters may run JS).
-    V::checked(cx, unsafe { qjs::JS_GetPropertyStr(cx, obj, k.as_ptr()) })
+    // The atom from the key's bytes, not a C string: decoding a long list
+    // of objects reads their fields this way, an allocation each.
+    // SAFETY: QuickJS copies the bytes.
+    let atom = unsafe { qjs::JS_NewAtomLen(cx, key.as_ptr().cast(), key.len() as _) };
+    if atom == qjs::JS_ATOM_NULL {
+        return Err(Throw);
+    }
+    // SAFETY: a live object (getters may run JS); the atom is ours to free.
+    unsafe {
+        let value = qjs::JS_GetProperty(cx, obj, atom);
+        qjs::JS_FreeAtom(cx, atom);
+        V::checked(cx, value)
+    }
 }
 
 /// `obj[atom]`.
@@ -686,6 +696,27 @@ pub(crate) fn rejected(cx: Ctx, reason: Raw) -> R<V> {
 pub(crate) fn rejected_with_exception(cx: Ctx) -> R<V> {
     let e = take_exception(cx);
     rejected(cx, e.raw())
+}
+
+/// `r`, what a native returning a promise made, as a promise: an exception
+/// (a wrong argument, an op past the limit) rejects it instead, as every
+/// call returning a promise does; an uncatchable one (an interrupt) stays
+/// thrown.
+pub(crate) fn rejecting(cx: Ctx, r: Raw) -> Raw {
+    // SAFETY: a check of a live value.
+    if !unsafe { qjs::JS_IsException(r) } {
+        return r;
+    }
+    let e = take_exception(cx);
+    // SAFETY: a check of a live value.
+    if unsafe { qjs::JS_IsUncatchableError(e.raw()) } {
+        let _ = throw(cx, e);
+        return qjs::JS_EXCEPTION;
+    }
+    match rejected(cx, e.raw()) {
+        Ok(p) => p.take(),
+        Err(Throw) => qjs::JS_EXCEPTION,
+    }
 }
 
 /// The result of `f` as a promise: its value, or rejected with what it

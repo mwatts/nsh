@@ -1,7 +1,7 @@
 import { type CanvasRenderingContext2D, effect, type JSX, type PanActivation, Text, type TouchProps, untracked, View } from "nsh";
-import { Animated, createAnimatedValue, Easing, type AnimatedNode } from "nsh/animated";
-import { PanResponder } from "nsh/gesture";
-import { alpha, colors, isDark } from "../../ui";
+import { Animated, createAnimatedValue, Easing, type AnimatedNode } from "nsh";
+import { PanResponder } from "nsh";
+import { alpha, colors, isDark, TERMINAL_COLUMN, TERMINAL_GAP, TERMINAL_ROW, terminal } from "../../ui";
 import type { Quote } from "./market";
 
 /**
@@ -75,7 +75,7 @@ export function LiveDot(props: { running: () => boolean; size?: number }) {
           borderRadius: size / 2,
           backgroundColor: colors.accent,
           opacity: p.interpolate({ inputRange: [0, 1], outputRange: [0.55, 0] }),
-          transform: [{ scale: p.interpolate({ inputRange: [0, 1], outputRange: [1, 2.5] }) }],
+          scale: p.interpolate({ inputRange: [0, 1], outputRange: [1, 2.5] }),
         }}
       />
       <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: props.running() ? colors.accent : colors.faint }} />
@@ -159,12 +159,12 @@ export function SpringBar(props: { share: () => number; color: string; from?: "l
   return (
     <View
       onLayout={(e) => {
-        width = e.size.width;
+        width = e.bounds.size.width;
         place();
       }}
       style={{ height: h, overflow: "hidden", borderRadius: props.radius ?? h / 2 }}
     >
-      <View style={{ position: "absolute", top: 0, bottom: 0, left: 0, right: 0, borderRadius: props.radius ?? h / 2, backgroundColor: props.color, transform: [{ translateX: x }] }} />
+      <View style={{ position: "absolute", top: 0, bottom: 0, left: 0, right: 0, borderRadius: props.radius ?? h / 2, backgroundColor: props.color, translate: [x, 0] }} />
     </View>
   );
 }
@@ -195,22 +195,25 @@ export function calm(rate: number) {
 
 /**
  * A flat section of a screen: a title with a faint note (or a control) on
- * the right, the content below, a hairline above all but the first.
+ * the right, the content below, a hairline above all but the first. In the
+ * terminal the hairline is a row of its own, the title on the row below it
+ * and the content right under the title.
  */
 export function Block(props: { title?: string; note?: JSX.Element; right?: JSX.Element; first?: boolean; gap?: number; children: JSX.Element }) {
   return (
     <View
-      style={{
-        paddingHorizontal: 16,
-        paddingVertical: 14,
-        gap: props.gap ?? 10,
-        borderTopWidth: props.first ? 0 : 1,
-        borderTopColor: colors.line,
-      }}
+      style={[
+        { borderTopWidth: props.first ? 0 : 1, borderTopColor: colors.line },
+        terminal
+          ? { paddingHorizontal: TERMINAL_COLUMN, paddingTop: props.first ? 0 : TERMINAL_ROW - 1, paddingBottom: TERMINAL_ROW }
+          : { paddingHorizontal: 16, paddingVertical: 14, gap: props.gap ?? 10 },
+      ]}
     >
       <If when={props.title}>
-        <View style={{ flexDirection: "row", alignItems: "center", gap: 8, minHeight: 22 }}>
-          <Text style={{ flex: 1, fontSize: 15, fontWeight: "600", color: colors.text }}>{props.title}</Text>
+        {/* A terminal keeps the title whole: a note with no room beside it
+            goes to the row below. */}
+        <View style={{ flexDirection: "row", flexWrap: terminal ? "wrap" : "nowrap", alignItems: "center", ...(terminal ? { columnGap: TERMINAL_GAP } : { gap: 8 }), minHeight: terminal ? TERMINAL_ROW : 22 }}>
+          <Text style={{ flexGrow: 1, flexShrink: terminal ? 0 : 1, flexBasis: terminal ? "auto" : 0, fontSize: 15, fontWeight: "600", color: colors.text }}>{props.title}</Text>
           <If when={props.note}>
             <Text style={{ fontSize: 12, color: colors.faint, fontVariant: ["tabular-nums"] }}>{props.note}</Text>
           </If>

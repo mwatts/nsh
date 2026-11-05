@@ -31,7 +31,7 @@ use std::rc::Rc;
 use gtk4::{gdk, glib, graphene, gsk, prelude::*};
 pub(crate) use nsh_core::transition::Live;
 use nsh_core::{
-    Bounds, LayoutAnimation, Points, ViewKind, ViewStyle,
+    AttributedText, Bounds, LayoutAnimation, Points, ViewKind, ViewStyle,
     transition::{self, Extra},
 };
 
@@ -132,6 +132,13 @@ pub(crate) fn removing(
     true
 }
 
+/// `view` is deleted and does not animate out: its animations end with it.
+/// A keyframe `animation` repeats for good, and its frame callback would
+/// keep the deleted view and the display frames going.
+pub(crate) fn deleted(view: &NshView) {
+    view.state_mut().live = None;
+}
+
 /// The frame a running layout animation of `view` is heading to, if any.
 pub(crate) fn frame_target(view: &NshView) -> Option<Bounds<Points>> {
     view.state().live.as_ref()?.frame_target()
@@ -171,6 +178,23 @@ pub(crate) fn style_changed(surface: &Rc<Surface>, view: &NshView, old: &ViewSty
         return;
     };
     animate(view, |live| live.restyle(restyle));
+}
+
+/// `view`'s text changed from `old` (the new one is in its state): its
+/// color transitions as its style's `transition` says, drawn over the new
+/// runs ([`Live::text_color`]) rather than typeset on every frame.
+pub(crate) fn text_changed(
+    surface: &Rc<Surface>,
+    view: &NshView,
+    old: &AttributedText,
+    text: &AttributedText,
+) {
+    let recolor = transition::recolor(old, text, &view.state().style, reduce_motion(surface));
+    if recolor.starts() {
+        animate(view, |live| live.recolor(recolor));
+    } else if let Some(live) = view.state_mut().live.as_deref_mut() {
+        live.recolor(recolor);
+    }
 }
 
 /// True if an ancestor of `view` is animating out (and takes `view` with

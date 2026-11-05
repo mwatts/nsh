@@ -8,7 +8,8 @@
 //! Views form a tree of reference-counted nodes: a parent holds its
 //! children in drawing order (bottom to top), a child its parent weakly.
 //! A view draws itself in [`crate::render`]: shadows and background
-//! ([`crate::decor`]), its content (text, image, canvas), its children
+//! ([`crate::decor`]), its shader ([`crate::shader`]), its content (text,
+//! image, canvas), its children
 //! (clipped to the rounded bounds when `overflow: hidden`), the items it
 //! hosts ([`ViewState::natives`]: text editors, web views, ...), then its
 //! border, as UIKit draws layer borders over the content.
@@ -18,7 +19,7 @@
 //! drawn in one pass, so damage is the window.
 
 use std::{
-    cell::{Ref, RefCell, RefMut},
+    cell::{Cell, Ref, RefCell, RefMut},
     rc::{Rc, Weak},
 };
 
@@ -117,9 +118,10 @@ pub(crate) trait Hosted {
         false
     }
 
-    /// A wheel or touchpad scroll at `(x, y)` (item coordinates) for a
-    /// [`Hosted::raw`] item; true when it took it (else the scroll views
-    /// around it get it).
+    /// A wheel or touchpad scroll at `(x, y)` (item coordinates): for a
+    /// [`Hosted::raw`] item under the pointer, or any other item of the
+    /// view under it (a native component); true when it took it (else the
+    /// scroll views around it get it).
     fn wheel(&self, x: f32, y: f32, event: &crate::input::WheelEvent) -> bool {
         let _ = (x, y, event);
         false
@@ -152,9 +154,9 @@ pub(crate) struct ViewState {
     /// Touch, accessibility and test properties.
     pub(crate) props: Box<ViewProps>,
     /// States to report (`TrackStates`), and the current ones.
-    pub(crate) tracked: u8,
+    pub(crate) tracked: u16,
     /// Current interaction states (pressed, hovered, focused).
-    pub(crate) states: u8,
+    pub(crate) states: u16,
     /// Extra translation (sticky list cells, screen transitions).
     pub(crate) shift: (f32, f32),
     /// Extra opacity (press feedback, screen and modal transitions).
@@ -169,6 +171,9 @@ pub(crate) struct ViewState {
     pub(crate) image: Option<crate::image::ImageState>,
     /// Canvas content.
     pub(crate) canvas: Option<crate::canvas::CanvasState>,
+    /// What a shader draws under the content and children
+    /// ([`crate::shader`]).
+    pub(crate) shader: Option<crate::shader::ShaderState>,
     /// Text field (input views).
     pub(crate) input: Option<Rc<crate::text_input::InputState>>,
     /// Hosted items, drawn above the children.
@@ -201,6 +206,7 @@ impl ViewState {
             text: None,
             image: None,
             canvas: None,
+            shader: None,
             input: None,
             natives: Vec::new(),
             overflow: None,
@@ -213,16 +219,6 @@ impl ViewState {
     pub(crate) fn opacity(&self) -> f32 {
         let live = self.live.as_ref().map_or(1.0, |l| l.opacity());
         self.anim.opacity.unwrap_or(self.style.opacity) * self.fade * live
-    }
-
-    /// Its shadow, with animated color, opacity and radius.
-    pub(crate) fn shadow(&self) -> nsh_core::Shadow {
-        let mut s = self.style.shadow;
-        let a = &self.anim;
-        s.color = a.shadow_color.unwrap_or(s.color);
-        s.opacity = a.shadow_opacity.unwrap_or(s.opacity);
-        s.radius = a.shadow_radius.unwrap_or(s.radius);
-        s
     }
 
     /// Its borders, with an animated color.
@@ -326,8 +322,12 @@ impl ViewState {
     }
 }
 
-/// Called when a view of the tree changed: the root's surface draws again.
-pub(crate) type Invalidate = Rc<dyn Fn()>;
+/// Called with the view of the tree that changed: the root's surface draws
+/// it again ([`crate::surface::Surface::invalidate_view`]).
+pub(crate) type Invalidate = Rc<dyn Fn(&NshView)>;
+
+/// A rectangle in the window's DIPs (points).
+pub(crate) type WindowRect = windows::Win32::Graphics::Direct2D::Common::D2D_RECT_F;
 
 struct Node {
     state: RefCell<ViewState>,
@@ -335,6 +335,43 @@ struct Node {
     children: RefCell<Vec<NshView>>,
     /// Set on a surface's root only.
     invalidate: RefCell<Option<Invalidate>>,
+    /// It is on its surface's list of changed views.
+    queued: Cell<bool>,
+    /// Where the window's last frame painted it (not its children), clipped
+    /// to what was visible: the area to draw again when it changes.
+    painted: Cell<Option<WindowRect>>,
+    /// The newest change in it or what it holds ([`NshView::changes`]).
+    changes: Cell<u64>,
+}
+
+thread_local! {
+    /// The last change stamped on the views ([`NshView::changed`]).
+    static CHANGES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The newest change stamp: a picture taken now holds every change up to
+/// it ([`NshView::changes`]).
+pub(crate) fn change_stamp() -> u64 {
+    CHANGES.with(Cell::get)
+}
+
+/// A change stamp newer than every one before ([`NshView::changed`],
+/// [`crate::surface::Surface::invalidate`]).
+pub(crate) fn next_change_stamp() -> u64 {
+    CHANGES.with(|c| {
+        c.set(c.get() + 1);
+        c.get()
+    })
+}
+
+/// The smallest rectangle holding `a` and `b`.
+pub(crate) fn union(a: &WindowRect, b: &WindowRect) -> WindowRect {
+    WindowRect {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
+    }
 }
 
 /// The view of one node (a cheap, reference-counted handle).
@@ -366,6 +403,9 @@ impl NshView {
             parent: RefCell::new(Weak::new()),
             children: RefCell::new(Vec::new()),
             invalidate: RefCell::new(None),
+            queued: Cell::new(false),
+            painted: Cell::new(None),
+            changes: Cell::new(0),
         }))
     }
 
@@ -401,21 +441,84 @@ impl NshView {
         *self.0.invalidate.borrow_mut() = Some(invalidate);
     }
 
-    /// Something it draws changed: its surface draws again (if it is in
-    /// one).
+    /// Something it or its subtree draws changed: its surface draws that
+    /// again (if it is in one), and it and the views it is in hold a newer
+    /// change ([`Self::changes`]: a shader picturing them takes them again).
     pub(crate) fn changed(&self) {
+        let stamp = next_change_stamp();
         let mut node = self.0.clone();
         loop {
+            node.changes.set(stamp);
             let parent = node.parent.borrow().upgrade();
             match parent {
                 Some(p) => node = p,
                 None => break,
             }
         }
+        if self.0.queued.get() {
+            return;
+        }
         let invalidate = node.invalidate.borrow().clone();
         if let Some(f) = invalidate {
-            f();
+            f(self);
         }
+    }
+
+    /// Draws again what it draws itself (a shader's own frame): a change
+    /// of what the views it is in hold, not of what it holds (a shader
+    /// picturing its children does not take them again for its own frame).
+    pub(crate) fn redraw(&self) {
+        let stamp = next_change_stamp();
+        let mut node = self.0.clone();
+        loop {
+            let parent = node.parent.borrow().upgrade();
+            match parent {
+                Some(p) => {
+                    p.changes.set(stamp);
+                    node = p;
+                }
+                None => break,
+            }
+        }
+        if self.0.queued.get() {
+            return;
+        }
+        let invalidate = node.invalidate.borrow().clone();
+        if let Some(f) = invalidate {
+            f(self);
+        }
+    }
+
+    /// The stamp of the newest change in it or what it holds
+    /// ([`change_stamp`] when it was made).
+    pub(crate) fn changes(&self) -> u64 {
+        self.0.changes.get()
+    }
+
+    /// Whether it is on its surface's list of changed views; set by the
+    /// surface, which clears it when it draws.
+    pub(crate) fn set_queued(&self, queued: bool) {
+        self.0.queued.set(queued);
+    }
+
+    /// Records where the window's frame painted it.
+    pub(crate) fn set_painted(&self, rect: Option<WindowRect>) {
+        self.0.painted.set(rect);
+    }
+
+    /// Where the window's last frames painted it and its subtree, as one
+    /// rectangle (`None`: nowhere).
+    pub(crate) fn painted_subtree(&self) -> Option<WindowRect> {
+        let mut area = self.0.painted.get();
+        for child in self.0.children.borrow().iter() {
+            if let Some(b) = child.painted_subtree() {
+                area = Some(match area {
+                    Some(a) => union(&a, &b),
+                    None => b,
+                });
+            }
+        }
+        area
     }
 
     /// Its frame, transform or shift changed.
@@ -463,15 +566,20 @@ impl NshView {
             .unwrap_or(children.len());
         children.insert(at, self.clone());
         drop(children);
-        parent.changed();
+        // Where it draws now (its parent draws nothing new of its own).
+        self.changed();
     }
 
     /// Takes this view out of its parent.
     pub(crate) fn unparent(&self) {
+        // Where it was drawn is drawn again: queued while it can still
+        // reach its surface.
+        if self.parent_view().is_some() {
+            self.changed();
+        }
         let parent = self.0.parent.replace(Weak::new()).upgrade();
         if let Some(parent) = parent {
             parent.children.borrow_mut().retain(|c| c != self);
-            NshView(parent).changed();
         }
     }
 
@@ -520,6 +628,60 @@ impl NshView {
             m = Mat4::mul(&m, &local);
             view = parent;
         }
+    }
+
+    /// The part of this view (its coordinates, an axis-aligned box) that
+    /// the views clipping around it leave in sight: where a scroll view
+    /// taller or wider than the scroll view it is in draws its indicator
+    /// ([`ScrollState::thumb_within`]), so its bar stays in view. Its own
+    /// bounds when nothing clips it.
+    pub(crate) fn visible_bounds(&self) -> Bounds<Points> {
+        let size = self.state().frame.size;
+        let full = Bounds::new(Default::default(), size);
+        let (mut left, mut top) = (0.0f32, 0.0f32);
+        let (mut right, mut bottom) = (size.width.0, size.height.0);
+        // This view's coordinates to `view`'s.
+        let mut m = Mat4::new();
+        let mut view = self.clone();
+        while let Some(parent) = view.parent_view() {
+            {
+                let s = view.state();
+                let (x, y) = parent.state().child_origin(s.frame, s.shift);
+                let mut local = Mat4::new().translate(x, y);
+                if let Some(t) = s.transform() {
+                    local = Mat4::mul(&t, &local);
+                }
+                m = Mat4::mul(&m, &local);
+            }
+            let clip = {
+                let p = parent.state();
+                p.clips()
+                    .then_some((p.frame.size.width.0, p.frame.size.height.0))
+            };
+            if let Some((w, h)) = clip {
+                let mut min = (f32::MAX, f32::MAX);
+                let mut max = (f32::MIN, f32::MIN);
+                for (cx, cy) in [(0.0, 0.0), (w, 0.0), (0.0, h), (w, h)] {
+                    let Some((x, y)) = m.unproject(cx, cy) else {
+                        return full;
+                    };
+                    min = (min.0.min(x), min.1.min(y));
+                    max = (max.0.max(x), max.1.max(y));
+                }
+                left = left.max(min.0);
+                top = top.max(min.1);
+                right = right.min(max.0);
+                bottom = bottom.min(max.1);
+            }
+            view = parent;
+        }
+        Bounds::new(
+            nsh_core::geometry::point(Points(left), Points(top)),
+            nsh_core::geometry::size(
+                Points((right - left).max(0.0)),
+                Points((bottom - top).max(0.0)),
+            ),
+        )
     }
 
     fn attached_root(&self, root: &NshView) -> bool {

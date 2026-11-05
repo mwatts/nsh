@@ -1,6 +1,9 @@
 use std::{cell::RefCell, sync::Arc};
 
-use nsh_core::{AttributedText, Bounds, Points, TextLayout, TextLink};
+use nsh_core::{
+    AttributedText, Bounds, Points, TextLayout, TextLink,
+    transition::{Recolor, TextColor},
+};
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
     rc::Retained,
@@ -177,8 +180,11 @@ pub(crate) struct TextViewIvars {
     pub(crate) selection: Selection,
     /// An animated `color` (`0xRRGGBBAA`): the whole text is drawn in it.
     color: std::cell::Cell<Option<u32>>,
-    /// The part a selection area selected (UTF-16 offsets) and its
-    /// highlight (`selection_area.rs`).
+    /// A transition of the text's color (`transition-colors`): while it
+    /// runs, the whole text is drawn in its color (under an animated one).
+    transition: RefCell<TextColor>,
+    /// The part a selectable view selected (UTF-16 offsets) and its
+    /// highlight (`selectable_view.rs`).
     area_highlight: std::cell::Cell<Option<((usize, usize), nsh_core::Color)>>,
 }
 
@@ -223,7 +229,7 @@ define_class!(
         fn did_move_to_window(&self) {
             // SAFETY: calling the superclass implementation.
             let _: () = unsafe { msg_send![super(self), didMoveToWindow] };
-            // Into or out of a selection area, which selects instead.
+            // Into or out of a selectable view, which selects instead.
             self.update_own_selection();
         }
 
@@ -284,6 +290,15 @@ define_class!(
             Some(self.sel_input_view())
         }
 
+        /// `UITextInput`'s `isEditable`: the text is not editable. Defined
+        /// on the class rather than in the protocol's block because the
+        /// protocol declares it only from iOS 18 (objc2 checks a protocol
+        /// block's selectors against the running OS's protocol).
+        #[unsafe(method(isEditable))]
+        fn is_editable(&self) -> bool {
+            false
+        }
+
         #[unsafe(method(drawRect:))]
         fn draw_rect(&self, _dirty: CGRect) {
             let layout = self.ivars().layout.borrow();
@@ -318,10 +333,15 @@ define_class!(
                     Some(&*unsafe { color.CGColor() }),
                 );
             }
-            // An animated color: the text (decorations too) drawn as is into
-            // a layer, then painted over in the color where it drew, so
-            // its antialiasing stays; the layer casts the shadow.
-            let color = self.ivars().color.get();
+            // An animated color, or a transition of the text's color: the
+            // text (decorations too) drawn as is into a layer, then painted
+            // over in the color where it drew, so its antialiasing stays;
+            // the layer casts the shadow.
+            let color = self
+                .ivars()
+                .color
+                .get()
+                .or_else(|| Some(self.ivars().transition.borrow().value()?.0));
             if color.is_some() {
                 // SAFETY: no auxiliary info.
                 unsafe { CGContext::begin_transparency_layer(c, None) };
@@ -512,11 +532,6 @@ define_class!(
             self.sel_character_at(point)
         }
 
-        #[unsafe(method(isEditable))]
-        fn is_editable(&self) -> bool {
-            false
-        }
-
         #[unsafe(method_id(textInputView))]
         fn text_input_view(&self) -> Retained<UIView> {
             self.retain().into_super().into_super()
@@ -548,6 +563,35 @@ impl TextView {
         }
     }
 
+    /// The content shown.
+    pub(crate) fn text(&self) -> Option<Arc<AttributedText>> {
+        self.ivars().text.borrow().clone()
+    }
+
+    /// Starts, keeps or stops the transition of the text's color, as
+    /// `transition::recolor` found for its new content. True while it
+    /// runs: something steps it ([`TextView::step_color`]).
+    pub(crate) fn recolor(&self, recolor: Recolor) -> bool {
+        let mut transition = self.ivars().transition.borrow_mut();
+        let shown = transition.value();
+        transition.recolor(recolor);
+        if transition.value() != shown {
+            self.setNeedsDisplay();
+        }
+        transition.running()
+    }
+
+    /// One frame of the text's color transition at `now` (ms): draws the
+    /// text again in its next color, from the lines already laid out.
+    /// True while it runs.
+    pub(crate) fn step_color(&self, now: f64) -> bool {
+        let mut transition = self.ivars().transition.borrow_mut();
+        if transition.step(now) {
+            self.setNeedsDisplay();
+        }
+        transition.running()
+    }
+
     pub(crate) fn set_layout(
         &self,
         text: Arc<AttributedText>,
@@ -555,7 +599,7 @@ impl TextView {
         content: Bounds<Points>,
     ) {
         let (selectable, color) = (
-            text.is_selectable() && !self.in_selection_area(),
+            text.is_selectable() && !self.in_selectable_view(),
             text.selection_color,
         );
         let changed = self
@@ -578,16 +622,16 @@ impl TextView {
             .borrow()
             .as_ref()
             .is_some_and(|t| t.is_selectable())
-            && !self.in_selection_area()
+            && !self.in_selectable_view()
     }
 
-    /// Whether a view above is a selection area: the area selects this
+    /// Whether a view above is a selectable view: the area selects this
     /// text with the others, so the text has no selection of its own.
-    pub(crate) fn in_selection_area(&self) -> bool {
+    pub(crate) fn in_selectable_view(&self) -> bool {
         let mut view = self.superview();
         while let Some(v) = view {
             if v.downcast_ref::<NshView>()
-                .is_some_and(NshView::is_selection_area)
+                .is_some_and(NshView::is_selectable_view)
             {
                 return true;
             }
@@ -597,7 +641,7 @@ impl TextView {
     }
 
     /// Turns the text's own selection on or off after it moved into or
-    /// out of a selection area (or one appeared or went above it).
+    /// out of a selectable view (or one appeared or went above it).
     pub(crate) fn update_own_selection(&self) {
         let Some((selectable, color)) = self
             .ivars()
@@ -611,14 +655,14 @@ impl TextView {
         if !selectable && !self.ivars().selection.is_on() {
             return;
         }
-        let on = selectable && !self.in_selection_area();
+        let on = selectable && !self.in_selectable_view();
         if on != self.ivars().selection.is_on() {
             self.set_selectable(on, color, false);
         }
     }
 
     /// Highlights a UTF-16 range in a color (the text's part of a
-    /// selection area's selection), or nothing.
+    /// selectable view's selection), or nothing.
     pub(crate) fn set_area_highlight(&self, highlight: Option<((usize, usize), nsh_core::Color)>) {
         if self.ivars().area_highlight.replace(highlight) != highlight {
             self.setNeedsDisplay();
@@ -654,51 +698,12 @@ impl TextView {
         let text = text.as_ref().filter(|t| !t.links.is_empty())?;
         let layout = self.ivars().layout.borrow();
         let (layout, content) = layout.as_ref()?;
-        let lines = &layout.downcast::<CoreTextLayout>()?.lines;
-        // CoreText's y-up space from the bottom of the box.
-        let x = point.x - content.origin.x.0 as CGFloat;
-        let y = (content.origin.y.0 + content.size.height.0) as CGFloat - point.y;
-        let mut best: Option<(&LaidLine, CGFloat)> = None;
-        for line in lines {
-            let (mut ascent, mut descent) = (0.0, 0.0);
-            // SAFETY: valid out pointers.
-            let width = unsafe {
-                line.line
-                    .typographic_bounds(&mut ascent, &mut descent, std::ptr::null_mut())
-            } as CGFloat;
-            let (top, bottom) = (line.origin.y + ascent, line.origin.y - descent);
-            if x < line.origin.x - 4.0 || x > line.origin.x + width + 4.0 {
-                continue;
-            }
-            let distance = if y > top {
-                y - top
-            } else if y < bottom {
-                bottom - y
-            } else {
-                0.0
-            };
-            // A little slack above and below the glyphs.
-            if distance <= 4.0 && best.is_none_or(|(_, d)| distance < d) {
-                best = Some((line, distance));
-            }
-        }
-        let (line, _) = best?;
-        let lx = x - line.origin.x;
-        // SAFETY: a valid line; no secondary offset wanted.
-        let index = unsafe {
-            let index = line.line.string_index_for_position(CGPoint::new(lx, 0.0));
-            // The caret index nearest to the point: the character is the
-            // one before it when the point is left of the caret.
-            let caret = line
-                .line
-                .offset_for_string_index(index, std::ptr::null_mut());
-            if lx < caret && index > 0 {
-                index - 1
-            } else {
-                index
-            }
-        };
-        text.link_at(index.max(0) as u32).copied()
+        let layout = layout.downcast::<CoreTextLayout>()?;
+        let index = layout.char_at(CGPoint::new(
+            point.x - content.origin.x.0 as CGFloat,
+            point.y - content.origin.y.0 as CGFloat,
+        ))?;
+        text.link_at(u32::try_from(index).ok()?).copied()
     }
 
     fn has_text(&self) -> bool {

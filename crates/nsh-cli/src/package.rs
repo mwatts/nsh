@@ -82,9 +82,10 @@ pub(crate) struct AppConfig {
     /// Read and checked by the bundler.
     #[serde(default, rename = "tailwind")]
     _tailwind: Option<serde::de::IgnoredAny>,
-    /// Read and checked by the bundler.
-    #[serde(default, rename = "capabilities")]
-    _capabilities: Option<serde::de::IgnoredAny>,
+    /// Read and checked by the bundler; packages read only what the
+    /// system must be told ahead (`speech`'s usage descriptions).
+    #[serde(default)]
+    pub(crate) capabilities: Option<serde_json::Value>,
     /// `"light"` / `"dark"` / `"system"`: the app's appearance (checked by
     /// the bundler, which hands it to the runtime); packages also start in
     /// it (the launch screen, the window's theme).
@@ -108,7 +109,66 @@ pub(crate) struct AppConfig {
     /// What the web's packages add to the page (`web.rs`).
     #[serde(default)]
     pub(crate) web: WebConfig,
+    /// Terminal layout options.
+    #[serde(default)]
+    pub(crate) tui: TuiConfig,
 }
+
+/// `nsh.json` `"tui"`.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct TuiConfig {
+    /// Width and height of one Cell in points (`8x16` by default).
+    pub(crate) points_per_cell: Option<String>,
+}
+
+impl AppConfig {
+    /// Whether the app may recognize speech: it declares no capabilities
+    /// (it gets them all) or grants `speech`.
+    fn speech(&self) -> bool {
+        match &self.capabilities {
+            None => true,
+            Some(capabilities) => {
+                capabilities.get("speech") == Some(&serde_json::Value::Bool(true))
+            }
+        }
+    }
+
+    /// Whether the app may show notifications: it declares no capabilities
+    /// (it gets them all) or grants `notifications`.
+    pub(crate) fn notifications(&self) -> bool {
+        match &self.capabilities {
+            None => true,
+            Some(capabilities) => {
+                capabilities.get("notifications") == Some(&serde_json::Value::Bool(true))
+            }
+        }
+    }
+
+    /// Adds what the system shows when the app first asks for the
+    /// microphone and speech recognition, which it requires (it ends an app
+    /// that asks without them), when the app may recognize speech.
+    fn usage_descriptions(&self, info: &mut plist::Dictionary) {
+        if !self.speech() {
+            return;
+        }
+        for (key, text) in USAGE_DESCRIPTIONS {
+            info.insert(key.into(), plist::Value::String(text.to_owned()));
+        }
+    }
+}
+
+/// The usage descriptions of an app that recognizes speech (`Speech`).
+pub(crate) const USAGE_DESCRIPTIONS: [(&str, &str); 2] = [
+    (
+        "NSMicrophoneUsageDescription",
+        "The app listens to the microphone while you dictate.",
+    ),
+    (
+        "NSSpeechRecognitionUsageDescription",
+        "The app turns what you say into text.",
+    ),
+];
 
 /// `nsh.json` `"web"`.
 #[derive(Debug, Default, Deserialize)]
@@ -138,6 +198,11 @@ pub(crate) struct PackageOptions<'a> {
     pub(crate) profile: Option<&'a Path>,
     /// Android release keystore, key alias and password.
     pub(crate) keystore: Option<(&'a Path, &'a str, &'a str)>,
+    /// Android: the ABIs of the APK (empty: [`android::DEFAULT_ABIS`], plus
+    /// the device's with `run`).
+    ///
+    /// [`android::DEFAULT_ABIS`]: crate::android::DEFAULT_ABIS
+    pub(crate) abis: &'a [String],
     /// Install and launch in the simulator or on the device afterwards
     /// (Linux, macOS, Windows: launch it; the web: serve it and open it in
     /// the browser).
@@ -153,6 +218,9 @@ pub(crate) fn read_config(entry: &Path) -> anyhow::Result<AppConfig> {
     };
     let mut config: AppConfig =
         serde_json::from_str(&text).with_context(|| format!("invalid {}", path.display()))?;
+    if let Some(value) = &config.tui.points_per_cell {
+        crate::run::parse_points_per_cell(value).map_err(anyhow::Error::msg)?;
+    }
     config.icon = config.icon.map(|icon| dir.join(icon));
     config.web.host = config.web.host.map(|host| dir.join(host));
     Ok(config)
@@ -162,7 +230,9 @@ pub(crate) fn read_config(entry: &Path) -> anyhow::Result<AppConfig> {
 /// file must be inside the app's directory, symbolic links resolved, as the
 /// page ships it as it is.
 pub(crate) fn web_host_module(entry: &Path, host: &Path) -> anyhow::Result<PathBuf> {
-    let dir = dunce::canonicalize(entry.parent().unwrap_or(Path::new(".")))
+    // `App.tsx`'s parent is the empty path, which does not canonicalize.
+    let dir = entry.parent().filter(|d| !d.as_os_str().is_empty());
+    let dir = dunce::canonicalize(dir.unwrap_or(Path::new(".")))
         .with_context(|| format!("the app's directory of {}", entry.display()))?;
     let module = dunce::canonicalize(host)
         .with_context(|| format!("nsh.json web.host {}", host.display()))?;
@@ -237,6 +307,9 @@ pub(crate) fn package(options: PackageOptions<'_>) -> anyhow::Result<()> {
             "GPUI is the backend for embedding in GPUI and GPUI Kit apps (`AppView`), not for packages: \
              package this app with --target {instead}"
         );
+    }
+    if !options.abis.is_empty() && options.target != PackageTarget::Android {
+        bail!("--abi only applies to --target android");
     }
     let entry = dunce::canonicalize(options.entry)?;
     let config = &options.config;
@@ -395,6 +468,43 @@ struct App<'a> {
     executable: &'a str,
 }
 
+/// The ABIs of an APK: `requested`, else [`android::DEFAULT_ABIS`] and the
+/// preferred ABI of the device it is installed on (`device`: its ABIs,
+/// preferred first), when the runtime is built for it: an emulator's
+/// `x86_64`.
+///
+/// [`android::DEFAULT_ABIS`]: crate::android::DEFAULT_ABIS
+fn apk_abis(requested: &[String], device: Option<&[String]>) -> anyhow::Result<Vec<String>> {
+    use crate::android::{ABIS, DEFAULT_ABIS};
+    if !requested.is_empty() {
+        let mut abis = Vec::new();
+        for abi in requested {
+            if !abis.contains(abi) {
+                abis.push(abi.clone());
+            }
+        }
+        if let Some(device) = device
+            && !device.iter().any(|abi| abis.contains(abi))
+        {
+            bail!(
+                "the device runs {}, which --abi leaves out",
+                device.join(", ")
+            );
+        }
+        return Ok(abis);
+    }
+    let mut abis: Vec<String> = DEFAULT_ABIS.iter().map(|abi| abi.to_string()).collect();
+    if let Some(abi) = device
+        .unwrap_or_default()
+        .iter()
+        .find(|abi| ABIS.contains(&abi.as_str()))
+        && !abis.contains(abi)
+    {
+        abis.push(abi.clone());
+    }
+    Ok(abis)
+}
+
 /// An APK with the release runtime: `AppActivity` runs `assets/nsh/bundle.nshc`.
 fn package_android(
     options: &PackageOptions<'_>,
@@ -405,7 +515,17 @@ fn package_android(
 ) -> anyhow::Result<()> {
     use crate::android::{self, Apk, Signing};
     let sdk = android::Sdk::find()?;
-    let runtime = runtime::android(false)?;
+    let serial = if options.run {
+        Some(android::device(&sdk)?)
+    } else {
+        None
+    };
+    let device = match &serial {
+        Some(serial) => Some(android::device_abis(&sdk, serial)?),
+        None => None,
+    };
+    let abis = apk_abis(options.abis, device.as_deref())?;
+    let runtime = runtime::android(false, &abis)?;
     // A Rust app has no bundle: `AppActivity` runs its root (the
     // manifest's `com.longbridge.nsh.RUST`).
     let mut assets = Vec::new();
@@ -448,18 +568,23 @@ fn package_android(
             version_code: config.build.unwrap_or(1),
             activity: "com.longbridge.nsh.AppActivity",
             dev: false,
+            notifications: config.notifications(),
             rust: built.rust_root,
             dark: config.appearance.as_deref() == Some("dark"),
             runtime: &runtime,
+            abis: &abis,
             icon: config.icon.as_deref(),
             assets,
             signing,
         },
         &apk_path,
     )?;
-    step.done(format!("packaged {}", ui::path(&apk_path)));
-    if options.run {
-        let serial = android::device(&sdk)?;
+    step.done(format!(
+        "packaged {} {}",
+        ui::path(&apk_path),
+        ui::dim(format!("({})", abis.join(", ")))
+    ));
+    if let Some(serial) = serial {
         let step = ui::Step::start(format!("installing {id} on {serial}"));
         android::adb(
             &sdk,
@@ -737,6 +862,7 @@ fn macos_info_plist(
     if icon {
         d.insert("CFBundleIconFile".into(), s("AppIcon"));
     }
+    config.usage_descriptions(&mut d);
     d
 }
 
@@ -797,12 +923,16 @@ fn info_plist(
         Value::Array(vec![1.into(), 2.into()]),
     );
     d.insert("LSRequiresIPhoneOS".into(), true.into());
+    config.usage_descriptions(&mut d);
     // A launch screen entry opts into the full screen (no letterboxing).
     d.insert(
         "UILaunchScreen".into(),
         Value::Dictionary(Default::default()),
     );
     d.insert("UIApplicationSupportsMultipleScenes".into(), false.into());
+    // ProMotion iPhones run display links above 60 Hz only with this:
+    // animations move at the rate scrolling does.
+    d.insert("CADisableMinimumFrameDurationOnPhone".into(), true.into());
     // The app's own appearance, from the launch screen on.
     match config.appearance.as_deref() {
         Some("light") => d.insert("UIUserInterfaceStyle".into(), s("Light")),
@@ -1015,6 +1145,50 @@ mod tests {
     use super::*;
 
     #[test]
+    fn an_apk_takes_the_phones_abis_and_the_devices() {
+        let abis = |list: &[&str]| list.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        let phones = abis(&["arm64-v8a", "armeabi-v7a"]);
+        assert_eq!(apk_abis(&[], None).unwrap(), phones);
+        // A phone: nothing more.
+        assert_eq!(
+            apk_abis(&[], Some(&abis(&["arm64-v8a", "armeabi-v7a", "armeabi"]))).unwrap(),
+            phones
+        );
+        // An emulator: its own, first of those the runtime has.
+        assert_eq!(
+            apk_abis(&[], Some(&abis(&["x86_64", "arm64-v8a"]))).unwrap(),
+            abis(&["arm64-v8a", "armeabi-v7a", "x86_64"])
+        );
+        // --abi, once each.
+        let only = abis(&["arm64-v8a", "arm64-v8a"]);
+        assert_eq!(apk_abis(&only, None).unwrap(), abis(&["arm64-v8a"]));
+        let error = apk_abis(&only, Some(&abis(&["x86_64"])))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("x86_64"), "{error}");
+    }
+
+    #[test]
+    fn apps_that_may_recognize_speech_explain_it() {
+        let usage = |capabilities: Option<serde_json::Value>| {
+            let config = AppConfig {
+                capabilities,
+                ..AppConfig::default()
+            };
+            let info = macos_info_plist("A", "com.a", "a", &config, false);
+            let ios = info_plist("A", "com.a", "a", &config, "iphoneos");
+            assert_eq!(
+                info.contains_key("NSMicrophoneUsageDescription"),
+                ios.contains_key("NSSpeechRecognitionUsageDescription")
+            );
+            info.contains_key("NSSpeechRecognitionUsageDescription")
+        };
+        assert!(usage(None));
+        assert!(usage(Some(serde_json::json!({ "speech": true }))));
+        assert!(!usage(Some(serde_json::json!({ "picker": true }))));
+    }
+
+    #[test]
     fn a_release_needs_the_apps_own_id() {
         let entry = Path::new("apps/Orders/App.tsx");
         let config = |id: Option<&str>| AppConfig {
@@ -1080,6 +1254,9 @@ mod tests {
             assert!(error.contains("inside the app's directory"), "{error}");
         }
         fs::remove_dir_all(&root).unwrap();
+        // An entry named without its directory is in the working directory
+        // (the crate's, under `cargo test`).
+        assert!(web_host_module(Path::new("App.tsx"), Path::new("Cargo.toml")).is_ok());
     }
 
     /// App icons are drawn at 1024 pixels, which `sips` alone cannot

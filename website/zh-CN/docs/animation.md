@@ -23,7 +23,7 @@ NSH 中的所有动画都运行在 UI 线程上。你用 Rust 或 TSX 描述一�
 
 ## 动效
 
-动效（motion）以原生方式让视图的不透明度和变换走过一组关键帧。在拥有该视图的组件中创建它（Rust 中的 `motion()`，TSX 中 `nsh/animated` 的 `createMotion()`），绑定到视图上，再在它上面播放现成的动效或你自己的动效。`enter` 让视图从某个动效的起点开始，并立即播放它，于是视图从第一帧起就在入场。
+动效（motion）以原生方式让视图的不透明度和变换走过一组关键帧。在拥有该视图的组件中创建它（Rust 中的 `motion()`，TSX 中 `nsh` 的 `createMotion()`），绑定到视图上，再在它上面播放现成的动效或你自己的动效。`enter` 让视图从某个动效的起点开始，并立即播放它，于是视图从第一帧起就在入场。
 
 ```rust tabs
 #[component]
@@ -44,7 +44,7 @@ pub fn App() -> impl IntoElement {
 
 ```tsx tabs
 import { mount, View } from "nsh";
-import { createMotion } from "nsh/animated";
+import { createMotion } from "nsh";
 
 function App() {
   const card = createMotion({ enter: "fadeInUp" });
@@ -63,16 +63,16 @@ mount(App);
 
 动效的每个通道都有一个动画值：`opacity`（0..1）、`translateX` 和 `translateY`（点）、`rotate`、`rotateX` 和 `rotateY`（度）、`scale`、`scaleX` 和 `scaleY`。它们从静止状态开始（不透明度和缩放为 1，其余为 0），并按这个顺序作用：先平移，再旋转，最后缩放，都绕视图的变换原点进行。动效本身没有外观：它只移动你设置好样式的东西。
 
-动效只移动不透明度和变换。展开 `m.style` 会设置视图的 `opacity`；想保留你自己的不透明度，就只绑定变换（`transform: m.transform`）。颜色用动画值和 [`interpolate`](#插值) 来驱动。
+动效只移动不透明度和变换。展开 `m.style` 会设置视图的 `opacity` 和 `transform`；想保留你自己的不透明度，就只绑定这些步骤（`transform: m.transform`）。颜色用动画值和 [`interpolate`](#插值) 来驱动。
 
 | TSX | Rust | 说明 |
 |---|---|---|
 | `createMotion(options?)` | `motion()` | 所有通道处于静止状态的动效。 |
 | `createMotion({ initial: { opacity: 0 } })` | `m.value(MotionChannel::Opacity).set(0.0)` | 各通道的起始值；未指定的通道从静止状态开始。 |
 | `createMotion({ enter, delay, duration, ... })` | `motion().entering(spec)` | 从 `enter` 的起点开始并立即播放它；其余选项修改它的时间参数。`enter` 设置它所移动的通道，优先于 `initial`。 |
-| `style={m.style}`、`m.transform` | `.bind_motion(&m)` | 绑定各通道：`m.style` 是 `{ opacity, transform }`；把 `m.transform` 展开到带有你自己一个步骤的变换中。一个动效占用视图 8 个变换步骤中的 7 个（`scale` 合并进 `scaleX` 和 `scaleY`），留下一个给你，例如 3D 翻转用的 `[{ perspective: 600 }, ...m.transform]`。Rust 中动效的变换作用在视图自身的变换之后。 |
+| `style={m.style}`、`m.transform` | `.bind_motion(&m)` | 绑定各通道：`m.style` 是 `{ opacity, transform }`，其中 `transform` 是七个步骤的列表（`scale` 合并进 `scaleX` 和 `scaleY`）。它们作用在视图的 `translate`、`rotate` 和 `scale` 之后；在它们前面加上透视就能给 3D 翻转加上纵深：`transform: [{ perspective: 800 }, ...m.transform]`。Rust 中动效的变换作用在视图自身的变换之后。 |
 | `m.opacity`、`m.translateX`、... | `m.value(MotionChannel::Opacity)`、... | 单个通道的动画值，可用于插值或手动驱动。 |
-| `m.play(motion, options?)` | `m.play(spec)` | 播放预设或你自己的动效；新的动效会打断正在播放的那个。播放完成时以 `true` 兑现（Rust 中为 `AnimationEnd`）。 |
+| `m.play(motion, options?)` | `m.play(spec)` | 播放预设或你自己的动效；新的动效会打断正在播放的那个。以 `{ finished }` 兑现，播放完成时为 `true`（Rust 中为 `AnimationEnd`）。 |
 | `m.animation(motion, options?)` | `m.animation(spec)` | 同一个动效，作为尚未启动的[组合动画](#组合动画)，可与其他动画串联、错开或循环。 |
 | `play(motion, { ignoreReduceMotion: true })` | `m.play_ignoring_reduce_motion(spec)` | 即使用户要求减少动态效果也照常播放。 |
 | `m.stop()` | `m.stop()` | 停在当前位置。 |
@@ -80,7 +80,7 @@ mount(App);
 
 ### 预设
 
-现成的动效就是数据：`nsh/animated` 的 `motions`（`play("fadeInUp")` 播放的就是 `motions.fadeInUp`），以及 Rust 中的 `MotionPreset`（`MotionPreset::FadeInUp.spec()`）。距离以点为单位，按控件和卡片的尺寸设定；对更大的视图，可以按比例放大动效的数值，或者编写自己的关键帧。`swing` 等旋转都绕视图的变换原点进行：给摇摆的挂牌加上 `transformOrigin: "top"`（`.origin_top()`）。
+现成的动效就是数据：`nsh` 的 `motions`（`play("fadeInUp")` 播放的就是 `motions.fadeInUp`），以及 Rust 中的 `MotionPreset`（`MotionPreset::FadeInUp.spec()`）。距离以点为单位，按控件和卡片的尺寸设定；对更大的视图，可以按比例放大动效的数值，或者编写自己的关键帧。`swing` 等旋转都绕视图的变换原点进行：给摇摆的挂牌加上 `transformOrigin: "top"`（`.origin_top()`）。
 
 **入场（enter）**：从隐藏或偏离的位置开始，在静止状态结束。
 
@@ -290,7 +290,8 @@ function App() {
           height: 100,
           borderRadius: on() ? 50 : 16,
           backgroundColor: on() ? "#8250df" : "#0969da",
-          transform: [{ rotate: on() ? "45deg" : "0deg" }, { scale: on() ? 1.2 : 1 }],
+          rotate: on() ? "45deg" : "0deg",
+          scale: on() ? 1.2 : 1,
           transitionProperty: "all",
           transitionDuration: 400,
           transitionTimingFunction: "ease-in-out",
@@ -367,7 +368,7 @@ Tailwind：`animate-spin`、`animate-ping`、`animate-pulse`、`animate-bounce`�
 
 ## 动画值
 
-动画值是一个存在于 UI 线程上的数字。创建它（Rust 中用 `animated_value(..)`，TSX 中用 `nsh/animated` 的 `createAnimatedValue`），把它绑定到样式，再让它动起来；绑定它的视图每一帧都跟随它，而无需更新。
+动画值是一个存在于 UI 线程上的数字。创建它（Rust 中用 `animated_value(..)`，TSX 中用 `nsh` 的 `createAnimatedValue`），把它绑定到样式，再让它动起来；绑定它的视图每一帧都跟随它，而无需更新。
 
 ```rust tabs
 #[component]
@@ -401,14 +402,14 @@ pub fn App() -> impl IntoElement {
 
 ```tsx tabs
 import { mount, Text, View } from "nsh";
-import { createAnimatedValue, Easing } from "nsh/animated";
+import { createAnimatedValue, Easing } from "nsh";
 
 function App() {
   const x = createAnimatedValue(0);
   const opacity = createAnimatedValue(1);
   return (
     <View style={{ flex: 1, justifyContent: "center", padding: 24, gap: 24 }}>
-      <View style={{ width: 60, height: 60, borderRadius: 12, backgroundColor: "#0969da", opacity, transform: [{ translateX: x }] }} />
+      <View style={{ width: 60, height: 60, borderRadius: 12, backgroundColor: "#0969da", opacity, translate: [x, 0] }} />
       <View
         onPress={async () => {
           await x.timing(240, { duration: 600, easing: Easing.out(Easing.cubic) });
@@ -426,7 +427,7 @@ function App() {
 mount(App);
 ```
 
-**可以绑定的属性：** 不透明度（`.bind_opacity(..)`）；背景色、边框颜色（所有边）和文字颜色（整段文字），通过插值得到颜色（`.bind_background(..)`、`.bind_border_color(..)`、`.bind_color(..)`）；阴影的颜色、不透明度和半径（`.bind_shadow_color(..)` 等）；以及变换步骤 `translateX`、`translateY`、`scale`、`scaleX`、`scaleY`、`rotate`、`rotateX`、`rotateY` 和 `rotateZ`（`.bind_translate_x(..)`、`.bind_translate_y(..)`、`.bind_scale(..)`、以度为单位的 `.bind_rotate(..)`、`.bind_transform(kind, ..)`）。聚焦环或闪绿的价格就是绑定到边框或文字颜色的颜色插值：
+**可以绑定的属性：** `opacity`（`.bind_opacity(..)`）；`backgroundColor`、`borderColor`（所有边）和文字的 `color`（整段文字），通过插值得到颜色（`.bind_background(..)`、`.bind_border_color(..)`、`.bind_color(..)`）；`translate`（`[x, y]`，每个轴一个值）、`rotate`（度）和 `scale`（`[x, y]` 每个轴一个值，或一个值同时作用于两个轴）；以及 `transform` 列表的步骤 `translateX`、`translateY`、`scale`、`scaleX`、`scaleY`、`rotate`、`rotateX`、`rotateY` 和 `rotateZ`（Rust 中为 `.bind_translate_x(..)`、`.bind_translate_y(..)`、`.bind_scale(..)`、以度为单位的 `.bind_rotate(..)`、`.bind_transform(kind, ..)`）。阴影用[过渡](#过渡)来变化。聚焦环或闪绿的价格就是绑定到边框或文字颜色的颜色插值：
 
 ```rust tabs
 let flash = animated_value(0.0);
@@ -453,7 +454,7 @@ const color = flash.interpolate({ inputRange: [0, 1], outputRange: ["#1f2328", "
 | TSX | Rust | 说明 |
 |---|---|---|
 | `set(value)` | `set(value)` | 跳到 `value`，停止正在进行的动画。 |
-| `stop()` | `stop()` | 让正在运行的动画停在原处；在 TSX 中会以停下时的值 resolve。 |
+| `stop()` | `stop()` | 让正在运行的动画停在原处；在 TSX 中以 `{ value }`（停下时的值）resolve。 |
 | `getValue()` | `value()` | 当前值，在它运动所在的 UI 线程上读取（一帧之内给出结果）：TSX 中是 promise，Rust 中是可 await 的结果。 |
 | `setOffset(offset)` | `set_offset(offset)` | 在显示值上加上 `offset`：绑定看到的是值 + 偏移，而 `set`、动画和拖动改变的是值本身。 |
 | `flattenOffset()` | `flatten_offset()` | 把偏移加到值上，并把偏移设为 0。 |
@@ -462,7 +463,7 @@ const color = flash.interpolate({ inputRange: [0, 1], outputRange: ["#1f2328", "
 | `spring(to, { stiffness?, damping?, mass?, velocity? })` | `spring(to, Spring { .. })` | 以弹簧运动到 `to`（默认 stiffness 170、damping 26、mass 1）。 |
 | `decay({ velocity?, deceleration?, clamp?, bounce? })` | `decay(velocity, deceleration)`、`decay_within(velocity, deceleration, (min, max), bounce)` | 以 `velocity`（每秒单位数）开始滑行并逐渐减速（默认每毫秒 deceleration 0.998）。设置范围 `[min, max]` 时，它停在边界上，或以 `bounce`（0..1）保留的速度从边界反弹。 |
 
-每个动画都给出一个可以 await 的结果：完成时为 `true`，被打断时（`stop()`、`set()`，或同一个值上启动了新动画）为 `false`。在 TSX 中它是 `Promise<boolean>`，在 Rust 中是 `AnimationEnd`。在运动中的值上启动新动画会平滑地接替旧动画：没有指定速度的弹簧或衰减会沿用该值当前的速度。
+每个动画都给出一个可以 await 的结果，表示它是否完成：播放到终点时为 `true`，被打断时（`stop()`、`set()`，或同一个值上启动了新动画）为 `false`。在 TSX 中它是 `Promise<{ finished: boolean }>`，在 Rust 中是 `AnimationEnd`，任务 await 它得到这个 `bool`。在运动中的值上启动新动画会平滑地接替旧动画：没有指定速度的弹簧或衰减会沿用该值当前的速度。
 
 ```rust tabs
 // 弹簧参数：damping 越小越容易过冲，stiffness 越大越快。
@@ -487,10 +488,10 @@ x.spring(200, { stiffness: 180, damping: 8 });   // 晃动
 x.spring(200, { stiffness: 400, damping: 30 });  // 干脆，不过冲
 
 // 以拖动的松手速度滑行到停止。
-<View pan={{ x }} onPanEnd={(e) => x.decay({ velocity: e.velocityX })} />
+<View pan={{ x }} onPanEnd={(e) => x.decay({ velocity: e.velocity.x })} />
 
 // 留在轨道上、在两端柔和反弹的滑行。
-x.decay({ velocity: e.velocityX, clamp: [0, 300], bounce: 0.3 });
+x.decay({ velocity: e.velocity.x, clamp: [0, 300], bounce: 0.3 });
 
 // 值现在在哪里（它在 UI 线程上运动，所以结果是异步的）。
 const where = await x.getValue();
@@ -539,7 +540,7 @@ hand.keyframes([0, 360], { duration: 60_000, easing: Easing.steps(60), iteration
 - 每次迭代都先跳到它的第一个关键帧。没有 offset 为 0 的关键帧时，值从它当前的位置出发。
 - 在 `delay` 期间，值已经停在第一个关键帧上（CSS `animation-fill-mode: backwards`），因此延迟的入场显示的是它的第一帧，而不是静止状态的视图。动效同样如此。
 - `reverse` 以及 `alternate` 中反向的迭代会倒着播放各段，每段的曲线也随之反转。
-- 值停在最后一次迭代结束的位置。播放完成时结果为 `true`，被打断时为 `false`。
+- 值停在最后一次迭代结束的位置。结果表示它们是否完成：完成时为 `true`，被打断时为 `false`。
 
 ### 插值
 
@@ -569,10 +570,8 @@ const t = createAnimatedValue(0);
   style={{
     backgroundColor: t.interpolate({ inputRange: [0, 1, 2], outputRange: ["#54aeff", "#8250df", "#cf222e"] }),
     opacity: t.interpolate({ inputRange: [0, 1], outputRange: [0.4, 1] }),
-    transform: [
-      { rotate: t.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "180deg"] }) },
-      { scale: t.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1.2], easing: Easing.out(Easing.back()) }) },
-    ],
+    rotate: t.interpolate({ inputRange: [0, 1], outputRange: ["0deg", "180deg"] }),
+    scale: t.interpolate({ inputRange: [0, 1], outputRange: [0.6, 1.2], easing: Easing.out(Easing.back()) }),
   }}
 />
 ```
@@ -607,12 +606,22 @@ const scroll = createAnimatedValue(0);
 const header = scroll.diffClamp(0, 56);
 
 <Scroll style={{ flex: 1 }} scrollValue={scroll}>…</Scroll>
-<View style={{ position: "absolute", top: 0, left: 0, right: 0, height: 56, transform: [{ translateY: header.mul(-1) }] }}>…</View>
+<View style={{ position: "absolute", top: 0, left: 0, right: 0, height: 56, translate: [0, header.mul(-1)] }}>…</View>
+```
+
+加上 `{ snap: true }`（Rust 中为 `diff_clamp_with(min, max, DiffClamp::snapping())`）后，滚动停止时只显示了一部分的标题栏会把移动做完：它在 UI 线程上用 200 ms 停到完全显示或完全隐藏，取较近的一端。只有当页面滚动的距离至少达到标题栏的高度时它才会隐藏，因此滚动距离不足的页面会显示整个标题栏。移动过程中再次滚动，标题栏会从当前位置继续跟随滚动。
+
+```rust tabs
+let header = offset.diff_clamp_with(0.0, 56.0, DiffClamp::snapping());
+```
+
+```tsx tabs
+const header = scroll.diffClamp(0, 56, { snap: true });
 ```
 
 ## 组合动画
 
-动画由步骤搭建（Rust 中的 `Animation`，TSX 中 `nsh/animated` 的 `Animated`），整棵动画树在原生端运行：每个步骤在上一步结束的那一刻就在 UI 线程上开始，没有间隙，中间也不运行你的代码。
+动画由步骤搭建（Rust 中的 `Animation`，TSX 中 `nsh` 的 `Animated`），整棵动画树在原生端运行：每个步骤在上一步结束的那一刻就在 UI 线程上开始，没有间隙，中间也不运行你的代码。
 
 ```rust tabs
 let ys: Vec<AnimatedValue> = (0..5).map(|_| animated_value(0.0)).collect();
@@ -641,7 +650,7 @@ spawn(async move {
 ```
 
 ```tsx tabs
-import { Animated, createAnimatedValue, Easing } from "nsh/animated";
+import { Animated, createAnimatedValue, Easing } from "nsh";
 
 const ys = [0, 1, 2, 3, 4].map(() => createAnimatedValue(0));
 const fade = createAnimatedValue(1);
@@ -678,13 +687,13 @@ hop.start(({ finished }) => console.log(finished ? "landed" : "stopped"));
 | `Animated.delay(ms)` | `Animation::delay(ms)` | 等待。 |
 | `Animated.loop(animation, { iterations?, resetBeforeIteration? })` | `.looped(iterations)`、`.reset_before_iteration(..)` | 重复（默认无限次；Rust 中为 `None`）。 |
 
-组合动画提供 `start()`（在 TSX 中也可以带回调，并返回表示是否完成的 promise；在 Rust 中返回可 await 的 `bool`；再次调用会重新运行）、`stop()`（停在原处）和 `reset()`（停止，并把各个值恢复到开始时的状态）。回调对整棵动画树只调用一次。
+组合动画提供 `start()`（在 TSX 中也可以带回调并返回 promise，两者都得到 `{ finished }`；在 Rust 中返回可 await 的 `bool`；再次调用会重新运行）、`stop()`（停在原处）和 `reset()`（停止，并把各个值恢复到开始时的状态）。回调对整棵动画树只调用一次。
 
-正在运行的动画不会让它的值保持存活：拥有这些值的组件（它的视图和变量）消失时，无限循环的动画随之停止，结果为 `false`。
+正在运行的动画不会让它的值保持存活：拥有这些值的组件（它的视图和变量）消失时，无限循环的动画随之停止，结果是未完成（`false`）。
 
 ## 缓动
 
-缓动曲线是在原生端求值的数据：TSX 中是 `nsh/animated` 的 `Easing`，Rust 中是 `Easing` 枚举。
+缓动曲线是在原生端求值的数据：TSX 中是 `nsh` 的 `Easing`，Rust 中是 `Easing` 枚举。
 
 | TSX | Rust | 说明 |
 |---|---|---|
@@ -715,7 +724,7 @@ x.timing(1, { easing: [0.2, 0.8, 0.2, 1] });
 `Easing.sample(easing, count)`（Rust 中的 `sample_easing`）返回曲线在 0 到 1 之间 `count` 个等距点上的值，`Animated.sampleSpring(config, fps?)` / `Animated.sampleDecay(config, fps?)`（`sample_spring`、`sample_decay`）返回弹簧或衰减经过的值，每帧一个（默认每秒 60 帧），从 `config.from`（0）开始直到结束。它们由运行动画的同一套原生代码计算，所以画出的曲线与动画的实际运动完全一致：
 
 ```rust tabs
-use nsh_core::ui::{sample_easing, sample_spring};
+use nsh_core::element::{sample_easing, sample_spring};
 
 let curve = sample_easing(Easing::Curve(Curve::Back(1.70158), EaseMode::Out), 50); // 50 个进度值
 let spring = sample_spring(0.0, 1.0, Spring { stiffness: 180.0, damping: 8.0, ..Spring::default() }, 60.0);
@@ -731,7 +740,7 @@ const spring = Animated.sampleSpring({ toValue: 1, stiffness: 180, damping: 8 })
 布局动画以原生动画呈现**下一次**更新中的布局变化：移动或改变尺寸的视图平滑地到达新位置，新视图淡入（或缩放）出现，被删除的视图淡出。在改变状态之前调用它：Rust 中是 `animate_layout(..)`，TSX 中是 `LayoutAnimation.configureNext(config)`。
 
 ```rust tabs
-use nsh_core::ui::LayoutAnimation;
+use nsh_core::element::LayoutAnimation;
 
 let items = signal(vec![1, 2, 3]);
 let next = stored(4);
@@ -754,7 +763,7 @@ let remove = move || {
 
 ```tsx tabs
 import { signal } from "nsh";
-import { LayoutAnimation } from "nsh/animated";
+import { LayoutAnimation } from "nsh";
 
 const items = signal([1, 2, 3]);
 let next = 4;
@@ -777,10 +786,10 @@ const remove = () => {
 | `easeInEaseOut(onEnd?)`、`linear(onEnd?)`、`spring(onEnd?)` | 用预设调用 `animate_layout` | 使用预设调用 `configureNext`。 |
 | `Types`、`Properties` | `LayoutCurve`、`LayoutProperty` | 构造配置时用的名称。 |
 
-配置为 `{ duration, create?, update?, delete? }`（Rust 中为 `LayoutAnimation { create, update, delete }`）：`create` 用于插入的视图，`update` 用于移动或改变尺寸的视图，`delete` 用于删除的视图。每个阶段为 `{ type?, property?, duration?, delay?, springDamping? }`（`LayoutTransition { curve, property, duration_ms, delay_ms }`），其中 `type` 为 `"easeInEaseOut"`、`"spring"`、`"linear"`、`"easeIn"` 或 `"easeOut"`；`property` 是出现和消失的视图做什么动画（`"opacity"`、`"scaleXY"`、`"scale"`）；`springDamping`（0..1，默认 0.7；`LayoutCurve::Spring { damping }`）决定弹簧的过冲程度。
+配置为 `{ duration, create?, update?, delete? }`（Rust 中为 `LayoutAnimation { create, update, delete }`）：`create` 用于插入的视图，`update` 用于移动或改变尺寸的视图，`delete` 用于删除的视图。每个阶段为 `{ type?, property?, duration?, delay?, springDamping? }`（`LayoutTransition { curve, property, duration_ms, delay_ms }`），其中 `type` 为 `"easeInEaseOut"`、`"spring"`、`"linear"`、`"easeIn"`、`"easeOut"` 或 `"keyboard"`（软键盘自己的曲线，从键盘开始移动时算起，让为它让位的内容与它一起移动；`LayoutCurve::Keyboard`）；`property` 是出现和消失的视图做什么动画（`"opacity"`、`"scaleXY"`、`"scale"`）；`springDamping`（0..1，默认 0.7；`LayoutCurve::Spring { damping }`）决定弹簧的过冲程度。
 
 ```rust tabs
-use nsh_core::ui::{LayoutAnimation, LayoutCurve, LayoutProperty, LayoutTransition};
+use nsh_core::element::{LayoutAnimation, LayoutCurve, LayoutProperty, LayoutTransition};
 
 animate_layout(LayoutAnimation {
     create: Some(LayoutTransition::new(LayoutCurve::EaseOut, 300.0)),
@@ -801,6 +810,23 @@ LayoutAnimation.configureNext({
 });
 ```
 
+布局动画覆盖这次更新改变的所有帧，无论它们在屏幕上的什么位置：同一次更新中刷新的列表或到达的实时数据也会随之动画。在 Rust 组件中，用 `ElementRef::animate_layout(transition)` 只为一个元素的变化所移动的内容做动画：元素自己和其内容的帧，以及被它的尺寸推动的视图（它的兄弟视图，以及各级祖先的兄弟视图）的帧。这次更新的其他帧立即变化。`nsh/base` 的 `Collapsible` 和 `AccordionPanel` 就是这样展开内容的。
+
+```rust
+use nsh_core::element::{LayoutCurve, LayoutTransition};
+
+let region = element_ref();
+let open = signal(false);
+let toggle = move || {
+    region.animate_layout(LayoutTransition::new(LayoutCurve::Spring { damping: 1.0 }, 265.0));
+    open.update(|o| *o = !*o);
+};
+view()
+    .element_ref(&region)
+    .overflow_hidden()
+    .style_with(move |s| if open.get() { s } else { s.h(px(0.0)) })
+```
+
 ## 各部分运行在哪里
 
 | | 运行于 | 每帧运行你的代码 |
@@ -816,9 +842,13 @@ LayoutAnimation.configureNext({
 
 ## 减少动态效果
 
-当用户要求减少动态效果时（iOS 的"减弱动态效果"、Android 的"移除动画"），Rust 中的 `reduce_motion()` 和 TSX 中 `nsh/accessibility` 的 `reduceMotion()` 为 `true`，Tailwind 的 `motion-reduce:` / `motion-safe:` 变体随之生效。
+在终端目标（`--target tui`）上，宿主逐帧推进动画值和组合动画，并调用完成回调。透明度、颜色和二维
+变换映射到 Cell 网格；文字保持直立的终端字形，画布路径使用盲文点阵。终端报告减少动态效果：动效、
+导航、模态框、布局和样式过渡立即落在终点，显式动画值驱动器和 `Animated` 组合动画按原样播放。
 
-[动效](#动效)会自动遵循这一设置：`play` 和 `enter` 会立即落在动效的终点，不产生移动，结果与正常播放完一样为 `true`。退场依然以隐藏结束，入场依然以静止结束。对承载用户所需信息的动效（例如表示进度的旋转指示器），传入 `ignoreReduceMotion: true`（Rust 中用 `play_ignoring_reduce_motion`）。
+当用户要求减少动态效果时（iOS 的"减弱动态效果"、Android 的"移除动画"），Rust 中的 `reduce_motion()` 和 TSX 中 `nsh` 的 `reduceMotion()` 为 `true`，Tailwind 的 `motion-reduce:` / `motion-safe:` 变体随之生效。
+
+[动效](#动效)会自动遵循这一设置：`play` 和 `enter` 会立即落在动效的终点，不产生移动，结果与正常播放完一样是已完成（`true`）。退场依然以隐藏结束，入场依然以静止结束。对承载用户所需信息的动效（例如表示进度的旋转指示器），传入 `ignoreReduceMotion: true`（Rust 中用 `play_ignoring_reduce_motion`）。
 
 过渡、关键帧动画、动画值、关键帧和组合动画按原样播放；用它们来选择更平和的替代方案：
 
@@ -836,7 +866,7 @@ view().style_when(|| !reduce_motion(), |s| s.animate_bounce())
 
 ```tsx tabs
 import { View } from "nsh";
-import { reduceMotion } from "nsh/accessibility";
+import { reduceMotion } from "nsh";
 
 const open = () => (reduceMotion() ? panel.set(0) : panel.spring(0));
 
@@ -847,7 +877,7 @@ const open = () => (reduceMotion() ? panel.set(0) : panel.spring(0));
 
 ## 相关内容
 
-- [`nsh/animated`](../modules/nsh-animated.md)：TSX 参考。
+- [`nsh` 的动画 API](../modules/nsh.md#animation)：TSX 参考。
 - [触摸与手势](./touch-and-gestures.md)：用手指驱动动画值。
 - [滚动](./scrolling.md#滚动联动效果scrollvalue)：`scrollValue`。
 - [画布](./canvas.md#用动画值驱动绘制)：在绘制中使用动画值。

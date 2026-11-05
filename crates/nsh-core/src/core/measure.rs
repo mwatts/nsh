@@ -108,9 +108,9 @@ impl<M: TextEngine> Core<M> {
         let Some(super::LeafContext::Text(cx)) = self.layout.get_node_context(layout) else {
             return None;
         };
-        let (content, text_layout) = cx.laid_out.as_ref()?;
-        let at = point(at.x - content.origin.x, at.y - content.origin.y);
-        self.text_engine.index_at(text_layout, at)
+        let laid = cx.laid_out.as_ref()?;
+        let at = point(at.x - laid.content.origin.x, at.y - laid.content.origin.y);
+        Some(self.text_engine.hit_test(&laid.layout, at).offset)
     }
 
     /// Completes an input's `onCaretMove` payload from its platform: adds

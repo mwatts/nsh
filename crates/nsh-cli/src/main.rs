@@ -9,6 +9,7 @@ mod build;
 mod cdp;
 mod check;
 mod dev;
+mod dev_port;
 mod entry;
 mod init;
 mod logger;
@@ -34,7 +35,7 @@ use std::{
 
 use anyhow::Context as _;
 use clap::{Args, Parser, Subcommand};
-use nsh_core::ui::{Registry, description::SetDescription};
+use nsh_core::element::{Registry, description::SetDescription};
 
 /// The UI sets this command line links: `nsh/base`.
 pub(crate) fn own_sets() -> &'static [Registry] {
@@ -54,7 +55,7 @@ pub(crate) fn ui_sets() -> Arc<[SetDescription]> {
     }
     let sets: Arc<[SetDescription]> = own_sets()
         .iter()
-        .flat_map(nsh_core::ui::Registry::sets)
+        .flat_map(nsh_core::element::Registry::sets)
         .map(SetDescription::from)
         .collect();
     *UI_SETS.write().unwrap_or_else(|e| e.into_inner()) = Some(sets.clone());
@@ -66,7 +67,7 @@ pub(crate) fn ui_sets() -> Arc<[SetDescription]> {
 pub(crate) fn set_app_sets(app: Vec<SetDescription>) {
     let sets: Arc<[SetDescription]> = own_sets()
         .iter()
-        .flat_map(nsh_core::ui::Registry::sets)
+        .flat_map(nsh_core::element::Registry::sets)
         .map(SetDescription::from)
         .chain(app)
         .collect();
@@ -131,8 +132,10 @@ enum Command {
     },
     /// Run an app's tests headless: its test files (`*.test.tsx`,
     /// `*.test.ts`, importing `nsh/test`), each test opening the app on an
-    /// engine of its own; or, given the app's entry, open it and take the
-    /// steps standard input gives (`await app.press("Add")`).
+    /// engine of its own, after the `cargo test` of its Rust crates
+    /// (`nsh.json` `"rust"`) in the directory; or, given the app's entry,
+    /// open it and take the steps standard input gives
+    /// (`await app.press("Add")`).
     Test {
         /// A test file, a directory whose test files to run (default: the
         /// current one), or an app's entry.
@@ -141,20 +144,28 @@ enum Command {
         /// The entry of the app `path` is part of (set from it).
         #[arg(skip)]
         entry: PathBuf,
-        /// Run only the tests whose name contains this.
+        /// Run only the tests whose name contains this (`cargo test`'s
+        /// too).
         #[arg(long)]
         filter: Option<String>,
         /// Print every mount batch of the apps the tests open, under the
         /// step it came in, and the time of every commit.
         #[arg(long)]
         trace: bool,
+        /// Log the performance monitor's readings of the apps the tests
+        /// open, once a second: frame rate, frame and commit costs, CPU,
+        /// memory (`--target linux`, `macos`, `windows` or `ios`; shown with
+        /// `-v`).
+        #[arg(long)]
+        fps: bool,
         /// Also write the results to this file as a JUnit XML report, the
         /// format CI services read.
         #[arg(long, value_name = "FILE")]
         junit: Option<PathBuf>,
         /// Run the apps the tests open on this platform's development host
         /// instead of headless: the steps act with the platform's own input
-        /// (macos, linux, windows, gpui, web, ios and android; web runs them
+        /// (macos, linux, windows, gpui, tui, web, ios and android; tui uses
+        /// an in-memory terminal; web runs them
         /// in a headless Chrome, Edge or Chromium, ios in a simulator,
         /// android on the first device adb lists).
         #[arg(long, value_enum)]
@@ -168,9 +179,19 @@ enum Command {
         /// `nsh/host` calls of each app the tests open and sends its events.
         #[arg(long, value_name = "JS")]
         web_host: Option<PathBuf>,
+        /// With `--target macos`: the display the apps' windows open on,
+        /// centered: 1 is the primary display (the one with the menu bar),
+        /// 2 the next, and so on; the main one when there is no such
+        /// display. Default: the first display besides the primary one
+        /// (not a mirror of it), so that a run keeps off the screen in use;
+        /// the primary one when there is no other.
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        display: Option<u32>,
     },
     /// Type check an app with TypeScript's native compiler (TypeScript 7,
-    /// downloaded once from the npm registry; no Node needed).
+    /// downloaded once from the npm registry; no Node needed); an app with
+    /// Rust crates (`nsh.json` `"rust"`): `cargo check` them first, and a
+    /// Rust app (`"root"`) without a `tsconfig.json` only that.
     Check {
         /// The entry module, or the app's directory (default: the current one),
         /// whose `App.tsx` is the entry.
@@ -189,7 +210,7 @@ enum Command {
         /// whose `App.tsx` is the entry.
         #[arg(default_value = ".")]
         entry: PathBuf,
-        /// Dev server port (the next free one is used if it is taken).
+        /// Dev server port (replaces the previous NSH development session).
         #[arg(long, default_value_t = nsh_dev::protocol::DEFAULT_PORT)]
         port: u16,
         /// Minify and strip debug info.
@@ -219,13 +240,13 @@ enum Command {
     Package(Box<PackageArgs>),
     /// Run an app in a development host with hot reload. Defaults to
     /// AppKit on macOS, GTK on Linux and Win32 on Windows; select mobile
-    /// hosts, Mac Catalyst, GPUI or a browser with --target.
+    /// hosts, Mac Catalyst, GPUI, a terminal or a browser with --target.
     Run {
         /// The entry module, or the app's directory (default: the current one),
         /// whose `App.tsx` is the entry.
         #[arg(default_value = ".")]
         entry: PathBuf,
-        /// Dev server port (the next free one is used if it is taken).
+        /// Dev server port (replaces the previous NSH development session).
         #[arg(long, default_value_t = nsh_dev::protocol::DEFAULT_PORT)]
         port: u16,
         /// Minify and strip debug info.
@@ -243,7 +264,10 @@ enum Command {
         #[arg(long)]
         trace: bool,
         /// Show the performance monitor over the app: frame rate, frame and
-        /// commit costs, CPU, GPU, memory (`--target macos`).
+        /// commit costs, CPU, GPU, memory (`--target macos`, which also logs
+        /// its readings once a second; `--target linux`, `windows` and `ios`
+        /// log them). On `tui`, show FPS/idle, frame p95, apply/draw/flush
+        /// times, bytes and changed Cells; C-h p toggles the line.
         #[arg(long)]
         fps: bool,
         /// Where to run.
@@ -253,6 +277,9 @@ enum Command {
         /// the newest iPhone.
         #[arg(long)]
         device: Option<String>,
+        /// Points per terminal Cell, overriding nsh.json tui.pointsPerCell (default: 8x16).
+        #[arg(long, value_name = "WIDTHxHEIGHT", value_parser = run::parse_points_per_cell)]
+        points_per_cell: Option<String>,
         /// The app's name in the host (the menu bar, the window title;
         /// `nsh.json`'s name by default; `--target macos` only).
         #[arg(long)]
@@ -262,6 +289,11 @@ enum Command {
         /// `windows`, `gpui`).
         #[arg(long = "window-size", value_name = "WIDTHxHEIGHT")]
         size: Option<String>,
+        /// The display the window opens on, centered: 1 is the primary
+        /// display (the one with the menu bar), 2 the next, and so on; the
+        /// main one when there is no such display (`--target macos` only).
+        #[arg(long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+        display: Option<u32>,
     },
     /// Create a signing key: `<name>.secret` (keep it offline for a root)
     /// and `<name>.pub` (what apps trust, for a root).
@@ -290,10 +322,12 @@ enum Command {
     },
     /// Build an app in release mode and sign it into a package (`.nshpkg`)
     /// for apps that embed nsh to verify and run. Metadata comes from
-    /// `nsh.json` next to the entry, overridden by the flags below.
+    /// `nsh.json` next to the entry, overridden by the flags below. Given a
+    /// package instead of an app, signs it again with this key: only its
+    /// certificate, signing time and signature change.
     Publish {
-        /// The entry module, or the app's directory (default: the current one),
-        /// whose `App.tsx` is the entry.
+        /// The entry module, the app's directory (default: the current one),
+        /// whose `App.tsx` is the entry, or a package (`.nshpkg`) to sign again.
         #[arg(default_value = ".")]
         entry: PathBuf,
         /// The release key's secret key (`.secret`).
@@ -302,7 +336,8 @@ enum Command {
         /// Its certificate (`nsh certify`).
         #[arg(long)]
         cert: PathBuf,
-        /// The package to write (default: `.nsh/out/<id>-<build>.nshpkg`).
+        /// The package to write (default: `.nsh/out/<id>-<build>.nshpkg`); a
+        /// package signed again may name the one read.
         #[arg(short, long)]
         out: Option<PathBuf>,
         /// App id, e.g. `com.example.app`.
@@ -316,9 +351,10 @@ enum Command {
         build: Option<u32>,
         /// Where the source map goes: into the package (devices report
         /// errors at app source positions), into a file next to it
-        /// (`<package>.map`, for `nsh symbolicate`), or nowhere.
-        #[arg(long, value_enum, default_value_t = sign::SourceMapOut::Package)]
-        source_map: sign::SourceMapOut,
+        /// (`<package>.map`, for `nsh symbolicate`), or nowhere (default:
+        /// into the package).
+        #[arg(long, value_enum)]
+        source_map: Option<sign::SourceMapOut>,
         /// Leave the line and column tables out of the bytecode: a smaller
         /// package whose error stacks have no positions.
         #[arg(long)]
@@ -417,6 +453,10 @@ struct PackageArgs {
     /// Keystore password (also `NSH_KEYSTORE_PASSWORD`).
     #[arg(long, env = "NSH_KEYSTORE_PASSWORD", hide_env_values = true)]
     keystore_password: Option<String>,
+    /// Android ABIs of the APK, repeated or separated by commas (default:
+    /// arm64-v8a and armeabi-v7a; with --run also the device's).
+    #[arg(long, value_delimiter = ',', value_parser = crate::android::ABIS)]
+    abi: Vec<String>,
     /// Install and launch the app in the simulator or on the Android device
     /// afterwards (Linux, macOS, Windows: launch it; web: serve it on this
     /// machine at the address it prints).
@@ -484,6 +524,36 @@ fn no_limits_for_rust(
 }
 
 fn run(mut command: Command) -> anyhow::Result<()> {
+    // A package given to `nsh publish` has no app to resolve or build.
+    if let Command::Publish {
+        entry,
+        key,
+        cert,
+        out,
+        id,
+        version,
+        build,
+        source_map,
+        strip_debug,
+        min_runtime,
+    } = &command
+        && sign::is_package(entry)
+    {
+        let build_flags = [
+            ("--id", id.is_some()),
+            ("--app-version", version.is_some()),
+            ("--build", build.is_some()),
+            ("--source-map", source_map.is_some()),
+            ("--strip-debug", *strip_debug),
+            ("--min-runtime", min_runtime.is_some()),
+        ];
+        if let Some((flag, _)) = build_flags.iter().find(|(_, given)| *given) {
+            anyhow::bail!(
+                "{flag} applies to a build: a package signed again keeps its contents as they are"
+            );
+        }
+        return sign::resign(entry, key, cert, out.clone());
+    }
     let mut types = true;
     // The app a test's path is part of.
     if let Command::Test { path, entry, .. } = &mut command {
@@ -492,14 +562,40 @@ fn run(mut command: Command) -> anyhow::Result<()> {
     }
     if let Some(entry) = command.entry_mut() {
         *entry = entry::resolve(entry)?;
-        // A Rust app has no TypeScript to declare things for.
-        types &= !rust_app::is_root(entry);
+        // A Rust app has no TypeScript to declare things for, unless it
+        // keeps TypeScript tests (a `tsconfig.json` for them).
+        types &= check::has_typescript(entry);
     }
-    // A Rust app (`nsh.json` "root") has no bundle: it is built, tested,
-    // run and packaged.
+    // Own the port across builds and restarts, until every host and forwarding
+    // rule from this command has been cleaned up.
+    let _port = match &command {
+        Command::Run { port, .. } | Command::Dev { port, .. } => dev_port::Session::acquire(*port)?,
+        _ => None,
+    };
+    let _terminal_logs = match &command {
+        Command::Run {
+            entry,
+            target: run::Target::Tui,
+            ..
+        }
+        | Command::Dev {
+            entry,
+            target: run::Target::Tui,
+            server_only: false,
+            ..
+        } => {
+            let work = entry.parent().context("app directory")?.join(".nsh");
+            std::fs::create_dir_all(&work)?;
+            Some(ui::LogFile::open(&work.join("tui.log"))?)
+        }
+        _ => None,
+    };
+    // A Rust app (`nsh.json` "root") has no bundle: it is built, checked,
+    // tested, run and packaged.
     let rust_command = matches!(
         command,
         Command::Build { .. }
+            | Command::Check { .. }
             | Command::Test { .. }
             | Command::Package(_)
             | Command::Run { .. }
@@ -513,8 +609,9 @@ fn run(mut command: Command) -> anyhow::Result<()> {
         && !rust_command
     {
         anyhow::bail!(
-            "{} declares a Rust app (\"root\"): it is built with `nsh build`, tested with `nsh test`, \
-             run with `nsh run` and packaged with `nsh package`; the other commands take a TSX entry",
+            "{} declares a Rust app (\"root\"): it is built with `nsh build`, checked with `nsh check`, \
+             tested with `nsh test`, run with `nsh run` and packaged with `nsh package`; the other \
+             commands take a TSX entry",
             ui::path(entry)
         );
     }
@@ -537,8 +634,20 @@ fn run(mut command: Command) -> anyhow::Result<()> {
     // from them, its hosts built with them. A development session ends
     // when its Rust code changes, and starts again with it built anew.
     rust_app::set_current(app.clone());
+    // Its crates are checked with cargo before anything is described from
+    // them: their errors are cargo's own. A Rust app without TypeScript
+    // has nothing else to check.
+    if let Command::Check { entry, .. } = &command {
+        check::cargo_check(&app)?;
+        if !check::has_typescript(entry) {
+            return Ok(());
+        }
+    }
     let mut restarted = false;
     loop {
+        if ui::stop_requested() {
+            return Ok(());
+        }
         match app.describe() {
             Ok(sets) => set_app_sets(sets),
             // Its build failed and waited for the next change already.
@@ -590,19 +699,23 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             entry,
             filter,
             trace,
+            fps,
             junit,
             target,
             browser,
             web_host,
+            display,
         } => test::test(
             &path,
             &entry,
             filter,
             trace,
+            fps,
             junit.as_deref(),
             target,
             browser.as_deref(),
             web_host,
+            display.map(|n| n as usize),
         ),
         Command::Dev {
             entry,
@@ -627,6 +740,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                         limits,
                         trace: false,
                         fps: false,
+                        points_per_cell: None,
                     },
                     target,
                     device.as_deref(),
@@ -649,6 +763,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                 keystore,
                 key_alias,
                 keystore_password,
+                abi,
                 run,
             } = *args;
             let mut config = package::read_config(&entry)?;
@@ -671,6 +786,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                         keystore_password.as_deref().unwrap_or_default(),
                     )
                 }),
+                abis: &abi,
                 run,
             })
         }
@@ -685,18 +801,26 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
             device,
             name,
             size,
+            display,
+            points_per_cell,
         } => {
             no_limits_for_rust(&entry, limits)?;
             run::run(
                 &entry,
                 port,
                 release,
-                run::HostFlags { limits, trace, fps },
+                run::HostFlags {
+                    limits,
+                    trace,
+                    fps,
+                    points_per_cell,
+                },
                 target,
                 device.as_deref(),
                 run::HostWindow {
                     name: name.as_deref(),
                     size: size.as_deref(),
+                    display: display.map(|n| n as usize),
                 },
             )
         }
@@ -731,7 +855,7 @@ fn dispatch(command: Command) -> anyhow::Result<()> {
                 cert: &cert,
                 out,
                 config,
-                source_map,
+                source_map: source_map.unwrap_or(sign::SourceMapOut::Package),
                 strip_debug,
             })
         }
@@ -757,6 +881,25 @@ mod command_tests {
     use clap::Parser as _;
 
     use super::{Cli, Command, run::Target};
+
+    /// Signing a package again changes no contents, so a flag that shapes a
+    /// build is refused rather than ignored, before any file is read.
+    #[test]
+    fn publishing_a_package_refuses_the_flags_of_a_build() {
+        for (flag, args) in [
+            ("--id", &["--id", "a.b"][..]),
+            ("--app-version", &["--app-version", "2.0.0"]),
+            ("--build", &["--build", "2"]),
+            ("--source-map", &["--source-map", "package"]),
+            ("--strip-debug", &["--strip-debug"]),
+            ("--min-runtime", &["--min-runtime", "0.2.0"]),
+        ] {
+            let mut line = vec!["nsh", "publish", "a.nshpkg", "--key", "k", "--cert", "c"];
+            line.extend_from_slice(args);
+            let error = super::run(Cli::try_parse_from(line).unwrap().command).unwrap_err();
+            assert!(error.to_string().starts_with(flag), "{flag}: {error}");
+        }
+    }
 
     #[test]
     fn version_includes_the_source_revision() {

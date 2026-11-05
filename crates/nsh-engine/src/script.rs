@@ -4,10 +4,11 @@
 //! uninhabited, so the loop needs no `cfg`).
 
 /// Host-owned permissions, data root and event wakeup for native system modules.
-#[cfg(feature = "js")]
+#[cfg(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32")))]
 pub(crate) struct SystemConfig {
     pub(crate) access: nsh_core::access::Access,
     pub(crate) websocket: Option<std::sync::Arc<dyn nsh_core::websocket::WebSocketTransport>>,
+    pub(crate) refuse_connections: Option<nsh_core::element::RefuseConnections>,
     pub(crate) filesystem: Option<std::sync::Arc<dyn nsh_core::filesystem::FileSystem>>,
     pub(crate) data_dir: Option<std::path::PathBuf>,
     pub(crate) paths: nsh_core::access::TrustedPaths,
@@ -16,15 +17,21 @@ pub(crate) struct SystemConfig {
     pub(crate) host: std::rc::Rc<dyn nsh_core::host_channel::HostBridge>,
 }
 
-#[cfg(not(feature = "js"))]
+#[cfg(not(any(feature = "js-core", all(feature = "browser", target_arch = "wasm32"))))]
 pub(crate) struct SystemConfig;
 
-#[cfg(feature = "js")]
+#[cfg(feature = "js-core")]
 pub(crate) use imp::Script;
-#[cfg(not(feature = "js"))]
+#[cfg(all(
+    not(feature = "js-core"),
+    not(all(feature = "browser", target_arch = "wasm32"))
+))]
 pub(crate) use stub::Script;
 
-#[cfg(feature = "js")]
+#[cfg(all(feature = "browser", target_arch = "wasm32", not(feature = "js-core")))]
+pub(crate) use crate::browser::Script;
+
+#[cfg(feature = "js-core")]
 mod imp {
     use std::{
         cell::{Cell, RefCell},
@@ -67,10 +74,11 @@ mod imp {
         pub(crate) fn start<M: TextEngine + 'static>(
             bundle: &Bundle,
             limits: Limits,
-            ui_sets: &[nsh_core::ui::Registry],
-            posts: nsh_core::ui::Posts,
+            ui_sets: &[nsh_core::element::Registry],
+            posts: nsh_core::element::Posts,
             environment: &Environment,
-            tokens: Arc<nsh_core::ui::Tokens>,
+            tokens: Arc<nsh_core::element::Tokens>,
+            theme: nsh_core::element::ThemeTokens,
             text_engine: Rc<M>,
             stop: Arc<AtomicBool>,
             sink: Rc<dyn MountSink>,
@@ -79,7 +87,6 @@ mod imp {
             let options = HostOptions {
                 limits,
                 harden: bundle.policy.harden,
-                harden_bytecode: bundle.harden_bytecode.clone(),
                 ui_sets: ui_sets.to_vec(),
                 posts,
                 base_url: bundle.base_url.as_deref().map(str::to_owned),
@@ -98,6 +105,7 @@ mod imp {
             host.set_system_access(system.access, system.data_dir);
             host.set_system_paths(system.paths);
             host.set_websocket_transport(system.websocket);
+            host.set_refuse_connections(system.refuse_connections);
             host.set_filesystem(system.filesystem);
             host.set_system_wake(system.wake);
             host.set_host_bridge(system.host);
@@ -134,6 +142,7 @@ mod imp {
             }));
             host.set_environment(environment);
             host.set_tokens(tokens);
+            host.set_theme_tokens(theme);
             let script = Script {
                 host,
                 exit_requested,
@@ -222,7 +231,7 @@ mod imp {
             self.host.dispatch_event(id, event, payload);
         }
 
-        pub(crate) fn deliver(&self, event: nsh_core::ui::JsEvent) {
+        pub(crate) fn deliver(&self, event: nsh_core::element::JsEvent) {
             self.host.deliver(event);
         }
 
@@ -284,8 +293,12 @@ mod imp {
             self.host.set_environment(environment);
         }
 
-        pub(crate) fn set_tokens(&self, tokens: Arc<nsh_core::ui::Tokens>) {
+        pub(crate) fn set_tokens(&self, tokens: Arc<nsh_core::element::Tokens>) {
             self.host.set_tokens(tokens);
+        }
+
+        pub(crate) fn set_theme_tokens(&self, theme: nsh_core::element::ThemeTokens) {
+            self.host.set_theme_tokens(theme);
         }
 
         pub(crate) fn take_fonts(&self, out: &mut Vec<String>) {
@@ -298,6 +311,10 @@ mod imp {
 
         pub(crate) fn fetch_event(&self, id: RequestId, event: FetchEvent) {
             self.host.fetch_event(id, event);
+        }
+
+        pub(crate) fn fetch_refused(&self, id: RequestId, message: &str, url: &str) {
+            self.host.fetch_refused(id, message, url);
         }
 
         pub(crate) fn collect_garbage(&self) {
@@ -314,18 +331,22 @@ mod imp {
     }
 }
 
-#[cfg(not(feature = "js"))]
+#[cfg(not(feature = "js-core"))]
 mod stub {
+    #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
     use std::{
         rc::Rc,
         sync::{Arc, atomic::AtomicBool},
     };
 
+    #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
     use nsh_core::{EventKind, EventPayload, NodeId, Op, TextEngine, time::Instant};
 
+    #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
     use crate::{AppError, AppErrorKind, Bundle, Chunk, Environment, HotUpdate, Limits, MountSink};
 
     /// No JS in this build: never made.
+    #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
     pub(crate) enum Script {}
 
     /// What JS asked of its requests (nothing without JS).
@@ -334,15 +355,17 @@ mod stub {
         pub(crate) ops: Vec<(u32, crate::FetchOp)>,
     }
 
+    #[cfg(not(all(feature = "browser", target_arch = "wasm32")))]
     impl Script {
         #[allow(clippy::too_many_arguments, reason = "as the real one's")]
         pub(crate) fn start<M: TextEngine + 'static>(
             _: &Bundle,
             _: Limits,
-            _: &[nsh_core::ui::Registry],
-            _: nsh_core::ui::Posts,
+            _: &[nsh_core::element::Registry],
+            _: nsh_core::element::Posts,
             _: &Environment,
-            _: Arc<nsh_core::ui::Tokens>,
+            _: Arc<nsh_core::element::Tokens>,
+            _: nsh_core::element::ThemeTokens,
             _: Rc<M>,
             _: Arc<AtomicBool>,
             sink: Rc<dyn MountSink>,
@@ -374,7 +397,7 @@ mod stub {
             match *self {}
         }
 
-        pub(crate) fn deliver(&self, _: nsh_core::ui::JsEvent) {
+        pub(crate) fn deliver(&self, _: nsh_core::element::JsEvent) {
             match *self {}
         }
 
@@ -430,7 +453,11 @@ mod stub {
             match *self {}
         }
 
-        pub(crate) fn set_tokens(&self, _: Arc<nsh_core::ui::Tokens>) {
+        pub(crate) fn set_tokens(&self, _: Arc<nsh_core::element::Tokens>) {
+            match *self {}
+        }
+
+        pub(crate) fn set_theme_tokens(&self, _: nsh_core::element::ThemeTokens) {
             match *self {}
         }
 
@@ -443,6 +470,10 @@ mod stub {
         }
 
         pub(crate) fn fetch_event(&self, _: u32, _: crate::FetchEvent) {
+            match *self {}
+        }
+
+        pub(crate) fn fetch_refused(&self, _: u32, _: &str, _: &str) {
             match *self {}
         }
 
@@ -460,10 +491,10 @@ mod stub {
     }
 }
 
-#[cfg(feature = "js")]
+#[cfg(feature = "js-core")]
 pub(crate) use nsh_js::{NetworkQueue, RequestId};
-#[cfg(not(feature = "js"))]
+#[cfg(not(feature = "js-core"))]
 pub(crate) use stub::NetworkQueue;
 /// Identifies a request between JS and the network stack.
-#[cfg(not(feature = "js"))]
+#[cfg(not(feature = "js-core"))]
 pub(crate) type RequestId = u32;

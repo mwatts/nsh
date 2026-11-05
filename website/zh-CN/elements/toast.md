@@ -1,7 +1,6 @@
 ---
 title: Toast
 description: Toast、ToastStack 和 ToastManager：与 gpui-base 一致的无样式 toast，带过渡状态的语义根、把 toast 排成层叠的栈，以及无界面的生命周期。
-order: 29.5
 group: base
 demo: el-toast
 ---
@@ -19,7 +18,7 @@ Toast 是在应用上方显示一段时间的简短消息："已复制"、"草�
 ```rust tabs
 use std::time::Duration;
 
-use nsh_core::{time::now, ui::prelude::*};
+use nsh_core::{time::now, prelude::*};
 
 use nsh_base::{
     Anchor, ToastManager, ToastMotion, ToastOptions, ToastStackState, theme, toast, toast_stack,
@@ -81,8 +80,8 @@ fn toasts() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { Overlay, signal, Text } from "nsh";
-import { safeArea, Toast, type ToastEntry, ToastManager, ToastStack } from "nsh/base";
+import { Overlay, signal, Text, safeArea } from "nsh";
+import { Toast, type ToastEntry, ToastManager, ToastStack } from "nsh/base";
 
 const manager = new ToastManager();
 const shown = signal<ToastEntry[]>([]);
@@ -101,7 +100,7 @@ export function toast(title: string) {
 export function Toaster() {
   return (
     <Overlay class="inset-x-0 bottom-0 items-center p-4" style={{ paddingBottom: safeArea().bottom + 16 }}>
-      <ToastStack placement="bottomCenter" class="w-80" onExpandedChange={expanded.set} onCancel={() => {
+      <ToastStack placement="bottomCenter" class="w-80" onExpandedChange={(e) => expanded.set(e.expanded)} onCancel={() => {
         const newest = shown().filter((t) => t.status !== "ending").at(-1);
         if (newest) { manager.dismiss(newest.id); sync(); }
       }}>
@@ -125,7 +124,7 @@ export function Toaster() {
 }
 ```
 
-`Toast`、`ToastStack` 和 `ToastManager` 来自 [`nsh/base`](../modules/nsh-base.md)。在 Rust 中请按名称导入 `toast`：prelude 中的 `toast` 是 Android 的系统 toast（[`nsh/android`](../modules/nsh-android.md) 的 `Toast.show`）。
+`Toast`、`ToastStack` 和 `ToastManager` 来自 [`nsh/base`](../modules/nsh-base.md)。在 Rust 中它们是 `nsh_base` 的 `toast`、`toast_stack` 和 `ToastManager`。
 
 <a id="toastmanager"></a>
 
@@ -144,7 +143,7 @@ Manager 没有界面：它不渲染任何东西，也不运行计时器。应用
 
 ## ToastStack
 
-栈的子元素就是它的 toast，从旧到新。从 `placement` 指定的边缘（默认 `"topRight"`；底部的锚点向上排列）开始，收起时 toast 以 `collapsedPeek` 的间距重叠，越靠后的每层窄 `collapsedScaleStep`，只显示 `collapsedVisible` 层；展开时它们是间距为 `expandedGap` 的列表。toast 的出现、离开和栈的展开都以临界阻尼弹簧移动它们。指针停在栈上或手指按在栈上时它是展开的（`onExpandedChange(expanded)`；Rust 的 `ToastStackState` 用 `is_expanded()` 读取），这样应用可以在用户阅读或触摸 toast 时暂停计时。
+栈的子元素就是它的 toast，从旧到新。从 `placement` 指定的边缘（默认 `"topRight"`；底部的锚点向上排列）开始，收起时 toast 以 `collapsedPeek` 的间距重叠，越靠后的每层窄 `collapsedScaleStep`，只显示 `collapsedVisible` 层；展开时它们是间距为 `expandedGap` 的列表（终端里间距为三行，每个 toast 的边框与下一个之间空一行）。toast 的出现、离开和栈的展开都以临界阻尼弹簧移动它们。指针停在栈上或手指按在栈上时它是展开的（`onExpandedChange({ expanded })`；Rust 的 `ToastStackState` 用 `is_expanded()` 读取），这样应用可以在用户阅读或触摸 toast 时暂停计时。
 
 栈由应用放置：放在边缘的 [Overlay](./overlay.md) 中，并位于安全区域之内。它的 `class` 和 `style` 决定宽度。只要它包含 toast，它就会收到 Escape 和 Android 返回键（`onCancel`；`closeOnEscape={false}` 把它们留给应用的其他部分）：关闭最新的 toast。
 
@@ -178,5 +177,5 @@ Toast 是包裹应用内容的 `alert` 角色。它的 `transitionStatus` 来自
 | `motion` | `.motion(..)` | `ToastMotion` | Sonner 的 | 它的动效参数。 |
 | `placement` | `.placement(..)` | `"topLeft" \| "topCenter" \| "topRight" \| "bottomLeft" \| "bottomCenter" \| "bottomRight" \| "leftCenter" \| "rightCenter"` | `"topRight"` | 它从哪一侧边缘开始排列。 |
 | `closeOnEscape` | `.close_on_escape(..)` | `boolean` | `true` | 包含 toast 时它会收到 Escape 和返回键。 |
-| `onExpandedChange` | `.on_expanded_change(..)`、`.state(..)` | `(expanded: boolean) => void` | 无 | 交互使它展开或收起。 |
+| `onExpandedChange` | `.on_expanded_change(..)`、`.state(..)` | `(e: { expanded: boolean }) => void` | 无 | 交互使它展开或收起。 |
 | `onCancel` | `.on_cancel(..)` | `() => void` | 无 | Escape 或返回键：关闭最新的 toast。 |

@@ -213,6 +213,11 @@ pub(crate) struct Surface {
     /// Frame callbacks of the platform's own animations (scroll glides,
     /// transitions): called on every frame while they return true.
     frame_callbacks: RefCell<Vec<FrameCallback>>,
+    /// How many of the frame callbacks have only cosmetic work left (a
+    /// scroll indicator fading out): what [`Surface::animating`] does not
+    /// count.
+    #[cfg(feature = "dev")]
+    cosmetic_frames: Cell<usize>,
     /// The model of a test session's app (`nsh test --target`).
     #[cfg(feature = "dev")]
     test_model: RefCell<Option<std::sync::Arc<nsh_testing::agent::Model>>>,
@@ -229,6 +234,9 @@ pub(crate) struct Surface {
     /// The engine missed the deadline of a resize ([`RESIZE_WAIT`]): later
     /// resizes do not wait until it reports one done.
     resize_late: Cell<bool>,
+    /// The move count ([`crate::sight::moves`]) the last revisit started
+    /// at: frames revisit only when it moved ([`Surface::tick`]).
+    revisited: Cell<u64>,
     /// The background set under the root ([`crate::system`]).
     pub(crate) background: Cell<Option<nsh_core::Color>>,
     on_error: RefCell<Option<ErrorHandler>>,
@@ -244,6 +252,8 @@ pub(crate) struct Surface {
     /// The app's keyboard shortcuts ([`crate::keymap`]).
     pub(crate) keymap: crate::keymap::KeymapState,
     pub(crate) file_drop: crate::file_drop::State,
+    /// The GPU device and the shader views rendering ([`crate::shader`]).
+    pub(crate) shaders: crate::shader::Shaders,
 }
 
 /// A per-frame callback ([`Surface::add_frame_callback`]): gets the frame
@@ -277,6 +287,8 @@ impl Surface {
             queued: RefCell::default(),
             frame_callbacks: RefCell::default(),
             #[cfg(feature = "dev")]
+            cosmetic_frames: Cell::new(0),
+            #[cfg(feature = "dev")]
             test_model: RefCell::default(),
             link: RefCell::new(None),
             perf: RefCell::new(None),
@@ -284,6 +296,7 @@ impl Surface {
             last_tick: Cell::new(0.0),
             fallback: Cell::new(false),
             resize_late: Cell::new(false),
+            revisited: Cell::new(0),
             background: Cell::new(None),
             on_error: RefCell::new(None),
             on_hot_update_failed: RefCell::new(None),
@@ -293,6 +306,7 @@ impl Surface {
             keymap: Default::default(),
             file_drop: Default::default(),
             chrome: Default::default(),
+            shaders: Default::default(),
         });
         SURFACES.with(|s| s.borrow_mut().insert(key, Rc::downgrade(&surface)));
         // CoreText's first use loads fonts and caches (tens of
@@ -344,6 +358,8 @@ impl Surface {
                 control.set_tokens(tokens);
             }
         };
+        // Remote images download with NSURLSession.
+        crate::image::install_transport();
         match Engine::start_with(config, CoreTextEngine::default, sink, setup) {
             Ok(engine) => {
                 // The app's downloaded images go through its disk cache.
@@ -380,6 +396,9 @@ impl Surface {
         self.queued.borrow_mut().clear();
         self.resize_late.set(false);
         self.frame_callbacks.borrow_mut().clear();
+        #[cfg(feature = "dev")]
+        self.cosmetic_frames.set(0);
+        crate::shader::clear(self);
     }
 
     /// Calls `f` with the engine's control, if an app runs.
@@ -436,7 +455,6 @@ impl Surface {
             c.set_environment(env);
         });
         crate::navigation::surface_resized(self, width, height);
-        crate::system::surface_resized(self, width, height);
         // Full screen and the window's size change the title bar's area.
         crate::chrome::update_area(self);
         self.await_layout(Size::new(Points(width), Points(height)));
@@ -544,7 +562,11 @@ impl Surface {
         });
         if let (Some(monitor), Some(start)) = (monitor, start) {
             // Core Animation's commit (drawing what changed) included.
-            monitor.record_work(start.elapsed(), applied);
+            let cost = start.elapsed();
+            monitor.record_work(cost, applied);
+            if applied {
+                crate::fps::drained(cost);
+            }
         }
         self.ensure_ticking();
     }
@@ -635,11 +657,20 @@ impl Surface {
     /// Writes the animated values to the views and reports finished
     /// animations.
     pub(crate) fn write_animations(&self) {
-        let finished = {
+        let (finished, moved) = {
             let mut anim = self.anim.borrow_mut();
             anim.write(&self.mounter.borrow());
-            std::mem::take(&mut anim.finished)
+            let mut moved = Vec::new();
+            anim.write_components(
+                |id| crate::native::has_component(self, id),
+                |id, name, value| moved.push((id, std::sync::Arc::<str>::from(name), value)),
+            );
+            (std::mem::take(&mut anim.finished), moved)
         };
+        // Shaders whose animated uniforms moved render from the next frame.
+        crate::shader::wake(self);
+        // No surface state borrowed while the app's components run.
+        crate::native::component_animated(self, moved);
         crate::scroll::pin_animated_sticky(self);
         if !finished.is_empty() {
             self.control(|c| c.animations_finished(finished));
@@ -655,12 +686,28 @@ impl Surface {
         self.ensure_ticking();
     }
 
-    /// Whether a native animation runs: the graph's, or the platform's own
-    /// (scroll glides, zooms); or batches wait for the next frame.
+    /// A frame callback's work left became cosmetic (`on`: a scroll
+    /// indicator fading out, which shows nothing the app did) or no longer
+    /// is; it ends with `on` false.
+    pub(crate) fn cosmetic_frame(&self, on: bool) {
+        #[cfg(feature = "dev")]
+        {
+            let n = self.cosmetic_frames.get();
+            self.cosmetic_frames
+                .set(if on { n + 1 } else { n.saturating_sub(1) });
+        }
+        #[cfg(not(feature = "dev"))]
+        let _ = on;
+    }
+
+    /// Whether a native animation runs: the graph's (not one looping
+    /// forever, which no test step waits for), or the platform's own
+    /// (scroll glides, zooms; not a scroll indicator's fade, after which
+    /// nothing changes); or batches wait for the next frame.
     #[cfg(feature = "dev")]
     pub(crate) fn animating(&self) -> bool {
-        self.anim.borrow().animating()
-            || !self.frame_callbacks.borrow().is_empty()
+        self.anim.borrow().finishing()
+            || self.frame_callbacks.borrow().len() > self.cosmetic_frames.get()
             || !self.queued.borrow().is_empty()
     }
 
@@ -798,7 +845,9 @@ impl Surface {
         let start = Instant::now();
         let dirty = self.wants_frames();
         quiet(|| self.tick(now));
-        monitor.record_work(start.elapsed(), dirty);
+        let cost = start.elapsed();
+        monitor.record_work(cost, dirty);
+        crate::fps::ticked(cost);
         monitor.vsync(
             Instant::now(),
             std::time::Duration::from_secs_f64(period.max(0.0)),
@@ -806,7 +855,7 @@ impl Surface {
     }
 
     fn tick(self: &Rc<Self>, now: f64) {
-        self.apply_queued(FRAME_BATCHES);
+        let applied = self.apply_queued(FRAME_BATCHES);
         if self.anim.borrow().animating() {
             self.anim.borrow_mut().tick(now);
             self.write_animations();
@@ -824,16 +873,23 @@ impl Surface {
         if self.js_frame.replace(false) {
             self.control(|c| c.frame());
         }
-        self.revisit();
+        // A batch changes more than moves count (clips, deletions); else
+        // only a move can show a view put off. An endless animation keeps
+        // the frames coming without moving any view (transforms and
+        // opacity are not looked at): no pass on each of its frames.
+        if applied || crate::sight::moves() != self.revisited.get() {
+            self.revisit();
+        }
     }
 
     /// Applies the batches that waited for this frame, in order, until
     /// `budget` is spent (at least one): the rest wait for the next frame,
     /// so one frame's main-thread work stays bounded when the engine sent
     /// several. A batch is the state of one commit and is applied whole.
-    fn apply_queued(self: &Rc<Self>, budget: std::time::Duration) {
+    /// Whether any was.
+    fn apply_queued(self: &Rc<Self>, budget: std::time::Duration) -> bool {
         if self.queued.borrow().is_empty() {
-            return;
+            return false;
         }
         let monitor = self.perf.borrow().clone();
         let start = Instant::now();
@@ -847,13 +903,18 @@ impl Surface {
         if applied {
             self.write_animations();
         }
+        applied
     }
 
     /// Draws views whose drawing changed out of sight and that show now
     /// ([`Mounter::draw_when_shown`]); after anything that moves views.
     pub(crate) fn revisit(&self) {
-        if let Ok(mounter) = self.mounter.try_borrow() {
-            mounter.revisit();
+        // Taken before the pass: a move during it is revisited next frame.
+        let moves = crate::sight::moves();
+        if let Ok(mounter) = self.mounter.try_borrow()
+            && mounter.revisit()
+        {
+            self.revisited.set(moves);
         }
     }
 }

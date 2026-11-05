@@ -4,11 +4,8 @@
 //! gallery's own last demo among them), all still there after a restart
 //! (as the TSX gallery's `demos/Storage.tsx`).
 
-use nsh_base::alert_dialog;
-use nsh_core::{
-    storage::Storage,
-    ui::{AnyElement, prelude::*},
-};
+use nsh_base::{alert_dialog, input};
+use nsh_core::{element::AnyElement, prelude::*, storage::Storage};
 
 use crate::ui::{
     Badge, Button, ButtonVariant, Card, DemoPage, Figure, Finish, Finished, IconName, MONO, Row,
@@ -99,6 +96,7 @@ fn note_card(
                         .on_change(move |text: &str| write(text))
                         .placeholder("Write something, then come back to it")
                         .placeholder_color(|| color(colors::FAINT))
+                        .caret_color(|| color(colors::ACCENT))
                         .selection_color(|| color(colors::ACCENT))
                         .label("Note")
                         .h(px(120.0))
@@ -236,14 +234,17 @@ pub(crate) fn StorageDemo() -> impl IntoElement {
             .description(
                 "Removes every key the gallery keeps, the launch count and the note among them.",
             )
-            .cancel("Cancel")
-            .destructive("Clear")
+            .cancel("cancel", "Cancel")
+            .destructive("clear", "Clear")
             .close_on_escape(true)
             .close_on_backdrop_press(true)
             .show();
         owner.run(|| {
             spawn(async move {
-                if chosen.await != Ok(Some("Clear".into())) {
+                if !chosen
+                    .await
+                    .is_ok_and(|r| r.action.as_deref() == Some("clear"))
+                {
                     return;
                 }
                 Storage::clear();

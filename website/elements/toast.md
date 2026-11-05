@@ -1,7 +1,6 @@
 ---
 title: Toast
 description: "Toast, ToastStack and ToastManager: unstyled toasts as gpui-base's, a semantic root with a transition status, a stack that lays toasts out as layers, and their headless lifecycle."
-order: 29.5
 group: base
 demo: el-toast
 ---
@@ -26,7 +25,7 @@ built on `gpui-base`'s toasts.
 ```rust tabs
 use std::time::Duration;
 
-use nsh_core::{time::now, ui::prelude::*};
+use nsh_core::{time::now, prelude::*};
 
 use nsh_base::{
     Anchor, ToastManager, ToastMotion, ToastOptions, ToastStackState, theme, toast, toast_stack,
@@ -88,8 +87,8 @@ fn toasts() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { Overlay, signal, Text } from "nsh";
-import { safeArea, Toast, type ToastEntry, ToastManager, ToastStack } from "nsh/base";
+import { Overlay, signal, Text, safeArea } from "nsh";
+import { Toast, type ToastEntry, ToastManager, ToastStack } from "nsh/base";
 
 const manager = new ToastManager();
 const shown = signal<ToastEntry[]>([]);
@@ -108,7 +107,7 @@ export function toast(title: string) {
 export function Toaster() {
   return (
     <Overlay class="inset-x-0 bottom-0 items-center p-4" style={{ paddingBottom: safeArea().bottom + 16 }}>
-      <ToastStack placement="bottomCenter" class="w-80" onExpandedChange={expanded.set} onCancel={() => {
+      <ToastStack placement="bottomCenter" class="w-80" onExpandedChange={(e) => expanded.set(e.expanded)} onCancel={() => {
         const newest = shown().filter((t) => t.status !== "ending").at(-1);
         if (newest) { manager.dismiss(newest.id); sync(); }
       }}>
@@ -132,8 +131,8 @@ export function Toaster() {
 }
 ```
 
-`Toast`, `ToastStack` and `ToastManager` come from [`nsh/base`](../modules/nsh-base.md). In Rust import `toast` by
-name: the prelude's `toast` is Android's system toast (`Toast.show` of [`nsh/android`](../modules/nsh-android.md)).
+`Toast`, `ToastStack` and `ToastManager` come from [`nsh/base`](../modules/nsh-base.md). In Rust they are
+`nsh_base`'s `toast`, `toast_stack` and `ToastManager`.
 
 ## ToastManager
 
@@ -159,9 +158,10 @@ included).
 
 The stack's children are its toasts, oldest first. From its `placement` edge (`"topRight"` by default; the bottom
 anchors lay out upward), collapsed toasts overlap `collapsedPeek` apart, each further one narrower by
-`collapsedScaleStep`, and only `collapsedVisible` show; expanded, they are a list `expandedGap` apart. Toasts that
+`collapsedScaleStep`, and only `collapsedVisible` show; expanded, they are a list `expandedGap` apart (in a terminal three rows apart, so
+each toast's frame keeps a blank row from the next's). Toasts that
 arrive or leave, and expansion, move them with critically damped springs. It is expanded while the pointer is on it
-or a finger is down on it (`onExpandedChange(expanded)`; Rust `ToastStackState`, whose `is_expanded()` reads it), so
+or a finger is down on it (`onExpandedChange({ expanded })`; Rust `ToastStackState`, whose `is_expanded()` reads it), so
 the app pauses the timeouts while the user reads or touches the toasts.
 
 The app places the stack: in an [Overlay](./overlay.md) at the edge, inside the safe area. Its `class` and `style`
@@ -198,5 +198,5 @@ out and asks to be dismissed (`onDismissRequest`), short of it, it goes back. Th
 | `motion` | `.motion(..)` | `ToastMotion` | Sonner's | Its motion tokens. |
 | `placement` | `.placement(..)` | `"topLeft" \| "topCenter" \| "topRight" \| "bottomLeft" \| "bottomCenter" \| "bottomRight" \| "leftCenter" \| "rightCenter"` | `"topRight"` | The edge it lays out from. |
 | `closeOnEscape` | `.close_on_escape(..)` | `boolean` | `true` | It hears Escape and back while it holds toasts. |
-| `onExpandedChange` | `.on_expanded_change(..)`, `.state(..)` | `(expanded: boolean) => void` | none | Interaction expanded or collapsed it. |
+| `onExpandedChange` | `.on_expanded_change(..)`, `.state(..)` | `(e: { expanded: boolean }) => void` | none | Interaction expanded or collapsed it. |
 | `onCancel` | `.on_cancel(..)` | `() => void` | none | Escape or back: dismiss the newest. |

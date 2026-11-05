@@ -63,10 +63,6 @@ const WHEEL_IDLE: f64 = 150.0;
 /// After a trackpad gesture ends, the system's momentum begins within this
 /// long (ms), or there is none.
 const MOMENTUM_WAIT: f64 = 100.0;
-/// How far past the top a release must be to trigger a refresh.
-const REFRESH_PULL: f32 = 64.0;
-/// Space kept above the content while refreshing (the spinner's).
-const REFRESH_SPACE: f32 = 56.0;
 /// Duration of animated scrolls and bounces back (ms).
 const ANIMATION: f64 = 300.0;
 /// The release speed (points per ms) a settled mouse wheel snaps with:
@@ -245,7 +241,7 @@ fn limits(state: &ViewState) -> (f32, f32) {
     };
     let max = s.max((state.frame.size.width.0, state.frame.size.height.0));
     let min = if !s.horizontal && s.live.refreshing {
-        -REFRESH_SPACE
+        -s.behavior.refresh_inset().0
     } else {
         0.0
     };
@@ -334,7 +330,14 @@ pub(crate) fn can_bounce(view: &NshView, dx: f32, dy: f32) -> bool {
 }
 
 /// Sends `kind` with the offset if JS listens to it.
-fn emit(surface: &Surface, view: &NshView, kind: EventKind) {
+fn emit(surface: &Rc<Surface>, view: &NshView, kind: EventKind) {
+    if kind == EventKind::ScrollEnd {
+        // Snapping animated values that follow it settle.
+        let id = view.state().id;
+        if surface.anim.borrow_mut().scroll_ended(id) {
+            surface.ensure_ticking();
+        }
+    }
     let (id, x, y) = {
         let state = view.state();
         if !state.events.contains(kind) {
@@ -437,8 +440,14 @@ const COMMIT_MS: u64 = 140;
 /// puts AppKit's model right for the price of one walk per scroll.
 fn apply_offset(surface: &Rc<Surface>, view: &NshView) {
     let origin = bounds_origin(view);
+    // Every offset, inset and mirroring change comes through here: what
+    // shows under it changed ([`crate::sight`]).
+    crate::sight::moved();
     let committed = view.container_bounds_origin();
     view.set_layer_scroll(committed.0 - origin.0, committed.1 - origin.1);
+    // What it shows moved without a view moving: the effects around it
+    // (and a screen effect reading the surface) picture it again.
+    crate::shader::ui_changed(view);
     arm_commit(surface, view);
 }
 
@@ -581,7 +590,7 @@ fn commit(key: u64, id: nsh_core::NodeId) {
 /// Moves `view`'s main axis offset to `pos` (not clamped: drags rubber
 /// band) and updates everything that follows it.
 fn moved_to(surface: &Rc<Surface>, view: &NshView, pos: f32) {
-    let (id, x, y) = {
+    let (id, x, y, pulled) = {
         let mut state = view.state_mut();
         let Some(s) = state.scroll.as_mut() else {
             return;
@@ -590,6 +599,9 @@ fn moved_to(surface: &Rc<Surface>, view: &NshView, pos: f32) {
         if *target == pos {
             return;
         }
+        // How far it is pulled past its top, when that changes.
+        let pulled =
+            (!s.horizontal && (*target < 0.0 || pos < 0.0)).then(|| Points((-pos).max(0.0)));
         *target = pos;
         if s.indicator {
             s.live.shown = now();
@@ -598,7 +610,7 @@ fn moved_to(surface: &Rc<Surface>, view: &NshView, pos: f32) {
         }
         s.live.report = true;
         let (x, y) = reported(&state);
-        (state.id, x, y)
+        (state.id, x, y, pulled)
     };
     crate::surface::quiet(|| {
         apply_offset(surface, view);
@@ -606,7 +618,11 @@ fn moved_to(surface: &Rc<Surface>, view: &NshView, pos: f32) {
         update_overlays(view);
     });
     crate::input::content_moved(surface, true);
-    if surface.anim.borrow_mut().scrolled(id, x, y) && surface.mounter.try_borrow().is_ok() {
+    let mut fed = surface.anim.borrow_mut().scrolled(id, x, y);
+    if let Some(distance) = pulled {
+        fed |= surface.anim.borrow_mut().pulled(id, distance);
+    }
+    if fed && surface.mounter.try_borrow().is_ok() {
         // While a batch is applied the surface writes animations after it.
         surface.write_animations();
     }
@@ -741,21 +757,41 @@ fn ensure_ticking(surface: &Rc<Surface>, view: &NshView) {
         s.live.ticking = true;
     }
     let view = view.clone();
+    // Whether only the indicator's fade is left (the agent of `nsh test`
+    // does not wait for it).
+    let mut fading = false;
     surface.add_frame_callback(move |surface, now| {
-        let busy = tick(surface, &view, now * 1000.0);
-        if !busy && let Some(s) = view.state_mut().scroll.as_mut() {
+        let left = tick(surface, &view, now * 1000.0);
+        if (left == Tick::Fading) != fading {
+            fading = !fading;
+            surface.cosmetic_frame(fading);
+        }
+        if left == Tick::Done
+            && let Some(s) = view.state_mut().scroll.as_mut()
+        {
             s.live.ticking = false;
         }
-        busy
+        left != Tick::Done
     });
 }
 
-/// One frame of `view`'s motion; false when there is nothing left to do.
-fn tick(surface: &Rc<Surface>, view: &NshView, now: f64) -> bool {
+/// What a scroll view has left to do after a frame ([`tick`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tick {
+    /// Nothing: its frame callback ends.
+    Done,
+    /// Motion, input it waits for, or the refresh spinner.
+    Busy,
+    /// Only the indicator's fade.
+    Fading,
+}
+
+/// One frame of `view`'s motion.
+fn tick(surface: &Rc<Surface>, view: &NshView, now: f64) -> Tick {
     let sampled = {
         let mut state = view.state_mut();
         let Some(s) = state.scroll.as_mut() else {
-            return false;
+            return Tick::Done;
         };
         // Events still come in these phases: hold at the newest until the
         // next one, rather than ending.
@@ -781,7 +817,9 @@ fn tick(surface: &Rc<Surface>, view: &NshView, now: f64) -> bool {
     }
     let (phase, pos, (min, max)) = {
         let state = view.state();
-        let Some(s) = &state.scroll else { return false };
+        let Some(s) = &state.scroll else {
+            return Tick::Done;
+        };
         (s.live.phase, main(s), limits(&state))
     };
     match phase {
@@ -838,18 +876,13 @@ fn tick(surface: &Rc<Surface>, view: &NshView, now: f64) -> bool {
         _ => {}
     }
     report(surface, view);
-    let (busy, overlays) = {
+    let (left, overlays) = {
         let mut state = view.state_mut();
         let Some(s) = state.scroll.as_mut() else {
-            return false;
+            return Tick::Done;
         };
-        let mut busy = !matches!(
-            s.live.phase,
-            Phase::Idle
-                | Phase::Thumb { .. }
-                | Phase::Momentum
-                | Phase::Wheel { gesture: true, .. }
-        ) || s.live.resampled.is_some();
+        let resampling = s.live.resampled.is_some();
+        let mut fading = false;
         let mut overlays = false;
         if matches!(s.live.phase, Phase::Thumb { .. }) {
             // A held thumb stays until it is let go (`thumb_end`).
@@ -860,19 +893,45 @@ fn tick(surface: &Rc<Surface>, view: &NshView, now: f64) -> bool {
                 s.live.alpha = alpha;
                 overlays = true;
             }
-            busy |= alpha > 0.0;
+            fading = alpha > 0.0;
         }
-        if !s.horizontal && main(s) < 0.0 && s.live.refreshing {
+        let spinning = !s.horizontal
+            && main(s) < 0.0
+            && s.live.refreshing
+            && s.behavior.refresh_indicator.is_none();
+        if spinning {
             s.live.spin = ((now / 1000.0) as f32 * 2.0 * PI) % (2.0 * PI);
             overlays = true;
-            busy = true;
         }
-        (busy, overlays)
+        (
+            what_is_left(&s.live.phase, resampling, fading, spinning),
+            overlays,
+        )
     };
     if overlays {
         update_overlays(view);
     }
-    busy
+    left
+}
+
+/// What a scroll view in `phase` has left after a frame: its own motion
+/// (an animated scroll, a mouse wheel coming to rest, the wait for
+/// momentum), trackpad offsets still to show (`resampling`) or the
+/// refresh spinner (`spinning`) keep it busy; the phases events drive
+/// (a trackpad gesture, momentum, a held thumb) wait for them; the
+/// indicator's fade (`fading`) is all that may be left.
+fn what_is_left(phase: &Phase, resampling: bool, fading: bool, spinning: bool) -> Tick {
+    let moving = !matches!(
+        phase,
+        Phase::Idle | Phase::Thumb { .. } | Phase::Momentum | Phase::Wheel { gesture: true, .. }
+    );
+    if moving || resampling || spinning {
+        Tick::Busy
+    } else if fading {
+        Tick::Fading
+    } else {
+        Tick::Done
+    }
 }
 
 // The indicator and the refresh spinner.
@@ -1013,7 +1072,10 @@ fn update_overlays(view: &NshView) {
         }
     }
     // The refresh spinner.
-    let shows = !s.horizontal && s.y < 0.0 && (s.live.refreshing || refresh_listened);
+    let shows = !s.horizontal
+        && s.y < 0.0
+        && s.behavior.refresh_indicator.is_none()
+        && (s.live.refreshing || refresh_listened);
     if !shows {
         if let Some(layer) = &s.live.spinner {
             layer.setHidden(true);
@@ -1035,9 +1097,9 @@ fn update_overlays(view: &NshView) {
     let progress = if s.live.refreshing {
         1.0
     } else {
-        (-s.y / REFRESH_PULL).min(1.0)
+        (-s.y / s.behavior.refresh_threshold().0).min(1.0)
     };
-    let cy = s.behavior.content_inset.top.0 - s.y - REFRESH_SPACE / 2.0;
+    let cy = s.behavior.content_inset.top.0 - s.y - s.behavior.refresh_inset().0 / 2.0;
     layer.setBounds(rect(0.0, 0.0, 0.0, 0.0));
     layer.setPosition(CGPoint::new((w / 2.0) as f64, cy as f64));
     let shown = ((progress * SPOKES as f32).ceil() as usize).min(SPOKES);
@@ -1197,6 +1259,7 @@ pub(crate) fn config(
     view: &NshView,
     horizontal: bool,
     indicator: bool,
+    replaced: bool,
     mirrored: bool,
 ) {
     let changed = {
@@ -1207,8 +1270,9 @@ pub(crate) fn config(
         s.horizontal = horizontal;
         // A horizontal view keeps its indicator: it is the mouse's scroll
         // bar, and a mouse without a horizontal wheel has no other way
-        // to move it (mouse drags do not scroll).
-        s.indicator = indicator || horizontal;
+        // to move it (mouse drags do not scroll); a built-in bar of the
+        // app's (`replaced`) is the mouse's then.
+        s.indicator = indicator || (horizontal && !replaced);
         if !indicator {
             s.live.alpha = 0.0;
         }
@@ -1356,29 +1420,42 @@ pub(crate) fn sticky(surface: &Rc<Surface>, view: &NshView, cells: Vec<StickyCel
 }
 
 /// `ScrollBehavior`.
-pub(crate) fn behavior(_surface: &Rc<Surface>, view: &NshView, behavior: &ScrollBehavior) {
-    let inset = {
+pub(crate) fn behavior(surface: &Rc<Surface>, view: &NshView, behavior: &ScrollBehavior) {
+    let (inset, refresh, held) = {
         let mut state = view.state_mut();
         let Some(s) = state.scroll.as_mut() else {
             return;
         };
         let inset = s.behavior.content_inset != behavior.content_inset;
+        let refresh = s.behavior.refresh_indicator != behavior.refresh_indicator;
         s.behavior = behavior.clone();
         if !behavior.enabled && matches!(s.live.phase, Phase::Thumb { .. } | Phase::Wheel { .. }) {
             s.live.phase = Phase::Idle;
         }
-        inset
+        // A refresh in progress keeps the room of the indicator now showing.
+        let held = (refresh
+            && !s.horizontal
+            && s.live.refreshing
+            && main(s) < 0.0
+            && !matches!(s.live.phase, Phase::Wheel { gesture: true, .. }))
+        .then(|| behavior.refresh_inset().0);
+        (inset, refresh, held)
     };
     if inset {
-        apply_offset(_surface, view);
+        apply_offset(surface, view);
+    }
+    if inset || refresh {
         update_overlays(view);
+    }
+    if let Some(room) = held {
+        animate_to(surface, view, -room, ANIMATION, false, false);
     }
 }
 
 /// `Refreshing`: shows the spinner above the content (scrolling to it
 /// when at the top) or hides it.
 pub(crate) fn refreshing(surface: &Rc<Surface>, view: &NshView, refreshing: bool) {
-    let (pos, held) = {
+    let (pos, held, inset) = {
         let mut state = view.state_mut();
         let Some(s) = state.scroll.as_mut() else {
             return;
@@ -1390,6 +1467,7 @@ pub(crate) fn refreshing(surface: &Rc<Surface>, view: &NshView, refreshing: bool
         (
             main(s),
             matches!(s.live.phase, Phase::Wheel { gesture: true, .. }),
+            s.behavior.refresh_inset().0,
         )
     };
     update_overlays(view);
@@ -1397,7 +1475,7 @@ pub(crate) fn refreshing(surface: &Rc<Surface>, view: &NshView, refreshing: bool
         return;
     }
     if refreshing && pos <= 0.5 {
-        animate_to(surface, view, -REFRESH_SPACE, ANIMATION, false, false);
+        animate_to(surface, view, -inset, ANIMATION, false, false);
     } else if !refreshing && pos < 0.0 {
         animate_to(surface, view, 0.0, ANIMATION, false, false);
     }
@@ -1464,7 +1542,7 @@ fn pulled_to_refresh(surface: &Surface, view: &NshView) -> bool {
         !s.horizontal
             && !s.live.refreshing
             && state.events.contains(EventKind::Refresh)
-            && main(s) <= -REFRESH_PULL
+            && s.behavior.refreshes(Points(main(s)))
     };
     if refresh {
         // Shown right away, as UIRefreshControl does; JS turns it off.
@@ -1982,6 +2060,34 @@ mod tests {
         let mut rested = Some(0.0);
         assert!(!commit_due(5000.0, 4900.0, false, true, &mut rested));
         assert_eq!(rested, None);
+    }
+
+    /// A keyboard scroll keeps the view busy while it moves; then only its
+    /// indicator's fade is left, which `nsh test`'s agent does not wait for
+    /// (`Surface::animating`); the spinner and resampled offsets stay busy.
+    #[test]
+    fn only_the_indicators_fade_is_cosmetic() {
+        let gliding = Phase::Animate {
+            from: 0.0,
+            to: 40.0,
+            start: 0.0,
+            duration: KEY_ANIMATION,
+            momentum: false,
+            end: true,
+        };
+        assert_eq!(what_is_left(&gliding, false, true, false), Tick::Busy);
+        assert_eq!(what_is_left(&Phase::Idle, false, true, false), Tick::Fading);
+        assert_eq!(what_is_left(&Phase::Idle, false, false, false), Tick::Done);
+        assert_eq!(what_is_left(&Phase::Idle, true, true, false), Tick::Busy);
+        assert_eq!(what_is_left(&Phase::Idle, false, true, true), Tick::Busy);
+        assert_eq!(
+            what_is_left(&Phase::AwaitMomentum { since: 0.0 }, false, true, false),
+            Tick::Busy
+        );
+        assert_eq!(
+            what_is_left(&Phase::Momentum, false, true, false),
+            Tick::Fading
+        );
     }
 
     #[test]

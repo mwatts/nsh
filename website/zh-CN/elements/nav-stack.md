@@ -1,7 +1,6 @@
 ---
 title: NavStack
 description: 原生导航栈：NavStack、NavPage 与 createNavStack，页面的推入与弹出、标题栏插槽、离开页面，以及各平台如何呈现导航栈。
-order: 22
 group: base
 demo: ui-navigation
 ---
@@ -14,7 +13,7 @@ demo: ui-navigation
 
 ```rust tabs
 use nsh_base::{button, nav_page, nav_stack};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 /// A button with the app's look.
 fn action(title: &'static str, on_press: impl Fn() + 'static) -> impl IntoElement {
@@ -221,6 +220,7 @@ TSX 的子函数接收路由值本身，以及一个表示它在栈中位置的 
 | `popOnBack` | `.pop_on_back(..)` | `boolean` | `true` | 返回按钮和侧滑返回会弹出页面。见[离开页面](#leaving-a-page)。 |
 | `popOnSwipe` | `.pop_on_swipe(..)` | `boolean` | `true` | 交互式返回手势会弹出页面：iOS 的侧滑返回、Android 跟随手指的预测性返回。返回按钮在任何情况下都会弹出页面。 |
 | `animation` | `.animation(..)` | `"default" \| "slide" \| "fade" \| "none"` | `"default"` | 页面进入和离开的方式。 |
+| `transitionShader` | `.transition_shader(TransitionShader::new(program))` | `{ source: string; uniforms?: Record<string, ShaderUniform>; duration?: number }` | 无 | 页面通过一个 WGSL 着色器进入和离开，取代它的 `animation`：`shade(uv)` 以 `sample_from` 读取下面的页面、以 `sample_to` 读取这个页面，`nsh.progress` 在 `duration` 毫秒内（默认 350）从 0 走到 1，页面离开时从 1 回到 0。系统要求减少动态效果时，页面使用自己的 `animation`。见 [Shader](./shader.md)。 |
 | `statusBar` | `.status_bar(..)` | `{ foreground?, hidden?, animated? }` | 无 | iOS 和 Android：页面位于顶部时的状态栏。见[状态栏](../modules/nsh-base.md#status-bar)。 |
 | `style`、`class` | 样式方法 | | 无 | 页面的样式。 |
 | `children` | `.child(..)` | `JSX.Element` | 无 | 内容。 |
@@ -243,7 +243,7 @@ TSX 的子函数接收路由值本身，以及一个表示它在栈中位置的 
 
 ```rust tabs
 use nsh_base::nav_page;
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn profile(edit: impl Fn() + 'static) -> Screen {
     nav_page()
@@ -266,7 +266,11 @@ fn profile(edit: impl Fn() + 'static) -> Screen {
 </NavPage>
 ```
 
-页面的内容从标题栏下方开始：在 iOS 和 Android 上位于不透明的系统标题栏之下，在桌面平台和 Web 上位于 `header` 之下。使用 `headerTransparent`、`headerLargeTitle` 或 `headerVisible={false}` 时，在 iOS 和 Android 上内容从页面顶部开始；用 [SafeAreaView](./safe-area-view.md) 或 `safeAreaInsets()` 让它避开标题栏和状态栏。
+页面的内容从标题栏下方开始：在 iOS 和 Android 上位于不透明的系统标题栏之下，在桌面平台和 Web 上位于 `header` 之下。使用 `headerTransparent`、`headerLargeTitle` 或 `headerVisible={false}` 时，在 iOS 和 Android 上内容从页面顶部开始；用 [`env(safe-area-inset-top)`](./safe-area.md) 或 `safeAreaInsets()` 让它避开标题栏和状态栏。
+
+在 iOS 上，设置 `headerVisible={false}` 的页面在 `popOnSwipe` 和 `popOnBack` 为 true 时仍支持侧滑返回。
+允许的交互式返回手势在转场开始时结束当前输入，键盘在拖动过程中收起。取消转场时，若其他控件没有取得焦点，
+会恢复原输入框的焦点。
 
 ```rust tabs
 nav_page()
@@ -289,7 +293,7 @@ nav_page()
 
 ```rust tabs
 use nsh_base::{alert_dialog, nav_page};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn edit_note(routes: Signal<Vec<u32>>) -> Screen {
     let note = signal(String::new());
@@ -297,11 +301,11 @@ fn edit_note(routes: Signal<Vec<u32>>) -> Screen {
         spawn(async move {
             let choice = alert_dialog()
                 .title("Discard your changes?")
-                .cancel("Keep editing")
-                .destructive("Discard")
+                .cancel("keep", "Keep editing")
+                .destructive("discard", "Discard")
                 .show()
                 .await;
-            if choice.ok().flatten().as_deref() == Some("Discard") {
+            if choice.is_ok_and(|r| r.action.as_deref() == Some("discard")) {
                 routes.update(|r| {
                     r.pop();
                 });
@@ -326,24 +330,24 @@ fn edit_note(routes: Signal<Vec<u32>>) -> Screen {
 ```
 
 ```tsx tabs
-import { Input, signal } from "nsh";
-import { AlertDialog, NavPage } from "nsh/base";
+import { signal } from "nsh";
+import { AlertDialog, NavPage, Input } from "nsh/base";
 
 function EditNote() {
   const text = signal("");
   const confirm = async () => {
-    const choice = await AlertDialog.show({
+    const { action } = await AlertDialog.show({
       title: "Discard your changes?",
       actions: [
-        { label: "Keep editing", role: "cancel" },
+        { label: "Keep editing", role: "cancel", id: "keep" },
         { label: "Discard", role: "destructive", id: "discard" },
       ],
     });
-    if (choice === "discard") nav.pop();
+    if (action === "discard") nav.pop();
   };
   return (
     <NavPage title="Edit" popOnBack={text().length === 0} onBackPress={() => text().length > 0 && confirm()}>
-      <Input value={text()} onChange={(v) => text.set(v)} placeholder="A note" />
+      <Input value={text()} onChange={({ value }) => text.set(value)} placeholder="A note" />
     </NavPage>
   );
 }
@@ -359,7 +363,7 @@ function EditNote() {
 ## 平台说明
 
 - **iOS**：`UINavigationController`，带系统标题栏、返回按钮和侧滑返回；`headerLargeTitle` 是 UIKit 的大标题。转场进行期间到达的栈变化会在转场结束时应用。
-- **Android**：带工具栏的页面栈。系统返回键弹出顶部页面，在支持的 Android 版本上带预测性返回；向上箭头给屏幕阅读器的描述是下面那个页面的 `headerBackTitle`，否则为系统的描述。要自己处理返回键，见 [nsh/android](../modules/nsh-android.md) 中的 `BackHandler`。
+- **Android**：带工具栏的页面栈。系统返回键弹出顶部页面，在支持的 Android 版本上带预测性返回；向上箭头给屏幕阅读器的描述是下面那个页面的 `headerBackTitle`，否则为系统的描述。要自己处理返回键，见 [`BackHandler`](../modules/nsh-mobile.md#backhandler) 中的 `BackHandler`。
 - **Mac Catalyst**：与 iOS 相同。
 - **桌面平台（macOS、Windows、Linux、GPUI）和 Web**：每个页面在顶部显示它的 `header`，内容位于其下方。桌面平台上 Escape、Alt+左方向键和鼠标的后退键返回，Web 上是浏览器的后退按钮。
 

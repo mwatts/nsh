@@ -43,6 +43,9 @@
 //! Focus is one field per surface. The window's (and the embedding app's)
 //! focus is followed apart from it: a surface that is not focused keeps
 //! its focused field (with no caret) and gets it back when focused again.
+//! Text typed after Enter, a binding, or a focus move waits until the
+//! engine has handled that key, then goes to the field that has the
+//! keyboard.
 //!
 //! Return follows the config's `submit()`: a single line submits; a
 //! multiline input whose return submits does so on a plain return (or
@@ -75,7 +78,7 @@ use std::{
 
 use gpui::{Font, FontFeatures, FontStyle, FontWeight, SharedString, TextSystem, px};
 use nsh_core::{
-    AutoCapitalize, Color, EventKind, EventPayload, InputConfig, PayloadValue, Points,
+    AutoCapitalize, Color, EventKind, EventPayload, InputConfig, NodeId, PayloadValue, Points,
     ReturnKeyType, SubmitBehavior, TextAlign,
     tailwind::state,
     text_edit::{self as model, Composition, Model, Unit, key_of, pasted, utf16_to_byte},
@@ -99,6 +102,17 @@ const CARET_WIDTH: f32 = 1.0;
 
 /// How long the caret shows, and then hides, while it blinks (ms).
 const BLINK_MS: u64 = 530;
+
+/// How many blinks the caret makes after the last edit, caret move or
+/// focus change before it stays shown: GTK's `gtk-cursor-blink-timeout`
+/// (10 s), as GTK apps on Linux do. Each blink draws a frame, so a field
+/// left focused would otherwise wake the process and the GPU twice a second
+/// for as long as the window stays open. macOS and Windows blink for good.
+const BLINKS: Option<u32> = if cfg!(target_os = "linux") {
+    Some((10_000 / BLINK_MS) as u32)
+} else {
+    None
+};
 
 /// What a drag that started with a press selects by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +139,8 @@ pub(crate) struct InputState {
     /// The surface's key ([`Surface::by_key`]): `focus()` and `blur()`
     /// come with the view only.
     surface: u64,
+    /// The input view's node (`EngineControl::input_scroll`).
+    id: NodeId,
     /// The app's text system (`None` outside a GPUI app: nothing is laid
     /// out).
     system: Option<Arc<TextSystem>>,
@@ -160,6 +176,10 @@ pub(crate) struct InputState {
     /// Scroll offset of the text: horizontal for one line, vertical for
     /// several.
     scroll: Cell<f32>,
+    /// The scroll of several lines as last reported to a built-in bar
+    /// (`InputConfig::replaced`): offset, text height, width, viewport
+    /// height. `None` until reported (again).
+    reported_scroll: Cell<Option<(f32, f32, f32, f32)>>,
     /// The x the caret keeps while it moves up and down lines.
     goal_x: Cell<Option<f32>>,
     /// A press is selecting.
@@ -173,9 +193,10 @@ pub(crate) struct InputState {
 }
 
 impl InputState {
-    fn new(surface: u64, system: Option<Arc<TextSystem>>) -> Self {
+    fn new(surface: u64, id: NodeId, system: Option<Arc<TextSystem>>) -> Self {
         InputState {
             surface,
+            id,
             system,
             model: RefCell::default(),
             config: RefCell::default(),
@@ -192,6 +213,7 @@ impl InputState {
             active: Cell::new(true),
             caret_on: Cell::new(true),
             scroll: Cell::new(0.0),
+            reported_scroll: Cell::new(None),
             goal_x: Cell::new(None),
             drag: Cell::new(None),
             style: RefCell::new(None),
@@ -391,6 +413,39 @@ impl InputState {
         self.origin(&layout);
     }
 
+    /// Reports how far several lines scrolled, the text's height and the
+    /// viewport's to the built-in bar that takes the place of an
+    /// indicator (`InputConfig::replaced`), when any of them changed since
+    /// last reported. Called with the clamped scroll ([`InputState::origin`]).
+    fn report_scroll(&self, layout: &Layout) {
+        {
+            let config = self.config.borrow();
+            if !config.replaced || !config.multiline {
+                return;
+            }
+        }
+        let (w, h) = self.size.get();
+        if w <= 0.0 || h <= 0.0 {
+            return;
+        }
+        let content = layout.height.max(h);
+        let now = (self.scroll.get(), content, w, h);
+        if self.reported_scroll.replace(Some(now)) == Some(now) {
+            return;
+        }
+        let Some(surface) = Surface::by_key(self.surface) else {
+            return;
+        };
+        surface.control(|c| {
+            c.input_scroll(
+                self.id,
+                nsh_core::geometry::point(Points::ZERO, Points(now.0)),
+                nsh_core::geometry::size(Points(w), Points(content)),
+                nsh_core::geometry::size(Points(w), Points(h)),
+            );
+        });
+    }
+
     /// The caret shows (again) for a whole blink: typing and moving never
     /// leave it hidden.
     fn wake_caret(&self) {
@@ -419,6 +474,9 @@ impl Hosted for InputState {
             cx.push_clip_rect(0.0, -1.0e4, w, 2.0e4);
         }
         let (ox, oy) = self.origin(&layout);
+        // Every change of the scroll, the text or the size draws again, so
+        // a built-in bar hears of each here.
+        self.report_scroll(&layout);
         let config = self.config.borrow();
         let model = self.model.borrow();
         let secure = config.secure;
@@ -499,11 +557,11 @@ impl Hosted for InputState {
             && (!model.has_selection() || composing);
         if caret_shown {
             let pos = model.display_caret(secure);
-            let (x, y, ch) = layout.caret(pos);
+            let (x, y, ch) = layout.drawn_caret(pos);
             // On whole pixels, so that the caret stays sharp.
             let snap = |v: f32| (v * cx.scale).round() / cx.scale;
             let x = snap(ox + x);
-            let tint = config.selection_color.unwrap_or(color);
+            let tint = config.caret_color.unwrap_or(color);
             cx.fill_rect(
                 crate::geom::rect(x, oy + y, CARET_WIDTH, ch),
                 [0.0; 4],
@@ -601,9 +659,9 @@ enum Held {
 struct Focus {
     view: Option<NshView>,
     inactive: bool,
-    /// Text typed after an action that can move focus, before a field
-    /// takes the keyboard, and the keys typed after that text. The next
-    /// field takes them, in order, before its own later text.
+    /// Text typed after an action that can move focus, and the editing
+    /// keys typed after that text. The field that has the keyboard when
+    /// the engine catches up takes them, in order.
     pending: VecDeque<Held>,
     /// [`Surface::clock`] time after which `pending` is dropped. None when
     /// nothing armed the queue.
@@ -707,7 +765,7 @@ fn set_focus(surface: &Rc<Surface>, view: Option<&NshView>) {
     if old.as_ref() != view {
         move_focus(surface, view, old.as_ref());
         // The new field's value may still be on its way from the engine,
-        // after what the old one reported: text typed now waits for it.
+        // after what the old one reported. Text typed now waits for it.
         if view.is_some() {
             arm(surface);
         }
@@ -804,7 +862,7 @@ pub(crate) fn arm(surface: &Surface) {
     });
 }
 
-/// The engine has not yet handled the action that armed the queue: the
+/// The engine has not yet handled the action that armed the queue. The
 /// field with the keyboard may be about to lose it.
 fn behind(surface: &Surface) -> bool {
     let after = FOCUS.with(|f| f.borrow().get(&surface.key()).map_or(0, |f| f.after));
@@ -812,7 +870,7 @@ fn behind(surface: &Surface) -> bool {
 }
 
 /// The engine handled more events ([`Surface::events_handled`]), and what
-/// they changed is applied: what waits goes to the field that now has the
+/// they changed is applied. What waits goes to the field that now has the
 /// keyboard.
 pub(crate) fn engine_caught_up(surface: &Rc<Surface>) {
     if armed(surface) && !behind(surface) {
@@ -821,8 +879,8 @@ pub(crate) fn engine_caught_up(surface: &Rc<Surface>) {
 }
 
 /// Keeps a key down for the next field when text typed before it waits
-/// there: the key comes after that text. True when kept. A key that types
-/// a character is not kept: its text comes through the input method, and
+/// there. The key comes after that text. True when kept. A key that types
+/// a character is not kept. Its text comes through the input method, and
 /// waits as text.
 pub(crate) fn hold_key(surface: &Surface, event: &KeyEvent) -> bool {
     let m = event.modifiers;
@@ -1060,6 +1118,28 @@ pub(crate) fn window_focus(surface: &Rc<Surface>, has_focus: bool) -> bool {
     input.caret_on.set(true);
     view.changed();
     true
+}
+
+/// The surface's window was presented or stopped being presented
+/// (`observe_window_visibility`). A hidden window draws no frames, but a
+/// window that keeps the keyboard while hidden would still blink its
+/// caret: the timer, the view's notify and GPUI's frame request woke the
+/// process twice a second for nothing. Shown again, the caret shows at
+/// once and blinks from there.
+/// The state is the surface's, not its focus entry's, so a reload while
+/// hidden (which forgets the focus) keeps the caret still.
+pub(crate) fn window_visibility(surface: &Rc<Surface>, visible: bool) {
+    if surface.window_hidden.replace(!visible) == !visible {
+        return;
+    }
+    if visible
+        && let Some(view) = focused(surface)
+        && let Some(input) = input_of(&view)
+    {
+        input.caret_on.set(true);
+        view.changed();
+    }
+    blink::update();
 }
 
 /// The surface with `key` stopped (its app or its view went): its focus
@@ -1650,7 +1730,7 @@ fn return_key(behavior: SubmitBehavior, multiline: bool, modifiers: Modifiers) -
 /// Sets up an input view.
 pub(crate) fn create(surface: &Rc<Surface>, view: &NshView) {
     let system = surface.text_system.borrow().clone();
-    let input = Rc::new(InputState::new(surface.key(), system));
+    let input = Rc::new(InputState::new(surface.key(), view.id(), system));
     input.active.set(window_active(surface));
     view.state_mut().input = Some(input);
 }
@@ -1690,6 +1770,16 @@ pub(crate) fn config(surface: &Rc<Surface>, view: &NshView, config: &InputConfig
         auto_focus(surface, view);
     }
     place(view, &input);
+    // A built-in bar (newly) taking the indicator's place hears where the
+    // text is now, once placed (else on the first draw).
+    input.reported_scroll.set(None);
+    if config.replaced
+        && config.multiline
+        && let Some(layout) = input.layout()
+    {
+        input.origin(&layout);
+        input.report_scroll(&layout);
+    }
 }
 
 /// Focuses the field once it is on screen (the batch that made it may
@@ -1981,6 +2071,7 @@ pub(crate) fn wheel(view: &NshView, dy: f32) -> bool {
     let moved = input.scroll.get() != before;
     if moved {
         view.changed();
+        input.report_scroll(&layout);
         if input.focused.get()
             && let Some(surface) = surface_of(view)
         {
@@ -1988,6 +2079,33 @@ pub(crate) fn wheel(view: &NshView, dy: f32) -> bool {
         }
     }
     moved
+}
+
+/// `Command::ScrollTo` for a multiline input: scrolls its text to `y`,
+/// clamped to the lines that do not fit (a built-in bar's drags).
+pub(crate) fn scroll_to(view: &NshView, y: Points) {
+    let Some(input) = input_of(view) else {
+        return;
+    };
+    if !input.multiline() {
+        return;
+    }
+    let Some(layout) = input.layout() else {
+        return;
+    };
+    let before = input.scroll.get();
+    input.scroll.set(y.0);
+    // Clamped to the text.
+    input.origin(&layout);
+    if input.scroll.get() != before {
+        view.changed();
+        input.report_scroll(&layout);
+        if input.focused.get()
+            && let Some(surface) = surface_of(view)
+        {
+            report_caret(&surface, view, &input);
+        }
+    }
 }
 
 /// A right click on field `view`: it takes the focus (keeping its
@@ -2415,7 +2533,8 @@ fn vertical(input: &InputState, down: bool, page: bool) -> usize {
 // --- The caret's blinking ----------------------------------------------------
 
 /// The caret blinks on one main-thread timer for all surfaces, running
-/// only while some field has the focus of a focused surface; restarting
+/// only while some field has the focus of a focused surface whose window
+/// is presented; restarting
 /// it (typing, moving) starts a new generation, and older timers stop.
 mod blink {
     use std::cell::Cell;
@@ -2427,6 +2546,8 @@ mod blink {
         static GENERATION: Cell<u64> = const { Cell::new(0) };
         /// A timer runs.
         static RUNNING: Cell<bool> = const { Cell::new(false) };
+        /// Blinks made since the timer started over.
+        static BLINKED: Cell<u32> = const { Cell::new(0) };
     }
 
     /// The fields whose caret shows now.
@@ -2434,7 +2555,9 @@ mod blink {
         FOCUS.with(|f| {
             f.borrow()
                 .iter()
-                .filter(|(key, f)| !f.inactive && Surface::by_key(**key).is_some())
+                .filter(|(key, f)| {
+                    !f.inactive && Surface::by_key(**key).is_some_and(|s| !s.window_hidden.get())
+                })
                 .filter_map(|(_, f)| f.view.clone())
                 .collect()
         })
@@ -2461,7 +2584,13 @@ mod blink {
             g.get()
         });
         RUNNING.with(|r| r.set(true));
+        BLINKED.with(|b| b.set(0));
         schedule(generation);
+    }
+
+    /// Whether the caret has blinked for long enough: it stays shown.
+    pub(super) fn tired(blinked: u32) -> bool {
+        BLINKS.is_some_and(|n| blinked >= n)
     }
 
     fn schedule(generation: u64) {
@@ -2474,11 +2603,24 @@ mod blink {
                 RUNNING.with(|r| r.set(false));
                 return;
             }
+            let blinked = BLINKED.with(|b| {
+                b.set(b.get() + 1);
+                b.get()
+            });
+            // Done blinking: the caret stays shown (and the timer stops)
+            // until the next edit, caret move or focus change starts it over.
+            let tired = tired(blinked);
             for view in views {
                 if let Some(input) = input_of(&view) {
-                    input.caret_on.set(!input.caret_on.get());
-                    view.changed();
+                    let on = tired || !input.caret_on.get();
+                    if input.caret_on.replace(on) != on {
+                        view.changed();
+                    }
                 }
+            }
+            if tired {
+                RUNNING.with(|r| r.set(false));
+                return;
             }
             schedule(generation);
         });
@@ -2576,7 +2718,7 @@ mod tests {
                 Focus {
                     view: Some(view),
                     inactive: false,
-                    ..Focus::default()
+                    ..Default::default()
                 },
             )
         });
@@ -2584,6 +2726,67 @@ mod tests {
         assert!(blink::carets().is_empty());
         surface_stopped(key);
         assert!(FOCUS.with(|f| !f.borrow().contains_key(&key)));
+    }
+
+    /// A field keeps the focus of a window that is no longer presented,
+    /// but its caret stops blinking until the window is shown again.
+    #[test]
+    fn hidden_windows_blink_no_caret() {
+        let surface = Surface::new(nsh_engine::Environment::default());
+        let view = NshView::new(2, nsh_core::ViewKind::Input);
+        FOCUS.with(|f| {
+            f.borrow_mut().insert(
+                surface.key(),
+                Focus {
+                    view: Some(view),
+                    ..Default::default()
+                },
+            )
+        });
+        assert_eq!(blink::carets().len(), 1);
+        window_visibility(&surface, false);
+        assert!(blink::carets().is_empty());
+        // The field keeps the focus.
+        assert!(FOCUS.with(|f| f.borrow()[&surface.key()].view.is_some()));
+        // Shown again, it blinks.
+        window_visibility(&surface, true);
+        assert!(!surface.window_hidden.get());
+        surface_stopped(surface.key());
+    }
+
+    /// A reload while the window is hidden forgets the focus but not the
+    /// window's visibility: the field the reloaded app focuses (autoFocus)
+    /// does not blink until the window is shown.
+    #[test]
+    fn a_reload_while_hidden_keeps_the_caret_still() {
+        let surface = Surface::new(nsh_engine::Environment::default());
+        window_visibility(&surface, false);
+        // `Surface::stop` (a reload) forgets the surface's focus.
+        surface_stopped(surface.key());
+        let view = NshView::new(3, nsh_core::ViewKind::Input);
+        FOCUS.with(|f| {
+            f.borrow_mut().insert(
+                surface.key(),
+                Focus {
+                    view: Some(view),
+                    ..Default::default()
+                },
+            )
+        });
+        assert!(blink::carets().is_empty());
+        // Shown again, it blinks (the test's field, never mounted, is then
+        // dropped as a removed one would be).
+        window_visibility(&surface, true);
+        assert!(!surface.window_hidden.get());
+        surface_stopped(surface.key());
+    }
+
+    /// On Linux the caret stops blinking, shown, after GTK's ten seconds.
+    #[test]
+    fn carets_stop_blinking() {
+        assert!(!blink::tired(0));
+        assert_eq!(blink::tired(18), cfg!(target_os = "linux"));
+        assert_eq!(blink::tired(u32::MAX), BLINKS.is_some());
     }
 
     /// What the input method sees of a composition.

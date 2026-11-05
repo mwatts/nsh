@@ -14,9 +14,10 @@
 //! `accessibilityRole`. Other views are plain containers: they are
 //! flattened, their elements becoming children of the nearest element
 //! above. `accessibilityElementsHidden`, `importantForAccessibility:
-//! "no-hide-descendants"` and screens below the top of a stack hide a
-//! whole subtree; `importantForAccessibility: "no"` / `accessible={false}`
-//! only the view itself.
+//! "no-hide-descendants"`, `visibility: hidden` (as in a browser) and
+//! screens below the top of a stack hide a whole subtree;
+//! `importantForAccessibility: "no"` / `accessible={false}` only the view
+//! itself.
 //!
 //! Buttons, links, checkboxes, tabs, ... and `accessible={true}` views
 //! group their content, as iOS and Android do: texts, images and groups
@@ -31,9 +32,9 @@
 //! help text, and the patterns its role and state call for: Invoke
 //! (presses; [`activate`] sends the press as a tap would, or the
 //! `activate` action), Toggle (`accessibilityState.checked`),
-//! ExpandCollapse (`expanded`), SelectionItem (tabs, radios, `selected`),
-//! RangeValue (the `accessibilityValue` of sliders, progress bars, ...),
-//! Value (inputs) and Scroll (scroll views).
+//! ExpandCollapse (`expanded`), SelectionItem (tabs, radios, options,
+//! `selected`), RangeValue (the `accessibilityValue` of sliders, progress
+//! bars, ...), Value (inputs) and Scroll (scroll views).
 //!
 //! Events are raised only while a client listens (`UiaClientsAreListening`,
 //! checked once per batch): the mount hooks queue the views a batch
@@ -50,7 +51,7 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 
 use nsh_core::{
     Accessibility, AccessibilityRole as Role, AttributedText, Checked, EventKind, EventMask,
-    LiveRegion, MountBatch, MountItem, NodeId, ViewKind,
+    LiveRegion, MountBatch, MountItem, NodeId, ViewKind, ViewStyle,
 };
 use rustc_hash::FxHashMap;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
@@ -137,12 +138,22 @@ pub(crate) enum Control {
     ToolBar,
     /// `UIA_ListControlTypeId`.
     List,
+    /// `UIA_ListItemControlTypeId`.
+    ListItem,
     /// A group read as "grid" (UIA's data grids need the Grid pattern).
     Grid,
     /// `UIA_GroupControlTypeId`.
     Group,
     /// `UIA_PaneControlTypeId` (scroll views).
     Pane,
+    /// A group that is a region landmark (ARIA's `region`).
+    Region,
+    /// A group that is a navigation landmark (ARIA's `navigation`).
+    Navigation,
+    /// `UIA_TreeControlTypeId`.
+    Tree,
+    /// `UIA_TreeItemControlTypeId`.
+    TreeItem,
 }
 
 impl Control {
@@ -171,6 +182,8 @@ impl Control {
                 | Control::Switch
                 | Control::TabItem
                 | Control::MenuItem
+                | Control::ListItem
+                | Control::TreeItem
         )
     }
 
@@ -198,6 +211,8 @@ impl Control {
                 | Control::Spinner
                 | Control::Switch
                 | Control::TabItem
+                | Control::ListItem
+                | Control::TreeItem
         )
     }
 
@@ -280,7 +295,7 @@ pub(crate) fn control_for(a: &Accessibility, kind: ViewKind, pressable: bool) ->
         Role::Combobox => Control::ComboBox,
         Role::Menu => Control::Menu,
         Role::Menubar => Control::MenuBar,
-        Role::Menuitem => Control::MenuItem,
+        Role::Menuitem | Role::MenuItemCheckbox | Role::MenuItemRadio => Control::MenuItem,
         Role::Progressbar => Control::ProgressBar,
         Role::Radio => Control::RadioButton,
         Role::Radiogroup => Control::RadioGroup,
@@ -291,15 +306,32 @@ pub(crate) fn control_for(a: &Accessibility, kind: ViewKind, pressable: bool) ->
         Role::Tablist => Control::TabList,
         Role::Timer => Control::Timer,
         Role::Toolbar => Control::ToolBar,
-        Role::List => Control::List,
-        Role::Grid => Control::Grid,
+        // A listbox is UIA's list, as browsers map ARIA's `listbox`.
+        Role::List | Role::Listbox => Control::List,
+        Role::Option => Control::ListItem,
+        Role::Grid | Role::Table => Control::Grid,
+        Role::Row | Role::Cell | Role::ColumnHeader | Role::RowGroup | Role::Group => {
+            Control::Group
+        }
+        Role::Region => Control::Region,
+        Role::Navigation => Control::Navigation,
+        Role::Tree => Control::Tree,
+        Role::TreeItem => Control::TreeItem,
     })
+}
+
+/// The toggle state of `a` (the Toggle pattern's): a checkable element's
+/// checked state, else a toggle button's pressed state.
+pub(crate) fn toggled(a: &Accessibility) -> Option<Checked> {
+    a.state.checked.or(a.state.pressed)
 }
 
 /// How the view of `s` takes part in the tree (its own state only).
 pub(crate) fn part(s: &ViewState) -> Part {
     let a = &s.props.accessibility;
-    if s.concealed || a.hidden {
+    // `visibility: hidden` takes the subtree out, as a browser does: what
+    // is not drawn is not read either.
+    if s.concealed || s.style.hidden || a.hidden {
         return Part::Hidden;
     }
     match control_for(a, s.kind, is_pressable(s.events)) {
@@ -508,7 +540,7 @@ fn spec_of(s: &ViewState) -> Spec {
         help: help_of(a, control),
         disabled: a.state.disabled,
         selected: a.state.selected,
-        checked: a.state.checked,
+        checked: toggled(a),
         expanded: a.state.expanded,
         busy: a.state.busy,
         now: a.value.as_ref().and_then(|v| v.now),
@@ -716,6 +748,13 @@ pub(crate) fn text_changed(view: &NshView) {
     mark(view);
 }
 
+/// The view's style changed: `visibility` hides or shows its subtree.
+pub(crate) fn style_changed(view: &NshView, old: &ViewStyle) {
+    if view.state().style.hidden != old.hidden {
+        mark(view);
+    }
+}
+
 /// `AccessibilityLabel`: the view's label changed, and nothing else. The
 /// label is kept in the view's props, so that the next `ViewProps` diffs
 /// against it.
@@ -906,6 +945,8 @@ mod tests {
             (Role::List, Control::List),
             (Role::Radio, Control::RadioButton),
             (Role::Menuitem, Control::MenuItem),
+            (Role::Listbox, Control::List),
+            (Role::Option, Control::ListItem),
         ] {
             assert_eq!(
                 control_for(&with_role(role), ViewKind::View, false),
@@ -969,7 +1010,7 @@ mod tests {
     ///   └ 22 text "Footer"
     fn tree() -> (NshView, Vec<NshView>) {
         let root = view(0, ViewKind::View, Accessibility::default());
-        root.set_invalidate(Rc::new(|| {}));
+        root.set_invalidate(Rc::new(|_| {}));
         let plain = view(2, ViewKind::View, Accessibility::default());
         let title = text(4, "Title");
         let button = pressable(6, Accessibility::default());
@@ -1042,6 +1083,26 @@ mod tests {
         // A detached view is not available.
         let lone = text(30, "lone");
         assert_eq!(exposed(&lone), Err(()));
+    }
+
+    /// `visibility: hidden` takes the view and its subtree out of the tree,
+    /// as a browser does, and showing it again brings them back.
+    #[test]
+    fn a_hidden_style_hides_the_subtree() {
+        let (root, all) = tree();
+        let plain = find(&all, 2);
+        plain.state_mut().style.hidden = true;
+        assert_eq!(part(&plain.state()), Part::Hidden);
+        assert_eq!(ids(&element_children(&root, true)), [22]);
+        assert_eq!(exposed(&find(&all, 4)), Err(()));
+        assert_eq!(exposed(&find(&all, 10)), Err(()));
+        // On an element itself.
+        plain.state_mut().style.hidden = false;
+        find(&all, 6).state_mut().style.hidden = true;
+        assert_eq!(ids(&element_children(&root, true)), [4, 22]);
+        assert_eq!(exposed(&find(&all, 14)), Err(()));
+        find(&all, 6).state_mut().style.hidden = false;
+        assert_eq!(ids(&element_children(&root, true)), [4, 6, 22]);
     }
 
     #[test]
@@ -1129,5 +1190,39 @@ mod tests {
         // Touch properties do not change what is exposed.
         v.state_mut().props.long_press_delay = Some(800.0);
         assert_eq!(spec_of(&v.state()), b);
+    }
+
+    /// The roles of gpui-base's structural components, and a button with
+    /// a pressed state: its toggle state is that state.
+    #[test]
+    fn structural_roles_and_toggle_buttons() {
+        let with_role = |role| Accessibility {
+            role,
+            ..Default::default()
+        };
+        for (role, control) in [
+            (Role::Group, Control::Group),
+            (Role::Region, Control::Region),
+            (Role::Navigation, Control::Navigation),
+            (Role::Tree, Control::Tree),
+            (Role::TreeItem, Control::TreeItem),
+            (Role::MenuItemCheckbox, Control::MenuItem),
+            (Role::MenuItemRadio, Control::MenuItem),
+        ] {
+            assert_eq!(
+                control_for(&with_role(role), ViewKind::View, false),
+                Some(control)
+            );
+        }
+        let toggle = Accessibility {
+            role: Role::Button,
+            state: AccessibilityState {
+                pressed: Some(Checked::True),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(toggled(&toggle), Some(Checked::True));
+        assert_eq!(toggled(&with_role(Role::Button)), None);
     }
 }

@@ -202,7 +202,18 @@ pub struct ScrollBehavior {
     pub pinch: bool,
     /// `centerContent`: content smaller than the viewport is centered.
     pub center_content: bool,
+    /// `refreshIndicator`: the height of the app's own pull-to-refresh
+    /// indicator, which replaces the platform's spinner; `None` for the
+    /// platform's.
+    pub refresh_indicator: Option<Points>,
 }
+
+/// How far past the top a released pull refreshes with the platform's
+/// spinner.
+const REFRESH_PULL: Points = Points(64.0);
+/// The room the platform's spinner keeps above the content while
+/// refreshing.
+const REFRESH_SPACE: Points = Points(56.0);
 
 impl Default for ScrollBehavior {
     fn default() -> Self {
@@ -222,6 +233,7 @@ impl Default for ScrollBehavior {
             bounces_zoom: true,
             pinch: true,
             center_content: false,
+            refresh_indicator: None,
         }
     }
 }
@@ -230,6 +242,25 @@ impl ScrollBehavior {
     /// Whether the content zooms (scrolling both ways while zoomed in).
     pub fn zooms(&self) -> bool {
         self.max_zoom > self.min_zoom
+    }
+
+    /// Whether a vertical scroll view dragged to `offset` (negative: pulled
+    /// past its top) refreshes when the finger lifts, if it listens to
+    /// `onRefresh` and is not refreshing yet.
+    pub fn refreshes(&self, offset: Points) -> bool {
+        offset.0 <= -self.refresh_threshold().0
+    }
+
+    /// How far past the top a released pull refreshes: the app's
+    /// indicator's height, or the platform spinner's distance.
+    pub fn refresh_threshold(&self) -> Points {
+        self.refresh_indicator.unwrap_or(REFRESH_PULL)
+    }
+
+    /// The room kept above the content while it refreshes: the app's
+    /// indicator's height, or the platform spinner's.
+    pub fn refresh_inset(&self) -> Points {
+        self.refresh_indicator.unwrap_or(REFRESH_SPACE)
     }
 
     /// Whether flings end at snap points.
@@ -358,6 +389,8 @@ pub struct ScreenConfig {
     pub large_title: bool,
     /// The content extends under the header.
     pub header_transparent: bool,
+    /// The system tab bar leaves while this page is on top.
+    pub hides_bottom_bar_when_pushed: bool,
     /// Color of the back button and bar buttons.
     pub tint_color: Option<Color>,
     /// Header background.
@@ -386,6 +419,13 @@ pub struct ScreenConfig {
     /// UIKit's own bar button in the trailing slot instead of `right`'s
     /// view (iOS); a press on it presses `right`'s first pressable view.
     pub right_system_item: Option<crate::HeaderSystemItem>,
+    /// UIKit's own bar button showing this SF Symbol in the trailing slot
+    /// instead of `right`'s view (iOS); `right_system_item` wins over it.
+    pub right_symbol: Option<Arc<str>>,
+    /// As `right_system_item`, in the leading slot, pressing `left`.
+    pub left_system_item: Option<crate::HeaderSystemItem>,
+    /// As `right_symbol`, in the leading slot, pressing `left`.
+    pub left_symbol: Option<Arc<str>>,
     /// Custom title view.
     pub title_view: Option<NodeId>,
     /// The app's header (`header`): on a platform without a native header
@@ -406,6 +446,7 @@ impl Default for ScreenConfig {
             header_visible: true,
             large_title: false,
             header_transparent: false,
+            hides_bottom_bar_when_pushed: false,
             tint_color: None,
             background_color: None,
             title_color: None,
@@ -417,6 +458,9 @@ impl Default for ScreenConfig {
             left: None,
             right: None,
             right_system_item: None,
+            right_symbol: None,
+            left_system_item: None,
+            left_symbol: None,
             title_view: None,
             header_view: None,
             header_height: Points::ZERO,
@@ -517,8 +561,11 @@ pub struct InputConfig {
     pub paste_behavior: PasteBehavior,
     /// Focus once on screen.
     pub auto_focus: bool,
-    /// Caret and selection color.
+    /// Selection highlight color (on iOS also the caret's, unless
+    /// [`InputConfig::caret_color`] is set: UIKit tints both with one).
     pub selection_color: Option<Color>,
+    /// Caret color; the platform's default when `None`.
+    pub caret_color: Option<Color>,
     /// What the input holds, for autofill.
     pub auto_fill: crate::ops::AutoFill,
     /// The text runs right to left.
@@ -529,6 +576,13 @@ pub struct InputConfig {
     pub accessory_id: Option<Box<str>>,
     /// The input accessory it names, if one is mounted.
     pub accessory: Option<NodeId>,
+    /// A multiline input shows its scroll indicator (`scrollbar`; false
+    /// while a built-in bar takes its place).
+    pub scrollbar_visible: bool,
+    /// A built-in bar of the app's takes the indicator's place: the
+    /// platform reports how far the text scrolled
+    /// (`EngineControl::input_scroll`) and takes `Command::ScrollTo`.
+    pub replaced: bool,
 }
 
 impl InputConfig {
@@ -568,11 +622,14 @@ impl Default for InputConfig {
             paste_behavior: PasteBehavior::Insert,
             auto_focus: false,
             selection_color: None,
+            caret_color: None,
             auto_fill: crate::ops::AutoFill::Default,
             rtl: false,
             caret_hidden: false,
             accessory_id: None,
             accessory: None,
+            scrollbar_visible: true,
+            replaced: false,
         }
     }
 }
@@ -598,6 +655,10 @@ pub struct ImageOptions {
 /// created by the preceding items.
 #[derive(Debug, Clone)]
 pub enum MountItem {
+    /// Mounted nodes in depth-first logical tree order, independent of native
+    /// stacking (`Insert`). Opt-in through `Core::set_tree_order_tracking`;
+    /// emitted after structural changes in the same batch as the affected views.
+    TreeOrder(Vec<NodeId>),
     /// Create a native view. It starts detached and invisible.
     Create {
         /// Node id, used to address the view in later items.
@@ -615,7 +676,18 @@ pub enum MountItem {
         /// View id.
         id: NodeId,
         /// The states.
-        states: u8,
+        states: u16,
+    },
+    /// The states the view shows as a part of a control (`tailwind::state`
+    /// bits: a list's highlighted option is focused while the focus stays
+    /// on its search field), for a platform that marks them itself. Opt-in
+    /// through `Core::set_projected_state_mounting`; the platform shows
+    /// them and never reports them back.
+    ProjectStates {
+        /// View id.
+        id: NodeId,
+        /// The states.
+        states: u16,
     },
     /// Insert (or move) `child` into `parent`, below sibling `before` (or
     /// on top when `None`). Siblings rather than indices, so platform-owned
@@ -702,8 +774,15 @@ pub enum MountItem {
         horizontal: bool,
         /// Shows the scroll indicator.
         scrollbar_visible: bool,
+        /// A built-in bar of the app's takes the indicator's place (the
+        /// core's, over the viewport): the platform shows none on either
+        /// axis, also where a horizontal view keeps its own.
+        replaced: bool,
         /// Native animation value fed with the main-axis offset.
         scroll_value: Option<crate::animation::NodeId>,
+        /// Native animation value fed with how far it is pulled past its
+        /// top (vertical views).
+        pull_value: Option<crate::animation::NodeId>,
         /// When dragging dismisses the keyboard.
         keyboard_dismiss: KeyboardDismissMode,
         /// A horizontal list laid out right to left: the platform mirrors
@@ -778,6 +857,52 @@ pub enum MountItem {
         /// The drawing.
         drawing: Arc<crate::canvas::Drawing>,
     },
+    /// What a shader view draws under its children (`None`: nothing); the
+    /// animated values among its uniforms come as
+    /// [`crate::animation::AnimationProp::CanvasArg`] bindings of its
+    /// [`crate::shader::ShaderLayer::slots`].
+    Shader {
+        /// The view.
+        id: NodeId,
+        /// The program and its uniforms.
+        layer: Option<Arc<crate::shader::ShaderLayer>>,
+    },
+    /// A shader transition starts: its `value` changed. It comes first in
+    /// its batch, so the platform takes the picture of what the view (the
+    /// surface, for a screen transition) shows before the batch's other
+    /// items, `sample_from`, and runs the layer's `nsh.progress` from 0 to
+    /// 1 over `duration`, what it draws from then on as `sample_to`; once
+    /// it ends the children show as they are.
+    ShaderTransition {
+        /// The transition.
+        id: NodeId,
+        /// How long it runs.
+        duration: std::time::Duration,
+    },
+    /// The shader a page or a dialog comes and goes through
+    /// (`transitionShader`; `None`: its `animation`): when it is pushed,
+    /// popped, presented or dismissed, the platform draws the change through
+    /// the layer for `duration`, the lower side's picture as `sample_from`
+    /// and the upper's as `sample_to`, whatever the page's `animation`; its
+    /// `animation` runs where it cannot and when the user asks for less
+    /// motion, and a change that starts while one runs ends that one first
+    /// (`docs/dev/shaders.md` "Pages and dialogs").
+    NavShader {
+        /// The page or dialog.
+        id: NodeId,
+        /// The layer (role [`crate::shader::ShaderRole::Transition`]) and
+        /// how long it runs.
+        shader: Option<NavShader>,
+    },
+    /// What a shader's pictures show changed, as far as the core knows: a
+    /// view in an effect's or a transition's subtree was in the batch, or
+    /// anything for a shader that reads what is behind it and for a screen
+    /// effect or transition. The platform takes them again; what changes
+    /// on its UI thread (animations, scrolling, loads) it notices itself.
+    ShaderInput {
+        /// The shader's view.
+        id: NodeId,
+    },
     /// Bind visual properties to native animation nodes.
     AnimationBindings {
         /// View.
@@ -809,7 +934,10 @@ pub enum MountItem {
         label: Option<Arc<str>>,
     },
     /// Animate the frame changes, insertions and removals that follow in
-    /// this batch.
+    /// this batch, until the next one replaces it: a batch may lead runs
+    /// of frames with different ones, an empty one for frames that do not
+    /// animate (`core/layout_scope.rs`). Platforms animate each frame with
+    /// the one before it.
     LayoutAnimation(LayoutAnimation),
     /// An animation graph change, in order with the other items.
     Animation(AnimationOp),
@@ -868,6 +996,16 @@ pub enum MountItem {
         /// The name it was registered by (`com.example.map`).
         name: Arc<str>,
     },
+    /// The names of a registered native component's animated prop slots:
+    /// `names[n]` is [`AnimationProp::ComponentSlot`]`(n)`. Sent before the
+    /// [`MountItem::AnimationBindings`] that use new slots; slots keep their
+    /// name for the component's life.
+    ComponentPropSlots {
+        /// The container.
+        id: NodeId,
+        /// The name of each slot.
+        names: Vec<Arc<str>>,
+    },
     /// Properties of a registered native component that changed (all of
     /// them after [`MountItem::Component`]); `None` removes one.
     ComponentProps {
@@ -883,6 +1021,55 @@ pub enum MountItem {
         /// The call.
         command: Command,
     },
+}
+
+impl MountItem {
+    /// The view the item changes (a parent for its children's insertions),
+    /// if it is about one: what [`MountItem::ShaderInput`] is derived from.
+    pub fn view(&self) -> Option<NodeId> {
+        use MountItem as M;
+        match self {
+            M::Create { id, .. }
+            | M::TrackStates { id, .. }
+            | M::Remove { id }
+            | M::Delete { id }
+            | M::Frame { id, .. }
+            | M::Overflow { id, .. }
+            | M::ViewStyle { id, .. }
+            | M::Text { id, .. }
+            | M::Image { id, .. }
+            | M::ScrollContent { id, .. }
+            | M::Canvas { id, .. }
+            | M::Shader { id, .. }
+            | M::ViewProps { id, .. }
+            | M::Input { id, .. }
+            | M::InputValue { id, .. }
+            | M::NativeProps { id, .. }
+            | M::Component { id, .. }
+            | M::ComponentProps { id, .. } => Some(*id),
+            M::Insert { parent, .. } => Some(*parent),
+            _ => None,
+        }
+    }
+}
+
+/// A page's or a dialog's transition through a shader
+/// ([`MountItem::NavShader`]). It has no `Default`: a layer holds a
+/// compiled program, which has none; [`NavShader::new`] makes one.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct NavShader {
+    /// The program and its uniforms.
+    pub layer: Arc<crate::shader::ShaderLayer>,
+    /// How long it runs.
+    pub duration: std::time::Duration,
+}
+
+impl NavShader {
+    /// `layer` running for `duration`.
+    pub fn new(layer: Arc<crate::shader::ShaderLayer>, duration: std::time::Duration) -> Self {
+        Self { layer, duration }
+    }
 }
 
 /// All mount items produced by one commit.

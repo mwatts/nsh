@@ -8,15 +8,16 @@ group: platforms
 # 原生组件
 
 原生组件是由**嵌入方应用**按名称注册的视图：地图、相机预览、图表库，或者 iOS 上任意的 `UIView`、Android 上任意的
-`android.view.View`、macOS 上任意的 `NSView`、Linux 上任意的 `gtk::Widget`，或者 Windows 上的 Direct2D 绘制或子 `HWND`。NSH 应用像使用其他元素一样使用它：Rust 应用用 `nsh_core::ui::prelude` 的 `native(name)` 创建它，TSX 应用用 [`nsh/native`](../modules/nsh-native.md) 提供的 `nativeComponent()` 声明它。NSH
+`android.view.View`、macOS 上任意的 `NSView`、Linux 上任意的 `gtk::Widget`，或者 Windows 上的 Direct2D 绘制或子 `HWND`。NSH 应用像使用其他元素一样使用它：Rust 应用用 `nsh_core::prelude` 的 `native(name)` 创建它，TSX 应用用 [`nativeComponent`](../modules/nsh.md#nativecomponent-and-nativemodule) 提供的 `nativeComponent()` 声明它。NSH
 会把它和应用的其余部分一起布局，向它发送 props，把它的事件交给对应的处理函数，并转发通过 `ref` 发出的命令。
 
 NSH 本身就用系统原生视图渲染，所以原生组件只是同一视图层级里多出来的一个子视图：不存在层级叠放问题，它会像 `<View>`
 一样被裁剪、随内容滚动并接收触摸。
 
 > [!NOTE]
-> 只有在嵌入 NSH 的应用中（[iOS](./ios.md)、[Android](./android.md)、[macOS](./macos.md#嵌入-mac-应用)、[Linux](./linux.md#嵌入-gtk-应用)、[Windows](./windows.md#嵌入-win32-应用)）才有原生组件。
-> 打包出的独立应用（`nsh package`）和开发宿主不会注册任何组件，因此在那里该元素会渲染成一个空视图（并记录一次“未知名称”日志）。
+> 原生组件由嵌入 NSH 的应用注册（[iOS](./ios.md)、[Android](./android.md)、[macOS](./macos.md#嵌入-mac-应用)、[Linux](./linux.md#嵌入-gtk-应用)、[Windows](./windows.md#嵌入-win32-应用)）；
+> 在 Windows、macOS、Linux 和 iOS 上也可以由应用自己的 Rust crate 注册，开发宿主和打包出的应用（`nsh package`）会注册这些组件（见[从应用的 crate 注册](#从应用的-crate-注册)）。
+> 没有任何地方注册的名称会渲染成一个空视图（并记录一次“未知名称”日志）。
 
 ## 整体流程
 
@@ -34,8 +35,7 @@ NSH 本身就用系统原生视图渲染，所以原生组件只是同一视图�
 在 TSX 中，`nativeComponent()` 为这个名称声明一个组件，列出它用到的 props 和事件。
 
 ```rust tabs
-use nsh_base::safe_area_view;
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 use serde_json::json;
 
 const COLORS: [&str; 4] = ["#8250df", "#0969da", "#1a7f37", "#cf222e"];
@@ -44,9 +44,11 @@ const COLORS: [&str; 4] = ["#8250df", "#0969da", "#1a7f37", "#cf222e"];
 pub fn App() -> impl IntoElement {
     let taps = signal(0_u64);
     let badge = element_ref();
-    safe_area_view()
+    view()
         .flex_1()
         .p(px(20.0))
+        .pt_safe_area_plus(px(20.0))
+        .pb_safe_area_plus(px(20.0))
         .gap(px(16.0))
         .bg(rgb(0xf6f8fa))
         .child(text("Rendered by nsh").text_size(px(22.0)).font_weight(FontWeight::BOLD))
@@ -74,9 +76,8 @@ pub fn App() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { mount, signal, Text, type YNode } from "nsh";
-import { nativeComponent } from "nsh/native";
-import { SafeAreaView } from "nsh/base";
+import { mount, type NativeComponentRef, signal, Text, View } from "nsh";
+import { nativeComponent } from "nsh";
 
 /** The host app's badge: a label it draws, sized to its text. */
 const Badge = nativeComponent<{ text: string; color?: string }, { tap: { count: number } }>("embed.badge", {
@@ -88,9 +89,9 @@ const colors = ["#8250df", "#0969da", "#1a7f37", "#cf222e"];
 
 function App() {
   const taps = signal(0);
-  let badge: YNode | undefined;
+  let badge: NativeComponentRef | undefined;
   return (
-    <SafeAreaView style={{ flex: 1, padding: 20, gap: 16, backgroundColor: "#f6f8fa" }}>
+    <View style={{ flex: 1, padding: 20, paddingTop: "calc(env(safe-area-inset-top) + 20px)", paddingBottom: "calc(env(safe-area-inset-bottom) + 20px)", gap: 16, backgroundColor: "#f6f8fa" }}>
       <Text style={{ fontSize: 22, fontWeight: "700" }}>Rendered by nsh</Text>
       <Badge
         ref={(node) => (badge = node)}
@@ -103,7 +104,7 @@ function App() {
         style={{ alignSelf: "flex-start", borderRadius: 8, overflow: "hidden" }}
       />
       <Text>{`JS saw ${taps()} taps`}</Text>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -118,7 +119,7 @@ TSX 版本就是 `examples/embedded/App.tsx`，仓库里的两个嵌入示例运
 function nativeComponent<P extends object = {}, E extends object = {}>(
   name: string,
   spec: NativeComponentSpec<P, E>,
-): (props: NativeComponentProps<P, E>) => YNode;
+): (props: NativeComponentProps<P, E>) => JSX.Element;
 ```
 
 | 参数 | 类型 | 说明 |
@@ -147,8 +148,25 @@ function nativeComponent<P extends object = {}, E extends object = {}>(
 | 元素被创建 | 组件创建后立即收到所有已设置的自有 prop |
 | 某个 prop 的值变化 | 该 prop 及其新值 |
 | 某个 prop 变为 `undefined` | 该 prop，但没有值（Swift 中为 `nil`，Java 中为 `null`） |
+| 绑定到动画值的 prop 变化 | `setAnimatedNumber` / `setAnimatedColor`，在值变化的那些帧 |
 
-Props 携带 JSON 值；接口只传数据（函数、类实例和 `AnimatedValue` 留在应用中）。
+Props 携带 JSON 值；接口只传数据（函数和类实例留在应用中）。
+
+### 动画 props
+
+prop 也可以是一个动画值：`AnimatedValue`，或由它派生的节点（`interpolate`、滚动视图的 `scrollValue` 或
+`pullValue`）。这时它不会以 JSON 发送：NSH 会绑定它，值每一帧变化时都会在 UI 线程直接交给组件，不经过 JS，所以组件能跟着拖动或下拉刷新。
+
+```tsx
+const pull = createAnimatedValue(0);
+<Scroll pullValue={pull} refreshIndicator={{ height: 72 }} refreshing={refreshing()} onRefresh={refresh}>
+  <Spinner progress={pull.interpolate({ inputRange: [0, 72], outputRange: [0, 1] })} />
+</Scroll>
+```
+
+组件通过 `setAnimatedNumber(name, value)` 收到数值，通过 `setAnimatedColor(name, argb)` 收到颜色（`0xAARRGGBB`）；两者默认都以该数值调用
+`setProp`，所以没有实现它们的组件也能收到值。Rust 组件实现 `set_animated_number` 和 `set_animated_color`，Rust 代码用
+`native(name).bind_animated_prop("progress", &value)` 绑定 prop。重新给该 prop 一个普通值即解除绑定，并发送这个值。Web 上没有注册的原生组件。
 
 ## 事件
 
@@ -209,7 +227,7 @@ map.command("zoomTo", json!({ "level": 3 }));
 ```
 
 ```tsx tabs
-let map: YNode | undefined;
+let map: NativeComponentRef | undefined;
 
 <MapView ref={(node) => (map = node)} latitude={52.52} longitude={13.405} style={{ flex: 1 }} />;
 
@@ -566,6 +584,67 @@ fn register(app: &AppView) {
 `set_size`（单位为点）和 `redraw` 可以在任意线程调用。请在 `AppView::load` 之前注册；注册表属于一个 `AppView`（以及用同一个
 `AppOptions` 创建的视图）。
 
+组件还可以通过 `wheel` 接收落在它上面的鼠标滚轮和触控板滚动（比如图片查看器用它来缩放）。它收到的 `Wheel` 包含指针位置
+（`x`、`y`，组件自身坐标，单位为点）、以点为单位的距离（`dx`、`dy`，向右、向下为正，和滚动视图移动内容的方向一致）、以滚轮刻度
+为单位的距离（`notches_x`、`notches_y`，精确触控板和高分辨率滚轮会给出小数）、是否为细粒度滚动（`precise`），以及按下的修饰键
+（`shift`、`ctrl`、`alt`）。接收了这次滚动就返回 `true`；其余的滚动交给外层的滚动视图，默认全部交给它们。滚动视图已经开始的
+一次滚动会一直留在那个视图上。Ctrl + 滚轮也是精确触控板的捏合手势，Shift + 滚轮按滚轮原本发送的方向到达（`dy`，`shift` 为真）：
+
+```rust
+use nsh_platform_windows::Wheel;
+
+impl NativeComponent for ImageView {
+    // draw、set_prop……
+
+    fn wheel(&mut self, event: &Wheel) -> bool {
+        if !event.ctrl {
+            return false; // 交给外层的滚动视图
+        }
+        // 每个刻度缩放 √2 倍，以指针为中心。
+        let factor = 2f32.powf(-event.notches_y / 2.0);
+        self.zoom_about(event.x, event.y, factor);
+        self.context.redraw();
+        true
+    }
+}
+```
+
+## 从应用的 crate 注册
+
+带有自己 Rust crate 的应用（`nsh.json` 的 `"rust"`，见 [Rust](./rust.md)）可以在这个 crate 里注册原生组件，NSH 为应用构建的宿主都会用到它们：
+`nsh run` 和 `nsh test --target` 的开发宿主，以及 `nsh package` 打包出的应用。在 crate 根（`lib.rs`）放一个带
+`#[native_components(<platform>)]` 的函数，把组件注册到该平台的 `Components` 上；宿主创建每个视图时都会调用它，就像嵌入应用在自己的 `AppView` 上注册一样：
+
+```rust
+use std::rc::Rc;
+use nsh_core::prelude::*;
+
+#[native_components(windows)]
+fn components(components: &nsh_platform_windows::Components) {
+    use nsh_platform_windows::{ComponentContext, NativeComponent};
+    components.register(
+        "embed.badge",
+        Rc::new(|context: ComponentContext| -> Box<dyn NativeComponent> {
+            Box::new(Badge { on: false, context })
+        }),
+    );
+}
+```
+
+平台可以是 `windows`、`macos`、`linux` 或 `ios`，对应的组件分别来自 `nsh_platform_windows`、`nsh_platform_macos`、
+`nsh_platform_linux` 和 `nsh_platform_ios`（见上面各节）。这个函数只在它的平台上编译，所以 crate 为支持的每个平台各写一个，注册相同的名称，
+并且只在对应平台上依赖该平台的 crate，版本和来源与它的其他 NSH crate（`nsh-core` 等）相同（CLI 会检查它们是否一致）：
+
+```toml
+[target.'cfg(windows)'.dependencies]
+nsh-platform-windows = { version = "0.3", default-features = false }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+nsh-platform-macos = { version = "0.3", default-features = false }
+```
+
+宿主在创建每个视图时注册 crate 的组件，早于持有该视图的代码自己的注册：之后在视图上注册的同名组件（`AppView::register_component`）会替换 crate 的。
+
 ## 规则与限制
 
 - **先注册，再加载。** 工厂只对注册之后创建的元素生效。请在 `loadBundle` / `loadAssetBundle` / `run` 之前注册所有名称，这样第一帧就能找到它们。
@@ -573,9 +652,10 @@ fn register(app: &AppView) {
 - **能力声明不适用。** 注册的组件是宿主应用自己的代码；应用声明的[能力](./sandbox-and-capabilities.md)限制不了它做什么。如果你嵌入的是不受信任的应用，就只注册那些可以放心让它们使用的组件。
 - **接口只传数据。** Props、事件负载和命令参数都以 JSON 文本跨越边界；每次变更时传递标识符和小数据，而不是大块数据。
 - **一个 bundle，两个平台。** 在 iOS 和 Android 上用相同的 props 和事件注册相同的名称，同一个 bundle 就能在两个平台上运行。
+- **`nsh/` 下的名称属于 NSH。** NSH 自己的组件（`nsh/mobile` 的 `TabBar` 所用的系统标签栏）注册在 `nsh/` 下；请用你的应用或公司来命名自己的组件（`embed.badge`），在 `nsh/` 下注册会记录一条警告，并保留 NSH 的组件。
 
 ## 另请参阅
 
-- [`nsh/native` 参考](../modules/nsh-native.md)
+- [`nativeComponent` 参考](../modules/nsh.md#nativecomponent-and-nativemodule)
 - [嵌入 iOS 应用](./ios.md)和[嵌入 Android 应用](./android.md)
 - [架构](./architecture.md)：props 和事件如何跨线程传递

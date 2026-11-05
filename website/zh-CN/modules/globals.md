@@ -8,7 +8,7 @@ order: 15
 
 除了 ECMAScript 标准库，NSH 应用的 JS 环境还提供一组标准全局对象：`fetch` 及其 `Headers`、`Request`、`Response`；Streams 标准；`URL` 和 `URLSearchParams`；`TextEncoder` / `TextDecoder`；`Blob`、`File` 和 `FormData`；`EventTarget`、`Event` 和 `AbortController`；定时器、`requestAnimationFrame` 和 `console`；以及用于数字与日期格式化的 `Intl`。它们都用 Rust 原生实现，遵循 WHATWG 标准，无需 import，因此大量基于这些标准的 JavaScript 库（HTTP 客户端、URL 与编码工具、流处理工具）可以直接使用。
 
-本页列出了应用拥有的全部全局对象。它们属于 TSX 环境：Rust 代码改用 Rust 标准库、crates.io 和 `nsh_core::ui::prelude` 中 NSH 的服务（`fetch`、定时器、任务；见[用 Rust 开发](../docs/rust.md)），表格的 Rust 列给出了对应项。界面用[元素](../elements/index.md)和应用自己的组件搭建，其余能力来自应用导入的[模块](./index.md)。
+本页列出了应用拥有的全部全局对象。它们属于 TSX 环境：Rust 代码改用 Rust 标准库、crates.io 和 `nsh_core::prelude` 中 NSH 的服务（`fetch`、定时器、任务；见[用 Rust 开发](../docs/rust.md)），表格的 Rust 列给出了对应项。界面用[元素](../elements/index.md)和应用自己的组件搭建，其余能力来自应用导入的[模块](./index.md)。
 
 这些全局对象的 TypeScript 声明会生成到 `.nsh/types/nsh/globals.d.ts`（见[项目结构](../docs/project-structure.md)）。
 
@@ -98,7 +98,7 @@ requestAnimationFrame(tick);
 ```
 
 > [!TIP]
-> 在 JS 里逐帧驱动动画，意味着每一帧都要在 QuickJS 中执行你的代码。样式和变换的动画请优先使用 [nsh/animated](./nsh-animated.md)，它的驱动器在原生侧运行，不回调 JS（见[动画](../docs/animation.md)）。
+> 在 JS 里逐帧驱动动画，意味着每一帧都要在 QuickJS 中执行你的代码。样式和变换的动画请优先使用 [`nsh` 的动画 API](./nsh.md#animation)，它的驱动器在原生侧运行，不回调 JS（见[动画](../docs/animation.md)）。
 
 ## Base64 与错误
 
@@ -357,7 +357,7 @@ await fetch("https://api.example.com/upload", { method: "POST", body: form });
 /**
  * HTTP through the platform's network stack (NSURLSession,
  * HttpURLConnection), streaming both ways; `data:` and `blob:` URLs are
- * answered locally.
+ * answered locally, and `asset:/` URLs with the app's bundled files.
  */
 function fetch(input: string | URL | Request, init?: RequestInit): Promise<Response>;
 
@@ -514,7 +514,7 @@ await fetch("https://api.example.com/upload", {
 - **`redirect: "manual"` 直接交付 3xx 响应本身**，带有状态码和 `Location` 头，而不是不透明的过滤响应。`"follow"` 会跟随重定向（每一跳都按能力声明检查）；`"error"` 在响应为重定向时 reject。
 - **`FormData` 请求体总是使用 `Content-Type: multipart/form-data; boundary=…`**，即使已经设置了 `Content-Type` 头。HTTP 库常常先设一个默认类型，只在检测到浏览器时才清除；缺少 boundary，服务器就无法解析请求体。
 - **`credentials`、`cache`、`referrer`、`referrerPolicy`、`integrity`、`keepalive` 和 `priority`** 会被校验并保存在 `Request` 对象上，但不会传给网络栈：缓存和 Cookie 的处理遵循平台网络栈自身的行为。
-- **能力声明。** 当应用在 `nsh.json` 中声明了 `network` 能力（或嵌入它的宿主应用授予的更少）时，访问未被允许的主机的请求根本不会发到网络，`fetch` 以 `TypeError` reject。参见[沙箱与能力](../docs/sandbox-and-capabilities.md)。
+- **能力声明。** 当应用在 `nsh.json` 中声明了 `network` 能力（或嵌入它的宿主应用授予的更少）时，访问未被允许的主机的请求根本不会发到网络，`fetch` 以 `TypeError` reject，其 `code` 为 `"ERR_ACCESS_DENIED"`，`permission` 为 `"network"`，`resource` 为被拒绝的 URL。参见[沙箱与能力](../docs/sandbox-and-capabilities.md)。
 - **错误。** 网络失败以 `TypeError` reject，消息以 `Network request failed:` 开头；中止则以 signal 的 `reason` reject。
 
 在组件中加载数据的完整指南见[网络](../docs/networking.md)。

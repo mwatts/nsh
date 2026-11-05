@@ -5,8 +5,9 @@
 // bar does not show with the title bar hidden, the bar's buttons open its
 // menus with `Menu.popup` (the shortcuts work everywhere).
 
-import { effect, Input, mount, signal, Text, View } from "nsh";
-import { colorScheme, platform } from "nsh/device";
+import { effect, mount, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
+import { colorScheme, platform } from "nsh";
 import { Menu, type MenuItem, titleBar, Window } from "nsh/desktop";
 
 Window.setTitle("nsh desktop");
@@ -66,7 +67,7 @@ function App() {
 
   effect(() => {
     // The bar is 40 points tall: the window controls are centered in it.
-    Window.setTitleBar(hidden() ? "hidden" : "default", 40);
+    Window.setTitleBar({ style: hidden() ? "hidden" : "default", height: 40 });
   });
 
   effect(() => {
@@ -114,7 +115,7 @@ function App() {
           <Each of={menus()}>
             {(menu) => (
               <View
-                onLayout={(e) => (buttons[menu().label] = { x: e.origin.x, width: e.size.width })}
+                onLayout={(e) => (buttons[menu().label] = { x: e.bounds.origin.x, width: e.bounds.size.width })}
                 onPress={() => {
                   const label = menu().label;
                   opened.set(label);

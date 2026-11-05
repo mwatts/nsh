@@ -144,9 +144,10 @@ text("Made with ")
 </Text>
 ```
 
-被 `numberOfLines` 或省略号截掉的行内元素会被隐藏；复制文字时也不会包含它们。
+被 `numberOfLines` 或省略号截掉的行内元素会被隐藏；复制文字时也不会包含它们。行内元素里的文字沿用外围文字的颜色（如同 CSS 的
+`color` 会传到行内块），自己设置了颜色时除外（上面的 `LIVE` 标签即是）；字体和行高仍是它自己的。
 
-样式键 `verticalAlign` 决定行内元素在所在行中的位置，与 CSS 的 `vertical-align` 摆放图片的方式一致：`"baseline"`（默认）让元素底边落在基线上，`"text-top"` 和 `"text-bottom"` 让元素顶边或底边对齐文本字体的顶部或底部，`"middle"` 让元素中心位于基线上方半个 x 高度处。元素超出字体的部分会撑高所在行。段首图标若要像 Android 的 `ImageSpan` 那样与文字底部对齐，使用 `"text-bottom"`。对应的类是 `align-baseline`、`align-text-top`、`align-text-bottom` 和 `align-middle`；Rust 中是同名的 `.align_text_bottom()` 等方法。
+样式键 `verticalAlign` 决定行内元素在所在行中的位置，与 CSS 的 `vertical-align` 摆放图片的方式一致：`"baseline"`（默认）让元素底边落在基线上，`"text-top"` 和 `"text-bottom"` 让元素顶边或底边对齐文本字体的顶部或底部，`"middle"` 让元素中心位于基线上方半个 x 高度处。元素超出字体的部分会撑高所在行，设置了固定 `lineHeight` 时也是如此。段首图标若要像 Android 的 `ImageSpan` 那样与文字底部对齐，使用 `"text-bottom"`。对应的类是 `align-baseline`、`align-text-top`、`align-text-bottom` 和 `align-middle`；Rust 中是同名的 `.align_text_bottom()` 等方法。
 
 ```tsx
 <Text style={{ fontSize: 16 }}>
@@ -161,17 +162,17 @@ text("Made with ")
 | `color` | 一个[颜色](./styling.md#颜色)。默认黑色 | `.text_color(..)` |
 | `fontSize` | 点。默认 14 | `.text_size(px(..))`、`.text_sm()`、`.text_lg()` 等 |
 | `fontWeight` | `"normal"`（400）、`"bold"`（700），或 `100`–`900`（数字或字符串） | `.font_weight(FontWeight::BOLD)` |
-| `fontStyle` | `"normal"`、`"italic"` | `.italic()` |
+| `fontStyle` | `"normal"`、`"italic"`：彩色表情保持正体 | `.italic()` |
 | `fontFamily` | 系统字体族、通用字体族或[导入的字体](./fonts.md) | `.font_family(..)` |
 | `lineHeight` | 点 | `.line_height(px(..))` |
 | `letterSpacing` | 点 | `.letter_spacing(px(..))` |
-| `textAlign` | `"auto"`、`"left"`、`"center"`、`"right"`、`"justify"` | `.text_left()`、`.text_center()`、`.text_right()`、`.text_justify()` |
+| `textAlign` | `"auto"`、`"left"`、`"center"`、`"right"`、`"justify"`、`"start"`、`"end"`：`left` 和 `right` 在从右到左时保持各自的一侧，`start` 和 `end` 跟随方向 | `.text_left()`、`.text_center()`、`.text_right()`、`.text_justify()` |
 | `textAlignVertical` | `"auto"`、`"top"`、`"center"`、`"bottom"`：文字比所在框矮时的位置 | |
 | `textTransform` | `"none"`、`"uppercase"`、`"lowercase"`、`"capitalize"` | `.normal_case()`、`.uppercase()`、`.lowercase()`、`.capitalize()` |
 | `textDecorationLine` | `"none"`、`"underline"`、`"line-through"`、`"underline line-through"` | `.no_underline()`、`.underline()`、`.line_through()` |
 | `textDecorationColor`、`textDecorationStyle` | 颜色；`"solid"`、`"double"`、`"dotted"`、`"dashed"`、`"wavy"` | `.text_decoration_color(..)`、`.text_decoration_wavy()` 等 |
 | `textDecorationThickness`、`textUnderlineOffset` | 点或 `"auto"`（粗细还可以是 `"from-font"`） | `.text_decoration_thickness(px(..))`、`.underline_offset(px(..))` |
-| `textShadowColor`、`textShadowOffset`、`textShadowRadius` | 字形后面的阴影 | `.text_shadow_color(..)`、`.text_shadow_offset(..)`、`.text_shadow_radius(..)` |
+| `textShadow` | CSS 的 `text-shadow`，字形后面的阴影：`"2px 2px 4px rgb(0 0 0 / 0.6)"`（偏移、模糊、颜色），或以数字写出的各层，`[{ x: 2, y: 2, blur: 4, color: "#00000099" }]`；多层按最宽的一层绘制 | `.text_shadow([TextShadow { .. }])`、`.text_shadow_sm()` 等、`.text_shadow_color(..)` |
 | `fontVariant` | OpenType 特性：`["tabular-nums"]`、`"small-caps"`、`"oldstyle-nums"`、`"lining-nums"`、`"proportional-nums"` | `.tabular_nums()`、`.small_caps()`、`.oldstyle_nums()`、`.lining_nums()`、`.proportional_nums()` |
 | `writingDirection` | `"auto"`、`"ltr"`、`"rtl"`：段落的基础方向 | `.writing_direction(WritingDirection::Rtl)` |
 
@@ -184,15 +185,18 @@ text("Shadow")
     .text_size(px(26.0))
     .font_weight(FontWeight::EXTRA_BOLD)
     .text_color(white())
-    .text_shadow_color(rgba(0x00000099))
-    .text_shadow_offset(point(px(2.0), px(2.0)))
-    .text_shadow_radius(px(4.0))
+    .text_shadow([TextShadow {
+        offset_x: px(2.0),
+        offset_y: px(2.0),
+        radius: px(4.0),
+        color: rgba(0x00000099).into(),
+    }])
 ```
 
 ```tsx tabs
 <Text style={{ fontSize: 18, fontVariant: ["tabular-nums"] }}>{price().toFixed(2)}</Text>
 <Text style={{ textDecorationLine: "underline", textDecorationStyle: "wavy", textDecorationColor: "#cf222e" }}>Typo</Text>
-<Text style={{ fontSize: 26, fontWeight: "800", color: "#ffffff", textShadowColor: "rgba(0,0,0,0.6)", textShadowOffset: { width: 2, height: 2 }, textShadowRadius: 4 }}>
+<Text style={{ fontSize: 26, fontWeight: "800", color: "#ffffff", textShadow: "2px 2px 4px rgba(0,0,0,0.6)" }}>
   Shadow
 </Text>
 ```
@@ -203,18 +207,18 @@ text("Shadow")
 
 ```rust tabs
 text(long_description).number_of_lines(2)
-text(file_path).number_of_lines(1).ellipsize_mode(EllipsizeMode::Middle)
+text(file_path).number_of_lines(1).text_overflow(EllipsizeMode::Middle)
 ```
 
 ```tsx tabs
-<Text numberOfLines={2}>{longDescription}</Text>
-<Text numberOfLines={1} ellipsizeMode="middle">{filePath}</Text>
+<Text style={{ numberOfLines: 2 }}>{longDescription}</Text>
+<Text style={{ numberOfLines: 1, textOverflow: "ellipsis-middle" }}>{filePath}</Text>
 ```
 
-| 属性 | Rust | 说明 |
+| 样式键 / 属性 | Rust | 说明 |
 |---|---|---|
-| `numberOfLines` | `.number_of_lines(n)` | 最多显示的行数；`0`（默认）表示不限 |
-| `ellipsizeMode` | `.ellipsize_mode(EllipsizeMode::Tail)` | 放不下时在哪里截断：`"tail"`（默认）、`"head"`、`"middle"`、`"clip"` |
+| `numberOfLines`（样式） | `.number_of_lines(n)` | 最多显示的行数；`0`（默认）显示全部行 |
+| `textOverflow`（样式） | `.text_overflow(EllipsizeMode::Middle)` | 放不下时如何截断：省略号在末尾（`"ellipsis"`，默认）、开头（`"ellipsis-start"`）或中间（`"ellipsis-middle"`），或者 `"clip"` 直接裁掉 |
 | `adjustsFontSizeToFit` | `.shrink_to_fit(min_scale)` | 缩小字号，直到文字能放进其行数和框内 |
 | `minimumFontScale` | | `adjustsFontSizeToFit` 最多能缩小到的比例（0–1） |
 
@@ -227,12 +231,12 @@ text(move || total.get())
 ```
 
 ```tsx tabs
-<Text numberOfLines={1} adjustsFontSizeToFit minimumFontScale={0.5} style={{ fontSize: 48, width: 200 }}>
+<Text adjustsFontSizeToFit minimumFontScale={0.5} style={{ numberOfLines: 1, fontSize: 48, width: 200 }}>
   {total()}
 </Text>
 ```
 
-Tailwind 类 `truncate` 和 `line-clamp-*` 效果相同；同时设置时以属性为准。
+Tailwind 类 `line-clamp-*`、`text-ellipsis` 和 `text-clip` 设置同样的键，`truncate`（`.truncate()`）是单行并以省略号截断；作为样式键，它们也能用在状态样式和变体中。
 
 ## 系统字号
 
@@ -243,7 +247,7 @@ Tailwind 类 `truncate` 和 `line-clamp-*` 效果相同；同时设置时以属�
 | `allowFontScaling` | `.allow_font_scaling(false)` | 设为 `false` 时字号固定。默认 `true` |
 | `maxFontSizeMultiplier` | `.max_font_size_multiplier(1.5)` | 允许的最大缩放比例，例如 `1.5`。`0` 表示不限 |
 
-Rust 中的 `font_scale()` 和 TSX 中 [`nsh/device`](../modules/nsh-device.md) 的 `fontScale()` 是当前的缩放比例，会在用户修改设置时变化。输入框同样支持 `allowFontScaling` 和 `maxFontSizeMultiplier`。
+Rust 中的 `font_scale()` 和 TSX 中 [`nsh` 的设备 API](../modules/nsh.md#device) 的 `fontScale()` 是当前的缩放比例，会在用户修改设置时变化。输入框同样支持 `allowFontScaling` 和 `maxFontSizeMultiplier`。
 
 ```rust tabs
 text("Tab label").max_font_size_multiplier(1.3).text_size(px(13.0))
@@ -257,19 +261,23 @@ text("Tab label").max_font_size_multiplier(1.3).text_size(px(13.0))
 
 ## 选择
 
-`selectable`（`.selectable(true)`）允许用户像在系统自带的文本视图中那样选择和复制文字：长按选中手指下的词，拖动选择柄移动选区两端，编辑菜单提供“拷贝”和“全选”（iOS 还有查询、翻译和共享；Android 还有分享）。选区只在一个文本块之内。样式键 `selectionColor`（`.selection_color(..)`、`selection:text-*`）设置高亮和选择柄的颜色。类 `select-text` 与 `selectable` 效果相同。
+样式键 `userSelect: "text"`（`.select_text()`，类 `select-text`）允许用户像在系统自带的文本视图中那样选择和复制文字：长按选中手指下的词，拖动选择柄移动选区两端，编辑菜单提供“拷贝”和“全选”（iOS 还有查询、翻译和共享；Android 还有分享）。选区只在一个文本块之内。样式键 `selectionColor`（`.selection_color(..)`、`selection:text-*`）设置高亮和选择柄的颜色。设在视图上的 `userSelect` 作用于其中未自行设置的文本。
 
-在桌面浏览器中，文字默认可以选择，和网页一样，但交互元素（带按压或触摸处理的视图，如按钮和可按压的列表行）里的文字除外；`selectable={false}`（`.selectable(false)`）或类 `select-none` 让文字在那里也不可选择。手机和平板浏览器遵循原生规则。
+在桌面浏览器中，文字默认可以选择，和网页一样，但交互元素（带按压或触摸处理的视图，如按钮和可按压的列表行）里的文字除外；`userSelect: "none"`（`.select_none()`，类 `select-none`）让文字在那里也不可选择。手机和平板浏览器遵循原生规则。
 
 ```rust tabs
-text(order_number).selectable(true).selection_color(rgb(0x7c3aed))
+text(order_number).select_text().selection_color(rgb(0x7c3aed))
 ```
 
 ```tsx tabs
-<Text selectable style={{ selectionColor: "#7c3aed" }}>{orderNumber}</Text>
+<Text style={{ userSelect: "text", selectionColor: "#7c3aed" }}>{orderNumber}</Text>
 ```
 
-要在代码中复制（比如“复制”按钮），在 Rust 中使用 `set_clipboard(..)`，在 TSX 中使用 [`nsh/clipboard`](../modules/nsh-clipboard.md)。
+要在代码中复制（比如“复制”按钮），在 Rust 中使用 `set_clipboard(..)`，在 TSX 中使用 [`Clipboard`](../modules/nsh.md#clipboard)。
+
+在终端宿主中，拖过可选择的 View 或 Text 即可按完整字素选择文本，双击选择一个词，三击选择其段落，双击或三击后继续拖动则按词或段落扩展选区，选中的 Cell 以反色显示。
+用 Ctrl+C、Ctrl+Shift+C、Ctrl+Insert、Alt+W 或 Cmd+C 复制，宿主通过 OSC 52 把文本发送到终端剪贴板。
+Shift+单击扩展选区，Ctrl+A / Cmd+A 选择区域内全部文本，Esc 或其他任意键清除选区。没有选区时，Ctrl+C 退出终端宿主。
 
 ## onTextLayout
 

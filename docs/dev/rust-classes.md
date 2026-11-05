@@ -1,6 +1,6 @@
 # Classes and functions from Rust
 
-Status: implemented (`nsh_core::ui` `class.rs`, `callback.rs`, `call.rs`, `js.rs`; `nsh-macros` `class.rs`;
+Status: implemented (`nsh_core::element` `class.rs`, `callback.rs`, `call.rs`, `js.rs`; `nsh-macros` `class.rs`;
 `nsh-js` `classes.rs`, `components.rs`); "Implementation notes" at the end says where it differs from the
 proposal.
 
@@ -115,13 +115,13 @@ so a class's methods can run directly inside the JS call, as the web classes nsh
   `with_mut` borrow the value between awaits) and returns a promise; it runs as a task of the core, where the free
   functions work (`dialog`, `timer`, `blocking`, `background`, the clipboard), as an `async` module function does.
   `this` and the arguments are converted in the JS call, as a synchronous member's are (a wrong one rejects the
-  promise with the same `TypeError`), into the start of the task: a closure holding the typed values, the
+  promise with the same `TypeError`: a call returning a promise never throws), into the start of the task: a closure holding the typed values, the
   instance among them, that an op carries to the core ([below](#how-calls-cross)). The task keeps the instance
   alive until it ends.
 - **One object per instance.** While both live, an instance has one JS object (`nsh-js` remembers it by the `Rc`'s
   address): a member returning an instance Rust keeps gives the object it has, so `a.badge === a.badge`.
-- **Errors.** `Result<T, E: Display>` throws (`Error` with the message) or rejects; a wrong argument throws a
-  `TypeError` naming the member and the parameter (``Tally.add: `by`: expected a number, got "x"``), and so does a
+- **Errors.** `Result<T, E: Display>` throws (`Error` with the message) or rejects; a wrong argument throws (or,
+  for a member returning a promise, rejects with) a `TypeError` naming the member and the parameter (``Tally.add: `by`: expected a number, got "x"``), and so does a
 disposed or busy instance passed for a borrowed parameter (``Account.transfer: `to`: Account is disposed``); a panic in
   Rust is caught and thrown as an `Error`, or rejects (the engine stays up) where Rust unwinds: the web runtime is
   built with `panic = "abort"` (`[profile.web]`), so there a panic ends the page's engine. Integer parameters take
@@ -149,7 +149,7 @@ a visibility (`pub fn`, `pub(crate) fn`; the others are the block's helpers):
 - **`async fn`:** a task of the core; it gives a Promise (`Promise<void>` for `()`, resolved when the task ends).
 
 The same holds for a component's ref methods (`docs/dev/components.md`, "Methods"). An op returning `()` is
-`void` because the runtime modules released theirs as `void` (`Toast.show`, `Window.close`,
+`void` because the runtime modules released theirs as `void` (`Window.close`,
 ...) and a return type never changes (`docs/dev/compatibility.md`); a Rust function that can fail says so with
 `Result<(), E>`, and TS gets a promise to see the error. `FunctionSpec::promises` / `MethodSpec::promises` decide
 it for the declarations and the JS face alike; `-> ()` written out is the same as no return type.
@@ -161,11 +161,11 @@ take `ModuleCx` or are `async`), and an app crate's are rebuilt with the app, wh
 
 What TSX imports from NSH is made two ways today:
 
-- **Runtime modules in Rust** (`crates/nsh-core/src/runtime/`: `nsh/accessibility`, `nsh/android`,
-  `nsh/clipboard`, `nsh/desktop`, `nsh/image`'s functions) already use `#[module]` and `Registry`, the app crates'
+- **Runtime modules in Rust** (`crates/nsh-core/src/runtime/`: `nsh`'s `Keyboard`, `Image`, `Clipboard`,
+  `Storage` and accessibility functions, `nsh/mobile`, `nsh/desktop`) already use `#[module]` and `Registry`, the app crates'
   mechanism; they take the synchronous functions and classes as they come.
-- **Hand-written in `nsh-js`:** the reactive graph and the renderer (`nsh`), `nsh/animated`'s `AnimatedValue` and
-  `AnimatedNode`, `nsh/canvas`'s `Path2D`, `CanvasGradient` and `CanvasRenderingContext2D`, the keymap, lists, and the
+- **Hand-written in `nsh-js`:** the reactive graph and the renderer (`nsh`), `nsh`'s `AnimatedValue` and
+  `AnimatedNode`, `nsh`'s `Path2D`, `CanvasGradient` and `CanvasRenderingContext2D`, the keymap, lists, and the
   web globals (`URL`, `Headers`, `Blob`, `fetch`, streams, events). Their classes already sit on one piece of
   machinery: a QuickJS class whose opaque is the Rust value in a `RefCell` (`nsh-js` `web/mod.rs`).
 
@@ -211,16 +211,19 @@ For that, two choices of the first version change:
   `TrustedPaths`, the VM's `Quotas` (counts of limited resources, `quotas.take(kind, max)` or
   `quotas.reserve(kind, amount, max)` giving a `Held` back when dropped) and the surface's `Os`. The host provides it (`JsHost::system`); one that configured nothing grants nothing.
 - **Work started in the call**: a function or method that is not `async` and returns `Later<T>` (or
-  `Result<Later<T>, E>`) runs in the JS call, where its checks throw as a synchronous call's do, and the work it
-  returns runs as a core task: TS `Promise<T>` (`FunctionCall::Start`, `MemberCall::Start`). The system modules
-  use it to keep Node's shape, a `RangeError` at the call and I/O errors as rejections (`net`, `fs/promises`).
+  `Result<Later<T>, E>`) runs in the JS call, in order with what JS sent before it, and the work it returns runs
+  as a core task: TS `Promise<T>` (`FunctionCall::Start`, `MemberCall::Start`). What the call refuses (an
+  argument, a grant, a quota) rejects the promise, as the task's errors do: a call returning a promise never
+  throws (`docs/dev/api-naming.md` "Failures"). The system modules use it (`net`, `fs/promises`).
 - **Errors of a chosen class**: `Result<T, JsError>` throws a `TypeError`, `RangeError` or `Error`
   (`JsError::Type` / `Range` / `Error`); any other `E: Display` throws an `Error` with its message. A `Later`
   task's (and an `async` function's) `Err(JsError)` rejects with the same, any other error with an `Error` of its
   message (the reply carries a `Thrown`). `JsError::with(key, value)` / `with_code(code)` add properties
   (`JsError::Fields`), so errors keep Node's shape: `code`, `syscall`, `path` (`error.code === "ENOENT"`);
   `JsError::from(io::Error)` and `io_code` name an I/O error's code from its OS error or kind. The system modules
-  share it (`fs/promises`; `process` and `net` can).
+  share it (`fs/promises`; `process` and `net` can). `JsError::access_denied(message, permission, resource)` is what
+  a call the capabilities do not grant fails with (`ERR_ACCESS_DENIED`), and `nsh_core::element::codes` holds the
+  codes NSH's calls use beside I/O's (`docs/dev/api-naming.md` "Failures").
 - **What a synchronous call can do beyond computing**: a parameter `cx: CallCx` (filled in by the call, never in an
   `async` one) starts a task of the core in order with the ops (`cx.start(future)`, nothing waits for it) and ties
   work to what owns the call in JS (`cx.on_cleanup(f)`: the reactive owner, else the module's run under hot
@@ -294,8 +297,12 @@ impl Downloader {
   never holds back later posts), and what the ops JS sent before it post while the core applies them goes before
   it. So an op function posting and then a synchronous one posting arrive in that order, and a task posting while
   JS is still busy after the synchronous call arrives after it. Once the VM stops, queued calls and those posted later are
-  dropped and their replies say so. `call_async_traced` is `call_async` with what was thrown whole (`Exception`: its
-  message and, for an `Error`, its stack), for a caller that says where it was thrown (`nsh test`'s failures).
+  dropped and their replies say so. `call_async_traced` is `call_async` (and `call_traced` is `call`) with what was
+  thrown whole (`Exception`: its message, for an `Error` its stack, and the value as JSON, `thrown`: an object's own
+  enumerable properties with its `name` and `message`, `None` when converting it throws), for a caller that says
+  where it was thrown or checks it (`nsh test`'s failures, its `toThrow` and `toMatchObject`).
+  `Callback::settling(value)` keeps a value in place of a function: `call_async` of it answers the value, a
+  promise what it settles to (`nsh/test`'s `expect(promise)`).
   `call` rethrows an uncatchable exception (the CPU budget's interrupt, running
   out of memory) when the synchronous call around it returns, whatever Rust made of its `Err`.
 - **In a finalizer:** a value whose JS object goes drops inside QuickJS's finalizer, where no JS may run. That is
@@ -319,50 +326,45 @@ impl Downloader {
   it alone holds: a `Drop` that moves such an instance out (into a static, a task) keeps the instance, but its
   callbacks are dead (calling fails, posting does nothing). `Trace` never panics, allocates JS values or runs JS
   (it runs in the collector's mark phase), part of its safety contract.
-- **Functions take them too:** `fn watch(path: String, on_change: Callback<String>)` (`on_change` kept and posted
+- **Functions take them too:** `fn on(event: String, listener: Callback<String>) -> Stop` (`listener` kept and posted
   later), and `async` functions and members can `call_async`.
 - **Listeners**: an instance keeps them in a field (`listeners: Vec<Callback<String>>`, added by
-  `on(&mut self, listener: Callback<String>)`) and its tasks post to them (`Later` work cloning the field); the
+  `on(&mut self, event: String, listener: Callback<String>) -> Stop`, below) and its tasks post to them (`Later` work cloning the field); the
   field is traced like any other, so no event machinery is needed for `child.on("stdout", ..)`.
+- **Stopping**: a function or method that registers a listener (`on(event, listener)`, `docs/dev/api-naming.md`
+  "Listening") returns `Stop` (`nsh_core::prelude`, `element/system.rs`; `Stop::new(f)`), which crosses as a JS
+  function (`() => void`). `f` runs once: when JS calls it, or when the owner of the call in JS goes (the reactive
+  owner it runs under, or the module's run under hot module replacement: `JsHost::on_cleanup`), whichever comes
+  first; calling it unregisters the cleanup, so a long-lived owner does not collect stopped listeners. The
+  Node-shaped standard modules keep Node's `on` returning the instance (`child.on(..)` chains).
 
 
 ## How calls cross
 
-Nothing crosses between JS and the core as JSON for a Rust component, module or class (`nsh_core::ui::call`):
+Nothing crosses between JS and the core as JSON for a Rust component, module or class (`nsh_core::element::call`):
 
 - **Arguments are converted in the JS call** by the generated decoders (`JsValue::from_js`), for every kind of
-  call: a synchronous member or function runs on them; a function with `cx`, an `async` function or member and a
-  component's ref method become a closure holding the typed values (`OpCall`, `TaskStart`, `MethodCall`) that an
-  op carries (`Op::Rust(RustOp { call, run })`, `RustCall::Op` / `Task` / `Method`). The core runs it in order with
-  the UI's ops: a function with a `ModuleCx` (its actions applied after it), the start of a task, the method with
-  the API the component registered. Instances and callbacks ride in the closure as the `Rc`s they are: no table,
-  no ids. A value of the wrong type throws a `TypeError` in the call, or rejects the promise of a call that returns
-  one, with the same message whatever the kind (``Ints.op: `n`: expected an integer that fits u32, got 1.5``).
-- **Results are boxed Rust values** (`JsResult = Result<Box<dyn ToJs>, String>`): the core hands them back in its
-  event stream (`JsEvent::Reply { call, result }`, `Core::take_events`), in order with the nodes' events, and
-  `nsh-js` converts the value (`Ret::into_js`) when it settles the promise (`Host::deliver`). Every path that drops
-  a call settles its promise: a panic or an error rejects it, a method of a node hosting no component rejects, and
-  the ops the engine drops when the script stops reject theirs (`Core::discard_ops`). The app's code that runs
-  on the way back stays caught: a panic converting a result rejects its promise with the message, one converting
-  an event's data or a posted call's arguments is logged, one in a prop's decoder throws at the assignment, and values
-  dropped unused (a result nobody waits for, a call that does not run) drop where a panicking `Drop` is logged.
-- **A Rust component's props** are decoded when JS sets them (`PropSpec::decode`, one per prop, generated by
-  `derive(Props)` from the field's type) into a type-erased value (`AnyValue`) that `Prop::RustProp` carries; the
-  core's instance takes it out (`Props::set`). A value of the wrong type is a warning, as a host element's bad
-  value is (logged with the VM's warnings, which the dev overlay shows: `Gauge.level: expected an integer that fits
-  u32, got 1.5`): the prop keeps its value (its default in the first render) and every other prop is set;
-  `undefined` resets the prop to its default. A decoder's panic, or a getter's exception, still throws there.
-- **A Rust component's events** reach JS as the event itself (`JsEvent::Component`, `Event::data_js` converting
-  its data when JS hears it), and whether its lazy children are placed as `JsEvent::Children`.
+  call. A synchronous member or function runs on them; the other kinds (a function with `cx`, an `async` function
+  or member, a component's ref method) are carried to the core as typed ops and run in order with the UI's ops. A
+  value of the wrong type throws a `TypeError` in the call, or rejects the promise of a call that returns one, with
+  the same message whatever the kind (``Ints.op: `n`: expected an integer that fits u32, got 1.5``).
+- **Results come back in the core's event stream** (`JsEvent::Reply`, `Core::take_events`), in order with the
+  nodes' events, and `nsh-js` converts them when it settles the promise (`Host::deliver`). Every path that drops a
+  call settles its promise: a panic or an error rejects it, a method of a node hosting no component rejects, and the
+  ops the engine drops when the script stops reject theirs (`Core::discard_ops`). Panics in the app's conversion
+  code on the way back are caught (rejected, logged or thrown at the assignment).
+- **A Rust component's props** are decoded when JS sets them (`PropSpec::decode`, generated by `derive(Props)`). A
+  value of the wrong type is a warning, as a host element's bad value is (`Gauge.level: expected an integer that
+  fits u32, got 1.5`): the prop keeps its value (its default in the first render) and every other prop is set;
+  `undefined` resets the prop to its default.
+- **A Rust component's events** reach JS as the event itself (`JsEvent::Component`), and whether its lazy children
+  are placed as `JsEvent::Children`.
 - **Platform native components** (Java, Swift, the embedder's GPUI components) keep JSON (`Prop::ComponentProp`,
   `MountItem::ComponentProps`, `EventPayload::Native`, `Command::Native`): their values cross into another
   language. The two kinds stay apart.
-- **A class a signature names is registered with it**: each member, module function and ref method lists the
-  classes its parameters and result name (`ClassRefs`: `Instance<Other>`, `&Other`, `Other` by value, the
-  arguments of a `Callback`), and `Registry::class` / `module` / `register` register them in turn, so their objects
-  have a class in JS, `import { Other }` and `instanceof` work, and the declarations declare it, in every build
-  (WebAssembly included: the lists are not TypeScript, which those builds leave out). Registering a class again does
-  nothing.
+- **A class a signature names is registered with it** (`ClassRefs`), so its objects have a class in JS,
+  `import { Other }` and `instanceof` work, and the declarations declare it, in every build. Registering a class
+  again does nothing.
 
 ## The pieces
 
@@ -380,10 +382,10 @@ Nothing crosses between JS and the core as JSON for a Rust component, module or 
   code fences): what follows `# Rust` (or rustdoc's `# Panics`, `# Examples`) is for Rust callers only, the place
   for notes about `&self`, `cx` or how a call crosses. `Registry::undocumented` lists the exports TS sees without a doc comment;
   the command line warns of an app's when it writes `.nsh/types`, and nsh's own sets are tested to have none.
-  It implements `ui::Class` (`Class::DEF`, a `ClassDef`: name, doc, members, each a `Member` with its
+  It implements `element::Class` (`Class::DEF`, a `ClassDef`: name, doc, members, each a `Member` with its
   `MemberCall`), as `#[module]` implements `Module`; on the struct it implements `Trace` (the callbacks the fields
   keep) and `Ret` (a value of the struct is a new instance).
-- **`nsh-core`:** `ui::Class`, `ClassSpec` (for the declarations), `Instance<T>`, `Callback<A, R>`, `Posts`,
+- **`nsh-core`:** `element::Class`, `ClassSpec` (for the declarations), `Instance<T>`, `Callback<A, R>`, `Posts`,
   `Registry::class::<C>()`; the direct conversions (`JsHost`, `JsIn`, `JsOwned`; `JsValue`'s `from_js` /
   `to_js`); the typed calls (`call.rs`: `RustOp`, `RustCall`, `JsEvent`, `AnyValue`, `ToJs`); the core runs
   them in order with the ops (`Core::run_rust`).
@@ -392,7 +394,7 @@ Nothing crosses between JS and the core as JSON for a Rust component, module or 
   `JsHost`); calls that become ops convert their values and push the op (`classes::send`), returning the promise
   `components.rs` settles when the core's events bring the result (`components::deliver`); the object is the web
   classes' (`web/mod.rs`), its slot holding the instance, and its mark hook reports the instance's callbacks.
-- **Declarations:** `nsh_core::ui::declarations` writes `export declare class` for each, with the types the members
+- **Declarations:** `nsh_core::element::declarations` writes `export declare class` for each, with the types the members
   use, next to the set's components and modules; the declarations test checks that what exists is declared.
 - **The CLI** needs no change: classes are part of the app's set like its modules.
 
@@ -409,7 +411,7 @@ JSON).
 1. **Synchronous or a promise is the Rust signature's `async`**: a member or function that is not `async` runs in
    the JS call and returns its value (it computes and keeps state, without the UI's free functions); an `async`
    one returns a promise and runs as a core task, with them. The one exception, for functions only: one taking
-   `cx: &mut ModuleCx` stays an op ordered with the UI (a toast, the status bar, focus), as now.
+   `cx: &mut ModuleCx` stays an op ordered with the UI (the status bar, focus), as now.
 2. **`dispose()` and `[Symbol.dispose]`** besides collection.
 3. **Callbacks in the first version** (above); events and iterators later.
 4. **Functions follow the same rule**, so a plain `fn` returning a value becomes synchronous in TS.
@@ -420,32 +422,18 @@ JSON).
 
 ## Implementation notes
 
-Where the implementation differs from the proposal above, and why:
-
-- **Posted calls go through one queue the engine shares, not a core action.** `Callback::post` / `call_async`
-  queue a `JsCall` in `Posts` (it wakes the engine), and the engine runs the queue at each commit round before
-  dispatching the core's events. A callback may be posted from a synchronous member, where the core is not
-  running, so the queue belongs to the engine rather than to the core's actions; the order with the core's events
-  is the same.
-- **Typed calls instead of a table.** The first version sent ops and async calls as JSON, the instances and
-  callbacks among them held in a table both sides shared under ids the op carried (and replies' instances under
-  an id beside the value). Converting in the JS call and carrying closures removed the table, the ids (so no data
-  can look like one, and no id can leak or be forged), the name-based lookup of the member or function the core
-  calls (`app/native:Tally#save`), and a JSON round trip per call.
+- **Posted calls** (`Callback::post` / `call_async`) go through a queue the engine shares (`Posts`), run at each
+  commit round before the core's events are dispatched.
 - **Results by value.** `Self` and another class's value are results through the `Ret` impl `#[class]` writes for
   the struct; `Option<Other>` by value cannot be one (Rust's coherence rules), `Option<Instance<Other>>` can.
-- **Subclassing works already**: constructors are QuickJS constructors (called only with `new`) and honor
-  `new.target`, so a TS subclass's objects are its own.
+- **Subclassing works**: constructors honor `new.target`, so a TS subclass's objects are its own.
 - **A class without `new`** is declared with `private constructor()`; JS calling it throws a `TypeError`. Members
   named `dispose` or `constructor`, and statics named `prototype`, `name` or `length`, are compile errors (the
   object has those already).
-- **Panics in `async` module functions** now reject their promise too (they used to fail the root and leave JS
-  waiting), as an `async` member's do.
-- **Module functions take instances and callbacks** in every kind: an op's and a task's ride in its closure like
-  an async member's.
-- **A context makes at most 32768 classes** (QuickJS keeps a constructor's index in 16 signed bits) and a class
-  at most 65535 members: past them, making the class throws a `RangeError` instead of a constructor naming
-  another class.
+- **Panics in `async` module functions** reject their promise, as an `async` member's do.
+- **Module functions take instances and callbacks** in every kind.
+- **A context makes at most 32768 classes** and a class at most 65535 members: past them, making the class throws a
+  `RangeError`.
 - **The standard library's classes** (the table above) have not moved yet; the machinery is shared, so each moves
   when it needs nothing more.
 

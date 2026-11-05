@@ -11,9 +11,10 @@ use nsh_base::dock::{
 };
 use nsh_core::{
     Size,
+    element::Root,
     geometry::{Axis, point},
     platform::{Idiom, Os},
-    ui::{Root, prelude::*},
+    prelude::*,
 };
 use nsh_engine::EngineConfig;
 use nsh_testing::Headless;
@@ -230,6 +231,15 @@ fn Workspace(props: WorkspaceProps) -> impl IntoElement {
                 ))
                 .child(button("unzoom", Box::new(|a| a.toggle_zoom(None))))
                 .child(button(
+                    "select-tab-9",
+                    Box::new(|a| {
+                        if let Some(group) = a.group_of("a".into()) {
+                            a.select_tab(group, 9);
+                        }
+                    }),
+                ))
+                .child(button("remove-x", Box::new(|a| a.remove_panel("x".into()))))
+                .child(button(
                     "remove-all",
                     Box::new(|a| {
                         for panel in ["a", "b", "c"] {
@@ -395,6 +405,19 @@ fn a_dock_opens_and_closes_and_keeps_its_panels() {
     app.wait_for("Layout h([*a b]:400 [*c]) left [*files] open 200")
         .unwrap();
     app.wait_for("Panel files").unwrap();
+}
+
+/// A method naming a tab or panel the layout does not have runs at the
+/// commit, so it cannot throw: it leaves the layout as it is (and logs).
+#[test]
+fn a_method_naming_what_the_layout_lacks_changes_nothing() {
+    let mut app = start(two_groups(), 1000.0);
+    app.press("id:select-tab-9").unwrap();
+    app.press("id:remove-x").unwrap();
+    app.wait(std::time::Duration::from_millis(100)).unwrap();
+    assert!(app.shows("Layout h([*a b]:400 [*c])"));
+    assert!(app.shows("Removed none"));
+    assert!(app.shows("Panel a"));
 }
 
 #[test]
@@ -588,6 +611,45 @@ fn a_compact_drawer_is_dismissed_on_a_manual_clock() {
     app.wait_for_gone("Panel files", std::time::Duration::from_secs(5))
         .unwrap();
     app.wait_for("Docks Left- Left+ Left-").unwrap();
+}
+
+#[test]
+fn a_terminals_compact_sheet_gives_its_panel_the_sheets_rows() {
+    // A terminal sizes a box that holds content by its content: the
+    // bottom dock's sheet keeps its own height there, so the panel in it
+    // fills the rows under its tab bar, not none.
+    let mut config = EngineConfig {
+        viewport: Size::new(px(400.0), px(900.0)),
+        ..EngineConfig::new(Root::new::<Workspace>(move || WorkspaceProps {
+            layout: with_two_docks(),
+            width: None,
+            height: None,
+            compact: Some(true),
+        }))
+    };
+    config.environment.os = Os::Linux;
+    config.environment.idiom = Idiom::Terminal;
+    config.environment.cell = Some(Size::new(px(8.0), px(21.0)));
+    let mut app = Headless::start(config).expect("the engine starts");
+    app.wait_for("Tab a").unwrap();
+    app.press("id:toggle-bottom").unwrap();
+    app.wait_for("Panel terminal").unwrap();
+    app.wait(std::time::Duration::from_millis(500)).unwrap();
+    let sizes = app
+        .screen()
+        .texts()
+        .into_iter()
+        .find(|t| t.starts_with("Sizes "))
+        .map(str::to_owned)
+        .unwrap();
+    let height: f32 = sizes
+        .split(' ')
+        .find_map(|part| part.strip_prefix("terminal="))
+        .and_then(|size| size.split('x').nth(1))
+        .and_then(|h| h.parse().ok())
+        .unwrap_or_else(|| panic!("no terminal panel: {sizes}"));
+    // The sheet is the dock's 200pt, its tab bar one row of it.
+    assert!(height >= 6.0 * 21.0, "{sizes}");
 }
 
 /// The workspace of `layout` on a phone-width browser page (the web in the

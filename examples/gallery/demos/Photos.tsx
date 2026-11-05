@@ -1,9 +1,15 @@
 import { computed, Image, List, signal, Text, untracked, View } from "nsh";
-import { createAnimatedValue } from "nsh/animated";
-import { platform } from "nsh/device";
+import { createAnimatedValue } from "nsh";
+import { platform } from "nsh";
 import logo from "../logo@2x.png";
 import { Icon } from "../icons";
-import { Badge, bindRefresh, Button, colors, columnsFor, desktop, finish, paneWidth, Press, radius, Stat, type Tone, toneColor } from "../ui";
+import { Badge, bindRefresh, Button, colors, columnsFor, desktop, finish, paneWidth, photoNames, photoUrl, Press, radius, scrollbarTheme, Stat, TERMINAL_COLUMN, TERMINAL_ROW, terminal, type Tone, toneColor } from "../ui";
+
+/** The gallery's scroll bar, starting below the compact bar laid over the list's top. */
+const belowBar = {
+  ...scrollbarTheme,
+  vertical: { ...scrollbarTheme.vertical, class: scrollbarTheme.vertical?.class?.replace("inset-y-0", "top-11 bottom-0") },
+};
 
 type Photo = { id: number; title: string; author: string; tone: Tone; views: number };
 
@@ -34,7 +40,7 @@ function PhotoRow(props: { photo: Photo }) {
     <Press scale={0.985} accessibilityLabel={props.photo.title}>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 12, paddingHorizontal: 16, height: 76 }}>
         <Image
-          src={`https://picsum.photos/seed/${props.photo.id}/112/112`}
+          src={photoUrl(photoNames[props.photo.id % photoNames.length], "360x360")}
           style={{
             width: 56,
             height: 56,
@@ -47,7 +53,7 @@ function PhotoRow(props: { photo: Photo }) {
           }}
         />
         <View style={{ flex: 1, gap: 4, alignSelf: "stretch", justifyContent: "center", borderBottomWidth: 1, borderBottomColor: colors.line }}>
-          <Text numberOfLines={1} style={{ fontSize: 15, fontWeight: "600", color: colors.text }}>
+          <Text style={{ numberOfLines: 1, fontSize: 15, fontWeight: "600", color: colors.text }}>
             {props.photo.title}
           </Text>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
@@ -69,7 +75,7 @@ function PhotoTile(props: { photo: Photo }) {
     <Press scale={0.97} accessibilityLabel={props.photo.title}>
       <View class="hover:bg-card" style={{ padding: 6, gap: 8, borderRadius: radius.card, borderCurve: "continuous", cursor: "pointer" }}>
         <Image
-          src={`https://picsum.photos/seed/${props.photo.id}/480/360`}
+          src={photoUrl(photoNames[props.photo.id % photoNames.length], "small")}
           style={{
             width: "100%",
             aspectRatio: 4 / 3,
@@ -83,14 +89,14 @@ function PhotoTile(props: { photo: Photo }) {
         />
         <View style={{ gap: 3, paddingHorizontal: 4, paddingBottom: 4 }}>
           <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
-            <Text numberOfLines={1} style={{ flex: 1, fontSize: 14, fontWeight: "600", color: colors.text }}>
+            <Text style={{ numberOfLines: 1, flex: 1, fontSize: 14, fontWeight: "600", color: colors.text }}>
               {props.photo.title}
             </Text>
             <Text style={{ fontSize: 12, color: colors.faint, fontVariant: ["tabular-nums"] }}>#{props.photo.id}</Text>
           </View>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
             <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: toneColor(props.photo.tone) }} />
-            <Text numberOfLines={1} style={{ fontSize: 12, color: colors.muted }}>
+            <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.muted }}>
               {props.photo.author} · {compact(props.photo.views)} views
             </Text>
           </View>
@@ -136,20 +142,26 @@ export function Photos() {
         paddingBottom: 16,
         opacity: scrollY.interpolate({ inputRange: [0, 150], outputRange: [1, 0] }),
         // Moves at half speed: the list slides over it.
-        transform: [{ translateY: scrollY.interpolate({ inputRange: [-200, 0, 300], outputRange: [0, 0, 150] }) }],
+        translate: [0, scrollY.interpolate({ inputRange: [-200, 0, 300], outputRange: [0, 0, 150] })],
       }}
     >
+      {/* The terminal frames the card as the gallery's sections are: a
+          filled box there is a band with no border. */}
       <View
-        style={{
-          backgroundColor: colors.surface,
-          borderRadius: radius.card,
-          borderCurve: "continuous",
-          borderWidth: 1,
-          borderColor: colors.border,
-          padding: 16,
-          gap: 12,
-          ...finish.card,
-        }}
+        style={
+          terminal
+            ? { borderWidth: 1, borderColor: colors.border, paddingVertical: TERMINAL_ROW - 1, paddingHorizontal: 2 * TERMINAL_COLUMN - 1 }
+            : {
+                backgroundColor: colors.surface,
+                borderRadius: radius.card,
+                borderCurve: "continuous",
+                borderWidth: 1,
+                borderColor: colors.border,
+                padding: 16,
+                gap: 12,
+                ...finish.card,
+              }
+        }
       >
         <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
           <View
@@ -186,7 +198,7 @@ export function Photos() {
       </View>
       <View style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingTop: 12 }}>
         <Icon name="arrow-down" size={14} tint={colors.faint} />
-        {platform.idiom === "desktop" ? (
+        {platform.desktop ? (
           <Text style={{ flex: 1, fontSize: 13, color: colors.faint }}>
             {refreshKey ? `${refreshKey} refreshes. ` : ""}Scrolling to the end loads {PAGE} more.
           </Text>
@@ -194,7 +206,7 @@ export function Photos() {
           <Text style={{ flex: 1, fontSize: 13, color: colors.faint }}>Pull to refresh. Scrolling to the end loads {PAGE} more.</Text>
         )}
         {/* The mouse does not pull scroll views down: desktops refresh here. */}
-        <If when={platform.idiom === "desktop"}>
+        <If when={platform.desktop}>
           <Button label={refreshing() ? "Refreshing…" : "Refresh"} variant="secondary" disabled={refreshing()} onPress={refresh} />
         </If>
       </View>
@@ -238,13 +250,16 @@ export function Photos() {
               numColumns={n}
               estimatedItemSize={tile}
               style={{ flex: 1 }}
-              contentStyle={{ padding: 24, gap: 16 }}
+              // Two columns between tiles in the terminal (from 24pt): a
+              // tile's count is not read as the next tile's title.
+              contentStyle={{ padding: 24, rowGap: 16, columnGap: platform.idiom === "terminal" ? 24 : 16 }}
               scrollValue={scrollY}
               refreshing={refreshing()}
               onRefresh={refresh}
               onLoadMore={loadMore}
               header={hero()}
               footer={footer()}
+              scrollbar={belowBar}
             >
               {(photo) => <PhotoTile photo={photo()} />}
             </List>
@@ -253,8 +268,8 @@ export function Photos() {
       </If>
       {/* The compact bar fades in once the hero has scrolled away. */}
       <View
-        pointerEvents="none"
         style={{
+          pointerEvents: "none",
           position: "absolute",
           top: 0,
           left: 0,
@@ -268,7 +283,7 @@ export function Photos() {
           borderBottomWidth: 1,
           borderBottomColor: colors.border,
           opacity: scrollY.interpolate({ inputRange: [140, 190], outputRange: [0, 1] }),
-          transform: [{ translateY: scrollY.interpolate({ inputRange: [140, 190], outputRange: [-8, 0] }) }],
+          translate: [0, scrollY.interpolate({ inputRange: [140, 190], outputRange: [-8, 0] })],
         }}
       >
         <Text style={{ flex: 1, fontSize: 15, fontWeight: "600", color: colors.text }}>Photo stream</Text>

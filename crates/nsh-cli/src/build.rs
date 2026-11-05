@@ -42,15 +42,27 @@ pub(crate) struct Built {
     pub(crate) bytecode: Vec<u8>,
     /// Source map of `code`.
     pub(crate) source_map: Option<String>,
-    /// The chunks `import()` loads, for a split build ([`compile_split`]).
+    /// Shared and lazy chunks for a split build ([`compile_split`]).
     pub(crate) chunks: Vec<BuiltChunk>,
+    /// Static chunks required by the entry, including transitive imports.
+    pub(crate) entry_imports: Vec<String>,
     /// The files the app ships: those it imports and those its UI sets'
     /// crates ship ([`crate_assets`]).
     pub(crate) assets: Vec<Asset>,
+    /// Files of the last build, including shared sources outside the app.
+    pub(crate) watch_files: Vec<PathBuf>,
     /// What the app declares it may reach (`nsh.json` `capabilities`).
     pub(crate) capabilities: Option<nsh_core::access::Capabilities>,
     /// The UI sets it imports, by specifier ([`imported_sets`]).
     pub(crate) ui_sets: Vec<String>,
+    /// What its code uses of the native modules, by export
+    /// (`nsh_bundler::Bundle::native_use`); `None` when unknown (a Rust
+    /// app's, a development build's).
+    pub(crate) native_use: Option<nsh_bundler::NativeUse>,
+    /// What the entry chunk's own code uses of them
+    /// (`nsh_bundler::Bundle::entry_native_use`); `None` when unknown, and
+    /// then the chunks' are not used either: everything is the entry's.
+    pub(crate) entry_native_use: Option<nsh_bundler::NativeUse>,
     /// How long bundling and compiling took.
     pub(crate) elapsed: Duration,
     /// A Rust app (`nsh.json` `"root"`, [`rust_root`]): no bundle, its
@@ -66,9 +78,13 @@ pub(crate) fn rust_root() -> Built {
         bytecode: Vec::new(),
         source_map: None,
         chunks: Vec::new(),
+        entry_imports: Vec::new(),
         assets: crate_assets().collect(),
+        watch_files: Vec::new(),
         capabilities: None,
         ui_sets: Vec::new(),
+        native_use: None,
+        entry_native_use: None,
         elapsed: Duration::ZERO,
         rust_root: true,
     }
@@ -86,6 +102,9 @@ pub(crate) struct BuiltChunk {
     pub(crate) bytecode: Vec<u8>,
     /// Source map of `code`.
     pub(crate) source_map: Option<String>,
+    /// What its own code uses of the native modules
+    /// (`nsh_bundler::Bundle::chunk_native_use`); `None` when unknown.
+    pub(crate) native_use: Option<nsh_bundler::NativeUse>,
 }
 
 /// A file an app ships.
@@ -198,7 +217,7 @@ fn compile_with(
     strip: nsh_js::Strip,
 ) -> Result<Built, BuildError> {
     let start = Instant::now();
-    let bundle = nsh_bundler::bundle(&BundleOptions {
+    let mut bundle = nsh_bundler::bundle(&BundleOptions {
         entry: entry.to_path_buf(),
         minify: release,
         split,
@@ -207,19 +226,25 @@ fn compile_with(
     let dir = dunce::canonicalize(entry)
         .ok()
         .and_then(|e| e.parent().map(Path::to_path_buf));
-    let bytecode = nsh_js::compile_bytecode_with(&bundle.code, strip, &crate::ui_sets())?;
-    let sources: Vec<(&str, &str)> = bundle
-        .chunks
-        .iter()
-        .map(|c| (c.id.as_str(), c.code.as_str()))
+    let sources: Vec<(&str, &str)> = std::iter::once((nsh_js::BUNDLE_NAME, bundle.code.as_str()))
+        .chain(
+            bundle
+                .chunks
+                .iter()
+                .map(|c| (c.id.as_str(), c.code.as_str())),
+        )
         .collect();
-    let chunk_bytecode =
-        nsh_js::compile_chunk_bytecode(&bundle.code, &sources, strip, &crate::ui_sets())?;
+    let mut compiled =
+        nsh_js::compile_chunk_bytecode(&bundle.code, &sources, strip, &crate::ui_sets())?
+            .into_iter();
+    let bytecode = compiled.next().expect("entry bytecode");
+    let mut chunk_native_use = std::mem::take(&mut bundle.chunk_native_use);
     let chunks = bundle
         .chunks
         .into_iter()
-        .zip(chunk_bytecode)
+        .zip(compiled)
         .map(|(c, bytecode)| BuiltChunk {
+            native_use: chunk_native_use.remove(&c.id),
             id: c.id,
             code: c.code,
             bytecode,
@@ -231,9 +256,13 @@ fn compile_with(
         bytecode,
         source_map: bundle.source_map,
         chunks,
+        entry_imports: bundle.entry_imports,
         assets: assets(dir.as_deref(), &bundle.assets),
+        watch_files: bundle.watch_files,
         capabilities: bundle.capabilities,
         ui_sets: imported_sets(&bundle.natives),
+        native_use: Some(bundle.native_use),
+        entry_native_use: Some(bundle.entry_native_use),
         elapsed: start.elapsed(),
         rust_root: false,
     })
@@ -254,9 +283,13 @@ pub(crate) fn compile_hot(entry: &Path) -> Result<(Built, nsh_bundler::HotBundle
         bytecode,
         source_map,
         chunks: Vec::new(),
+        entry_imports: Vec::new(),
         assets: assets(dir.as_deref(), &hot.assets),
+        watch_files: hot.watch_files.clone(),
         capabilities: hot.capabilities.clone(),
         ui_sets: imported_sets(hot.natives()),
+        native_use: None,
+        entry_native_use: None,
         elapsed: start.elapsed(),
         rust_root: false,
     };
@@ -351,7 +384,7 @@ mod tests {
 
     #[test]
     fn hosts_must_serve_the_ui_sets_an_app_imports() {
-        let natives = ["nsh", "nsh/list", "nsh/base"].map(String::from);
+        let natives = ["nsh", "nsh/mobile", "nsh/base"].map(String::from);
         assert_eq!(super::imported_sets(&natives), ["nsh/base"]);
     }
 

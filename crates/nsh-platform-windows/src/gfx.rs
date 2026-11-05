@@ -3,7 +3,9 @@
 //! One Direct3D 11 device (hardware, else WARP) and the Direct2D device and
 //! device context on it serve every surface of the thread ([`with`]); each
 //! window has a flip-model swap chain ([`SwapChain`]) the context draws
-//! into in turn. When the device is lost (a driver update, a GPU reset),
+//! into in turn. The swap chain is sequential: a back buffer keeps the
+//! frame it showed two presents ago, so a frame draws only what changed
+//! since then and presents its changed rectangles (`Present1`). When the device is lost (a driver update, a GPU reset),
 //! [`lost`] drops it and bumps [`generation`]: caches of device resources
 //! (bitmaps, brushes, command lists) compare the generation they were made
 //! in and make them again.
@@ -15,7 +17,7 @@ use std::cell::{Cell, RefCell};
 
 use windows::{
     Win32::{
-        Foundation::HWND,
+        Foundation::{HWND, RECT},
         Graphics::{
             Direct2D::{
                 Common::{
@@ -37,8 +39,9 @@ use windows::{
                     DXGI_ALPHA_MODE_IGNORE, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN,
                     DXGI_SAMPLE_DESC,
                 },
-                CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH,
-                DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_DISCARD,
+                CreateDXGIFactory2, DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT,
+                DXGI_PRESENT_PARAMETERS, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
+                DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
                 DXGI_USAGE_RENDER_TARGET_OUTPUT, IDXGIDevice, IDXGIDevice1, IDXGIFactory2,
                 IDXGISurface, IDXGISwapChain1,
             },
@@ -190,6 +193,11 @@ pub(crate) struct SwapChain {
     pub(crate) size: (u32, u32),
     /// The generation of the device it was made on.
     generation: u64,
+    /// What the last frame presented changed (pixels); `None`: all of it
+    /// (or the buffers' content is unknown: new, resized).
+    last: Option<Vec<RECT>>,
+    /// A frame was presented since the buffers were made or resized.
+    shown: bool,
 }
 
 impl SwapChain {
@@ -209,7 +217,8 @@ impl SwapChain {
             BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
             BufferCount: 2,
             Scaling: DXGI_SCALING_STRETCH,
-            SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
+            // Back buffers keep their pixels: frames draw only what changed.
+            SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
             AlphaMode: DXGI_ALPHA_MODE_IGNORE,
             Flags: 0,
         };
@@ -225,7 +234,14 @@ impl SwapChain {
             target: None,
             size: (size.0.max(1), size.1.max(1)),
             generation: generation(),
+            last: None,
+            shown: false,
         })
+    }
+
+    /// The window shows a frame of these buffers, which stays until the next.
+    pub(crate) fn shows_a_frame(&self) -> bool {
+        self.shown
     }
 
     /// True when it was made on a device that is gone.
@@ -253,6 +269,8 @@ impl SwapChain {
             )?;
         }
         self.size = size;
+        self.last = None;
+        self.shown = false;
         Ok(())
     }
 
@@ -276,9 +294,35 @@ impl SwapChain {
         self.target = None;
     }
 
-    /// Shows the frame drawn, waiting for the vertical blank.
-    pub(crate) fn present(&self) -> Result<()> {
-        // SAFETY: a COM call on a live swap chain.
-        unsafe { self.swap.Present(1, DXGI_PRESENT(0)).ok() }
+    /// What a frame that changes `changed` (pixels; `None`: everything)
+    /// draws: the back buffer holds the frame of two presents ago, so the
+    /// last frame's changes too. `None`: the whole buffer.
+    pub(crate) fn to_draw(&self, changed: Option<&[RECT]>) -> Option<Vec<RECT>> {
+        let (changed, last) = (changed?, self.last.as_deref()?);
+        Some(changed.iter().chain(last).copied().collect())
+    }
+
+    /// Shows the frame drawn, waiting for the vertical blank; `changed`:
+    /// the rectangles that differ from the last frame (`None`: all).
+    pub(crate) fn present(&mut self, changed: Option<Vec<RECT>>) -> Result<()> {
+        let result = match &changed {
+            Some(rects) if !rects.is_empty() => {
+                let mut rects = rects.clone();
+                let params = DXGI_PRESENT_PARAMETERS {
+                    DirtyRectsCount: rects.len() as u32,
+                    pDirtyRects: rects.as_mut_ptr(),
+                    pScrollRect: std::ptr::null_mut(),
+                    pScrollOffset: std::ptr::null_mut(),
+                };
+                // SAFETY: a COM call on a live swap chain; the rectangles
+                // outlive it and lie in the buffer.
+                unsafe { self.swap.Present1(1, DXGI_PRESENT(0), &params).ok() }
+            }
+            // SAFETY: a COM call on a live swap chain.
+            _ => unsafe { self.swap.Present(1, DXGI_PRESENT(0)).ok() },
+        };
+        self.shown = result.is_ok();
+        self.last = if result.is_ok() { changed } else { None };
+        result
     }
 }

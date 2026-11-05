@@ -10,19 +10,27 @@
 //! longer than the line breaks between characters. That is a subset of
 //! UAX #14, enough for app text.
 
-use std::{cell::RefCell, sync::Arc};
+use std::{
+    cell::{Cell, RefCell},
+    ops::Range,
+    sync::{Arc, OnceLock},
+};
 
 use nsh_core::{
-    AttributedText, EllipsizeMode, Points, ResolvedTextStyle, Size, TextAlign, TextEngine,
-    TextLayout, TextLine,
+    AttributedText, Bounds, EllipsizeMode, Point, Points, ResolvedTextStyle, Size, TextAlign,
+    TextEngine, TextLayout, TextLine, TextPosition, text_edit::next_cluster,
 };
 use rustc_hash::FxHashMap;
 
-use self::css::measured_by_char;
 pub(crate) use self::css::{css_font, font_variant_numeric};
+use self::{
+    css::{emoji_excess, figure_width, measured_by_char},
+    hit::Stop,
+};
 use crate::ffi;
 
 mod css;
+mod hit;
 mod wrap;
 
 /// The placeholder character of an inline attachment.
@@ -35,6 +43,12 @@ type WidthKey = (Arc<str>, Option<Arc<str>>, String);
 pub(crate) struct WebTextEngine {
     /// Width of `(font, font-variant-numeric, text)`.
     widths: RefCell<FxHashMap<WidthKey, f32>>,
+    /// How much wider the DOM draws an emoji cluster in a font than canvas
+    /// measures it.
+    emoji: RefCell<FxHashMap<(Arc<str>, String), f32>>,
+    /// Whether a width since the caches were cleared has an emoji's excess:
+    /// those are stale once the pixel ratio changes.
+    emoji_measured: Cell<bool>,
     /// Ascent and descent of a font.
     metrics: RefCell<FxHashMap<Arc<str>, (f32, f32)>>,
     /// The x height of a font (attachments in the middle of a line).
@@ -46,6 +60,8 @@ impl WebTextEngine {
     /// measured with a fallback font is stale.
     pub(crate) fn clear_caches(&self) {
         self.widths.borrow_mut().clear();
+        self.emoji.borrow_mut().clear();
+        self.emoji_measured.set(false);
         self.metrics.borrow_mut().clear();
         self.x_heights.borrow_mut().clear();
     }
@@ -68,16 +84,17 @@ impl WebTextEngine {
         if text.is_empty() {
             return 0.0;
         }
-        // A figure is the sum of its characters, each measured once: a live
-        // value lays the page out for no new one, and its strings, new on
-        // every update, stay out of the cache.
+        // A figure is measured by its characters and pairs, each once: a
+        // live value lays the page out for no new one, and its strings, new
+        // on every update, stay out of the cache.
         if numeric.is_some() && text.chars().nth(1).is_some() && measured_by_char(text) {
-            let mut buf = [0u8; 4];
-            return text
-                .chars()
-                .map(|c| self.width(font, numeric, c.encode_utf8(&mut buf)))
-                .sum();
+            return figure_width(text, |part| self.measured(font, numeric, part));
         }
+        self.measured(font, numeric, text)
+    }
+
+    /// The width of `text` measured whole, cached.
+    fn measured(&self, font: &Arc<str>, numeric: Option<&Arc<str>>, text: &str) -> f32 {
         let key = (font.clone(), numeric.cloned(), text.to_owned());
         if let Some(&w) = self.widths.borrow().get(&key) {
             return w;
@@ -86,7 +103,10 @@ impl WebTextEngine {
             // Canvas cannot measure numeric variants: tabular digits are
             // wider than the proportional ones it measures.
             Some(numeric) => ffi::measure_numeric_text(font, numeric, text),
-            None => ffi::measure_text(font, text),
+            None => {
+                ffi::measure_text(font, text)
+                    + emoji_excess(text, |cluster| self.cluster_excess(font, cluster))
+            }
         };
         let mut widths = self.widths.borrow_mut();
         // Bounded: a long-running app measures many distinct strings.
@@ -95,6 +115,31 @@ impl WebTextEngine {
         }
         widths.insert(key, w);
         w
+    }
+
+    /// Whether a width measured since the caches were cleared has an
+    /// emoji's excess ([`emoji_excess`]).
+    pub(crate) fn emoji_measured(&self) -> bool {
+        self.emoji_measured.get()
+    }
+
+    /// How much wider the DOM draws emoji `cluster` than canvas measures
+    /// it: measured in the DOM once per font, so a line being typed is
+    /// still measured on canvas.
+    fn cluster_excess(&self, font: &Arc<str>, cluster: &str) -> f32 {
+        self.emoji_measured.set(true);
+        let key = (font.clone(), cluster.to_owned());
+        if let Some(&e) = self.emoji.borrow().get(&key) {
+            return e;
+        }
+        let e =
+            ffi::measure_numeric_text(font, "normal", cluster) - ffi::measure_text(font, cluster);
+        let mut emoji = self.emoji.borrow_mut();
+        if emoji.len() > 20_000 {
+            emoji.clear();
+        }
+        emoji.insert(key, e);
+        e
     }
 
     fn run_width(&self, run: &RunStyle, text: &str) -> f32 {
@@ -113,6 +158,85 @@ impl WebTextEngine {
         };
         self.metrics.borrow_mut().insert(font.clone(), m);
         m
+    }
+
+    /// Where the caret can stand on line `i` of `layout`: measured at the
+    /// first call and kept with the layout, which is as stale as the
+    /// measurements are once a font loads (the page lays out again then).
+    fn stops<'l>(&self, layout: &'l WebLayout, i: usize) -> &'l [Stop] {
+        let Some(line) = layout.hit.get(i) else {
+            return &[];
+        };
+        line.stops
+            .get_or_init(|| {
+                let mut stops = Vec::new();
+                for part in &line.parts {
+                    let Some(run) = layout.styles.get(usize::from(part.style)) else {
+                        continue;
+                    };
+                    // An attachment: one unit, its box.
+                    let Some(t) = &part.text else {
+                        hit::push_stops(&mut stops, part.x, part.width, part.start, None, |_| {
+                            (0.0, 0.0)
+                        });
+                        continue;
+                    };
+                    // The piece's characters, its drawn run and what the
+                    // run holds before it.
+                    let Some((drawn, text, before)) = layout.runs.get(t.run).and_then(|drawn| {
+                        let end = t.byte.checked_add(t.len)?;
+                        Some((
+                            drawn,
+                            drawn.text.get(t.byte..end)?,
+                            drawn.text.get(..t.byte)?,
+                        ))
+                    }) else {
+                        log::warn!("a piece of a line lost its run");
+                        continue;
+                    };
+                    // Measured in the whole drawn run: an ellipsis or a
+                    // neighbouring piece can change bidi ordering.
+                    let base = u32::try_from(before.encode_utf16().count()).unwrap_or(0);
+                    let mut ranges = Vec::new();
+                    let (mut byte, mut unit) = (0, base);
+                    while byte < text.len() {
+                        let next = next_cluster(text, byte);
+                        let Some(cluster) = text.get(byte..next).filter(|_| next > byte) else {
+                            break;
+                        };
+                        let end = unit.saturating_add(
+                            u32::try_from(cluster.encode_utf16().count()).unwrap_or(0),
+                        );
+                        ranges.push([unit, end]);
+                        unit = end;
+                        byte = next;
+                    }
+                    let mut boxes = vec![[0.0; 2]; ranges.len()];
+                    ffi::text_cluster_boxes(
+                        &run.font,
+                        run.numeric.as_deref().unwrap_or(""),
+                        run.style.letter_spacing.0,
+                        &drawn.text,
+                        &ranges,
+                        &mut boxes,
+                    );
+                    let mut boxes = boxes.into_iter();
+                    hit::push_stops(
+                        &mut stops,
+                        drawn.x,
+                        part.width,
+                        part.start,
+                        Some(text),
+                        |_| {
+                            boxes
+                                .next()
+                                .map_or((0.0, 0.0), |[left, right]| (left, right))
+                        },
+                    );
+                }
+                stops
+            })
+            .as_slice()
     }
 }
 
@@ -178,6 +302,9 @@ pub(crate) struct Prepared {
     ellipsize: EllipsizeMode,
     no_wrap: bool,
     rtl: bool,
+    /// The UTF-16 ranges of the text's links (`AttributedText::links`), in
+    /// their order.
+    links: Box<[(u32, u32)]>,
 }
 
 /// One drawn run.
@@ -188,6 +315,15 @@ pub(crate) struct Run {
     pub(crate) y: f32,
     pub(crate) text: String,
     pub(crate) style: u16,
+    /// Offset of its first character (UTF-16 units); `None` when it begins
+    /// with a truncated line's `…`, which belongs to no offset.
+    pub(crate) start: Option<u32>,
+    /// Its characters in links: `(from, to, link)`, UTF-16 units in the
+    /// run and an index into `AttributedText::links` (the innermost).
+    /// They stay in the run, whose shaping and bidi order they keep.
+    pub(crate) links: Vec<(u32, u32, u16)>,
+    /// It ends with a truncated line's `…`, which belongs to no offset.
+    ellipsis: bool,
     /// What follows the run when the text is copied: the line's break (a
     /// newline, or the spaces a wrap dropped) after its last run.
     pub(crate) after: String,
@@ -213,7 +349,41 @@ pub(crate) struct WebLayout {
     pub(crate) backgrounds: Vec<Background>,
     pub(crate) styles: Arc<[RunStyle]>,
     lines: Vec<TextLine>,
+    /// What the caret stops of each line are made of, line for line as
+    /// `lines`.
+    hit: Vec<HitLine>,
     attachments: Vec<Option<(f32, f32)>>,
+}
+
+/// A line's drawn pieces, for hit testing, and where the caret can stand on
+/// it: measured at the first hit test of the line, when the text is
+/// selected or edited, not for every layout.
+#[derive(Debug)]
+struct HitLine {
+    parts: Vec<HitPart>,
+    stops: OnceLock<Vec<Stop>>,
+}
+
+/// A piece of a line as laid out, without the ellipsis (never selected).
+#[derive(Debug)]
+struct HitPart {
+    x: f32,
+    width: f32,
+    style: u16,
+    /// Offset of its first character.
+    start: u32,
+    /// Its characters; `None` for an attachment.
+    text: Option<RunText>,
+}
+
+/// Where a piece's characters are in the layout's runs (they are drawn
+/// there, so they are not kept twice): bytes `byte..byte + len` of run
+/// `run`.
+#[derive(Debug)]
+struct RunText {
+    run: usize,
+    byte: usize,
+    len: usize,
 }
 
 impl wrap::Item for Atom {
@@ -249,6 +419,52 @@ struct LineBox {
     above: f32,
 }
 
+/// A piece of a line on its way to the runs.
+struct Part {
+    text: String,
+    style: u16,
+    width: f32,
+    kind: AtomKind,
+    /// Offset of its first character (not meaningful for the ellipsis).
+    start: u32,
+    /// The `…` of a truncated last line, which is drawn but belongs to no
+    /// offset.
+    ellipsis: bool,
+}
+
+/// The characters of a run starting at `start` that are in `links`:
+/// `(from, to, link)` in the run, each part in one innermost link.
+fn link_parts(links: &[(u32, u32)], start: u32, text: &str) -> Vec<(u32, u32, u16)> {
+    let end = start + text.encode_utf16().count() as u32;
+    let mut cuts: Vec<u32> = links
+        .iter()
+        .flat_map(|&(s, e)| [s, e])
+        .filter(|&b| b > start && b < end)
+        .collect();
+    cuts.push(start);
+    cuts.push(end);
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut parts: Vec<(u32, u32, u16)> = Vec::new();
+    for pair in cuts.windows(2) {
+        let (from, to) = (pair[0], pair[1]);
+        let Some(link) = links
+            .iter()
+            .enumerate()
+            .filter(|(_, (s, e))| from >= *s && from < *e)
+            .min_by_key(|(_, (s, e))| e - s)
+            .and_then(|(i, _)| u16::try_from(i).ok())
+        else {
+            continue;
+        };
+        match parts.last_mut() {
+            Some(last) if last.1 == from - start && last.2 == link => last.1 = to - start,
+            _ => parts.push((from - start, to - start, link)),
+        }
+    }
+    parts
+}
+
 impl WebTextEngine {
     /// Lines of `p` at `max_width` (unbounded: `None`).
     fn break_lines(&self, p: &Prepared, max_width: Option<f32>) -> (Vec<Atom>, Vec<LineBox>) {
@@ -260,18 +476,25 @@ impl WebTextEngine {
                 Some(max) if atom.kind == AtomKind::Text && atom.width > max + 0.01 => {
                     let run = &p.styles[atom.style as usize];
                     let mut at = atom.start;
-                    for c in atom.text.chars() {
-                        let s = c.to_string();
-                        let len = c.len_utf16() as u32;
+                    let mut from = 0;
+                    // By cluster: a caret never stands inside one.
+                    while from < atom.text.len() {
+                        let to = next_cluster(&atom.text, from);
+                        let (Some(cluster), true) = (atom.text.get(from..to), to > from) else {
+                            break;
+                        };
+                        let len = u32::try_from(cluster.encode_utf16().count()).unwrap_or(0);
                         atoms.push(Atom {
-                            width: self.run_width(run, &s) + run.style.letter_spacing.0,
-                            text: s,
+                            width: self.run_width(run, cluster)
+                                + run.style.letter_spacing.0 * cluster.chars().count() as f32,
+                            text: cluster.to_owned(),
                             style: atom.style,
                             kind: AtomKind::Text,
                             start: at,
                             end: at + len,
                         });
                         at += len;
+                        from = to;
                     }
                 }
                 _ => atoms.push(atom.clone()),
@@ -286,10 +509,13 @@ impl WebTextEngine {
                 let mut height = 0.0f32;
                 let mut above = 0.0f32;
                 // Below the baseline, and whether an attachment reaches below
-                // it (the line is then as tall as its extents; lines of
-                // attachments on the baseline keep their height).
+                // it or above the text (the line is then as tall as its
+                // extents, as a replaced inline box grows a CSS line; lines
+                // of attachments on the baseline that fit keep their height).
                 let mut below = 0.0f32;
                 let mut reaches_below = false;
+                let mut text_above = 0.0f32;
+                let mut attachment_above = 0.0f32;
                 let range = if line.start < end {
                     line.start..end
                 } else {
@@ -300,15 +526,17 @@ impl WebTextEngine {
                     let (h, lead) = s.line();
                     height = height.max(h);
                     above = above.max(lead + s.ascent);
+                    text_above = text_above.max(lead + s.ascent);
                     below = below.max(h - lead - s.ascent);
                     if let AtomKind::Attachment(_, _, up, down) = atom.kind {
                         above = above.max(up);
+                        attachment_above = attachment_above.max(up);
                         height = height.max(up + down);
                         below = below.max(down);
                         reaches_below |= down > 0.0;
                     }
                 }
-                if reaches_below {
+                if reaches_below || attachment_above > text_above {
                     height = height.max(above + below);
                 }
                 if height == 0.0 && !p.styles.is_empty() {
@@ -508,6 +736,7 @@ impl TextEngine for WebTextEngine {
             ellipsize: text.ellipsize,
             no_wrap: text.no_wrap,
             rtl: text.writing_direction.unwrap_or(text.rtl),
+            links: text.links.iter().map(|l| (l.start, l.end)).collect(),
         }
     }
 
@@ -539,6 +768,7 @@ impl TextEngine for WebTextEngine {
         let mut runs: Vec<Run> = Vec::new();
         let mut backgrounds = Vec::new();
         let mut line_pieces = Vec::new();
+        let mut hit_lines = Vec::with_capacity(lines.len());
         let mut text_lines = Vec::with_capacity(lines.len());
         let mut attachments = vec![
             None;
@@ -557,31 +787,49 @@ impl TextEngine for WebTextEngine {
             while end > line.start && atoms[end - 1].kind == AtomKind::Space {
                 end -= 1;
             }
-            let mut pieces: Vec<(String, u16, f32, AtomKind)> = atoms[line.start..end]
+            let mut pieces: Vec<Part> = atoms[line.start..end]
                 .iter()
-                .map(|a| (a.text.clone(), a.style, a.width, a.kind))
+                .map(|a| Part {
+                    text: a.text.clone(),
+                    style: a.style,
+                    width: a.width,
+                    kind: a.kind,
+                    start: a.start,
+                    ellipsis: false,
+                })
                 .collect();
             let mut width = line.width;
+            // Not drawn, but a caret after them stands past them: the line
+            // reports them in its width, as CoreText's lines do.
+            let mut hanging: f32 = atoms[end..line.end].iter().map(|a| a.width).sum();
             if last && truncated && prepared.ellipsize != EllipsizeMode::Clip {
-                let style = pieces.last().map_or(0, |p| p.1);
+                hanging = 0.0;
+                let style = pieces.last().map_or(0, |p| p.style);
                 let ellipsis = self.run_width(&styles[style as usize], "…");
                 // Drop characters from the end until the ellipsis fits.
-                while width + ellipsis > size.width.0 + 0.01 && !pieces.is_empty() {
-                    let (text, style, w, kind) = pieces.pop().expect("not empty");
-                    width -= w;
-                    if kind == AtomKind::Text && text.chars().count() > 1 {
-                        let mut t = text;
-                        t.pop();
-                        let nw = self.run_width(&styles[style as usize], &t);
-                        width += nw;
-                        pieces.push((t, style, nw, kind));
+                while width + ellipsis > size.width.0 + 0.01
+                    && let Some(mut piece) = pieces.pop()
+                {
+                    width -= piece.width;
+                    if piece.kind == AtomKind::Text && piece.text.chars().count() > 1 {
+                        piece.text.pop();
+                        piece.width = self.run_width(&styles[piece.style as usize], &piece.text);
+                        width += piece.width;
+                        pieces.push(piece);
                     }
                 }
                 // Trailing spaces before the ellipsis go.
-                while pieces.last().is_some_and(|p| p.3 == AtomKind::Space) {
-                    width -= pieces.pop().expect("not empty").2;
+                while let Some(space) = pieces.pop_if(|p| p.kind == AtomKind::Space) {
+                    width -= space.width;
                 }
-                pieces.push(("…".to_owned(), style, ellipsis, AtomKind::Text));
+                pieces.push(Part {
+                    text: "…".to_owned(),
+                    style,
+                    width: ellipsis,
+                    kind: AtomKind::Text,
+                    start: 0,
+                    ellipsis: true,
+                });
                 width += ellipsis;
             }
             let free = (size.width.0 - width).max(0.0);
@@ -600,7 +848,16 @@ impl TextEngine for WebTextEngine {
             // Neighbouring pieces of one style draw as one run.
             let mut merge = false;
             line_pieces.clear();
-            for (text, style, w, kind) in pieces {
+            let mut hit_parts: Vec<HitPart> = Vec::with_capacity(pieces.len());
+            for part in pieces {
+                let Part {
+                    text,
+                    style,
+                    width: w,
+                    kind,
+                    start,
+                    ellipsis,
+                } = part;
                 let s = &styles[style as usize];
                 let attachment = matches!(kind, AtomKind::Attachment(..));
                 line_pieces.push(nsh_core::LinePiece {
@@ -615,20 +872,58 @@ impl TextEngine for WebTextEngine {
                         *slot = Some((x, baseline - top));
                     }
                     attachment_index += 1;
+                    hit_parts.push(HitPart {
+                        x,
+                        width: w,
+                        style,
+                        start,
+                        text: None,
+                    });
                     x += w;
                     merge = false;
                     continue;
                 }
                 let s = &styles[style as usize];
-                match runs.last_mut() {
-                    Some(r) if merge && r.style == style => r.text.push_str(&text),
-                    _ => runs.push(Run {
-                        x,
-                        y: baseline - s.ascent,
-                        text,
-                        style,
-                        after: String::new(),
-                    }),
+                let len = text.len();
+                let index = runs.len();
+                let (run, byte) = match runs.last_mut() {
+                    Some(r) if merge && r.style == style => {
+                        let byte = r.text.len();
+                        r.text.push_str(&text);
+                        r.ellipsis |= ellipsis;
+                        (index.saturating_sub(1), byte)
+                    }
+                    _ => {
+                        runs.push(Run {
+                            x,
+                            y: baseline - s.ascent,
+                            text,
+                            style,
+                            start: (!ellipsis).then_some(start),
+                            links: Vec::new(),
+                            ellipsis,
+                            after: String::new(),
+                        });
+                        (index, 0)
+                    }
+                };
+                if !ellipsis {
+                    if let Some(last) = hit_parts.last_mut()
+                        && let Some(previous) = &mut last.text
+                        && previous.run == run
+                        && previous.byte + previous.len == byte
+                    {
+                        previous.len += len;
+                        last.width += w;
+                    } else {
+                        hit_parts.push(HitPart {
+                            x,
+                            width: w,
+                            style,
+                            start,
+                            text: Some(RunText { run, byte, len }),
+                        });
+                    }
                 }
                 merge = true;
                 x += w;
@@ -654,26 +949,58 @@ impl TextEngine for WebTextEngine {
                 }
             }
             let first = &styles[atoms.get(line.start).map_or(0, |a| a.style) as usize];
+            // An empty line (a break right after another, or after the last
+            // one) starts where the break before it ended.
+            let start = atoms.get(line.start).map_or_else(
+                || {
+                    line.start
+                        .checked_sub(1)
+                        .and_then(|i| atoms.get(i))
+                        .map_or(0, |a| a.end)
+                },
+                |a| a.start,
+            );
+            // Before the break character, never after it.
+            let line_end = match line.end.checked_sub(1).and_then(|i| atoms.get(i)) {
+                Some(a) if line.end > line.start => a.end,
+                _ => start,
+            };
             text_lines.push(TextLine {
                 text: String::new(),
-                start: atoms.get(line.start).map_or(0, |a| a.start),
-                end: atoms.get(line.end.saturating_sub(1)).map_or(0, |a| a.end),
+                start,
+                end: line_end,
                 x: Points(x0),
                 y: Points(y),
-                width: Points(width),
+                width: Points(width + hanging),
                 height: Points(line.height),
                 ascender: Points(first.ascent),
                 descender: Points(first.descent),
                 cap_height: first.style.font_size * 0.7,
                 x_height: first.style.font_size * 0.5,
             });
+            hit_lines.push(HitLine {
+                parts: hit_parts,
+                stops: OnceLock::new(),
+            });
             y += line.height;
+        }
+        if !prepared.links.is_empty() {
+            for run in &mut runs {
+                if let Some(start) = run.start {
+                    let text = match run.ellipsis {
+                        true => run.text.strip_suffix('…').unwrap_or(&run.text),
+                        false => &run.text,
+                    };
+                    run.links = link_parts(&prepared.links, start, text);
+                }
+            }
         }
         TextLayout(Arc::new(WebLayout {
             runs,
             backgrounds,
             styles,
             lines: text_lines,
+            hit: hit_lines,
             attachments,
         }))
     }
@@ -693,6 +1020,25 @@ impl TextEngine for WebTextEngine {
         })
     }
 
+    fn hit_test(&self, layout: &TextLayout, point: Point<Points>) -> TextPosition {
+        let Some(l) = layout.downcast::<WebLayout>() else {
+            return TextPosition::default();
+        };
+        hit::hit_test(&l.lines, |i| self.stops(l, i), point)
+    }
+
+    fn caret_rect(&self, layout: &TextLayout, position: TextPosition) -> Option<Bounds<Points>> {
+        let l = layout.downcast::<WebLayout>()?;
+        hit::caret_rect(&l.lines, |i| self.stops(l, i), position)
+    }
+
+    fn range_rects(&self, layout: &TextLayout, range: Range<u32>, out: &mut Vec<Bounds<Points>>) {
+        let Some(l) = layout.downcast::<WebLayout>() else {
+            return;
+        };
+        hit::range_rects(&l.lines, |i| self.stops(l, i), range, out);
+    }
+
     fn register_font(&self, data: &[u8]) -> Result<(), String> {
         let face = ttf_parser::Face::parse(data, 0).map_err(|e| e.to_string())?;
         let name = |id| {
@@ -709,5 +1055,15 @@ impl TextEngine for WebTextEngine {
         // when the face finishes loading: `nsh_fonts_loaded`).
         self.clear_caches();
         Ok(())
+    }
+}
+
+/// Canvas drawings use the same font and numeric-variant measurements as text.
+#[cfg(feature = "browser-core")]
+pub(crate) fn canvas_width(font: &nsh_core::canvas::CanvasFont, text: &str) -> f32 {
+    let css = crate::canvas::font(font);
+    match css::font_variant_numeric(font.variant) {
+        Some(numeric) => ffi::measure_numeric_text(&css, &numeric, text),
+        None => ffi::measure_text(&css, text),
     }
 }

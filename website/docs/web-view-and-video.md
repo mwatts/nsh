@@ -7,7 +7,7 @@ group: ui
 
 # Web view and video
 
-The web view and the video player embed the platform's own web engine and media player as ordinary views: `web_view` and `video` in Rust (`nsh_core::ui::prelude`), `WebView` and `Video` from `nsh` in TSX. Because NSH renders with native views, they sit in your layout like any other element: they scroll with their parent, take rounded corners and clipping, and other views can overlap them without layering problems.
+The web view and the video player embed the platform's own web engine and media player as ordinary views: `web_view` and `video` in Rust (`nsh_core::prelude`), `WebView` and `Video` from `nsh` in TSX. Because NSH renders with native views, they sit in your layout like any other element: they scroll with their parent, take rounded corners and clipping, and other views can overlap them without layering problems.
 
 | Component | iOS | Android | macOS | Linux | Windows |
 |---|---|---|---|---|---|
@@ -37,7 +37,7 @@ codecs decode; `rate` works, there is no poster, and the control bar always show
 ## WebView
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 #[component]
 pub fn App() -> impl IntoElement {
@@ -98,10 +98,10 @@ Events:
 
 ### A browser with back and forward
 
-The web view's ref (an `element_ref()` put on it with `.element_ref(&web)` in Rust, `ref` in TSX) has `reload`, `go_back` / `goBack`, `go_forward` / `goForward`, `stop_loading` / `stopLoading`, `inject_java_script` / `injectJavaScript(script)` and `post_message` / `postMessage(data)`:
+The web view's ref (an `element_ref()` put on it with `.element_ref(&web)` in Rust, `ref` in TSX) has `reload`, `go_back` / `goBack`, `go_forward` / `goForward`, `stop_loading` / `stopLoading`, `inject_java_script` / `injectJavaScript(script)`, `post_message` / `postMessage(data)` and `send_input` / `sendInput(input)` ([below](#input-as-the-users-own)):
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 pub fn browser() -> impl IntoElement {
     let web = element_ref();
@@ -148,10 +148,10 @@ pub fn browser() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { mount, signal, Text, View, WebView, type WebViewNavigation, type YNode } from "nsh";
+import { mount, signal, Text, View, WebView, type WebViewNavigation, type WebViewRef } from "nsh";
 
 function Browser() {
-  let web!: YNode;
+  let web!: WebViewRef;
   const nav = signal<WebViewNavigation | null>(null);
   const button = (label: string, enabled: boolean, action: () => void) => (
     <Text onPress={enabled ? action : undefined} style={{ padding: 12, color: enabled ? "#0969da" : "#8c959f" }}>
@@ -160,7 +160,7 @@ function Browser() {
   );
   return (
     <View style={{ flex: 1, paddingTop: 50 }}>
-      <Text numberOfLines={1} style={{ paddingHorizontal: 12, color: "#57606a" }}>
+      <Text style={{ numberOfLines: 1, paddingHorizontal: 12, color: "#57606a" }}>
         {nav()?.loading ? "Loading…" : nav()?.title ?? ""}
       </Text>
       <WebView
@@ -187,7 +187,7 @@ mount(Browser);
 Pages talk to the app with `window.nsh.postMessage(string)`, which arrives as `on_message` (`onMessage`). The app talks to the page with the ref's `post_message` (`postMessage(string)`), which arrives in the page as a `message` event on `window`. Messages are strings; send JSON for structured data.
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 const PAGE: &str = r#"<!doctype html>
 <html><head><meta name="viewport" content="width=device-width"></head>
@@ -231,7 +231,7 @@ pub fn App() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { mount, signal, Text, View, WebView, type YNode } from "nsh";
+import { mount, signal, Text, View, WebView, type WebViewRef } from "nsh";
 
 const page = `<!doctype html>
 <html><head><meta name="viewport" content="width=device-width"></head>
@@ -248,7 +248,7 @@ const page = `<!doctype html>
 </body></html>`;
 
 function App() {
-  let web!: YNode;
+  let web!: WebViewRef;
   const last = signal("");
   return (
     <View style={{ flex: 1, paddingTop: 50, gap: 12 }}>
@@ -287,6 +287,58 @@ web_view("https://example.com")
 />
 ```
 
+### Input as the user's own
+
+`injectJavaScript` can only make synthetic events, which a page sees as untrusted (`event.isTrusted` is `false`) and some widgets ignore. The ref's `send_input` (`sendInput(input)`) gives the page input as the user's own hands would, so its events are trusted:
+
+- `{ type: "click", x, y }` clicks a point of the viewport, in CSS pixels (what `getBoundingClientRect()` reports).
+- `{ type: "text", text }` types the text into what has the page's focus, a key at a time: each character on the US layout's key for it, a line break as Enter, and what no US key types (`é`, CJK, emoji) on no key (`code` is `"Unidentified"`).
+- `{ type: "key", key }` presses `Enter`, `Tab`, `Escape` or `Backspace`.
+
+```rust tabs
+use nsh_core::{WebInput, WebKey, prelude::*};
+use std::time::Duration;
+
+fn search(web: &ElementRef) {
+    web.send_input(WebInput::Click { x: px(120.0), y: px(40.0) });
+    let web = *web;
+    set_timeout(Duration::from_millis(50), move || {
+        web.send_input(WebInput::Text("espresso".into()));
+        web.send_input(WebInput::Key(WebKey::Enter));
+    });
+}
+```
+
+```tsx tabs
+web.sendInput({ type: "click", x: 120, y: 40 });
+setTimeout(() => {
+  web.sendInput({ type: "text", text: "espresso" });
+  web.sendInput({ type: "key", key: "Enter" });
+}, 50);
+```
+
+In Rust these are `WebInput::Click { x, y }`, `WebInput::Text(text)` and `WebInput::Key(WebKey::Enter)`.
+
+Trusted input carries user activation (it may open windows, write the clipboard, open the system's file panel or press a page's confirm button), so it is a capability of its own: the app needs `"webview": { "input": true }` in `nsh.json`'s `capabilities` ([`webview`](./sandbox-and-capabilities.md#webview)), also when it declares none, and the core drops the call otherwise.
+
+Like a click, `sendInput` takes the keyboard focus for the web view, away from the app's own `Input`. The page handles input on its own schedule: a click's events can still be on their way when the next call starts, so let a click settle (a frame or so) before typing after it. macOS delivers the input; the other platforms ignore it for now.
+
+Before offering anything that depends on it, ask whether it works here: `web_input_available()` (`WebView.inputAvailable()`) resolves `true` only where the platform delivers the input and the app holds `webview.input`, so it is `false` on platforms that ignore the call and in apps without the grant.
+
+```rust tabs
+use nsh_core::prelude::*;
+
+let input = signal(false);
+spawn(async move { input.set(web_input_available().await) });
+```
+
+```tsx tabs
+import { signal, WebView } from "nsh";
+
+const input = signal(false);
+WebView.inputAvailable().then((available) => input.set(available));
+```
+
 ### Which sites a web view may show
 
 If your `nsh.json` declares `"capabilities"`, a web view may only show and navigate to the hosts listed under `webview`:
@@ -304,7 +356,7 @@ The check covers the web view's `src` and every top-level navigation the page ma
 ## Video
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 pub fn player() -> impl IntoElement {
     let player = element_ref();
@@ -321,7 +373,7 @@ pub fn player() -> impl IntoElement {
                 .element_ref(&player)
                 .paused(paused)
                 .repeat(true)
-                .resize_mode(ResizeMode::Contain)
+                .object_fit(ResizeMode::Contain)
                 .h(px(220.0))
                 .rounded(px(12.0))
                 .overflow_hidden()
@@ -349,10 +401,10 @@ pub fn player() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { mount, signal, Text, Video, View, type YNode } from "nsh";
+import { mount, signal, Text, Video, type VideoRef, View } from "nsh";
 
 function Player() {
-  let video!: YNode;
+  let video!: VideoRef;
   const paused = signal(true);
   const time = signal("");
   return (
@@ -362,7 +414,6 @@ function Player() {
         src="https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4"
         paused={paused()}
         repeat
-        resizeMode="contain"
         style={{ height: 220, borderRadius: 12, overflow: "hidden", backgroundColor: "#000000" }}
         onProgress={(e) => time.set(`${e.currentTime.toFixed(1)} / ${e.duration.toFixed(1)} s`)}
         onEnd={() => paused.set(true)}
@@ -385,7 +436,7 @@ mount(Player);
 
 Playback is controlled by props: set `paused`, `muted`, `volume` and `rate` from signals and the player follows. The ref has `seek(seconds)`.
 
-In Rust, `video(url)` makes the player (the URL a value, a signal or a closure) and each prop is a builder method in snake case (`paused`, `repeat(true)`, `resize_mode(ResizeMode::Contain)`, `progress_interval` for `progressUpdateInterval`); `on_load` gets a `VideoInfo` (`duration`, `size`), `on_progress` a `VideoProgress` (`current_time`, `duration`) and `on_buffer` a `bool`.
+In Rust, `video(url)` makes the player (the URL a value, a signal or a closure) and each prop is a builder method in snake case (`paused`, `repeat(true)`, `object_fit(ResizeMode::Contain)` (the `objectFit` style), `progress_interval` for `progressUpdateInterval`); `on_load` gets a `VideoInfo` (`duration`, `size`), `on_progress` a `VideoProgress` (`current_time`, `duration`) and `on_buffer` a `bool`.
 
 | Prop | Type | Default | Description |
 |---|---|---|---|
@@ -395,7 +446,7 @@ In Rust, `video(url)` makes the player (the URL a value, a signal or a closure) 
 | `volume` | `number` | `1` | 0..1. |
 | `rate` | `number` | `1` | The playback speed. |
 | `repeat` | `boolean` | `false` | Plays again from the start at the end. |
-| `resizeMode` | `"cover" \| "contain" \| "stretch" \| "center"` | | How the picture fits the view. |
+| `objectFit` (style), `object-*` classes | `"cover" \| "contain" \| "fill" \| "none" \| "scale-down"` | `"contain"` | How the picture fits the view, as CSS's `object-fit` (`class="object-cover"`). |
 | `controls` | `boolean` | `false` | The platform's playback controls. |
 | `progressUpdateInterval` | `number` | `250` | Milliseconds between `onProgress` events. |
 

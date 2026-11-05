@@ -6,7 +6,8 @@
 use nsh_core::{
     Bounds, Points,
     animation::{Curve, EaseMode},
-    ui::{AnyElement, prelude::*},
+    element::AnyElement,
+    prelude::*,
 };
 
 use super::live;
@@ -192,6 +193,13 @@ pub(crate) fn MarketButton() -> impl IntoElement {
                                 } else {
                                     IconName::Play
                                 }
+                            })
+                            .label(move || {
+                                Some(SharedString::from(if running.get() {
+                                    "Pause"
+                                } else {
+                                    "Resume"
+                                }))
                             })
                             .size(13.0)
                             .tint(move || {

@@ -48,11 +48,12 @@ view()
 | `.label(..)` | `accessibilityLabel` | `string` | What screen readers read, instead of the texts inside. |
 | `.hint(..)` | `accessibilityHint` | `string` | What activating the element does, read after a pause. |
 | `.role(..)` | `role` | `AccessibilityRole` | What the element is. |
-| `.accessibility_state(..)` | `accessibilityState` | `AccessibilityState` | Its state: disabled, selected, checked, busy, expanded. `selected` also applies the selected style, `checked` the checked style when true and the indeterminate style when `"mixed"`. |
+| `.accessibility_state(..)` | `accessibilityState` | `AccessibilityState` | Its state: disabled, selected, checked, busy, expanded, pressed, current, has popup. `selected` also applies the selected style, `checked` the checked style when true and the indeterminate style when `"mixed"`, `pressed` the pressed style when true. |
+| `.accessibility_level(..)` | `accessibilityLevel` | `number` | The level of a heading (1 the top), the depth of a tree item (1 at the top). |
 | `.accessibility_value(..)` | `accessibilityValue` | `{ min?, max?, now?, text? }` | The value of a range or textual element. |
 | | `accessibilityActions` | `{ name, label? }[]` | Actions offered to assistive technologies. |
 | `.on_accessibility_action(..)` | `onAccessibilityAction` | `(e: { actionName }) => void` | An action was performed (Rust: its name). |
-| | `accessibilityElementsHidden` | `boolean` | Hides the view and its subtree from assistive technologies. |
+| `.accessibility_elements_hidden(..)` | `accessibilityElementsHidden` | `boolean` | Hides the view and its subtree from assistive technologies. |
 | | `importantForAccessibility` | `"auto" \| "yes" \| "no" \| "no-hide-descendants"` | Whether the view (and its subtree) is exposed. |
 | | `android={{ accessibilityLiveRegion }}` | `"none" \| "polite" \| "assertive"` | Android: how changes of the view are announced to TalkBack. |
 | `.test_id(..)` | `testID` | `string` | An identifier for UI tests (the accessibility identifier on iOS, the resource id on Android); not read aloud. |
@@ -61,14 +62,19 @@ Give every icon-only control a label: a screen reader cannot read a glyph or an 
 
 ### Roles
 
-The role (`.role(AccessibilityRole::Header)`, `role="header"`) tells the user what kind of element this is and how to operate it. In Rust it is an `AccessibilityRole` variant (`Button`, `Header`, `Switch`, ...); the TSX values are `"none"`, `"button"`, `"link"`, `"search"`, `"image"`, `"imagebutton"`, `"keyboardkey"`, `"text"`, `"adjustable"`, `"header"`, `"summary"`, `"alert"`, `"checkbox"`, `"combobox"`, `"menu"`, `"menubar"`, `"menuitem"`, `"progressbar"`, `"radio"`, `"radiogroup"`, `"scrollbar"`, `"spinbutton"`, `"switch"`, `"tab"`, `"tablist"`, `"timer"`, `"toolbar"`, `"list"` and `"grid"`.
+The role (`.role(AccessibilityRole::Header)`, `role="header"`) tells the user what kind of element this is and how to operate it. In Rust it is an `AccessibilityRole` variant (`Button`, `Header`, `Switch`, ...); the TSX values are `"none"`, `"button"`, `"link"`, `"search"`, `"image"`, `"imagebutton"`, `"keyboardkey"`, `"text"`, `"adjustable"`, `"header"`, `"summary"`, `"alert"`, `"checkbox"`, `"combobox"`, `"menu"`, `"menubar"`, `"menuitem"`, `"progressbar"`, `"radio"`, `"radiogroup"`, `"scrollbar"`, `"spinbutton"`, `"switch"`, `"tab"`, `"tablist"`, `"timer"`, `"toolbar"`, `"list"`, `"grid"`, `"table"`, `"rowgroup"`, `"row"`, `"columnheader"` and `"cell"` (the roles of [`Table`](../elements/table.md)'s parts), `"listbox"` and `"option"` (a list of options to choose from, such as [`Select`](../elements/select.md)'s list, and its options, the chosen one marked by `accessibilityState.selected`), `"group"` (related elements that belong together), `"region"` (a section worth reaching on its own, such as an accordion's panel), `"navigation"` (links that move around the app, such as a pagination), `"tree"` and `"treeitem"` (items that expand and collapse, each at its `accessibilityLevel`), `"menuitemcheckbox"` and `"menuitemradio"` (menu items that are checked, alone or as one choice of a group).
 
 The most useful ones:
 
 - `"button"` for anything pressable that is not a link; `"link"` for navigation to content.
-- `"header"` for section titles: screen reader users jump between headers to skim a screen.
+- `"header"` for section titles: screen reader users jump between headers to skim a screen. `accessibilityLevel` gives its level (1 the top) where the platform reads one.
+- `"button"` with `accessibilityState.pressed` for a toggle button, one that stays on or off (bold in a toolbar).
+- `"navigation"` around links that move between pages, the link of the shown page with `accessibilityState.current: "page"`.
 - `"switch"`, `"checkbox"`, `"radio"` with `accessibilityState.checked`.
-- `"adjustable"` for sliders and steppers, with `accessibilityValue` and the `increment` / `decrement` actions.
+- `"adjustable"` for sliders and steppers, with `accessibilityValue` and the `increment` / `decrement` actions
+  (each thumb of a [`Slider`](../elements/slider.md) is one).
+- `"spinbutton"` for a field that holds a number the user can also step, with the same value and actions (the
+  field of a [`NumberInput`](../elements/number-input.md)).
 - `"image"` for meaningful images, with a label; decorative images should be hidden instead.
 
 ```rust tabs
@@ -87,7 +93,7 @@ text("Settings")
 For an on / off control in an app, use [`Switch`](../elements/switch.md) from `nsh/base`, which sets the role and state itself. The example shows what a role and state on a view do.
 
 ```rust tabs
-use nsh_core::{Checked, ui::prelude::*};
+use nsh_core::{Checked, prelude::*};
 
 // A toggle drawn with views.
 view()
@@ -128,7 +134,7 @@ view()
 </View>
 ```
 
-The state is `AccessibilityState { disabled, selected, checked: Option<Checked>, busy, expanded }` in Rust and `{ disabled?, selected?, checked?: boolean | "mixed", busy?, expanded? }` in TSX. `disabled` is also implied by disabling the view (`.disabled(..)`, `disabled`). `accessibilityValue` with `min`, `max` and `now` is read as a percentage; with `text` it is read as given ("3 of 10", "Medium").
+The state is `AccessibilityState { disabled, selected, checked: Option<Checked>, busy, expanded, pressed: Option<Checked>, current: Option<AccessibilityCurrent>, has_popup }` in Rust and `{ disabled?, selected?, checked?: boolean | "mixed", busy?, expanded?, pressed?: boolean | "mixed", current?: boolean | "page" | "step" | "location" | "date" | "time", hasPopup? }` in TSX. `pressed` makes a button a toggle button (ARIA's `aria-pressed`); `current` marks the current item of a set (ARIA's `aria-current`): a pagination's page, a wizard's step; `hasPopup` marks the trigger of a popup, a menu or a list (ARIA's `aria-haspopup`), whose `expanded` says whether it is open, where an `expanded` element without it is a disclosure that shows its content in place (`Popover`, `Menu`, `HoverCard`, `Select`, `Combobox` and `DatePicker` set it on their triggers). `disabled` is also implied by disabling the view (`.disabled(..)`, `disabled`). `accessibilityValue` with `min`, `max` and `now` is read as a percentage; with `text` it is read as given ("3 of 10", "Medium").
 
 ## Actions
 
@@ -163,11 +169,13 @@ Some action names are standard and map to the platforms' own gestures:
 | Name | iOS (VoiceOver) | Android (TalkBack) |
 |---|---|---|
 | `activate` | Double tap | Double tap (click) |
-| `increment`, `decrement` | Swipe up / down on an adjustable element | Scroll forward / backward |
+| `increment`, `decrement` | Swipe up / down, then VoiceOver reads the new value | Scroll forward / backward |
 | `longpress` | | Double tap and hold |
 | `expand`, `collapse` | | Expand / collapse |
 | `magicTap` | Two-finger double tap | |
 | `escape` | Two-finger Z scrub | |
+
+An element with `increment` or `decrement` is adjustable whatever its role: a chart keeps its `"image"` role and steps through its points with VoiceOver's swipes and TalkBack's scrolls, its `accessibilityValue` read after each step.
 
 Any other name becomes a custom action, listed in VoiceOver's actions rotor and TalkBack's actions menu with its `label` (or its name). Custom actions are the accessible form of swipe-to-delete and similar gestures:
 
@@ -213,7 +221,7 @@ Hide what adds nothing: decorative images, dividers, an icon next to a text that
 
 ## The screen reader and the user's settings
 
-In Rust, the prelude reports the user's settings and talks to the screen reader: `screen_reader()` and `reduce_motion()` are reactive, `announce_for_accessibility(message)` has the screen reader read a message, and an element's `element_ref()` moves the screen reader's focus to it with `set_accessibility_focus()`. In TSX, `nsh/accessibility` reports the user's settings and lets you talk to the screen reader.
+In Rust, the prelude reports the user's settings and talks to the screen reader: `screen_reader()` and `reduce_motion()` are reactive, `announce_for_accessibility(message)` has the screen reader read a message, and an element's `element_ref()` moves the screen reader's focus to it with `set_accessibility_focus()`. In TSX, `nsh`'s accessibility API reports the user's settings and lets you talk to the screen reader.
 
 | Member | Description |
 |---|---|
@@ -225,7 +233,7 @@ In Rust, the prelude reports the user's settings and talks to the screen reader:
 The settings are accessors: read them in a binding or an effect, and what reads them updates when the user changes the setting, with no cleanup.
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn upload() -> impl IntoElement {
     let done = signal(false);
@@ -247,12 +255,12 @@ fn upload() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { signal, Text, View, type YNode } from "nsh";
-import { announce, screenReaderEnabled, setAccessibilityFocus } from "nsh/accessibility";
+import { signal, Text, View, type ViewRef } from "nsh";
+import { announce, screenReaderEnabled, setAccessibilityFocus } from "nsh";
 
 function Upload() {
   const done = signal(false);
-  let result!: YNode;
+  let result!: ViewRef;
   const finish = () => {
     done.set(true);
     announce("Upload complete");
@@ -278,7 +286,7 @@ Text and inputs follow the system text size (Dynamic Type on iOS, font size on A
 
 - Let text wrap: avoid fixed heights on views that contain text.
 - Cap very large headings with `.max_font_size_multiplier(..)` / `maxFontSizeMultiplier` instead of disabling scaling.
-- Switch layouts when the text is large: read `font_scale()` (Rust) or `fontScale()` from `nsh/device` (TSX) (for example, stack a label and its value vertically above 1.3).
+- Switch layouts when the text is large: read `font_scale()` (Rust) or `fontScale()` from `nsh` (TSX) (for example, stack a label and its value vertically above 1.3).
 
 See [Device and environment](./device-and-environment.md#text-size).
 
@@ -287,7 +295,7 @@ See [Device and environment](./device-and-environment.md#text-size).
 `reduce_motion()` (Rust) and `reduceMotion()` (TSX) are `true` when the user turned on iOS's Reduce Motion or Android's remove animations setting. Your animations run as you write them, so use it, or the `motion-reduce:` and `motion-safe:` Tailwind variants, to replace large movement with a fade or an instant change:
 
 ```rust tabs
-use nsh_core::ui::{LayoutAnimation, prelude::*};
+use nsh_core::{element::LayoutAnimation, prelude::*};
 
 let toggle = move || {
     if !reduce_motion() {
@@ -303,8 +311,8 @@ view()
 
 ```tsx tabs
 import { View } from "nsh";
-import { reduceMotion } from "nsh/accessibility";
-import { LayoutAnimation } from "nsh/animated";
+import { reduceMotion } from "nsh";
+import { LayoutAnimation } from "nsh";
 
 const toggle = () => {
   if (!reduceMotion()) LayoutAnimation.configureNext(LayoutAnimation.Presets.spring);
@@ -328,6 +336,6 @@ Make pressable elements at least 44 × 44 points. When a control must look small
 
 ## Related
 
-- [`nsh/accessibility`](../modules/nsh-accessibility.md): the reference.
+- [`nsh`'s accessibility API](../modules/nsh.md#accessibility): the reference.
 - [`View`](../elements/view.md): every accessibility prop.
 - [Animation](./animation.md#reduced-motion) and [Device and environment](./device-and-environment.md).

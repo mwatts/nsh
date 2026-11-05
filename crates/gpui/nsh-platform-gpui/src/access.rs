@@ -24,8 +24,9 @@
 //! scroll views, views with press handlers, labelled views and every view
 //! with an `accessibilityRole` are elements; plain containers are looked
 //! through; `accessibilityElementsHidden`, `importantForAccessibility:
-//! "no-hide-descendants"` and screens below the top of a stack hide a whole
-//! subtree, `importantForAccessibility: "no"` / `accessible={false}` only
+//! "no-hide-descendants"`, `visibility: hidden` (as in a browser) and
+//! screens below the top of a stack hide a whole subtree, its texts naming
+//! nothing, `importantForAccessibility: "no"` / `accessible={false}` only
 //! the view itself. Buttons, links, checkboxes, tabs, ... and
 //! `accessible={true}` views group their content: texts, images and groups
 //! inside them name the element ([`own_name`]); controls inside stay
@@ -87,12 +88,14 @@ use std::{
 use gpui::{
     A11ySubtreeBuilder, AnyElement, App, AvailableSpace, FocusHandle, InteractiveElement,
     IntoElement, StatefulInteractiveElement, Styled, Window,
-    accesskit::{self, Action, ActionData, CustomAction, Live, Node, Role, ScrollUnit, Toggled},
+    accesskit::{
+        self, Action, ActionData, AriaCurrent, CustomAction, Live, Node, Role, ScrollUnit, Toggled,
+    },
     div, point, px, size,
 };
 use nsh_core::{
-    Accessibility, AccessibilityRole as AxRole, Checked, Command, EventKind, EventMask, LiveRegion,
-    MountBatch, NodeId, ViewKind, geometry::Points,
+    Accessibility, AccessibilityCurrent, AccessibilityRole as AxRole, Checked, Command, EventKind,
+    EventMask, LiveRegion, MountBatch, NodeId, ViewKind, geometry::Points,
 };
 use rustc_hash::FxHashMap;
 
@@ -137,6 +140,10 @@ fn groups_role(role: Role) -> bool {
             | Role::Switch
             | Role::Tab
             | Role::MenuItem
+            | Role::MenuItemCheckBox
+            | Role::MenuItemRadio
+            | Role::ListBoxOption
+            | Role::TreeItem
     )
 }
 
@@ -165,6 +172,10 @@ fn focusable(role: Role) -> bool {
             | Role::SpinButton
             | Role::Switch
             | Role::Tab
+            | Role::ListBoxOption
+            | Role::MenuItemCheckBox
+            | Role::MenuItemRadio
+            | Role::TreeItem
     )
 }
 
@@ -226,13 +237,29 @@ pub(crate) fn role_for(a: &Accessibility, kind: ViewKind, pressable: bool) -> Op
         AxRole::Toolbar => Role::Toolbar,
         AxRole::List => Role::List,
         AxRole::Grid => Role::Grid,
+        AxRole::Table => Role::Table,
+        AxRole::Row => Role::Row,
+        AxRole::Cell => Role::Cell,
+        AxRole::ColumnHeader => Role::ColumnHeader,
+        AxRole::RowGroup => Role::RowGroup,
+        AxRole::Listbox => Role::ListBox,
+        AxRole::Option => Role::ListBoxOption,
+        AxRole::Group => Role::Group,
+        AxRole::Region => Role::Region,
+        AxRole::Navigation => Role::Navigation,
+        AxRole::Tree => Role::Tree,
+        AxRole::TreeItem => Role::TreeItem,
+        AxRole::MenuItemCheckbox => Role::MenuItemCheckBox,
+        AxRole::MenuItemRadio => Role::MenuItemRadio,
     })
 }
 
 /// How the view of `s` takes part in the tree (its own state only).
 pub(crate) fn part(s: &ViewState) -> Part {
     let a = &s.props.accessibility;
-    if s.concealed || a.hidden {
+    // `visibility: hidden` takes the subtree out, as a browser does: what
+    // is not drawn is not read either, nor part of a name.
+    if s.concealed || s.style.hidden || a.hidden {
         return Part::Hidden;
     }
     match role_for(a, s.kind, is_pressable(s.events)) {
@@ -457,15 +484,32 @@ fn describe(
     if state.disabled {
         node.set_disabled();
     }
-    if state.selected || role == Role::Tab {
+    // Tabs and options are selectable whether selected or not: a `false`
+    // tells assistive technologies they can be.
+    if state.selected || matches!(role, Role::Tab | Role::ListBoxOption) {
         node.set_selected(state.selected);
     }
-    if let Some(checked) = state.checked {
+    // A button's pressed state makes it a toggle button (ARIA's
+    // `aria-pressed`), as AccessKit reads a toggled button.
+    if let Some(checked) = state.checked.or(state.pressed) {
         node.set_toggled(match checked {
             Checked::False => Toggled::False,
             Checked::True => Toggled::True,
             Checked::Mixed => Toggled::Mixed,
         });
+    }
+    if let Some(current) = state.current {
+        node.set_aria_current(match current {
+            AccessibilityCurrent::True => AriaCurrent::True,
+            AccessibilityCurrent::Page => AriaCurrent::Page,
+            AccessibilityCurrent::Step => AriaCurrent::Step,
+            AccessibilityCurrent::Location => AriaCurrent::Location,
+            AccessibilityCurrent::Date => AriaCurrent::Date,
+            AccessibilityCurrent::Time => AriaCurrent::Time,
+        });
+    }
+    if let Some(level) = a.level {
+        node.set_level(level as usize);
     }
     if let Some(expanded) = state.expanded {
         node.set_expanded(expanded);
@@ -647,7 +691,7 @@ fn walk(
     for child in &view.child_views() {
         let Some(s) = child.try_state() else { continue };
         let part = part(&s);
-        if part == Part::Hidden || s.style.hidden {
+        if part == Part::Hidden {
             continue;
         }
         let (x, y) = view.state().child_origin(s.frame, s.shift);
@@ -1264,6 +1308,8 @@ mod tests {
             (AxRole::List, Role::List),
             (AxRole::Radio, Role::RadioButton),
             (AxRole::Menuitem, Role::MenuItem),
+            (AxRole::Listbox, Role::ListBox),
+            (AxRole::Option, Role::ListBoxOption),
             (AxRole::Summary, Role::Status),
             (AxRole::Alert, Role::Alert),
         ] {
@@ -1440,6 +1486,75 @@ mod tests {
         assert_eq!(node(&built(&root), 6).label(), Some("Store"));
     }
 
+    /// The roles of gpui-base's structural components; a button's pressed
+    /// state, a level and a current item.
+    #[test]
+    fn structural_roles_pressed_level_and_current() {
+        let with_role = |role| Accessibility {
+            role,
+            ..Default::default()
+        };
+        for (role, expected) in [
+            (AxRole::Group, Role::Group),
+            (AxRole::Region, Role::Region),
+            (AxRole::Navigation, Role::Navigation),
+            (AxRole::Tree, Role::Tree),
+            (AxRole::TreeItem, Role::TreeItem),
+            (AxRole::MenuItemCheckbox, Role::MenuItemCheckBox),
+            (AxRole::MenuItemRadio, Role::MenuItemRadio),
+        ] {
+            assert_eq!(
+                role_for(&with_role(role), ViewKind::View, false),
+                Some(expected)
+            );
+        }
+        let root = view(0, ViewKind::View, Accessibility::default());
+        root.set_invalidate(Rc::new(|| {}));
+        let toggle = pressable(
+            2,
+            Accessibility {
+                role: AxRole::Button,
+                label: Some("Bold".into()),
+                state: AccessibilityState {
+                    pressed: Some(Checked::True),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        let heading = view(
+            4,
+            ViewKind::View,
+            Accessibility {
+                role: AxRole::Header,
+                label: Some("Details".into()),
+                level: Some(3),
+                ..Default::default()
+            },
+        );
+        let page = pressable(
+            6,
+            Accessibility {
+                role: AxRole::Link,
+                label: Some("2".into()),
+                state: AccessibilityState {
+                    current: Some(AccessibilityCurrent::Page),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        );
+        toggle.insert_before(&root, None);
+        heading.insert_before(&root, None);
+        page.insert_before(&root, None);
+        let b = built(&root);
+        assert_eq!(node(&b, 2).role(), Role::Button);
+        assert_eq!(node(&b, 2).toggled(), Some(Toggled::True));
+        assert_eq!(node(&b, 4).role(), Role::Heading);
+        assert_eq!(node(&b, 4).level(), Some(3));
+        assert_eq!(node(&b, 6).aria_current(), Some(AriaCurrent::Page));
+    }
+
     #[test]
     fn states_and_actions() {
         let root = view(0, ViewKind::View, Accessibility::default());
@@ -1522,6 +1637,26 @@ mod tests {
         assert_eq!(f.label(), Some("Password"));
         assert_eq!(f.value(), None);
         assert!(f.supports_action(Action::SetValue));
+    }
+
+    /// `visibility: hidden` takes the view and its subtree out of the tree,
+    /// of names folded from content and of the accessibility focus, as a
+    /// browser does.
+    #[test]
+    fn a_hidden_style_hides_the_subtree() {
+        let (root, all) = tree();
+        find(&all, 8).state_mut().style.hidden = true;
+        assert_eq!(part(&find(&all, 8).state()), Part::Hidden);
+        assert_eq!(name_of(&find(&all, 6)).as_deref(), Some("icon"));
+        assert_eq!(node(&built(&root), 6).label(), Some("icon"));
+        assert_eq!(exposed(&find(&all, 10)), Err(()));
+        find(&all, 2).state_mut().style.hidden = true;
+        let b = built(&root);
+        assert_eq!(b.top, [node_id(7, 22)]);
+        assert_eq!(exposed(&find(&all, 14)), Err(()));
+        find(&all, 2).state_mut().style.hidden = false;
+        find(&all, 8).state_mut().style.hidden = false;
+        assert_eq!(node(&built(&root), 6).label(), Some("Save icon"));
     }
 
     #[test]

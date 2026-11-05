@@ -6,7 +6,8 @@
 // `caret`, `defaultValue` (the initial text, then the user's) and
 // `value` (the text, controlled: what the app sets it to). Its script checks
 // each.
-import { Input, Text, View, signal } from "nsh";
+import { Text, View, signal } from "nsh";
+import { Input } from "nsh/base";
 
 function App() {
   const name = signal("Ada");
@@ -28,7 +29,7 @@ function App() {
       <Input
         testID="controlled"
         value={name()}
-        onChange={(text) => name.set(text.toUpperCase())}
+        onChange={({ value }) => name.set(value.toUpperCase())}
       />
       <Text>{`Name: ${name()}`}</Text>
       <View testID="reset" onPress={() => name.set("Grace")}>

@@ -20,6 +20,7 @@ mod agent;
 mod animation;
 mod app;
 mod blur;
+mod bottom_bar;
 mod canvas;
 mod component;
 mod decor;
@@ -27,6 +28,7 @@ mod decor;
 pub mod dev;
 #[cfg(feature = "embed")]
 pub mod embed;
+mod fps;
 mod image;
 mod input;
 mod interaction;
@@ -37,11 +39,19 @@ mod navigation;
 mod net;
 mod picker;
 mod press;
-mod selection_area;
+mod selectable_view;
+mod shader;
+// The Speech framework's recognizer, shared with macOS.
+#[path = "../../nsh-platform-macos/src/speech.rs"]
+mod speech;
+// The notification center, shared with macOS.
+#[path = "../../nsh-platform-macos/src/notifications.rs"]
+mod notifications;
 mod surface;
 #[cfg(feature = "dev")]
 mod synth;
 mod system;
+mod system_tab_bar;
 mod target;
 mod text;
 mod text_selection;
@@ -56,14 +66,42 @@ mod zoom;
 pub use nsh_engine::{Bundle, ByteSize, CacheLocation, CacheOptions, CachePolicy, Root};
 
 /// The UI sets apps import ([`set_ui_sets`]; by default `nsh/base`).
-static UI_SETS: std::sync::RwLock<Option<Vec<nsh_core::ui::Registry>>> =
+static UI_SETS: std::sync::RwLock<Option<Vec<nsh_core::element::Registry>>> =
     std::sync::RwLock::new(None);
 
 /// Sets the UI sets the engines started from now on serve: `nsh/base`
 /// and an app's own Rust components (`nsh.json` `"rust"`), which a host
 /// built for the app passes before it starts.
-pub fn set_ui_sets(sets: Vec<nsh_core::ui::Registry>) {
+pub fn set_ui_sets(sets: Vec<nsh_core::element::Registry>) {
     *UI_SETS.write().unwrap_or_else(|e| e.into_inner()) = Some(sets);
+}
+
+/// The app's native components ([`set_components`]). Process-wide, as the
+/// UI sets of [`set_ui_sets`] are: only the hosts and runners nsh generates
+/// for an app's crate set it, so in an embedding app (the iOS SDK included)
+/// it stays `None` and each registry holds only what was registered on its
+/// own view.
+static COMPONENTS: std::sync::RwLock<Option<fn(&Components)>> = std::sync::RwLock::new(None);
+
+/// Sets what registers the app's own native components (`nsh.json`
+/// `"rust"`, `#[native_components(ios)]`): every [`AppView`] calls it on
+/// its [`SurfaceOptions::components`] when it is made, so the app's
+/// elements find them as an embedding app's. It runs before the code
+/// holding the view can register: a name registered on the view afterwards
+/// ([`AppView::register_component`]) replaces the crate's. The development
+/// host and release runner nsh generates for such an app call this before
+/// [`run_app`].
+pub fn set_components(register: fn(&Components)) {
+    *COMPONENTS.write().unwrap_or_else(|e| e.into_inner()) = Some(register);
+}
+
+/// Registers the app's native components ([`set_components`]) on
+/// `components`.
+fn register_app_components(components: &Components) {
+    let register = *COMPONENTS.read().unwrap_or_else(|e| e.into_inner());
+    if let Some(register) = register {
+        register(components);
+    }
 }
 
 /// The app's Rust root ([`set_root`]).
@@ -87,7 +125,7 @@ fn root() -> Option<nsh_engine::Root> {
 }
 
 /// The UI sets engines serve.
-fn ui_sets() -> Vec<nsh_core::ui::Registry> {
+fn ui_sets() -> Vec<nsh_core::element::Registry> {
     UI_SETS
         .read()
         .unwrap_or_else(|e| e.into_inner())

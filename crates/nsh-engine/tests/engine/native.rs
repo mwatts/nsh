@@ -14,7 +14,7 @@ use serde_json::json;
 use crate::ChannelSink;
 
 const APP: &str = r#"import { mount, signal, Text, View } from "nsh";
-import { nativeComponent } from "nsh/native";
+import { nativeComponent } from "nsh";
 
 const Map = nativeComponent<
   { center: { lat: number; lng: number }; zoom?: number; title?: string },
@@ -45,7 +45,25 @@ mount(App);
 "#;
 
 fn start(app: &str) -> (Engine, Receiver<MountBatch>) {
-    let dir = std::env::temp_dir().join(format!("nsh-native-{}", std::process::id()));
+    start_with(app, None)
+}
+
+fn start_with(
+    app: &str,
+    declared: Option<nsh_core::access::Capabilities>,
+) -> (Engine, Receiver<MountBatch>) {
+    start_in(app, declared, Default::default())
+}
+
+fn start_in(
+    app: &str,
+    declared: Option<nsh_core::access::Capabilities>,
+    environment: nsh_core::platform::Environment,
+) -> (Engine, Receiver<MountBatch>) {
+    // One directory per app started: the tests run in parallel.
+    static STARTED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let n = STARTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("nsh-native-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let entry = dir.join("App.tsx");
     std::fs::write(&entry, app).unwrap();
@@ -56,16 +74,19 @@ fn start(app: &str) -> (Engine, Receiver<MountBatch>) {
         ui_sets: vec![nsh_base::registry().into()],
     })
     .unwrap();
+    let mut app = Bundle::source(bundle.code);
+    app.policy.declared = declared;
     let (tx, rx) = crossbeam_channel::unbounded();
     let config = EngineConfig {
-        app: nsh_engine::App::Js(Bundle::source(bundle.code)),
+        app: nsh_engine::App::Js(app),
         viewport: Size::new(px(320.0), px(480.0)),
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
-        environment: Default::default(),
+        environment,
         header_heights: (nsh_core::Points(44.0), nsh_core::Points(96.0)),
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
@@ -79,6 +100,7 @@ fn start(app: &str) -> (Engine, Receiver<MountBatch>) {
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -156,4 +178,274 @@ fn cross_as_json((engine, rx): (Engine, Receiver<MountBatch>)) {
         MountItem::Command { id: c, command: Command::Native { name, args } }
             if *c == id && &**name == "flyTo" && *args == json!({ "zoom": 7, "animated": true })
     )));
+}
+
+const ANIMATED_APP: &str = r#"import { mount, signal, View } from "nsh";
+import { createAnimatedValue } from "nsh";
+import { nativeComponent } from "nsh";
+
+const Thing = nativeComponent<{ progress?: number }, { mode: { animated: boolean; tick: number } }>(
+  "com.example.thing",
+  { props: ["progress"], events: ["mode"] },
+);
+
+function App() {
+  const v = createAnimatedValue(36);
+  const animated = signal(true);
+  const tick = signal(0);
+  return (
+    <View>
+      <Thing
+        progress={(tick(), animated() ? v.interpolate({ inputRange: [0, 72], outputRange: [0, 1] }) : 0.3)}
+        style={{ height: 100 }}
+        onMode={(e: { animated: boolean; tick: number }) => {
+          tick.set(e.tick);
+          animated.set(e.animated);
+        }}
+      />
+    </View>
+  );
+}
+
+mount(App);
+"#;
+
+fn native_id(batch: &MountBatch) -> u32 {
+    batch
+        .items
+        .iter()
+        .find_map(|i| match i {
+            MountItem::Create {
+                id,
+                kind: ViewKind::Native,
+            } => Some(*id),
+            _ => None,
+        })
+        .expect("a native container")
+}
+
+fn component_props(batch: &MountBatch, id: u32) -> Vec<(String, Option<JsonValue>)> {
+    batch
+        .items
+        .iter()
+        .filter_map(|i| match i {
+            MountItem::ComponentProps { id: c, props } if *c == id => Some(props.clone()),
+            _ => None,
+        })
+        .flatten()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+}
+
+fn bound_slots(batch: &MountBatch, id: u32) -> Option<Vec<nsh_core::animation::AnimationProp>> {
+    batch.items.iter().rev().find_map(|i| match i {
+        MountItem::AnimationBindings { id: c, bindings } if *c == id => {
+            Some(bindings.iter().map(|(p, _)| *p).collect())
+        }
+        _ => None,
+    })
+}
+
+fn set_mode(engine: &Engine, id: u32, animated: bool, tick: u32) {
+    engine.control().dispatch_event(
+        id,
+        EventKind::NativeEvent,
+        EventPayload::Native {
+            name: "mode".into(),
+            data: json!({ "animated": animated, "tick": tick }),
+        },
+    );
+}
+
+#[test]
+fn animated_props_bind_instead_of_crossing_as_json() {
+    let (engine, rx) = start(ANIMATED_APP);
+    let first = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first frame");
+    let id = native_id(&first);
+    assert!(first.items.iter().any(|i| matches!(
+        i,
+        MountItem::ComponentPropSlots { id: c, names } if *c == id && names.len() == 1 && &*names[0] == "progress"
+    )));
+    assert_eq!(
+        bound_slots(&first, id),
+        Some(vec![nsh_core::animation::AnimationProp::ComponentSlot(0)])
+    );
+    // Never as `{ "__av": n }`.
+    assert!(
+        component_props(&first, id)
+            .iter()
+            .all(|(k, _)| k != "progress")
+    );
+
+    // A plain number again: sent as JSON, the slot unbound.
+    set_mode(&engine, id, false, 1);
+    let batch = rx.recv_timeout(Duration::from_secs(5)).expect("a batch");
+    assert_eq!(
+        component_props(&batch, id),
+        vec![("progress".to_owned(), Some(json!(0.3)))]
+    );
+    assert_eq!(bound_slots(&batch, id), Some(vec![]));
+}
+
+#[test]
+fn animated_component_prop_survives_rerender() {
+    let (engine, rx) = start(ANIMATED_APP);
+    let first = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("first frame");
+    let id = native_id(&first);
+    // The prop is read again; the same interpolation is the same node.
+    set_mode(&engine, id, true, 1);
+    if let Ok(batch) = rx.recv_timeout(Duration::from_secs(2)) {
+        assert!(
+            !batch.items.iter().any(|i| matches!(
+                i,
+                MountItem::AnimationBindings { id: c, .. } | MountItem::ComponentPropSlots { id: c, .. } if *c == id
+            )),
+            "{:?}",
+            batch.items
+        );
+    }
+}
+
+const WEB_INPUT_APP: &str = r#"import { mount, View, WebView } from "nsh";
+
+function App() {
+  return (
+    <View>
+      <WebView
+        src="https://example.com/"
+        style={{ height: 100 }}
+        ref={(page: any) =>
+          page &&
+          queueMicrotask(() => {
+            page.sendInput({ type: "click", x: 12.5, y: 40 });
+            page.sendInput({ type: "text", text: "a b!" });
+            page.sendInput({ type: "key", key: "Enter" });
+            // Not one of its forms: nothing is sent.
+            page.sendInput({ type: "key", key: "F13" });
+            page.sendInput({ type: "click", x: 1 });
+          })
+        }
+      />
+    </View>
+  );
+}
+
+mount(App);
+"#;
+
+/// The web view's id and the input the app sent it, within `wait`.
+fn sent_input(
+    declared: Option<nsh_core::access::Capabilities>,
+    wait: Duration,
+) -> (
+    nsh_core::NodeId,
+    Vec<(nsh_core::NodeId, nsh_core::WebInput)>,
+) {
+    let (_engine, rx) = start_with(WEB_INPUT_APP, declared);
+    let mut web = None;
+    let mut sent = Vec::new();
+    let deadline = std::time::Instant::now() + wait;
+    while sent.len() < 3 && std::time::Instant::now() < deadline {
+        let Ok(batch) = rx.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        for item in &batch.items {
+            match item {
+                MountItem::Create {
+                    id,
+                    kind: ViewKind::WebView,
+                } => web = Some(*id),
+                MountItem::Command {
+                    id,
+                    command: Command::SendInput(input),
+                } => sent.push((*id, input.clone())),
+                _ => {}
+            }
+        }
+    }
+    (web.expect("a web view"), sent)
+}
+
+#[test]
+fn a_web_view_ref_sends_trusted_input_to_its_view() {
+    use nsh_core::{WebInput, WebKey, access::Capabilities};
+    let declared =
+        Capabilities::from_json(&json!({ "webview": { "hosts": ["example.com"], "input": true } }))
+            .unwrap();
+    let (web, sent) = sent_input(Some(declared), Duration::from_secs(5));
+    assert_eq!(
+        sent,
+        [
+            (
+                web,
+                WebInput::Click {
+                    x: nsh_core::Points(12.5),
+                    y: nsh_core::Points(40.0)
+                }
+            ),
+            (web, WebInput::Text("a b!".into())),
+            (web, WebInput::Key(WebKey::Enter)),
+        ]
+    );
+    // Not declared (also with no declaration at all): the core sends none.
+    let hosts =
+        Capabilities::from_json(&json!({ "webview": { "hosts": ["example.com"] } })).unwrap();
+    for declared in [Some(hosts), None] {
+        let (_, sent) = sent_input(declared, Duration::from_secs(1));
+        assert_eq!(sent, []);
+    }
+}
+
+const WEB_INPUT_AVAILABLE_APP: &str = r#"import { mount, signal, Text, WebView } from "nsh";
+
+function App() {
+  const available = signal("asking");
+  WebView.inputAvailable().then((v: boolean) => available.set(`web input ${v}`));
+  return <Text>{available()}</Text>;
+}
+
+mount(App);
+"#;
+
+/// What `WebView.inputAvailable()` resolves with on a platform that does
+/// (`platform`) or does not deliver trusted web input, with the
+/// capabilities `declared`.
+fn web_input_available(platform: bool, declared: Option<nsh_core::access::Capabilities>) -> String {
+    let environment = nsh_core::platform::Environment {
+        web_input: platform,
+        ..Default::default()
+    };
+    let (_engine, rx) = start_in(WEB_INPUT_AVAILABLE_APP, declared, environment);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        let Ok(batch) = rx.recv_timeout(Duration::from_millis(200)) else {
+            continue;
+        };
+        if let Some(shown) = texts(&batch)
+            .into_iter()
+            .find(|t| t.starts_with("web input"))
+        {
+            return shown;
+        }
+    }
+    panic!("WebView.inputAvailable() did not resolve");
+}
+
+#[test]
+fn web_view_input_available_needs_the_platform_and_the_grant() {
+    use nsh_core::access::Capabilities;
+    let granted = || {
+        Some(
+            Capabilities::from_json(&json!({ "webview": { "hosts": [], "input": true } })).unwrap(),
+        )
+    };
+    assert_eq!(web_input_available(true, granted()), "web input true");
+    assert_eq!(web_input_available(false, granted()), "web input false");
+    let hosts = Capabilities::from_json(&json!({ "webview": { "hosts": [] } })).unwrap();
+    assert_eq!(web_input_available(true, Some(hosts)), "web input false");
+    assert_eq!(web_input_available(true, None), "web input false");
 }

@@ -49,7 +49,9 @@ four trees and the docks' states as one value, where a move across trees is a de
 leaves the area on the way). Every edit, the user's or a method of the ref's (`DockAreaApi`), runs on the `Area` in
 the core and is reported as the whole new layout (`onLayoutChange`), every id included; a controlled area shows it
 once the app passes it back. Reported ids are what keep containers' identity across that round trip, and what the
-ref's methods name groups by.
+ref's methods name groups by. A method naming a panel, group, tab or dock the layout does not hold (checked against
+the layout the next edit builds on, `AreaCx::latest`) does nothing and logs a `log::warn!` (`docs/dev/components.md`
+"Methods").
 
 What crosses to JS is the result of an interaction, never its frames: a split or dock being resized, a tab being
 dragged over the groups and its drop indicator all run in the core on the engine thread (the touch responder,
@@ -63,7 +65,7 @@ leaves for good (a moved one never hears it), `onZoomChange` with the displayed 
 
 ## Panels' content: render keys
 
-The content of a panel is the app's, rendered by `renderPanel` (a `Renderer<DockPanel>`, `nsh_core::ui::renderer`)
+The content of a panel is the app's, rendered by `renderPanel` (a `Renderer<DockPanel>`, `nsh_core::element::renderer`)
 keyed by the panel's key. Each group's content frame places a placeholder for every panel of the group with the
 panel's key, shows the displayed one and hides the others, and the core shows JS's holder for a key in the last
 placeholder placing it (`crates/nsh-core/src/core/renders.rs`). A panel that moves to another tab group, another
@@ -100,10 +102,18 @@ view's coordinates in one task, answered with the next commit. Each move resolve
 a tab bar, the slot between the tabs the pointer is past (counted without the dragged tab); over a content frame, its
 middle merges and its outer 35% on each side splits (`split_placement_at`), except back onto its own group when that would change
 nothing. The drop indicator part covers what the panel would take in the target group
-(`DropPlaceholderBounds::for_placement`): it is one overlay in the root view, placed with the content frame the drag
-measured, so it draws above the handles, whose lines lie over the edges of the groups beside them, and no frame clips
-it, and the release applies one move (`PaneTree::move_panel` within a tree,
+(`DropPlaceholderBounds::for_placement`): it is one overlay in the root view, under the drag preview (overlays stack
+in the order they open, and the indicator opens once the drag has a target, so the preview is mounted again after it, a
+row keyed by `AreaCx::indicator_shown`: a region run again keeps its node and its place), placed with the content frame the drag measured, so it draws above the handles, whose lines lie over
+the edges of the groups beside them, and no frame clips it, and the release applies one move (`PaneTree::move_panel` within a tree,
 detach and insert across trees) and one `onLayoutChange`. A gesture the system takes away drops nothing.
+In a terminal a press on a tab arms its drag at once, as on the desktops (a terminal's pointer is a mouse), and the
+area grows into its parent's room (`flex-grow: 1`: a terminal keeps no percentage height for a box of content); a
+bottom dock's size is its basis in the column (its rows), and each dock keeps a Cell on the edge its handle hugs for
+the handle's line. The
+drop indicator is the region's outline: a 1-Cell border in the accent (`terminal::ACCENT`) on the
+region's outer Cells, over what the group shows, which is not cleared; it has no fill and none of the app's
+indicator parts, and it jumps from Cell to Cell instead of easing (`tab_group.rs` `drop_indicator`).
 
 The rules of what may move are `Area::groups`', as `gpui-base`'s: a locked or zoomed area rearranges nothing, and a
 group with nothing beside it in its tree cannot give its last visible panel away (dragging or closing it would empty
@@ -153,7 +163,7 @@ Docking has a mobile counterpart, so the dock runs on every platform and adapts 
   `open` says. `toggleDock` / `setDockOpen` present one (dismissing the other) or dismiss it, and a press on its
   backdrop, Escape and back dismiss it. The layout's `open` stays the full presentation's: compact never changes it
   and reports no `onLayoutChange`, so an area that widens again shows the docks as they were.
-  `onDockOpenChange(placement, open)` reports what shows in either presentation (the layout's `open` in the full one, the presented dock in the compact
+  `onDockOpenChange({ placement, open })` reports what shows in either presentation (the layout's `open` in the full one, the presented dock in the compact
   one, and the docks whose shown state changes when the presentation switches; on mount, the docks whose shown state
   differs from the layout's `open`), so a toolbar toggle that starts from the layout's `open` follows both;
   `DockInfo.open` is the same "shown now".
@@ -190,7 +200,7 @@ panel where it was, and the app persists one layout.
 - Drags run in the core: the band claims the touches that go down on it (the touch responder; the desktops' mouse
   drags are touches too), reads the panels' laid out sizes once as the drag starts, and resizes the panel before the
   handle on every move. Nothing reaches JS until the drag ends: when it changed the sizes, the group reports every
-  visible panel's size (`onResize(sizes)`), each changed panel its own.
+  visible panel's size (`onResize({ sizes })`), each changed panel its own.
 - A panel's `size` is what it wants, within its range: unsized panels share what is left (in proportion to the sizes
   when every panel has one), and when the group is too small the panels shrink (`fixed` ones aside) and come back to
   their sizes when room returns. A drag gives the panels it moved the user's sizes until the app passes a new `size`;
@@ -199,6 +209,13 @@ panel where it was, and the app persists one layout.
 - `ResizeHandle` (Rust only) is the same band on a container's edge (`HandleEdge::Leading` / `Trailing` hug it from
   inside, as a clipping dock frame needs), reporting `on_drag_start`, `on_drag_move(offset)` and
   `on_drag_end(offset)`; the dock's edges use it.
+- In a terminal a band is one Cell across, its line the terminal's own: `│` down a horizontal handle's column,
+  `─` along a vertical one's row (`terminal::DIVIDER_VERTICAL` / `DIVIDER_HORIZONTAL`), muted, in the accent while
+  the pointer is over it, holds it or the keyboard focus is on it: only the line's color changes, nothing is
+  filled under it. A group's panes are a Cell apart (8 points of gap
+  in a row, 24 in a column) and the band sits in that Cell. A drag follows the pointer Cell by Cell; the band is a
+  stop of the keyboard focus whose arrows along its axis move it one Cell, each step one drag (`resize_handle.rs`
+  `terminal_band`).
 
 ## Accessibility
 

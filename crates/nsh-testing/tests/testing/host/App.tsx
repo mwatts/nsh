@@ -1,5 +1,5 @@
 import { mount, signal, Text, View } from "nsh";
-import { host } from "nsh/host";
+import { host } from "nsh";
 
 function App() {
   const result = signal("(none)");
@@ -8,7 +8,7 @@ function App() {
   const call = (name: string, options?: { timeout?: number }) => () =>
     host.call(name, { n: 1 }, options).then(
       (value) => result.set(JSON.stringify(value)),
-      (e: Error) => result.set(`rejected: ${e.message}`),
+      (e: Error & { code?: string }) => result.set(`rejected: ${e.code ?? "-"} ${e.message}`),
     );
   return (
     <View>

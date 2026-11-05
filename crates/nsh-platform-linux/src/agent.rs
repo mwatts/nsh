@@ -6,7 +6,11 @@
 //! default priority, as input does: an idle source (`MainContext::invoke`)
 //! waits for a busy main loop (software rendering redrawing) to be idle.
 
-use std::{rc::Rc, sync::mpsc, time::Duration};
+use std::{
+    rc::Rc,
+    sync::mpsc,
+    time::{Duration, Instant},
+};
 
 use gtk4::{self as gtk, gdk, glib, prelude::*};
 use nsh_core::{
@@ -21,7 +25,7 @@ use crate::{input::Simulated, surface::Surface, synth};
 const MAIN: Duration = Duration::from_secs(10);
 /// A press's hold, as a quick click's.
 const CLICK: Duration = Duration::from_millis(60);
-/// A touchpad's scroll events, a display frame apart.
+/// A display frame, where the window's monitor tells none.
 const FRAME: Duration = Duration::from_millis(16);
 /// How far one scroll event moves at most, in points.
 const SCROLL_STEP: f32 = 20.0;
@@ -48,6 +52,21 @@ impl LinuxNative {
             let _ = tx.send(Surface::by_key(key).map(|surface| f(&surface)));
         });
         rx.recv_timeout(MAIN).ok().flatten()
+    }
+
+    /// A frame of the monitor showing the window: a touchpad sends its
+    /// scroll events at the display's rate.
+    fn frame(&self) -> Duration {
+        self.with_window(|_, window| {
+            let surface = window.surface()?;
+            let rate = WidgetExt::display(window)
+                .monitor_at_surface(&surface)?
+                .refresh_rate();
+            // Millihertz.
+            (rate > 0).then(|| Duration::from_secs_f64(1000.0 / rate as f64))
+        })
+        .flatten()
+        .unwrap_or(FRAME)
     }
 
     /// `f` with the surface's window on the main thread.
@@ -121,12 +140,16 @@ impl Native for LinuxNative {
     fn scroll(&self, at: Point<Points>, delta: Point<Points>) {
         let (x, y) = (at.x.0, at.y.0);
         let (dx, dy) = (delta.x.0, delta.y.0);
-        // A touchpad's smooth events, a frame apart, adding up to it.
+        // A touchpad's smooth events, a frame apart, adding up to it: on a
+        // schedule, so the main thread's hops do not slow them down.
         let n = (dx.abs().max(dy.abs()) / SCROLL_STEP).ceil().max(1.0) as u32;
+        let frame = self.frame();
+        let mut next = Instant::now();
         for _ in 0..n {
             let (sx, sy) = (dx / n as f32, dy / n as f32);
             self.on_main(move |s| crate::input::simulate(s, Simulated::Wheel(x, y, sx, sy)));
-            std::thread::sleep(FRAME);
+            next += frame;
+            std::thread::sleep(next.saturating_duration_since(Instant::now()));
         }
     }
 
@@ -146,6 +169,37 @@ impl Native for LinuxNative {
         }
         let (x, y) = (last.x.0, last.y.0);
         self.on_main(move |s| crate::input::simulate(s, Simulated::Up(x, y)));
+    }
+
+    fn drag_and_hold(&self, from: Point<Points>, to: Point<Points>) -> Result<(), String> {
+        let (x, y) = (from.x.0, from.y.0);
+        self.on_main(move |s| {
+            crate::input::simulate(s, Simulated::Hover(x, y));
+            crate::input::simulate(s, Simulated::Down(x, y));
+        })
+        .ok_or("the window is gone")?;
+        std::thread::sleep(nsh_testing::agent::LANDING);
+        for at in nsh_testing::agent::drag_path(from, to) {
+            std::thread::sleep(FRAME);
+            let (x, y) = (at.x.0, at.y.0);
+            self.on_main(move |s| crate::input::simulate(s, Simulated::Move(x, y)));
+        }
+        Ok(())
+    }
+
+    fn drop_files(&self, at: Point<Points>, uris: Vec<String>) -> Result<(), String> {
+        let (x, y) = (at.x.0, at.y.0);
+        match self.on_main(move |s| crate::file_drop::drop_uris(s, x, y, uris)) {
+            Some(true) => Ok(()),
+            Some(false) => Err("no view there listens to `onFileDrop`".into()),
+            None => Err("the window is gone".into()),
+        }
+    }
+
+    fn drop_at(&self, at: Point<Points>) -> Result<(), String> {
+        let (x, y) = (at.x.0, at.y.0);
+        self.on_main(move |s| crate::input::simulate(s, Simulated::Up(x, y)))
+            .ok_or_else(|| "the window is gone".to_owned())
     }
 
     fn type_text(&self, text: &str) {
@@ -182,6 +236,26 @@ impl Native for LinuxNative {
     fn close_menu(&self) -> Result<(), String> {
         self.on_main(|s| crate::chrome::close_open_menu(s))
             .unwrap_or_else(|| Err("the window is gone".to_owned()))
+    }
+
+    fn hold_keys(&self, keys: &str, down: bool) -> Result<(), String> {
+        let mut mask = gdk::ModifierType::empty();
+        for name in keys.split('+') {
+            mask |= match name.trim().to_ascii_lowercase().as_str() {
+                // Linux's command key is Control.
+                "mod" | "ctrl" | "control" => gdk::ModifierType::CONTROL_MASK,
+                "alt" | "option" => gdk::ModifierType::ALT_MASK,
+                "shift" => gdk::ModifierType::SHIFT_MASK,
+                "meta" | "cmd" | "command" | "super" => gdk::ModifierType::SUPER_MASK,
+                other => {
+                    return Err(format!(
+                        "`{other}` is no modifier key: mod, shift, alt, ctrl or meta"
+                    ));
+                }
+            };
+        }
+        self.on_main(move |_| crate::input::hold(mask, down))
+            .ok_or_else(|| "the window is gone".to_owned())
     }
 
     fn hover(&self, at: Point<Points>) -> Result<(), String> {
@@ -227,7 +301,7 @@ impl Native for LinuxNative {
                 self.with_window(|_, w| synth::select_all(w));
             }
             K::Char(c) if plain => {
-                let c = if m.shift { c.to_ascii_uppercase() } else { c };
+                let c = if m.shift { shifted(c) } else { c };
                 self.with_window(move |_, w| synth::type_text(w, &c.to_string()));
             }
             // The root's keys: going back.
@@ -244,6 +318,43 @@ impl Native for LinuxNative {
             _ => {}
         }
         Ok(())
+    }
+
+    fn focused(&self) -> Option<NodeId> {
+        self.with_window(|_, w| {
+            let field = synth::focused_text(w)?;
+            let view = field
+                .ancestor(crate::view::NshView::static_type())
+                .and_then(|v| v.downcast::<crate::view::NshView>().ok())?;
+            Some(view.id())
+        })
+        .flatten()
+    }
+
+    fn paste(&self, content: &nsh_core::PasteEvent) -> Result<(), String> {
+        // As the user's paste of `content` does (`text_input`'s `pasting`),
+        // without the system's clipboard: reported, then its text inserted
+        // where the input inserts pastes.
+        let content = content.clone();
+        self.with_window(move |surface, w| {
+            let field = synth::focused_text(w).ok_or("no focused input to paste into")?;
+            let view = field
+                .ancestor(crate::view::NshView::static_type())
+                .and_then(|v| v.downcast::<crate::view::NshView>().ok())
+                .ok_or("the focused field is no input's")?;
+            if view.state().events.contains(nsh_core::EventKind::Paste) {
+                surface.event(
+                    view.id(),
+                    nsh_core::EventKind::Paste,
+                    nsh_core::EventPayload::Paste(Box::new(content.clone())),
+                );
+            }
+            if crate::text_input::pastes_text(&view) && !content.text.is_empty() {
+                synth::type_text(w, &content.text);
+            }
+            Ok(())
+        })
+        .unwrap_or_else(|| Err("the window is gone".into()))
     }
 
     fn input_text(&self, id: NodeId) -> Option<String> {
@@ -306,4 +417,36 @@ impl Native for LinuxNative {
     fn quit(&self) {
         self.with_window(|_, w| w.close());
     }
+}
+
+/// The character Shift and `c` type on a US layout, as a keyboard's keys
+/// name them: a letter's capital, a digit's or a symbol's upper sign.
+fn shifted(c: char) -> char {
+    const PAIRS: [(char, char); 21] = [
+        ('1', '!'),
+        ('2', '@'),
+        ('3', '#'),
+        ('4', '$'),
+        ('5', '%'),
+        ('6', '^'),
+        ('7', '&'),
+        ('8', '*'),
+        ('9', '('),
+        ('0', ')'),
+        ('-', '_'),
+        ('=', '+'),
+        ('[', '{'),
+        (']', '}'),
+        ('\\', '|'),
+        (';', ':'),
+        ('\'', '"'),
+        (',', '<'),
+        ('.', '>'),
+        ('/', '?'),
+        ('`', '~'),
+    ];
+    PAIRS
+        .iter()
+        .find(|(plain, _)| *plain == c)
+        .map_or(c.to_ascii_uppercase(), |(_, up)| *up)
 }

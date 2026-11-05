@@ -1,8 +1,8 @@
-//! Surface-wide commands and the environment: dialogs, toasts, the
-//! clipboard, exiting; the system's settings followed into
+//! Surface-wide commands and the environment: dialogs, the clipboard,
+//! exiting; the system's settings followed into
 //! [`Environment`].
 //!
-//! Dialogs and toasts are drawn inside the surface, as items the root view
+//! Dialogs are drawn inside the surface, as items the root view
 //! hosts over the app's views ([`Hosted`]), rather than as separate
 //! windows: they stay with the surface when it is embedded in another
 //! GPUI app's window, never block the main loop (the engine and
@@ -39,7 +39,13 @@
 //!   preference on macOS, AT-SPI's `ScreenReaderEnabled` on Linux;
 //! - the pixel ratio: the window's scale factor (the surface sets it);
 //! - the OS version: the kernel's on Linux, `RtlGetVersion`'s on Windows,
-//!   `kern.osproductversion` on macOS.
+//!   `kern.osproductversion` on macOS;
+//! - the app's state, from GPUI's window activation and visibility
+//!   (`observe_window_activation`, `observe_window_visibility`):
+//!   background while the surface's window is not presented (GPUI's
+//!   `WindowVisibility::Hidden`: minimized, covered or on another desktop,
+//!   as far as the platform reports it), active while one of the windows
+//!   showing a surface is the active one, inactive otherwise.
 //!
 //! On Windows and macOS the settings are read again whenever the window's
 //! appearance changes (GPUI reports no other setting changes); on Linux
@@ -68,7 +74,7 @@ use nsh_core::{
     Points, ROOT_ID,
     platform::{Appearance, clipboard},
 };
-use nsh_engine::{ColorScheme, Edges, Environment, Locale};
+use nsh_engine::{ColorScheme, Edges, Environment, Lifecycle, Locale};
 
 use crate::{
     app::AppView,
@@ -79,10 +85,6 @@ use crate::{
     view::{Hosted, ItemPointer},
 };
 
-/// How long a toast shows, in milliseconds (Android's short and long
-/// durations).
-const TOAST_SHORT: u64 = 2000;
-const TOAST_LONG: u64 = 3500;
 /// Fades of overlays, in seconds.
 const FADE_IN: f64 = 0.167;
 const FADE_OUT: f64 = 0.12;
@@ -102,7 +104,7 @@ thread_local! {
     static SIMULATED: Cell<Option<bool>> = const { Cell::new(None) };
     /// The surfaces whose environment this module keeps.
     static WATCHED: RefCell<Vec<Watched>> = const { RefCell::new(Vec::new()) };
-    /// The dialogs and toasts of this thread's surfaces.
+    /// The dialogs of this thread's surfaces.
     static OVERLAYS: RefCell<Vec<Overlay>> = const { RefCell::new(Vec::new()) };
     /// Numbers overlays, to find them again from deferred calls.
     static NEXT_SERIAL: Cell<u64> = const { Cell::new(1) };
@@ -123,6 +125,10 @@ struct Watched {
     owns_window: bool,
     /// The appearance last given to the window (owned windows).
     forced: Option<Appearance>,
+    /// The window is the active one, as last seen.
+    active: bool,
+    /// The window is presented (GPUI's visibility), as last seen.
+    visible: bool,
 }
 
 /// Runs `f` on the record of the surface with `key`, if it is watched.
@@ -179,6 +185,40 @@ fn settings_changed() {
     }
 }
 
+/// A surface's window was activated or deactivated, or shown or hidden:
+/// every surface follows, as whether the app is the active one depends on
+/// all of their windows.
+fn lifecycle_changed() {
+    let surfaces: Vec<Rc<Surface>> = WATCHED.with(|w| {
+        let mut w = w.borrow_mut();
+        w.retain(|w| w.surface.strong_count() > 0);
+        w.iter().filter_map(|w| w.surface.upgrade()).collect()
+    });
+    for surface in surfaces {
+        let mut env: Environment = surface.environment.get();
+        env.lifecycle = lifecycle(&surface, env.lifecycle);
+        surface.set_environment(env);
+    }
+}
+
+/// The app's state as `surface` sees it; `current` while it is not
+/// watched.
+fn lifecycle(surface: &Surface, current: Lifecycle) -> Lifecycle {
+    WATCHED.with(|w| {
+        let w = w.borrow();
+        let Some(this) = w.iter().find(|w| w.key == surface.key()) else {
+            return current;
+        };
+        if !this.visible {
+            Lifecycle::Background
+        } else if w.iter().any(|w| w.active && w.surface.strong_count() > 0) {
+            Lifecycle::Active
+        } else {
+            Lifecycle::Inactive
+        }
+    })
+}
+
 /// True when the window looks dark (or a test made the system look so).
 fn window_dark(window: &Window) -> bool {
     if let Some(dark) = SIMULATED.with(Cell::get) {
@@ -223,11 +263,29 @@ pub(crate) fn watch_environment(
             window: Some(window.window_handle()),
             owns_window: false,
             forced: None,
+            active: window.is_window_active(),
+            visible: window.is_visible(),
         });
     });
+    crate::text_input::window_visibility(surface, window.is_visible());
     cx.observe_window_appearance(window, |view, window, cx| {
         let surface = view.surface().clone();
         appearance_changed(&surface, window);
+        crate::rt::flush(cx);
+    })
+    .detach();
+    cx.observe_window_activation(window, |view, window, cx| {
+        let active = window.is_window_active();
+        with_watched(view.surface().key(), |w| w.active = active);
+        lifecycle_changed();
+        crate::rt::flush(cx);
+    })
+    .detach();
+    cx.observe_window_visibility(window, |view, visibility, _, cx| {
+        let surface = view.surface().clone();
+        with_watched(surface.key(), |w| w.visible = visibility.is_visible());
+        crate::text_input::window_visibility(&surface, visibility.is_visible());
+        lifecycle_changed();
         crate::rt::flush(cx);
     })
     .detach();
@@ -329,6 +387,7 @@ fn update(surface: &Surface) {
     env.os_version = settings.os_version;
     env.safe_area = Edges::default();
     env.keyboard_height = Points(0.0);
+    env.lifecycle = lifecycle(surface, env.lifecycle);
     surface.set_environment(env);
 }
 
@@ -904,7 +963,6 @@ mod os {
 pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
     match command {
         Command::Dialog(dialog) => show_dialog(surface, dialog),
-        Command::Toast { text, long } => show_toast(surface, text, *long),
         Command::SetClipboard(text) => {
             let text = text.clone();
             crate::rt::on_app(move |cx| {
@@ -974,6 +1032,7 @@ pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
             });
         }
         Command::PickImages { id, request } => pick_images(surface, *id, *request),
+        Command::FileRequest { id, request } => file_request(surface, *id, request),
         Command::ExitApp => {
             // The window goes after the batch is applied (closing it stops
             // the surface). An embedded surface closes the window it is in,
@@ -1051,6 +1110,91 @@ fn pick_images(surface: &Rc<Surface>, id: u32, request: nsh_core::picker::PickRe
     });
 }
 
+/// A request on local paths ([`nsh_core::file_dialog`]): GPUI's open and
+/// save prompts (which take no title, filters or starting folder for
+/// picks, so the files whose extension the dialog does not take are left
+/// out), `open_with_system` and `reveal_path`, which report nothing back
+/// (only a path that is not there fails). GPUI has no trash.
+fn file_request(surface: &Rc<Surface>, id: u32, request: &nsh_core::file_dialog::FileRequest) {
+    use nsh_core::file_dialog::{self, FileRequest, OpenDialogKind};
+    let mut control = None;
+    surface.control(|c| control = Some(c.clone()));
+    let Some(control) = control else { return };
+    let request = request.clone();
+    crate::rt::on_app(move |cx| {
+        let answer =
+            move |payload| control.dispatch_event(ROOT_ID, EventKind::FileRequest, payload);
+        let missing = |path: &std::path::Path| {
+            EventPayload::file_failed(id, format!("`{}` does not exist", path.display()))
+        };
+        match request {
+            FileRequest::OpenDialog(dialog) => {
+                // Files and folders pick files where GPUI cannot do both.
+                let (files, directories) = match dialog.kind {
+                    OpenDialogKind::Folders => (false, true),
+                    OpenDialogKind::FilesAndFolders => (true, cx.can_select_mixed_files_and_dirs()),
+                    _ => (true, false),
+                };
+                let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files,
+                    directories,
+                    multiple: dialog.multiple,
+                    prompt: dialog.button_label.clone().map(Into::into),
+                });
+                cx.spawn(async move |_| {
+                    let payload = match paths.await {
+                        Ok(Ok(paths)) => EventPayload::file_answer(
+                            id,
+                            paths
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter(|p| p.is_dir() || file_dialog::passes(&dialog.filters, p))
+                                .collect(),
+                        ),
+                        Ok(Err(err)) => EventPayload::file_failed(id, err.to_string()),
+                        Err(_) => EventPayload::file_answer(id, Vec::new()),
+                    };
+                    answer(payload);
+                })
+                .detach();
+            }
+            FileRequest::SaveDialog(dialog) => {
+                let directory = dialog
+                    .directory
+                    .clone()
+                    .or_else(std::env::home_dir)
+                    .unwrap_or_default();
+                let path = cx.prompt_for_new_path(&directory, dialog.file_name.as_deref());
+                cx.spawn(async move |_| {
+                    let payload = match path.await {
+                        Ok(Ok(path)) => EventPayload::file_answer(id, path.into_iter().collect()),
+                        Ok(Err(err)) => EventPayload::file_failed(id, err.to_string()),
+                        Err(_) => EventPayload::file_answer(id, Vec::new()),
+                    };
+                    answer(payload);
+                })
+                .detach();
+            }
+            FileRequest::OpenPath(path) if path.exists() => {
+                cx.open_with_system(&path);
+                answer(EventPayload::file_answer(id, Vec::new()));
+            }
+            FileRequest::RevealPath(path) if path.exists() => {
+                cx.reveal_path(&path);
+                answer(EventPayload::file_answer(id, Vec::new()));
+            }
+            FileRequest::OpenPath(path) | FileRequest::RevealPath(path) => answer(missing(&path)),
+            FileRequest::MoveToTrash(_) => {
+                answer(EventPayload::file_failed(id, "GPUI has no trash"))
+            }
+            other => {
+                log::debug!("gpui: file request {other:?} is not supported");
+                answer(EventPayload::file_failed(id, "not supported"));
+            }
+        }
+    });
+}
+
 fn set_clipboard_image(uri: &str) {
     let Some((mime, bytes)) = clipboard::decode_data_uri(uri) else {
         log::warn!("Clipboard.writeImage: not a base64 data: URI");
@@ -1122,7 +1266,7 @@ fn dialog_answer(id: u32, index: i32) -> EventPayload {
 // ---------------------------------------------------------------------------
 // Overlays
 
-/// A dialog or toast over a surface.
+/// A dialog over a surface.
 struct Overlay {
     /// The surface's key.
     key: u64,
@@ -1133,21 +1277,18 @@ struct Overlay {
 #[derive(Clone)]
 enum OverlayKind {
     Dialog(Rc<DialogItem>),
-    Toast(Rc<ToastItem>),
 }
 
 impl OverlayKind {
     fn item(&self) -> Rc<dyn Hosted> {
         match self {
             OverlayKind::Dialog(d) => d.clone(),
-            OverlayKind::Toast(t) => t.clone(),
         }
     }
 
     fn opacity(&self) -> &Cell<f32> {
         match self {
             OverlayKind::Dialog(d) => &d.opacity,
-            OverlayKind::Toast(t) => &t.opacity,
         }
     }
 }
@@ -1211,7 +1352,7 @@ pub(crate) fn surface_resized(surface: &Surface, width: f32, height: f32) {
     }
 }
 
-/// The app stopped: its dialogs and toasts go too.
+/// The app stopped: its dialogs go too.
 pub(crate) fn clear(surface: &Surface) {
     let removed: Vec<Overlay> = OVERLAYS.with(|o| {
         let mut o = o.borrow_mut();
@@ -1254,9 +1395,8 @@ fn remove_overlay(surface: &Rc<Surface>, serial: u64) {
     let Some(kind) = find(serial) else {
         return;
     };
-    if let OverlayKind::Dialog(d) = &kind {
-        d.closing.set(true);
-    }
+    let OverlayKind::Dialog(d) = &kind;
+    d.closing.set(true);
     if surface.environment.get().reduce_motion {
         drop_overlay(surface, serial);
     } else {
@@ -2269,97 +2409,6 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
         }
         None => false,
     }
-}
-
-// ---------------------------------------------------------------------------
-// Toasts
-
-/// A short message at the bottom of the surface; never takes the pointer.
-/// Hosted over the whole surface, it places itself when drawn.
-struct ToastItem {
-    label: Label,
-    opacity: Cell<f32>,
-}
-
-impl ToastItem {
-    const PAD_X: f32 = 16.0;
-    const PAD_Y: f32 = 9.0;
-    const MAX_WIDTH: f32 = 420.0;
-    /// From the bottom of the surface.
-    const BOTTOM: f32 = 64.0;
-
-    /// Where it goes in a surface of `size`.
-    fn frame(&self, window: &Window, size: (f32, f32)) -> nsh_core::Bounds<Points> {
-        let max = (size.0 - 48.0).min(Self::MAX_WIDTH) - 2.0 * Self::PAD_X;
-        let (w, h) = self.label.measure(window, max.max(1.0));
-        let (w, h) = (w + 2.0 * Self::PAD_X, h + 2.0 * Self::PAD_Y);
-        rect(
-            ((size.0 - w) / 2.0).round(),
-            (size.1 - Self::BOTTOM - h).round(),
-            w,
-            h,
-        )
-    }
-}
-
-impl Hosted for ToastItem {
-    fn draw(&self, cx: &mut DrawCx<'_>, size: (f32, f32)) {
-        let opacity = self.opacity.get();
-        if opacity <= 0.0 {
-            return;
-        }
-        cx.push_opacity(opacity);
-        let (fill, text) = if cx.dark {
-            (Color(0xfafa_faeb), Color(0x0a0a_0aff))
-        } else {
-            (Color(0x1717_17eb), Color(0xfafa_faff))
-        };
-        let r = self.frame(cx.window, size);
-        let radius = 18.0_f32.min(r.size.height.0 / 2.0);
-        draw_shadow(cx, r, radius, 2.0, 0.12);
-        fill_rounded(cx, r, radius, fill);
-        let inner = rect(
-            r.origin.x.0 + Self::PAD_X,
-            r.origin.y.0 + Self::PAD_Y,
-            r.size.width.0 - 2.0 * Self::PAD_X,
-            r.size.height.0 - 2.0 * Self::PAD_Y,
-        );
-        self.label.draw(cx, inner, text);
-        cx.pop();
-    }
-
-    fn hit(&self, _x: f32, _y: f32, _size: (f32, f32)) -> bool {
-        false
-    }
-}
-
-/// Shows `text` at the bottom of the surface for a while (one at a time:
-/// a new toast replaces the one showing).
-fn show_toast(surface: &Rc<Surface>, text: &str, long: bool) {
-    let showing: Vec<u64> = OVERLAYS.with(|o| {
-        o.borrow()
-            .iter()
-            .filter(|o| o.key == surface.key() && matches!(o.kind, OverlayKind::Toast(_)))
-            .map(|o| o.serial)
-            .collect()
-    });
-    for serial in showing {
-        remove_overlay(surface, serial);
-    }
-    let fs = surface.environment.get().font_scale;
-    let serial = next_serial();
-    let item = Rc::new(ToastItem {
-        label: Label::new(text, 14.0 * fs, 400.0, TextAlign::Center, true),
-        opacity: Cell::new(0.0),
-    });
-    add_overlay(surface, serial, OverlayKind::Toast(item));
-    crate::access::announce(surface, text);
-    let key = surface.key();
-    crate::rt::after_ms(if long { TOAST_LONG } else { TOAST_SHORT }, move || {
-        if let Some(surface) = Surface::by_key(key) {
-            remove_overlay(&surface, serial);
-        }
-    });
 }
 
 /// Puts `text` on the clipboard (soon: GPUI's app is not at hand). True

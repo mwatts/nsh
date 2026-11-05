@@ -19,6 +19,7 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.Window;
 import android.view.WindowInsets;
+import android.view.WindowInsetsAnimation;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -77,7 +78,7 @@ public class NshView extends FrameLayout {
          *
          * @param url the URL
          * @return true when the embedding app handled it (routed it through
-         *     its own router; the app's {@code openUrl} resolves true), false
+         *     its own router; the app's {@code openUrl} resolves {@code { opened: true }}), false
          *     for the system to open it ({@code Intent.ACTION_VIEW})
          */
         boolean openUrl(String url);
@@ -92,8 +93,12 @@ public class NshView extends FrameLayout {
     long handle;
     /** Serializes background sends with releasing the native handle. */
     private final Object hostLock = new Object();
-    private final float density;
+    private float density;
     private final Box root;
+    /** The screen effect or transition drawing over the surface, if any. */
+    Box screen;
+    /** The page and dialog transitions through a shader running, by stack or dialog id. */
+    final android.util.SparseArray<ShaderFrames> navFrames = new android.util.SparseArray<>();
     private final Mounter mounter;
     private final TouchTracker touches;
 
@@ -219,6 +224,25 @@ public class NshView extends FrameLayout {
         // sets no soft input mode, this makes the system resize (and report
         // the keyboard as insets) instead of panning the window.
         setScrollContainer(true);
+        // The keyboard's curve and duration, as it starts to move: what makes
+        // room for it moves with it (`LayoutCurve::Keyboard`).
+        if (Build.VERSION.SDK_INT >= 30) {
+            setWindowInsetsAnimationCallback(new WindowInsetsAnimation.Callback(
+                    WindowInsetsAnimation.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
+                @Override
+                public void onPrepare(WindowInsetsAnimation animation) {
+                    // Before the end state's insets are applied.
+                    if ((animation.getTypeMask() & WindowInsets.Type.ime()) == 0) return;
+                    keyboardDuration = animation.getDurationMillis();
+                    mounter.keyboardMotion(animation.getInterpolator(), keyboardDuration);
+                }
+
+                @Override
+                public WindowInsets onProgress(WindowInsets insets, java.util.List<WindowInsetsAnimation> running) {
+                    return insets;
+                }
+            });
+        }
         // The back key where the window has no OnBackInvokedCallback in
         // effect (below Android 13, or `enableOnBackInvokedCallback` off).
         addOnUnhandledKeyEventListener((v, e) -> onBackKey(e));
@@ -451,10 +475,17 @@ public class NshView extends FrameLayout {
      * Registers native component {@code name} ({@code nativeComponent(name, ...)}
      * in JS): {@code factory} makes one for every element created from now on.
      *
+     * Names under {@code nsh/} are NSH's own: registering one logs a warning
+     * and changes nothing.
+     *
      * @param name the name JS uses
      * @param factory makes the components (UI thread)
      */
     public void registerComponent(String name, NshComponent.Factory factory) {
+        if (name.startsWith("nsh/")) {
+            android.util.Log.w("nsh", "native component `" + name + "` is not registered: names under `nsh/` are NSH's");
+            return;
+        }
         mounter.components.put(name, factory);
     }
 
@@ -524,6 +555,17 @@ public class NshView extends FrameLayout {
         Native.setOpenUrlHandler(handle, handler != null);
     }
 
+    /**
+     * Reports the notification press {@code intent} carries to the app, if it does. The activity showing this view
+     * calls it from {@code onCreate} and {@code onNewIntent}, with {@code Notifications} of {@code nsh}: a press opens
+     * the app's launcher activity.
+     *
+     * @param intent the activity's intent
+     */
+    public void handleNotificationIntent(android.content.Intent intent) {
+        Notifications.handleIntent(intent);
+    }
+
     /** A URL the app opens ({@code request}, answered once); called by libnsh on the engine thread. */
     void openUrlMessage(String url, long request) {
         main.post(() -> {
@@ -582,21 +624,54 @@ public class NshView extends FrameLayout {
         // Joining the engine needs no Java lock.
         if (taken != 0) Native.destroy(taken);
         mounter.destroyComponents();
+        endShaders();
     }
 
     /**
      * Called by the native side when the running app stopped because another
      * one replaced it ({@code Host::load}). Batches the old app sent before
-     * are already queued, so its components go after them and before the
-     * new app's first batch.
+     * are already queued, so its components and shaders go after them and
+     * before the new app's first batch.
      */
     void appStopped() {
-        main.post(mounter::destroyComponents);
+        main.post(() -> {
+            mounter.destroyComponents();
+            endShaders();
+        });
+    }
+
+    /**
+     * The app stopped: libnsh forgot its shaders, so the frames they left go
+     * too (its page and dialog transitions, its screen shader's, its
+     * effects'), and none stays frozen over the next app.
+     */
+    private void endShaders() {
+        for (int i = navFrames.size() - 1; i >= 0; i--) {
+            ShaderFrames frames = navFrames.valueAt(i);
+            if (frames instanceof NavTransition) ((NavTransition) frames).cancel();
+        }
+        navFrames.clear();
+        mounter.dropShaders();
+    }
+
+    /**
+     * A view in the surface draws anew (its own invalidation brings the
+     * window frame): a screen shader pictures the surface again before it.
+     * The screen shader's own frames invalidate this view, not a descendant.
+     */
+    @Override
+    public void onDescendantInvalidated(View child, View target) {
+        super.onDescendantInvalidated(child, target);
+        if (screen != null) screen.surfaceChanged();
     }
 
     @Override
     protected void onSizeChanged(int w, int h, int oldw, int oldh) {
         super.onSizeChanged(w, h, oldw, oldh);
+        if (screen != null) {
+            screen.shaderSize();
+            screen.picturesChanged();
+        }
         // The environment follows in onLayout.
         if (handle != 0 && w > 0 && h > 0) Native.resize(handle, w / density, h / density);
     }
@@ -604,6 +679,13 @@ public class NshView extends FrameLayout {
     // --- Environment ---------------------------------------------------------
 
     private float keyboard;
+    /**
+     * Whether the app is in use (`lifecycle()`): its activity's state, 0 resumed (active), 1 paused or started
+     * again (inactive: visible without the focus), 2 stopped (background). Active until the activity says otherwise.
+     */
+    private int lifecycle;
+    /** How long the keyboard's last move took (ms; `keyboardFrame().duration`). */
+    private long keyboardDuration = 250;
     /** The host app's locale and text size ({@link #setLocale}, {@link #setFontScale}). */
     private java.util.Locale hostLocale;
     private float hostFontScale;
@@ -617,7 +699,19 @@ public class NshView extends FrameLayout {
     @Override
     protected void onConfigurationChanged(Configuration config) {
         super.onConfigurationChanged(config);
+        // `wm density` or a display change: the view keeps its pixel size, so
+        // only its size in dp changes. The environment's new density makes the
+        // engine send every view again; it goes first so that the new window
+        // size reaches JS with it.
+        float d = getResources().getDisplayMetrics().density;
+        boolean rescaled = d > 0 && d != density;
+        if (rescaled) {
+            density = d;
+            mounter.setDensity(d);
+        }
         publishEnvironment(getRootWindowInsets());
+        int w = getWidth(), h = getHeight();
+        if (rescaled && handle != 0 && w > 0 && h > 0) Native.resize(handle, w / density, h / density);
     }
 
     private static Window windowOf(Context context) {
@@ -693,7 +787,7 @@ public class NshView extends FrameLayout {
         java.util.Locale locale = hostLocale != null ? hostLocale : java.util.Locale.getDefault();
         float fontScale = hostFontScale > 0 && !Float.isInfinite(hostFontScale) ? hostFontScale : c.fontScale;
         Native.environment(handle, new float[] {
-            top / density, right / density, bottom / density, left / density, ime / density, 0.25f, fontScale,
+            top / density, right / density, bottom / density, left / density, ime / density, (float) keyboardDuration, fontScale,
             android.text.TextUtils.getLayoutDirectionFromLocale(java.util.Locale.getDefault()) == LAYOUT_DIRECTION_RTL ? 1 : 0,
             // "Remove animations" sets the animator scale to 0.
             android.provider.Settings.Global.getFloat(getContext().getContentResolver(),
@@ -703,7 +797,52 @@ public class NshView extends FrameLayout {
             Build.VERSION.SDK_INT,
             (c.uiMode & Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION ? 3
                     : c.smallestScreenWidthDp >= 600 ? 1 : 0,
+            lifecycle,
         }, dark, locale.toLanguageTag());
+    }
+
+    /** The view's activity reported `state` (`lifecycle()`'s values). */
+    private void activityState(Activity activity, int state) {
+        if (activity != activity(getContext()) || state == lifecycle) return;
+        lifecycle = state;
+        publishEnvironment(getRootWindowInsets());
+    }
+
+    /**
+     * The activities going through their lifecycle: `lifecycle()`. One callback per application, registered by the
+     * first view attached and kept for the process, so it knows each activity's last state while views come and go: a
+     * view attached again starts from its activity's state then, whatever the activity did while it was detached.
+     */
+    private static final class Lifecycles implements android.app.Application.ActivityLifecycleCallbacks {
+        private static Lifecycles registered;
+        private final java.util.WeakHashMap<Activity, Integer> states = new java.util.WeakHashMap<>();
+        private final java.util.ArrayList<NshView> views = new java.util.ArrayList<>();
+
+        static Lifecycles of(Activity activity) {
+            if (registered == null) {
+                registered = new Lifecycles();
+                activity.getApplication().registerActivityLifecycleCallbacks(registered);
+            }
+            return registered;
+        }
+
+        /** The last state `activity` reported, or null before it reported one. */
+        Integer state(Activity activity) {
+            return states.get(activity);
+        }
+
+        private void state(Activity activity, int state) {
+            states.put(activity, state);
+            for (NshView view : new java.util.ArrayList<>(views)) view.activityState(activity, state);
+        }
+
+        @Override public void onActivityResumed(Activity a) { state(a, 0); }
+        @Override public void onActivityPaused(Activity a) { state(a, 1); }
+        @Override public void onActivityStarted(Activity a) { state(a, 1); }
+        @Override public void onActivityStopped(Activity a) { state(a, 2); }
+        @Override public void onActivityCreated(Activity a, android.os.Bundle b) {}
+        @Override public void onActivitySaveInstanceState(Activity a, android.os.Bundle b) {}
+        @Override public void onActivityDestroyed(Activity a) { states.remove(a); }
     }
 
     private android.view.accessibility.AccessibilityManager accessibility() {
@@ -806,6 +945,14 @@ public class NshView extends FrameLayout {
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
         accessibility().addTouchExplorationStateChangeListener(screenReader);
+        Activity activity = activity(getContext());
+        if (activity != null) {
+            Lifecycles lifecycles = Lifecycles.of(activity);
+            lifecycles.views.add(this);
+            // What the activity did while the view was detached.
+            Integer state = lifecycles.state(activity);
+            if (state != null) activityState(activity, state);
+        }
         // The dispatcher exists once attached.
         if (handle != 0) mounter.updateBack();
     }
@@ -814,6 +961,7 @@ public class NshView extends FrameLayout {
     protected void onDetachedFromWindow() {
         super.onDetachedFromWindow();
         accessibility().removeTouchExplorationStateChangeListener(screenReader);
+        if (Lifecycles.registered != null) Lifecycles.registered.views.remove(this);
     }
 
     /** `BackHandler.exitApp()`: what the back button does without the app. */
@@ -858,6 +1006,39 @@ public class NshView extends FrameLayout {
     private final Choreographer.FrameCallback jsFrame = nanos -> {
         if (handle != 0) Native.frame(handle);
     };
+
+    /** Where a shader's frames show. */
+    interface ShaderFrames {
+        /**
+         * A new frame: {@code pixels} (null for an empty frame) are only valid
+         * during the call; whether it {@code replaces} what it covers, how far
+         * it reaches beyond the box ({@code overflow}, points).
+         */
+        void shaderFrame(java.nio.ByteBuffer pixels, int width, int height, boolean replaces, float overflow);
+    }
+
+    /**
+     * A shader view's new frame, called by libnsh on the UI thread during
+     * {@link Native#tick}.
+     */
+    void shaderFrame(int id, java.nio.ByteBuffer pixels, int width, int height, boolean replaces, float overflow) {
+        ShaderFrames nav = navFrames.get(id);
+        View v = nav == null ? mounter.view(id) : null;
+        if (nav == null && v instanceof ShaderFrames) nav = (ShaderFrames) v;
+        if (nav != null) nav.shaderFrame(pixels, width, height, replaces, overflow);
+    }
+
+    /** A screen shader's frame where it replaces the surface. */
+    @Override
+    protected void dispatchDraw(android.graphics.Canvas canvas) {
+        if (screen != null && screen.drawScreen(canvas)) return;
+        super.dispatchDraw(canvas);
+    }
+
+    /** The surface as it is (a screen shader's picture). */
+    void drawSurface(android.graphics.Canvas canvas) {
+        super.dispatchDraw(canvas);
+    }
 
     /** JS waits for a display frame (`requestAnimationFrame`). */
     void requestJsFrame() {

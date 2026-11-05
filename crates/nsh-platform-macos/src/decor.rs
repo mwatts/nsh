@@ -4,19 +4,26 @@
 //! The cheap path is the view's own layer: `cornerRadius` covers every
 //! shape whose corners share one radius. Other corners need shape layers
 //! (scroll views take the largest radius instead). A view
-//! that both clips its children and casts a shadow gets a container
-//! ([`NshView::ensure_container`]) that clips the children, so its own
-//! layer keeps the shadow (clipping a layer clips its shadow too). Scroll
+//! that both clips its children and draws outside its box (an outer box
+//! shadow, an outline) gets a container ([`NshView::ensure_container`])
+//! that clips the children, so its own layer keeps what it draws outside
+//! (clipping a layer clips that too). Scroll
 //! views always have a container: there it clips too, and the decoration
 //! stays in the view's own layer, where it does not scroll.
 //!
-//! Text and canvas views draw into their layer's contents (`drawRect:`),
-//! which Core Animation shows below every sublayer: their background is the
-//! layer's own, never a fill layer, and nothing inside the box is drawn over
-//! them but borders.
+//! A shader view's frames are the contents of a sublayer
+//! ([`crate::shader`]) shaped here as an image view's image layer is. An
+//! effect's or a running transition's frames show instead of the children:
+//! their container's mask hides them ([`hide_children`]), and clipping
+//! leaves it in place until they show again.
 //!
-//! With a background a shadow gets a `shadowPath` (no offscreen pass); with
-//! a transparent background it follows the content (text shadows).
+//! Text and canvas views draw into a content sublayer
+//! ([`NshView::redraw`]: `drawLayer:inContext:`) at `BEHIND / 2`, above the
+//! decoration behind them and below their children and the borders in
+//! front. Their background is the layer's own, never a fill layer.
+//!
+//! A `drop-shadow()` filter is the layer's own shadow: it follows the
+//! content.
 //!
 //! [`apply`] runs on every frame of an animation that touches the view
 //! (transitions, animated colors): it compares what it applied last and
@@ -38,7 +45,7 @@ use objc2_quartz_core::{
 };
 
 use crate::{
-    image::Decoded,
+    image::Picture,
     surface::quiet,
     view::{NshView, ViewState},
 };
@@ -87,12 +94,15 @@ struct Shape {
     border_style: BorderStyle,
     /// Whether every side has the same color (one ring layer, or four).
     one_color: bool,
-    shadow: bool,
-    shadow_offset: (Points, Points),
-    solid: bool,
+    /// Whether a side draws something: [`Decor::shape`] gives the layers a
+    /// border only then, so a transparent border turning visible (a
+    /// `border-transparent` row's `focus:border-*`) shapes them again.
+    border_visible: bool,
     tint: Option<Color>,
     outline: nsh_core::Outline,
     effects: Option<std::sync::Arc<nsh_core::Effects>>,
+    /// It shows a shader's frames ([`crate::shader`]).
+    shader: bool,
 }
 
 /// The colors [`apply`] set last.
@@ -100,7 +110,6 @@ struct Shape {
 struct Colors {
     background: Color,
     borders: [Color; 4],
-    shadow: (Color, f32, Points),
 }
 
 /// The layers decoration added to a view, created on demand.
@@ -112,6 +121,9 @@ pub(crate) struct Decor {
     stroke: Option<Retained<CAShapeLayer>>,
     /// Clip shape for corners of different radii.
     mask: Option<Retained<CAShapeLayer>>,
+    /// A shader draws instead of the children: their container's mask
+    /// hides them ([`hide_children`]) in place of the clip shape.
+    hidden: bool,
     /// Borders whose sides differ: one even-odd ring per color.
     ring: Vec<Retained<CAShapeLayer>>,
     /// Image content (image views only): clips the picture to the view's
@@ -121,7 +133,7 @@ pub(crate) struct Decor {
     /// mode and the position put it.
     picture: Option<Retained<CALayer>>,
     /// The image shown, and its natural size in points.
-    contents: Option<(Decoded, (f32, f32))>,
+    contents: Option<(Picture, (f32, f32))>,
     /// How the image fits.
     mode: ResizeMode,
     /// Where the fitted image sits.
@@ -159,7 +171,7 @@ impl Decor {
 
     /// Shows `image` (natural size `natural` in points), fading in over
     /// `fade` seconds; an animated image plays its frames, forever.
-    pub(crate) fn set_image(&mut self, image: Option<(&Decoded, (f32, f32))>, fade: f64) {
+    pub(crate) fn set_image(&mut self, image: Option<(&Picture, (f32, f32))>, fade: f64) {
         self.contents = image.map(|(d, n)| (d.clone(), n));
         self.image_layer();
         let Some(layer) = self.picture.clone() else {
@@ -230,7 +242,7 @@ impl Decor {
         self.mode
     }
 
-    /// How an image view fits its image (`resizeMode`) and where it places
+    /// How an image view fits its image (`objectFit`) and where it places
     /// it (`objectPosition`).
     pub(crate) fn set_fit(&mut self, mode: ResizeMode, position: ObjectPosition) {
         if self.mode != mode || self.position != position || self.image.is_none() {
@@ -340,13 +352,6 @@ impl Decor {
         if border_layer.borderWidth() > 0.0 {
             border_layer.setBorderColor(cg_color(b.colors[0]).as_deref());
         }
-    }
-
-    /// Sets the shadow's color, opacity and radius.
-    fn set_shadow(layer: &CALayer, shadow: &nsh_core::Shadow) {
-        layer.setShadowColor(cg_color(shadow.color).as_deref());
-        layer.setShadowOpacity(shadow.opacity.clamp(0.0, 1.0));
-        layer.setShadowRadius(shadow.radius.max(Points::ZERO).0 as CGFloat);
     }
 
     /// Shapes the layers of `view` after `s` at its current size.
@@ -500,20 +505,18 @@ impl Decor {
         // view on every scroll step. Not with a shadow or anything drawn
         // outside, which the mask would cut.
         let contained = kind == Kind::Text
-            && !shape.shadow
             && !crate::visual::draws_outside(style)
             && crate::visual::drop_shadow(style).is_none();
         if let Some(cl) = clip_layer {
             cl.setMasksToBounds((clips && shared.is_some()) || (contained && container.is_none()));
-            if masks {
-                let m = shape_mask(&mut self.mask, local, radii);
-                // SAFETY: a mask layer owned by this decoration.
-                unsafe { cl.setMask(Some(&m)) };
+            let mask = if masks {
+                Some(shape_mask(&mut self.mask, local, radii))
             } else {
-                // SAFETY: clearing the mask.
-                unsafe { cl.setMask(None) };
                 self.mask = None;
-            }
+                None
+            };
+            let mask: Option<&CALayer> = mask.as_deref().map(|m| &**m);
+            set_clip_mask(cl, mask, self.hidden && container.is_some());
         }
 
         // Image content follows the view's shape.
@@ -537,17 +540,27 @@ impl Decor {
             self.fit_contents();
         }
 
-        // Shadow. With a background the shape is known and passed as a
-        // path, which spares Core Animation an offscreen pass.
-        if shape.shadow {
-            let sh = style.shadow;
-            layer.setShadowOffset(CGSize::new(
-                sh.offset_x.0 as CGFloat,
-                sh.offset_y.0 as CGFloat,
-            ));
-            let path = shape.solid.then(|| rounded(local, radii));
-            layer.setShadowPath(path.as_deref().map(|p| &**p));
-        } else if let Some((x, y, blur, color)) = crate::visual::drop_shadow(style) {
+        // A shader's frames fill the view's shape, as a background does
+        // (clipped even when the children are not).
+        if let Some(shader) = s.shader.as_ref().filter(|s| s.fills()) {
+            let l = shader.layer();
+            l.setFrame(local);
+            set_corners(l, r, continuous);
+            if shared.is_some() {
+                // SAFETY: clearing the mask.
+                unsafe { l.setMask(None) };
+            } else {
+                let m = CAShapeLayer::new();
+                m.setPath(Some(&rounded(local, radii)));
+                // SAFETY: a fresh mask layer, owned by the shader layer.
+                unsafe { l.setMask(Some(&m)) };
+            }
+            if l.superlayer().is_none() {
+                layer.addSublayer(l);
+            }
+        }
+
+        if let Some((x, y, blur, color)) = crate::visual::drop_shadow(style) {
             // `drop-shadow()`: follows the content's shape (no path).
             layer.setShadowColor(cg_color(Color(color.0 | 0xff)).as_deref());
             layer.setShadowOpacity((color.0 & 0xff) as f32 / 255.0);
@@ -644,6 +657,42 @@ impl Decor {
     }
 }
 
+/// Clips the children with `mask` (corners of different radii) or none on
+/// `cl`, the layer that clips them, unless a shader `hides` them: their
+/// container keeps the mask that hides them ([`hide_children`]).
+fn set_clip_mask(cl: &CALayer, mask: Option<&CALayer>, hides: bool) {
+    if !hides {
+        // SAFETY: a mask layer owned by this decoration (or none).
+        unsafe { cl.setMask(mask) };
+    }
+}
+
+/// Hides `view`'s children while a shader draws instead of them
+/// ([`crate::shader`]): an empty mask on their container (AppKit hit-tests
+/// views, so they keep their clicks), which clipping leaves in place.
+/// Shown again, the view is shaped anew and its own clip comes back.
+pub(crate) fn hide_children(view: &NshView, hidden: bool) {
+    {
+        let mut state = view.state_mut();
+        if state.decor.hidden == hidden {
+            return;
+        }
+        state.decor.hidden = hidden;
+        if !hidden {
+            state.decor.shape = None;
+        }
+    }
+    if !hidden {
+        apply(view);
+        return;
+    }
+    if let Some(layer) = view.ensure_container().layer() {
+        let mask = CALayer::new();
+        // SAFETY: a fresh, empty mask layer owned by the container's layer.
+        quiet(|| unsafe { layer.setMask(Some(&mask)) });
+    }
+}
+
 /// Applies a view's decoration (background, corners, borders, shadows,
 /// clipping, effects) to its layers. Cheap when nothing changed.
 pub(crate) fn apply(view: &NshView) {
@@ -655,9 +704,7 @@ pub(crate) fn apply(view: &NshView) {
     // an outline) clips them in a container instead.
     let needs_container = {
         let s = view.state();
-        kind == Kind::View
-            && s.clips()
-            && (s.style.shadow.is_visible() || crate::visual::draws_outside(&s.style))
+        kind == Kind::View && s.clips() && crate::visual::draws_outside(&s.style)
     };
     if needs_container && view.container_view().is_none() {
         view.ensure_container();
@@ -666,12 +713,10 @@ pub(crate) fn apply(view: &NshView) {
     let mut guard = view.state_mut();
     let state = &mut *guard;
     let shape = shape_of(state, kind);
-    let shadow = state.shadow();
     let borders = state.borders();
     let colors = Colors {
         background: state.background(),
         borders: borders.colors,
-        shadow: (shadow.color, shadow.opacity, shadow.radius),
     };
     let reshape = state.decor.shape.as_deref() != Some(&shape);
     if !reshape && state.decor.colors == Some(colors) {
@@ -687,9 +732,6 @@ pub(crate) fn apply(view: &NshView) {
         let d = &state.decor;
         d.set_background(&layer, colors.background);
         d.set_border_colors(&layer, container.as_deref(), &borders);
-        if shape.shadow {
-            Decor::set_shadow(&layer, &shadow);
-        }
     });
     state.decor.shape = Some(Box::new(shape));
     state.decor.colors = Some(colors);
@@ -705,7 +747,6 @@ fn shape_of(s: &ViewState, kind: Kind) -> Shape {
     let style = &s.style;
     let (w, h) = (s.frame.size.width.0, s.frame.size.height.0);
     let borders = s.borders();
-    let shadow = s.shadow();
     Shape {
         kind,
         size: (w, h),
@@ -714,12 +755,11 @@ fn shape_of(s: &ViewState, kind: Kind) -> Shape {
         widths: borders.widths,
         border_style: borders.style,
         one_color: borders.colors.iter().all(|&c| c == borders.colors[0]),
-        shadow: shadow.is_visible() || s.anim.shadow_opacity.is_some(),
-        shadow_offset: (style.shadow.offset_x, style.shadow.offset_y),
-        solid: !style.background_color.is_transparent() || s.anim.background.is_some(),
+        border_visible: borders.is_visible(),
         tint: style.tint_color,
         outline: style.outline,
         effects: style.effects.clone(),
+        shader: s.shader.as_ref().is_some_and(|s| s.fills()),
     }
 }
 
@@ -756,7 +796,7 @@ pub(crate) fn cg_color(color: Color) -> Option<CFRetained<CGColor>> {
 }
 
 /// A CGImage as an object (`contents` values).
-fn image_object(image: &objc2_core_graphics::CGImage) -> Retained<AnyObject> {
+pub(crate) fn image_object(image: &objc2_core_graphics::CGImage) -> Retained<AnyObject> {
     let ptr = image as *const objc2_core_graphics::CGImage as *mut AnyObject;
     // SAFETY: CF objects are Objective-C objects; retained for the result.
     unsafe { Retained::retain(ptr) }.expect("image")
@@ -925,4 +965,27 @@ pub(crate) fn set_corners(layer: &CALayer, r: CGFloat, continuous: bool) {
             kCACornerCurveCircular
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clipping_leaves_the_mask_that_hides_the_children() {
+        let container = CALayer::new();
+        let hiding = CALayer::new();
+        // SAFETY: an empty mask layer owned by the container.
+        unsafe { container.setMask(Some(&hiding)) };
+        let shape = CAShapeLayer::new();
+        let shape: &CALayer = &shape;
+        set_clip_mask(&container, Some(shape), true);
+        set_clip_mask(&container, None, true);
+        assert!(container.mask().is_some_and(|m| *m == *hiding));
+        // Shown again: the decoration's own clip.
+        set_clip_mask(&container, Some(shape), false);
+        assert!(container.mask().is_some_and(|m| *m == *shape));
+        set_clip_mask(&container, None, false);
+        assert!(container.mask().is_none());
+    }
 }

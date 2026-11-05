@@ -10,21 +10,22 @@ demo: guide-device
 
 应用运行时，所处的环境会不断变化：窗口改变尺寸（旋转、分屏、Mac 窗口），用户切换到深色模式或更大的字号，键盘出现又消失。NSH 把这些都以**响应式访问器**的形式提供：像 signal 一样调用它，读取了它的东西（样式、文本、计算值）就会在它变化时更新。不需要添加或移除监听器。
 
-在 Rust 中，访问器是 `nsh_core::ui::prelude` 中的函数；在 TSX 中，它们来自表中列出的模块。
+在 Rust 中，访问器是 `nsh_core::prelude` 中的函数；在 TSX 中，它们来自表中列出的模块。
 
 | Rust | TSX | 值 |
 |---|---|---|
-| `window()` | `windowSize()`（`nsh/device`） | surface 的宽和高，单位为点。 |
-| `dark()` | `colorScheme()`（`nsh/device`） | 深色或浅色：系统的外观，或应用自己设置的外观（`set_color_scheme`、`setColorScheme`）。 |
-| `font_scale()` | `fontScale()`（`nsh/device`） | 用户偏好的文字大小相对于默认值的比例（1 为默认）。 |
-| `safe_area()` | `safeArea()`（`nsh/base`） | surface 中未被系统 UI 遮挡的 inset：上、右、下、左。 |
-| `cx.insets()` | `safeAreaInsets()`（`nsh/base`） | 调用组件渲染位置（页面、对话框）的 inset。 |
-| `keyboard_height()`、`keyboard_duration()` | `keyboardFrame()`（`nsh/base`） | 软键盘的高度和动画时长。 |
-| `locale()` | `locale()`（`nsh/device`） | 用户的区域设置，BCP 47 标签（`"en-US"`、`"zh-Hans-CN"`）：`Intl` 默认按它格式化。 |
-| `reduce_motion()`、`screen_reader()` | `reduceMotion()`、`screenReaderEnabled()`（`nsh/accessibility`） | 见[无障碍](./accessibility.md)。 |
+| `window()` | `windowSize()`（`nsh`） | surface 的宽和高，单位为点。 |
+| `dark()` | `colorScheme()`（`nsh`） | 深色或浅色：系统的外观，或应用自己设置的外观（`set_color_scheme`、`setColorScheme`）。 |
+| `font_scale()` | `fontScale()`（`nsh`） | 用户偏好的文字大小相对于默认值的比例（1 为默认）。 |
+| `safe_area()` | `safeArea()`（`nsh`） | surface 中未被系统 UI 遮挡的 inset：上、右、下、左。 |
+| `cx.insets()` | `safeAreaInsets()`（`nsh`） | 调用组件渲染位置（页面、对话框）的 inset。 |
+| `keyboard_height()`、`keyboard_duration()` | `keyboardFrame()`（`nsh`） | 软键盘的高度和动画时长。 |
+| `locale()` | `locale()`（`nsh`） | 用户的区域设置，BCP 47 标签（`"en-US"`、`"zh-Hans-CN"`）：`Intl` 默认按它格式化。 |
+| `lifecycle()` | `lifecycle()`（`nsh`） | 应用是否正在使用：`active`、`inactive`（可见但没有焦点）或 `background`（[在后台](#在后台)）。 |
+| `reduce_motion()`、`screen_reader()` | `reduceMotion()`、`screenReaderEnabled()`（`nsh`） | 见[无障碍](./accessibility.md)。 |
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 #[component]
 pub fn App() -> impl IntoElement {
@@ -50,9 +51,8 @@ pub fn App() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { mount, Text, View } from "nsh";
-import { colorScheme, fontScale, windowSize } from "nsh/device";
-import { safeArea } from "nsh/base";
+import { mount, Text, View, safeArea } from "nsh";
+import { colorScheme, fontScale, windowSize } from "nsh";
 
 function App() {
   return (
@@ -72,7 +72,7 @@ mount(App);
 `window()`（TSX：`windowSize()`）是 NSH 渲染目标 surface 的尺寸：手机上是屏幕，iPad 分屏或 Mac 上是窗口，嵌入时是宿主视图。用它来改变布局，而不只是改变尺寸：
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn gallery() -> impl IntoElement {
     let columns = || {
@@ -90,7 +90,7 @@ fn gallery() -> impl IntoElement {
 
 ```tsx tabs
 import { Image, View } from "nsh";
-import { windowSize } from "nsh/device";
+import { windowSize } from "nsh";
 
 function Gallery() {
   const columns = () => (windowSize().width >= 700 ? 4 : windowSize().width >= 500 ? 3 : 2);
@@ -130,7 +130,7 @@ view()
 其他情况下，在闭包或计算值中读取 `dark()`（TSX：`colorScheme()`）；在 TSX 中颜色较多时，先统一派生出一套调色板：
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 // `dark()` 是响应式的：外观变化时闭包重新运行。
 view()
@@ -141,7 +141,7 @@ view()
 
 ```tsx tabs
 import { computed, Text, View } from "nsh";
-import { colorScheme } from "nsh/device";
+import { colorScheme } from "nsh";
 
 const palette = computed(() =>
   colorScheme() === "dark"
@@ -164,10 +164,10 @@ Rust 组件也从主题中取色，主题为每种颜色提供浅色和深色两
 { "appearance": "dark" }
 ```
 
-`set_color_scheme(Appearance::Dark)`（TSX：`nsh/device` 中的 `setColorScheme`）在运行时修改它，用于应用内的外观设置；`Appearance::System`（`"system"`）恢复跟随系统：
+`set_color_scheme(Appearance::Dark)`（TSX：`nsh` 中的 `setColorScheme`）在运行时修改它，用于应用内的外观设置；`Appearance::System`（`"system"`）恢复跟随系统：
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 view()
     .on_press(move || {
@@ -186,7 +186,7 @@ view()
 
 ```tsx tabs
 import { Text, View } from "nsh";
-import { colorScheme, setColorScheme } from "nsh/device";
+import { colorScheme, setColorScheme } from "nsh";
 
 <View onPress={() => setColorScheme(colorScheme() === "dark" ? "light" : "dark")} role="button" class="rounded-lg px-4 py-2 bg-neutral-200 dark:bg-neutral-800">
   <Text class="text-neutral-900 dark:text-neutral-50">{colorScheme() === "dark" ? "Light" : "Dark"}</Text>
@@ -225,7 +225,7 @@ text("Today")
 `locale()` 是用户的区域设置，形式为 BCP 47 标签（Rust 中为 `locale().as_str()`）。在 TSX 中，`Intl` 默认按它格式化数字和日期，所以 `new Intl.NumberFormat().format(1234.5)` 在 `en-US` 下得到 `1,234.5`，在 `de-DE` 下得到 `1.234,5`。读取 `locale()` 来选择你自己的翻译文案：读取它的文字会在它变化时更新。
 
 ```rust tabs
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn greeting() -> &'static str {
     match locale().as_str().split('-').next() {
@@ -240,7 +240,7 @@ text(greeting)
 
 ```tsx tabs
 import { Text } from "nsh";
-import { locale } from "nsh/device";
+import { locale } from "nsh";
 
 const greetings: Record<string, string> = { en: "Welcome", de: "Willkommen", zh: "欢迎" };
 
@@ -251,21 +251,44 @@ const greetings: Record<string, string> = { en: "Welcome", de: "Willkommen", zh:
 
 嵌入在原生应用中的 NSH 应用，会跟随宿主应用自己设置的语言和文字大小：嵌入 API 设置的语言和文字大小（Rust 中 [GPUI](./gpui.md)、[macOS](./macos.md)、[Linux](./linux.md) 和 [Windows](./windows.md) 的 `AppView::set_locale` 和 `set_font_scale`，[iOS](./ios.md) 上 Swift 的 `locale` 和 `fontScale`，[Android](./android.md) 上 Java 的 `setLocale` 和 `setFontScale`）代替系统的语言和文字大小。`locale()`、`Intl`、`fontScale()` 和文字会立即跟随，就像跟随系统设置的变化一样；宿主清除设置后恢复为系统的值。原生应用允许用户选择自己的语言或文字大小时使用它们。
 
+## 在后台
+
+`lifecycle()`（TSX 中同名）表示用户是否正在使用应用。应用在前台时为 `active`；仍可见但焦点在另一个应用或窗口上（或系统在它上面显示了内容：应用切换器、来电）时为 `inactive`；不可见时为 `background`：手机上在后台、桌面上已最小化、Web 上是隐藏的标签页。与所有访问器一样，它会更新读取它的地方，因此 effect 可以在后台暂停实时数据、轮询或视频，并在用户回来时恢复：
+
+```rust tabs
+effect(move || {
+    if lifecycle() == Lifecycle::Background {
+        feed.pause();
+    } else {
+        feed.resume();
+    }
+});
+```
+
+```tsx tabs
+effect(() => {
+  if (lifecycle() === "background") feed.pause();
+  else feed.resume();
+});
+```
+
+用 `background` 暂停工作，并在用户做出更改时就保存它：系统可能在应用进入后台几秒后就将其挂起，早于读取这一变化的副作用运行。显示在原生应用中的应用跟随该应用的状态；应用有多个窗口时（iPad、桌面），视图跟随它所在的窗口。在测试中，`nsh/test` 的 `app.setLifecycle("background")` 会把应用移到后台（[测试](./testing-and-trace.md#操作步骤)）。
+
 ## 安全区域
 
 刘海、Home 指示条、状态栏、Android 导航栏以及 Mac Catalyst 的标题栏会遮挡 surface 的一部分。NSH 应用在所有平台上都是全屏绘制，被遮挡的部分以 inset 的形式提供。
 
 - `safe_area()`（TSX：`safeArea()`）给出整个 surface 的 inset。
 - 组件的 `cx.insets()`（TSX：`safeAreaInsets()`）给出**组件渲染位置**的 inset：在导航[页面](./navigation.md#标题栏下的安全区域)中从标题栏下方算起，在[对话框](../elements/dialog.md)中是对话框自己的。可能出现在多个地方的组件应该优先用它。
-- `nsh_base` 的 `safe_area_view()`（TSX：`nsh/base` 的 `SafeAreaView`）是一个按这些 inset 添加内边距的视图（默认四边都加，或用 `.edges(vec![Edge::Top, Edge::Bottom])`、`edges={["top", "bottom"]}` 指定），叠加在它自己的内边距之上。
+- CSS 的 `env(safe-area-inset-top)`、`-right`、`-bottom`、`-left` 在 `padding*` 和 `margin*` 中按组件渲染处的 inset 为任意视图加内边距或外边距（`calc(env(safe-area-inset-bottom) + 8px)` 再加一段长度；Tailwind `pt-[env(safe-area-inset-top)]`；Rust `.p_safe_area()`、`.pt_safe_area()`、`.pb_safe_area_plus(px(8.0))` 等）。inset 变化时内边距原生更新（[安全区域](../elements/safe-area.md)）。
 
 ```rust tabs
-use nsh_base::{Edge, safe_area_view};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn screen() -> impl IntoElement {
-    safe_area_view()
-        .edges(vec![Edge::Top, Edge::Left, Edge::Right])
+    view()
+        .pt_safe_area()
+        .px_safe_area()
         .flex_1()
         .bg(white())
         .child(content())
@@ -284,15 +307,14 @@ fn BottomBar(cx: Scope<NoEvent>) -> impl IntoElement {
 ```
 
 ```tsx tabs
-import { View } from "nsh";
-import { SafeAreaView, safeAreaInsets } from "nsh/base";
+import { View, safeAreaInsets } from "nsh";
 
 function Screen() {
   return (
-    <SafeAreaView edges={["top", "left", "right"]} style={{ flex: 1, backgroundColor: "#ffffff" }}>
+    <View class="flex-1 bg-white pt-[env(safe-area-inset-top)] pr-[env(safe-area-inset-right)] pl-[env(safe-area-inset-left)]">
       <Content />
       <BottomBar />
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -306,14 +328,15 @@ function BottomBar() {
 
 ## 平台
 
-Rust 中的 `os()`、`os_version()`、`idiom()` 和 `is_desktop()`，以及 TSX 中 `nsh/device` 的常量 `platform`，描述应用运行的平台。它们在应用运行期间保持不变。
+Rust 中的 `os()`、`os_version()`、`idiom()`、`is_desktop()` 和 `is_catalyst()`，以及 TSX 中 `nsh` 的常量 `platform`，描述应用运行的平台。它们在应用运行期间保持不变。
 
 | Rust | TSX | 说明 |
 |---|---|---|
 | `os()` | `platform.os` | `Os::Ios`、`Os::Android`、`Os::MacOs`、`Os::Windows`、`Os::Linux` 或 `Os::Web`（`os().name()` 即 TSX 的字符串）。Mac Catalyst 为 iOS。 |
 | `os_version()` | `platform.version` | 主版本号和次版本号；Android 上为 API 级别和 0。 |
-| `idiom()` | `platform.idiom`、`platform.catalyst` | `Idiom::Phone`、`Pad`、`Mac`、`Tv` 或 `Desktop`。 |
-| `is_desktop()` | `platform.idiom === "desktop"` | macOS、Windows 或 Linux，或桌面浏览器。 |
+| `idiom()` | `platform.idiom` | `Idiom::Phone`、`Pad`、`Mac`、`Tv`、`Desktop` 或 `Terminal`；在终端中为 `Terminal`，否则 `is_desktop()` 成立时恰好是 `Desktop`。 |
+| `is_desktop()` | `platform.desktop` | macOS、Windows 或 Linux、桌面浏览器或终端（[桌面与移动端](./platform-specific.md#桌面与移动端)）。 |
+| `is_catalyst()` | `platform.catalyst` | Mac Catalyst，无论哪种界面风格。 |
 
 TSX 的 `platform` 完整成员：
 
@@ -321,18 +344,19 @@ TSX 的 `platform` 完整成员：
 |---|---|
 | `platform.os` | `"ios"`、`"android"`、`"macos"`、`"windows"`、`"linux"` 或 `"web"`。Mac Catalyst 报告 `"ios"`。 |
 | `platform.version` | 字符串：iOS 和桌面平台为系统版本（`"17.5"`）；Android 为 API 级别（`"35"`）；Web 为 `"0.0"`。 |
-| `platform.idiom` | `"phone"`、`"pad"`、`"mac"`、`"tv"` 或 `"desktop"`。`"desktop"` 表示桌面行为：macOS、Windows、Linux 和桌面浏览器。 |
-| `platform.catalyst` | Mac 界面风格的 Mac Catalyst。 |
+| `platform.idiom` | `"phone"`、`"pad"`、`"mac"`、`"tv"`、`"desktop"` 或 `"terminal"`。在终端中为 `"terminal"`，否则 `platform.desktop` 为 `true` 时恰好是 `"desktop"`。`"mac"` 是 Mac Catalyst 下 UIKit 的 Mac 界面风格，属于移动端界面风格。 |
+| `platform.desktop` | 适用桌面行为：macOS、Windows、Linux、桌面浏览器和终端。`desktop={{…}}` 属性和 `platform.select({ desktop })` 以它为准。 |
+| `platform.catalyst` | 应用运行在 Mac Catalyst 下（`os` 为 `"ios"`），无论是 Mac 还是 iPad 界面风格。 |
 | `platform.select(spec)` | 当前平台对应的值；见[平台特定代码](./platform-specific.md#platformselect)。 |
 
 ```rust tabs
-use nsh_core::ui::{Os, prelude::*};
+use nsh_core::{element::Os, prelude::*};
 
 let haptics_supported = os() == Os::Ios || (os() == Os::Android && os_version().0 >= 30);
 ```
 
 ```tsx tabs
-import { platform } from "nsh/device";
+import { platform } from "nsh";
 
 const hapticsSupported = platform.os === "ios" || (platform.os === "android" && Number(platform.version) >= 30);
 ```
@@ -356,9 +380,12 @@ const hapticsSupported = platform.os === "ios" || (platform.os === "android" && 
 `"desktop"`，平板上为 `"pad"`，手机上为 `"phone"`，在应用启动时确定。区域设置、`reduceMotion()`、
 `fontScale()`（浏览器的文字大小）、`pixelRatio()`、安全区域和键盘高度都来自浏览器，并实时跟随。
 
+在终端中（[终端后端](./tui.md)），`platform.idiom` 为 `"terminal"`，`platform.desktop` 为 `true`，`platform.os` 是本机自己的系统。
+`colorScheme()` 跟随终端的背景色，`reduceMotion()` 为 `true`，安全区域和键盘高度为 0。
+
 ## 像素密度
 
-Rust 中的 `pixel_ratio()` 和 `round_to_nearest_pixel(points)`，以及 TSX 中 `nsh/device` 的 `pixelRatio()`，在点与设备像素之间换算。
+Rust 中的 `pixel_ratio()` 和 `round_to_nearest_pixel(points)`，以及 TSX 中 `nsh` 的 `pixelRatio()`，在点与设备像素之间换算。
 
 | Rust | TSX | 说明 |
 |---|---|---|
@@ -375,7 +402,7 @@ view()
 
 ```tsx tabs
 import { View } from "nsh";
-import { pixelRatio } from "nsh/device";
+import { pixelRatio } from "nsh";
 
 <View style={{ height: 1 / pixelRatio(), backgroundColor: "#d0d7de" }} />
 ```
@@ -384,18 +411,18 @@ import { pixelRatio } from "nsh/device";
 
 ## 从右到左
 
-当设备语言是从右到左书写的（阿拉伯语、希伯来语、波斯语等），NSH 会从右到左布局应用：横排从右侧开始，`left` 和 `right` 样式属性互换，文字右对齐，原生控件镜像显示。布局方向自动跟随用户的语言。视图的 `direction` 样式（`"ltr"`、`"rtl"` 或 `"inherit"`；Rust 中为 `.direction(LayoutDirection::..)`）设置其子树的方向；设在根视图上即设置整个应用的方向。
+当设备语言是从右到左书写的（阿拉伯语、希伯来语、波斯语等），NSH 会从右到左布局应用：横排从右侧开始，逻辑样式属性取从右到左时的那一侧，文字右对齐，原生控件镜像显示。布局方向自动跟随用户的语言。视图的 `direction` 样式（`"ltr"`、`"rtl"` 或 `"inherit"`；Rust 中为 `.direction(LayoutDirection::..)`）设置其子树的方向；设在根视图上即设置整个应用的方向。
 
 修改会立即生效，无需重启应用；本页的演示就在切换 `direction` 样式。
 
-用逻辑属性编写两个方向都适用的布局：Rust 中的 `ms` / `me` 和 `ps` / `pe`（与 Tailwind 同名），TSX 中的 `marginStart` / `marginEnd`、`paddingStart` / `paddingEnd`、`start` / `end`、`borderTopStartRadius` 等，它们在从左到右布局中表示左和右，从右到左时则相反。`left` 和 `right` 本身也会互换。`direction` 样式（`"inherit"`、`"ltr"`、`"rtl"`）可以为子树覆盖方向，例如让电话号码或播放器控件保持从左到右。Tailwind 的 `rtl:` 和 `ltr:` 变体按方向生效。
+用逻辑属性编写两个方向都适用的布局：Rust 中的 `ms` / `me` 和 `ps` / `pe`（与 Tailwind 同名），TSX 中的 `marginStart` / `marginEnd`、`paddingStart` / `paddingEnd`、`start` / `end`、`borderTopStartRadius`、`textAlign: "start"` 等，它们在从左到右布局中表示左和右，从右到左时则相反。`left` 和 `right`（`marginLeft`、`paddingRight`、`left`、`textAlign: "left"` 等）在两个方向上都保持各自的一侧，与 CSS 相同。`direction` 样式（`"inherit"`、`"ltr"`、`"rtl"`）可以为子树覆盖方向，例如让电话号码或播放器控件保持从左到右。Tailwind 的 `rtl:` 和 `ltr:` 变体按方向生效。
 
 在从右到左布局中，横向滚动视图和列表从最右端开始。在 Android 上，宿主应用必须在清单中声明 `android:supportsRtl="true"`，原生控件才会镜像。
 
 ## 相关内容
 
-- [`nsh/device`](../modules/nsh-device.md)：参考。
+- [`nsh` 的设备 API](../modules/nsh.md#device)：参考。
 - [平台特定代码](./platform-specific.md)：`platform.select`、平台属性与模块。
 - [无障碍](./accessibility.md)：屏幕阅读器与减少动态效果。
-- [`SafeAreaView`](../modules/nsh-base.md#safeareaview) 与[状态栏](../modules/nsh-base.md#status-bar)。
+- [安全区域](../elements/safe-area.md)、[键盘](../elements/keyboard.md)与[状态栏](../modules/nsh-base.md#status-bar)。
 - [Tailwind](./tailwind.md)：`dark:`、断点与方向变体。

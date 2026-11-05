@@ -68,7 +68,6 @@ pub use crate::{
     error::JsError,
     host::{ErrorHandler, Host, HostOptions, TextMeasurer},
     net::{FetchEvent, FetchOp, HttpBody, HttpHead, HttpRequest, NetworkQueue, RequestId},
-    sandbox::compile_harden,
 };
 
 /// The names native module `specifier` exports, if it is one: nsh's own
@@ -76,7 +75,7 @@ pub use crate::{
 /// imports against them).
 pub fn native_module_exports(
     specifier: &str,
-    ui_sets: &[nsh_core::ui::description::SetDescription],
+    ui_sets: &[nsh_core::element::description::SetDescription],
 ) -> Option<Vec<String>> {
     modules::ModuleTable::compiling(ui_sets).export_names(specifier)
 }

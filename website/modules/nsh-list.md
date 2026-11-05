@@ -17,7 +17,7 @@ See [Lists](../docs/lists.md) for the guide and [`<List>`](../elements/list.md) 
 ## List
 
 ```ts
-function List<T>(props: ListProps<T>): YNode;
+function List<T>(props: ListProps<T>): JSX.Element;
 ```
 
 ```tsx
@@ -73,7 +73,7 @@ element takes, which go to the list's scroll view.
 | `contentClass` | `string` | | Padding and gaps of the content as classes (`p-*`, `gap-*`); `contentStyle` wins over them. |
 | `style` | `StyleProp<ViewStyle>` | | The list's own style (give it a size: `flex: 1` or a height). |
 | `testID` | `string` | | The id UI tests find the list's scroll view by (`nsh test`'s `id:`, XCUITest, UI Automator). |
-| `ref` | `YNode \| ((node: YNode) => void)` | | See [ref methods](#ref-methods). |
+| `ref` | `ListRef \| ((node: ListRef) => void)` | | See [ref methods](#ref-methods). |
 
 `ListSlot` is a component (`Header`) or an element (`<Header />`).
 
@@ -87,6 +87,8 @@ element takes, which go to the list's scroll view.
 | `loadMoreAtStartThreshold` | `number` | `1` | How close to the start (in viewport lengths) `onLoadMoreAtStart` fires. |
 | `refreshing` | `boolean` | | The pull-to-refresh spinner shows. |
 | `onRefresh` | `() => void` | | Enables pull to refresh; set `refreshing` while you load. |
+| `refreshIndicator` | `{ height: number }` | | The app draws its own pull-to-refresh indicator, `height` tall, in place of the spinner. |
+| `pullValue` | `AnimatedValue` | | Fed with how far the list is pulled past its top, for that indicator. |
 | `onViewableItemsChange` | `(info: { viewableItems: ViewToken<T>[]; changed: ViewToken<T>[] }) => void` | | Items that became or stopped being viewable. |
 | `viewabilityConfig` | `ViewabilityConfig` | | When an item counts as viewable. |
 
@@ -99,10 +101,10 @@ interface ViewToken<T> {
 }
 
 interface ViewabilityConfig {
-  /** Percent of the viewport an item must cover to count as viewable. */
-  viewAreaCoveragePercentThreshold?: number;
-  /** Percent of an item that must be visible. Without either threshold, any visible pixel counts. */
-  itemVisiblePercentThreshold?: number;
+  /** How much of the viewport an item must cover to count as viewable, from 0 to 1. */
+  viewAreaCoverageThreshold?: number;
+  /** How much of an item must be visible, from 0 to 1. Without either threshold, any visible pixel counts. */
+  itemVisibleThreshold?: number;
   /** Milliseconds items must stay viewable before they are reported. */
   minimumViewTime?: number;
 }
@@ -112,7 +114,7 @@ interface ViewabilityConfig {
 
 | Prop | Type | Default | Description |
 |---|---|---|---|
-| `scrollbar` | `boolean` | `true` | The scroll indicator shows. |
+| `scrollbar` | `boolean \| ScrollbarTheme` | `true` | The scroll indicator shows: the platform's, or the app's [built-in bar](../elements/scrollbar.md#built-in-bars); an object is a theme of the view's own. |
 | `scrollable` | `boolean` | `true` | The user can scroll it. |
 | `bounces` | `boolean` | `true` | Overscroll past the edges. |
 | `pagingEnabled` | `boolean` | `false` | Stops at multiples of the viewport. |
@@ -126,24 +128,24 @@ interface ViewabilityConfig {
 | `keyboardShouldPersistTaps` | `"never" \| "always" \| "handled" \| boolean` | `"never"` | Whether a tap dismisses the keyboard (`"never"`: the tap only dismisses it). |
 | `keyboardDismissMode` | `"none" \| "on-drag" \| "interactive"` | `"none"` | Whether dragging dismisses the keyboard. |
 | `scrollEventThrottle` | `number` | | Minimum milliseconds between `onScroll` events (at most one per frame anyway). |
-| `scrollValue` | `AnimatedValue` | | A [animated value](./nsh-animated.md) fed with the scroll offset (main axis) on the UI thread, for scroll-linked effects. |
+| `scrollValue` | `AnimatedValue` | | A [animated value](./nsh.md#animation) fed with the scroll offset (main axis) on the UI thread, for scroll-linked effects. |
 
 ### Scroll events
 
 | Event | Payload | When |
 |---|---|---|
 | `onScroll` | `ScrollEvent`: `{ offset, contentSize, size, zoomScale }` | While scrolling. |
-| `onScrollDragStart` | `{ x, y }` | A drag starts. |
-| `onScrollDragEnd` | `{ x, y }` | The finger lifts. |
-| `onMomentumStart` | `{ x, y }` | A glide starts after the drag. |
-| `onMomentumEnd` | `{ x, y }` | The glide ends (also when a new drag catches it). |
-| `onScrollEnd` | `{ x, y }` | Scrolling came to rest. |
+| `onScrollDragStart` | `{ offset }` | A drag starts. |
+| `onScrollDragEnd` | `{ offset }` | The finger lifts. |
+| `onMomentumStart` | `{ offset }` | A glide starts after the drag. |
+| `onMomentumEnd` | `{ offset }` | The glide ends (also when a new drag catches it). |
+| `onScrollEnd` | `{ offset }` | Scrolling came to rest. |
 
 Lists also take the props every element takes ([common props](../elements/index.md)).
 
 ## Ref methods
 
-A list's `ref` receives a `YNode` with these methods:
+A list's `ref` receives a `ListRef`, with these methods besides `ViewRef`'s:
 
 | Method | Description |
 |---|---|
@@ -153,9 +155,9 @@ A list's `ref` receives a `YNode` with these methods:
 | `scrollTo({ x?, y?, animated? })` | Scrolls to an offset. |
 
 ```tsx
-import { List, Text, View, type YNode } from "nsh";
+import { List, type ListRef, Text, View } from "nsh";
 
-let list!: YNode;
+let list!: ListRef;
 
 <View style={{ flex: 1 }}>
   <Text onPress={() => list.scrollToIndex({ index: 60, viewPosition: 0.5 })}>Jump to 60</Text>

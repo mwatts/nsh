@@ -15,7 +15,10 @@ colored with the theme's tokens; the app restyles each part over it.
 | `extension.rs` | `MarkdownOptions`, `MarkdownExtension` (declared syntax), `MarkdownPlugin` / `MarkdownPlugins` (Rust), `Parser` |
 | `markdown/` | Markdown into the model (markdown-rs's mdast); `container.rs`: `:::` containers, split out before parsing (markdown-rs has no such syntax); `streaming.rs`: streaming repair |
 | `html/` | HTML into the model (html5ever, as a reader mode reads a page) |
+| `tex_text.rs` | A formula's TeX as plain text, which a terminal shows when the app has no `renderMath` |
 | `common.rs` | What both parsers share: `pattern` extensions on inline content, headings' anchors |
+| `math.rs` | Formulas without a `renderMath`: RaTeX's parse and layout, drawn on a canvas with the KaTeX fonts (`fonts/katex.pack.zst`; embedded, or fetched on the web: "Formulas on the web"); feature `math`, which the platforms turn on |
+| `formula.rs` | What the view calls: `math.rs` directly on native, and on the web once its side module and fonts arrived |
 
 ## How it works
 
@@ -33,9 +36,9 @@ colored with the theme's tokens; the app restyles each part over it.
 - **Each block is made with primitives** (`Cx::block`): a paragraph or heading is one `text` whose children are spans
   (`Inline` → nested texts, inline images, slots), lists are rows of a marker text and a column, code blocks a column
   with floating actions and a horizontal `scroll`, tables one grid in a horizontal `scroll` (below), disclosures a
-  pressable summary and an `If`. With `selectable`, every text carries `selectable` and the root is a selection area
-  (`Element::selection_area`), so one selection runs across the blocks, and inside a `SelectionArea` on into the
-  texts around the view ("Selection areas" in `text.md`).
+  pressable summary and an `If`. With `selectable`, every text carries `userSelect: "text"` (`.select_text()`) and the root is a selectable view
+  (`Element::selectable`), so one selection runs across the blocks, and inside a selectable view on into the
+  texts around the view ("Selectable views" in `text.md`).
 - **Tables** (`Cx::table`) lay out as gpui-kit's: columns fit their content when there is room, shrink (their cells
   wrapping) down to a floor per column when the view is narrower, and below the floors the table scrolls horizontally
   (`tableScroll`; `tableScrollbar` hides its indicator, as `codeBlockScrollbar` a code block's). The cells are one CSS grid, so columns line up across rows: each column is a `minmax(<floor>,
@@ -62,10 +65,15 @@ colored with the theme's tokens; the app restyles each part over it.
   in and fades back after 1.6 s); a press reports `onCodeBlockAction`. Each render has a key of the block's position (`code:3`,
   `math:2.0.1`, ...); content rendered for a key stays while the value is equal, so a streamed reply renders the app's
   code blocks again only while they are being written.
+- **Formulas are typeset** when the app gives no `renderMath` (`math.rs`): parsed and laid out by RaTeX (KaTeX's
+  parser and layout in Rust), drawn natively in the text's color; TeX it rejects shows as its source.
 - **Links report presses**: `onLinkPress({ url })`; a heading's anchor is `#<slug>` (GitHub's slugs, `common.rs`), a
   footnote reference `#footnote-<label>`. By default nothing opens a URL: the app decides. `links="open"`
-  (`TextViewLinks::Open`, opt-in) also opens a link with a scheme after reporting it (`nsh_core::ui::open_url`,
+  (`TextViewLinks::Open`, opt-in) also opens a link with a scheme after reporting it (`nsh_core::element::open_url`,
   under the `openUrl` capability and the embedding app's URL handler), never an anchor (`#…`): `Cx::link_press`.
+  Each link (and footnote reference) is a pressable span, so it is a stop of the keyboard focus where the platform
+  walks links (`elements.md` "Keyboard focus": `TextLink::focus_stop`): Tab reaches it, Return presses it, and the
+  press goes through `onLinkPress` and `links` as a pointer's does.
 
 ## Parts and their default styles
 
@@ -74,8 +82,9 @@ The defaults are a reading typography modeled on Allsum's documents (the constan
 20 / 17 / 15 with lines of 1.25 (level 1) or 1.35 and letter spacing of -0.02 em (level 1) or -0.012 em, with room
 above them after a block (1.1 / 1.6 / 1.4 em, 0.6 em after a heading, none first: their top margin less the gap,
 from `Before`, which the top level's rows keep as a memo); strong text semibold; links underlined 1 pt at 40 % of
-their color, 3 pt below; `<mark>` on a rounded yellow (a marker's, `HIGHLIGHT`); code, keys and TeX at 13 in the
-theme's `font-mono` (else the system's `monospace`) on a faint rounded
+their color, at the platform's automatic underline position (or an offset an ancestor sets, which links inherit;
+the `Link` part's own wins); `<mark>` on a rounded yellow (a marker's,
+`HIGHLIGHT`); code, keys and TeX at 13 in the theme's `font-mono` (else the system's `monospace`) on a faint rounded
 background (spans have no padding); lists indented 1.4 em, their markers (`•`, `◦`, `▪` by depth, or numbers) right-aligned against the content in
 the indent (so `10.` reaches further left and the items stay in line), items 0.25 em apart, tasks a
 15 pt box drawn as a view (filled with a `✓` when done, the item's text then muted and struck); quotes a 2 pt line at
@@ -107,7 +116,7 @@ overlapping or off a character boundary, and keeps its header, actions, scroll v
 last: the app's `renderCodeBlock` (TS and Rust: the whole block is the app's), the app's `CodeHighlighter`
 (`provide_context`, Rust: `tree-sitter`, a theme of its own, ...), the built-in one.
 
-The built-in highlighter (`highlight.rs`, `nsh-base`'s feature `highlight`, on by default) is syntect 5 with pure-Rust
+The built-in highlighter (`highlight.rs`, on the tokens, palette and syntaxes of `syntax.rs`, which the `Editor` shares; `nsh-base`'s feature `highlight`, on by default) is syntect 5 with pure-Rust
 regexes (`regex-fancy`, so it builds for WebAssembly; no Oniguruma) and two-face's syntaxes (bat's set: syntect's own
 plus TypeScript / TSX, TOML, Dockerfile, ...). A block's language is found by extension or name, case-insensitive
 (`ts`, `tsx`, `rs`, `py`, `sh`, `yml`, `md`, `Rust`, ...) plus the other names fences use (`jsx`, `shell`, `golang`,
@@ -137,7 +146,8 @@ Some grammars give declarations and types one scope (Rust's `let`, `const` and `
 is `keyword.operator.rust`): those settle by their text (`Token::settle`). The website's Shiki themes
 (`website/src/light.theme.json` / `dark.theme.json`, `allsum-light` / `allsum-dark`) color the same scopes with the same
 palette, so the site's code looks as an app's does. These colors are the one look NSH ships beyond `TextView`'s
-typography; an app with its own palette provides its own `CodeHighlighter`.
+typography and the `Editor`'s look, which colors its text with the same tokens (`crate::syntax`, `editor.md`); an app
+with its own palette provides its own `CodeHighlighter`.
 
 Cost (release, x86-64, 500 lines of real files): a fresh block takes 22 ms in Rust, 139 ms in TSX (TypeScript's
 grammar is the heaviest), 2-3x that for the first block of a language, which compiles its regexes; loading the
@@ -154,6 +164,11 @@ syntaxes takes tens of milliseconds more. So the engine thread parses only what 
   that has a language. A block that goes away before its colors arrive leaves its tokens in the cache.
 - WebAssembly has no threads: there the work is done after the frame that shows the block plain (`next_frame`), so
   the block appears at once but that later frame pays for the parsing.
+- The web runtime gets the syntaxes from its page: `nsh-syntaxes.bin`, two-face's dump, next to `nsh.wasm` (the
+  build that makes the module copies it from the two-face its workspace resolves, so it matches the module's syntect;
+  `nsh package --target web` publishes it as `nsh-syntaxes.<digest>.bin` and names it in the page's `data`). The
+  first block with a language asks for it (`syntax::load_async`, `nsh_core::runtime_data`), the page fetches it once
+  and every block waiting is highlighted when it arrives. A page that cannot serve it keeps code plain (one warning).
 
 `bench_highlight` (ignored: `cargo test --release -p nsh-base bench_highlight -- --ignored --nocapture`) prints these
 numbers.
@@ -202,11 +217,34 @@ metadata, scripts, styles, form controls, embedded media; elements `hidden`, `ar
 checkboxes, `<math>` with a TeX annotation, `language-*` classes of code). Depth is bounded (256) and `colspan` too
 (64): the input is untrusted.
 
+## In a terminal
+
+On the terminal backend (`is_terminal()`) the document takes the forms of a terminal reader, in `text_view/view.rs`
+next to the screen forms; the full list is `TextView`'s row in `docs/dev/components.md` "In a terminal". In short:
+blocks are one blank row apart and nothing trails the last (`shown_before` skips the blocks that show nothing: a
+rule, a paragraph of images without alt text); headings drop their `#` marks and take their level's color in bold,
+with a `─` rule under h1 only (`terminal_heading`); a quote is `▎` in the accent before muted text; code blocks and
+formulas are bands as wide as their longest line plus a Cell each side (`terminal_band`), a code block under its
+language label; an alert is one band across the body text's width, its icon and text a Cell in, and keeps a `│` in its
+tint where the terminal draws no bands; tables fit the view by narrowing their widest column, never below
+`MIN_COLUMN` Cells (`fit_columns`, recomputed from the table's laid-out width), their cells wrapping; tasks show
+`☐` / `☑`. The tests are `nsh-base`'s `tests/base/terminal.rs`.
+
 ## Accessibility
 
 Headings have role `header`, links (and footnote references) role `link` with their title as the hint, task markers
 role `checkbox` with their checked state, a disclosure's summary role `button` with its `expanded` state, images role
 `image` with their alt text as the label. The texts are real texts, so screen readers read the document in order.
+
+## Formulas on the web
+
+The typesetter (`text_view/math.rs`: RaTeX and the glyph outlines) and the KaTeX fonts are about 0.5 MB of Brotli that
+pages without formulas should not pay for. `nsh package` keeps the code in a side module with the gate
+`nsh_feature_math` (`onDemand`, so neither `prefetchSides` nor `preloadSides` touches it) and publishes the fonts as
+`nsh-math.bin`. The first formula a `TextView` makes calls `runtime_data::load("math")`: `loadData` loads the side
+module, runs its gate, then hands over the fonts. Until then the formula shows as its TeX; the rows that have one are
+made again afterwards (`text_view/formula.rs`). A page without a `sides` table (the dev host) runs the gate from the
+module, which has everything.
 
 ## Performance
 
@@ -224,14 +262,14 @@ role `checkbox` with their checked state, a disclosure's summary role `button` w
 |---|---|
 | `TextView::markdown` / `::html` | `markdown` / `html` props; `document` for blocks the app builds |
 | `TextViewStyle` (colors, code block style, heading sizes) | A default typography in the theme's colors; `classes` / `styles` by part; `TextViewParts` (typed, Rust) |
-| Selection across the view | `selectable`: the view is a selection area, one selection across its blocks (drag, double / triple click, Shift+click; long press and handles); `SelectionArea` joins several views and texts |
+| Selection across the view | `selectable`: the view is a selectable view, one selection across its blocks (drag, double / triple click, Shift+click; long press and handles); a `selectable` `View` joins several views and texts |
 | Code block actions (copy) | `codeBlockActions` (`copy` built in, the app's with `renderCodeBlockAction` / `onCodeBlockAction`) |
 | Highlighter (tree-sitter) | Built in (syntect, Allsum's palette, feature `highlight`); the app's `CodeHighlighter` (Rust, styled ranges) or `renderCodeBlock` replaces it |
 | Table actions | `renderTableActions` |
 | `MarkdownPlugin` | `MarkdownPlugin` (Rust) and `MarkdownExtension` (declared, from TS too) |
 | `image_source` / image loading | `renderImage`; the default loads the URL with the runtime's image loader |
 | Link clicks | `onLinkPress({ url })` |
-| Streaming fade / motion | The app's: the blocks are views it styles and animates (`nsh/animated`, layout animation) |
+| Streaming fade / motion | The app's: the blocks are views it styles and animates (`nsh`'s `Animated`, layout animation) |
 
 ## Limits
 

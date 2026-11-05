@@ -1,7 +1,6 @@
 ---
 title: Resizable
 description: "ResizablePanelGroup and ResizablePanel: panels side by side or stacked, with a handle between each two that the user drags to share the room. The group owns the drag, the panels' limits, the resize cursor and the handles' role for screen readers; the sizes, the handles' look and the panels' content are the app's."
-order: 29.5
 group: base
 demo: el-resizable
 ---
@@ -17,7 +16,7 @@ indicator; the panels are the app's views.
 
 ```rust tabs
 use nsh_base::{h_resizable, resizable_panel, theme};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn workspace() -> impl IntoElement {
     h_resizable()
@@ -51,7 +50,7 @@ function App() {
       handleClass="bg-border group-hover:bg-ring group-active:bg-primary"
       handleAccessibilityLabel="Resize the sidebar"
     >
-      <ResizablePanel size={sidebar()} minSize={160} maxSize={480} onResize={(v) => sidebar.set(v)} class="p-4">
+      <ResizablePanel size={sidebar()} minSize={160} maxSize={480} onResize={({ size }) => sidebar.set(size)} class="p-4">
         <Text class="text-muted-foreground">Files</Text>
       </ResizablePanel>
       <ResizablePanel class="p-4">
@@ -84,7 +83,7 @@ While the user drags a handle, the group moves the room between the panels in th
 When a drag ends having changed the sizes, the group reports every visible panel's size, in the order they are laid
 out (`onResize` on the group), and each panel whose size changed reports its own (`onResize` on the panel). The panels
 a drag moved keep the user's sizes until the app passes a new `size`; the app keeps them beyond the group's life by
-passing the reported sizes back as `size`, so a layout it restores from [storage](../modules/nsh-storage.md) opens at
+passing the reported sizes back as `size`, so a layout it restores from [storage](../modules/nsh.md#storage) opens at
 the sizes the user left. Only drags and screen readers' steps report: a window resized or a panel shown or hidden
 reports nothing.
 
@@ -170,8 +169,8 @@ the whole drag, wherever the pointer goes.
 
 | Event | Rust | Description |
 |---|---|---|
-| `onResize` (`ResizablePanelGroup`) | `.on_resize(\|sizes: &Vec<Points>\| ..)` | A drag ended and moved a handle, or a screen reader adjusted one: every visible panel's size, in the order they are laid out (left to right, top to bottom). |
-| `onResize` (`ResizablePanel`) | `.on_resize(\|size: &Points\| ..)` | A drag ended and changed this panel's size: the new one, to pass back as its `size`. |
+| `onResize` (`ResizablePanelGroup`) | `.on_resize(\|sizes: &Vec<Points>\| ..)` | A drag ended and moved a handle, or a screen reader adjusted one: `sizes`, every visible panel's size, in the order they are laid out (left to right, top to bottom). |
+| `onResize` (`ResizablePanel`) | `.on_resize(\|size: &Points\| ..)` | A drag ended and changed this panel's size: `size`, the new one, to pass back as its `size`. |
 
 ## Parts
 

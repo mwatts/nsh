@@ -1,4 +1,5 @@
-import { Input, List, mount, signal, Text, View } from "nsh";
+import { List, mount, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
 
 const people = ["Alice", "Bob", "Carol", "Dave", "Erin", "Frank", "Grace", "Heidi", "Ivan", "Judy", "Mallory", "Niaj"];
 
@@ -8,7 +9,7 @@ function App() {
   const shown = () => people.filter((p) => p.toLowerCase().includes(query().toLowerCase()));
   return (
     <View style={{ flex: 1, paddingTop: 80 }}>
-      <Input testID="search" value={query()} onChange={(t) => query.set(t)} style={{ height: 40 }} />
+      <Input testID="search" value={query()} onChange={({ value }) => query.set(value)} style={{ height: 40 }} />
       <Text>{`picked: ${picked()}`}</Text>
       <List each={shown()} estimatedItemSize={50} keyboardShouldPersistTaps="handled" style={{ flex: 1 }}>
         {(name) => (

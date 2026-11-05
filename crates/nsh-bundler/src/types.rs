@@ -55,7 +55,7 @@ pub fn type_definitions() -> Vec<(String, String)> {
 
 /// `tokens.d.ts`: the names of the app's design tokens `tokens` (its
 /// theme's over the default's), for `token()` of `nsh`.
-pub fn tokens_declaration(tokens: &nsh_core::ui::Tokens) -> String {
+pub fn tokens_declaration(tokens: &nsh_core::element::Tokens) -> String {
     use std::fmt::Write as _;
     let mut names: Vec<(&str, &str)> = tokens
         .colors()
@@ -107,6 +107,7 @@ mod tests {
         let assets = super::assets();
         assert!(assets.contains("declare module \"*.png\""));
         assert!(assets.contains("declare module \"*.ttf\""));
+        assert!(assets.contains("declare module \"*.woff2\""));
     }
 
     #[test]

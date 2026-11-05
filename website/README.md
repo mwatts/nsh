@@ -47,7 +47,7 @@ Name the product **Native Shell** in formal places (page titles, the home page,
 a page's first mention, the README's opening, meta descriptions) and **NSH**
 everywhere else in prose, as GPUI is written: "NSH apps", "NSH's components",
 "NSH 应用". Lowercase `nsh` is for code only, in backticks: the CLI (`nsh run`),
-`nsh.json`, the modules (`nsh`, `nsh/animated`), crates and packages. A short,
+`nsh.json`, the modules (`nsh`, `nsh/base`), crates and packages. A short,
 uppercase name is one the community can build on (`nsh-*` crates, NSH plugins).
 
 Write in positive terms: say what nsh, a platform or a feature is and does,
@@ -89,6 +89,11 @@ demo: guide-getting-started     # optional; a demo from demos/<name>.tsx
   (`group:`, a key of `GROUPS` in `src/lib/sections.ts`; the Guide uses
   them). A group is a run of consecutive pages, so keep a group's `order`
   values together.
+- **Elements** list the primitives (`group: primitives`), then the base
+  components (`group: base`), as the gallery's Elements does. A primitive
+  takes an `order` (steps of 10, from the simplest); a base component takes
+  none and lists by name. `tests/elements.test.ts` holds the gallery's
+  Elements (`examples/gallery/App.tsx`) to the same order.
 - **The heading comes from `title`.** A leading `# Title` in the body is
   removed, so pages may keep one for GitHub. The first paragraph is shown as
   the page's standfirst.
@@ -132,6 +137,48 @@ CI sets `NSH_REQUIRE_PLAY=1`, so a failed player build fails the deployment
 instead of publishing pages without their live demos. Pull requests build and
 test without deploying.
 
+The published site holds every version of the documentation, as GPUI Kit's
+does: the latest release at `/`, `main` at `/versions/main` and each earlier
+release (from v0.2.0) at `/versions/<tag>`, with a menu in the header that
+opens the same page in another version. `bun run build:versions`
+(`scripts/versions.js`) builds them all into `dist/`. Every version uses this
+checkout's site (layouts, components, styles); a release takes from its tag
+only its pages (`docs`, `elements`, `modules`, `zh-CN`) and its demos, which
+run on the player its own `cargo xtask web` builds, so a page and its demo
+always match. Releases' builds are kept in `.versions/` (cached in CI) and
+rebuilt only when the site's own files change or, for the latest, the catalog's
+commit. Versions other than the latest are not indexed (their canonical link is
+the latest's page) and link to the latest's App Stories. The Release workflow's completion deploys the site, so
+a new release moves to the root. `NSH_SITE_VERSIONS=main,v0.3.0` limits a
+local run to those versions.
+
+## App Stories
+
+`/apps` (`src/components/Apps.astro`, `src/pages/apps/`) presents apps built
+with Native Shell from the reviewed catalog in
+[`longbridge/nsh-showcases`](https://github.com/longbridge/nsh-showcases):
+one folder per app with its manifest, screenshots and an optional README,
+which becomes the app's page at `/apps/<id>`. `src/lib/showcases.ts` reads the
+catalog and runs the catalog's own `validate.ts` and `readme.ts`; the site
+serves each app's screenshots and media from its own build
+(`src/pages/apps/[id]/[file].ts`). Search, sorting and pages are
+`src/lib/showcase-browser.ts`.
+
+For a local preview, clone the catalog next to this repository and install
+its locked dependencies:
+
+```sh
+git clone https://github.com/longbridge/nsh-showcases ../nsh-showcases
+bun install --frozen-lockfile --cwd ../nsh-showcases
+```
+
+`SHOWCASES_DIR` points at a checkout elsewhere. Without one the site builds
+with an empty App Stories page; `NSH_REQUIRE_SHOWCASES=1` (the deployment's)
+requires the catalog. CI checks it out into `.showcases` and requires it,
+and the catalog's workflow dispatches
+`website.yml` after each merge and its weekly star refresh, with its
+`DOCS_DISPATCH_TOKEN` secret.
+
 ## Playground
 
 `/playground` (`src/components/Playground.astro`, `src/lib/playground-client.ts`)
@@ -145,7 +192,8 @@ base64url).
 
 `demos/<name>.tsx` are small runnable nsh apps (try one with
 `nsh run website/demos/<name>.tsx`). A page with `demo: <name>` shows the demo
-after its first paragraph: a frame with the app running in an iframe of
+after its first paragraph, and a section with a demo of its own shows it where
+its `<!-- demo: <name> -->` line is (on the English and the Chinese page alike): a frame with the app running in an iframe of
 `play/index.html?idiom=…#<name>`, beside its source (wide pages, Mobile) or
 behind a Preview / Source switch (narrow ones), and two icon buttons: edit in
 the playground, open in a new tab. The home page runs `demos/counter.tsx` the
@@ -158,8 +206,14 @@ every demo and is remembered:
 
 | Layout | Frame | Idiom | What the app has |
 | --- | --- | --- | --- |
-| Mobile | 390×844 points, the default | `phone` | touches; menus as sheets, held fingers |
-| Desktop | 1024×640 points, scaled to the column, the source below | `desktop` | a pointer; hover, right clicks, popups, keyboard |
+| Mobile | up to 390×844 points, the default | `phone` | touches; menus as sheets, held fingers |
+| Desktop | the column's width (up to 1024) × up to 900 points | `desktop` | a pointer; hover, right clicks, popups, keyboard |
+
+Panels show the app at its real size, never scaled, with Preview and Source as
+tabs: the frame is as wide as the column allows up to the layout's width, and
+once the app settles its height ends just below what it draws (a scroll
+view that fills the frame grows it by what is out of view)
+(`contentHeight` in `demo-client.ts`), so short demos leave no empty screen.
 
 The rules every demo follows, now and for the ones to come:
 
@@ -172,8 +226,10 @@ The rules every demo follows, now and for the ones to come:
   "Layout patterns"): the subject on a stage that takes the room, beside an
   inspector column of about 300 points with its state, its event log and
   the options that tune it (`Split`, or `Stage` and `Inspector`, with
-  `Panel`, `Log` and `Segmented`). With a pointer (`desktop`, from
-  `platform.idiom === "desktop"`) it has desktop density (`size`: controls
+  `Panel`, `Log` and `Segmented`; buttons and text fields are never styled by hand: spread `button(kind)` and
+  `field()` and give the label `buttonText(kind)`, so every demo shares one size, radius, hover, pressed, focus and
+  disabled treatment). With a pointer (`desktop`, from
+  `platform.desktop`) it has desktop density (`size`: controls
   of 28 and 32 points, rows of 32 and 40): buttons as wide as their labels,
   never as wide as the stage, comparable numbers in tabular figures at the
   end, one content inset for the whole demo. Where the element behaves
@@ -183,27 +239,30 @@ The rules every demo follows, now and for the ones to come:
   The phone layout keeps working as the desktop one changes.
 - **It shows the element, not the gallery.** A short screen of what the page
   explains: the element's main props and events, its state printed on screen,
-  colours from `demos/palette.ts` (light and dark).
+  colours and reusable components from `demos/palette.ts`, backed by `examples/nsh-gallery-ui` (light and dark).
 - **It is checked in both.** `nsh test website/demos/<name>.tsx` runs it as a
   phone; `nsh test website/demos/<name>.tsx --target web` (a browser) or
   `--target linux` (a window) as a desktop. Look at both before adding it.
 
 The player in `public/play/` is the WebAssembly build of the nsh runtime
 (`crates/nsh-platform-web`, rendering to the DOM) with every demo bundled by
-`nsh build`; it is generated, not checked in:
+`nsh build` as an ES module, which the browser's JavaScript engine runs; it is
+generated, not checked in:
 
 ```sh
-bun run play       # = cargo xtask web: nsh.wasm, nsh.js, index.html, demos/*.nshc (dev and build run it)
+bun run play       # = cargo xtask web: nsh.wasm, nsh.js, browser/, index.html, demos/*.js (dev and build run it)
 ```
 
-Run it again after changing a demo or the runtime. Embedded demos follow
-the page's theme (`?theme=`, then a message on each change) and take their
-colours from `demos/palette.ts`; `demos/nsh.json` gives Rust components the matching light and dark
-theme (`demos/graphite-theme.json`).
-The playground compiles in the browser, without that theme, one file at a
-time: it puts `demos/palette.ts` in place of a demo's import of it, so the
-palette is written without JSX and a demo declares none of its names at the
-top level. The
+Run it again after changing the runtime. Gallery and website demos share the internal
+`examples/nsh-gallery-ui` components, palette, `finishes.json` and `theme.json`.
+The site also generates CSS variables from these files (`src/lib/gallery-ui-css.js`), so page surfaces and native
+demos follow the same visual foundation. `demos/palette.ts` is their documentation
+adapter; `demos/nsh.json` references that shared theme. Embedded demos follow the page's appearance (`?theme=`,
+then a message on each change).
+
+The playground compiles one file in the browser. `src/lib/inline-gallery-ui.ts` includes the adapter's shared
+modules in separate scopes and applies the same theme before the first render, so a demo's imports and theme
+work in the playground as they do in a normal NSH build. The
 player is built separately from the site. Whether it exists is decided
 at build time: without `public/play/index.html`, pages show the demo's source
 only and the home page's host app shows a placeholder. Adding or removing the
@@ -219,6 +278,7 @@ player, or editing a demo, invalidates Astro's content cache automatically
 | `src/lib/remark-*.js`, `rehype-heading-anchors.js` | Title removal, callouts, code tabs, `.md` links, demo insertion, heading anchors |
 | `src/lib/code-tabs-client.ts` | Switches code tabs, page-wide, and remembers the choice |
 | `src/lib/demo.js` | Demo sources, the demo frame and the demo panel markup |
+| `src/lib/showcases.ts`, `showcase-browser.ts` | App Stories: the catalog, its READMEs and media; search, sorting and pages |
 | `src/lib/markdown-endpoint.ts`, `llms.ts` | `<page>.md`, `llms.txt`, `llms-full.txt` |
 | `src/pages/[section]/[...slug].astro` | Content pages (and `zh-CN/`); `[section].md.ts` / `[...slug].md.ts` the Markdown |
 | `src/components/Home.astro` | The home page in both languages |

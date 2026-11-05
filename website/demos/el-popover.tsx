@@ -1,6 +1,6 @@
 import { mount, signal, Text, View } from "nsh";
 import { Popover } from "nsh/base";
-import { desktop, Inspector, Log, Segmented, size, Stage, ui, wide } from "./palette";
+import { button, buttonText, desktop, Inspector, Log, PopIn, Segmented, Stage, ui, wide } from "./palette";
 
 type Placement = "top" | "bottom" | "left" | "right";
 
@@ -18,40 +18,33 @@ function App() {
       placement={placement()}
       offset={offset()}
       margin={12}
-      popupClass="w-56 gap-2 rounded-xl p-4"
-      popupStyle={ui().card}
-      onOpenChange={(open, reason) => events.set([`${open ? "opened" : "closed"} · ${reason}`, ...events()].slice(0, 4))}
+      onOpenChange={({ open, reason }) => events.set([`${open ? "opened" : "closed"} · ${reason}`, ...events()].slice(0, 4))}
       trigger={
-        <View
-          activeStyle={{ opacity: 0.7 }}
-          style={{ ...ui().accentFill, borderRadius: desktop ? 8 : 10, paddingHorizontal: desktop ? 14 : 18, height: desktop ? size.control : 40, justifyContent: "center" }}
-        >
-          <Text style={{ fontSize: desktop ? 14 : 15, fontWeight: "600", color: ui().onAccent }}>Order #1024</Text>
+        <View {...button("accent")}>
+          <Text style={buttonText("accent")}>Order #1024</Text>
         </View>
       }
     >
-      <Text style={{ fontSize: 15, fontWeight: "600", color: ui().text }}>Shipped yesterday</Text>
-      <Text style={{ fontSize: 13, color: ui().muted }}>Arriving Friday. The trigger, a press outside and Escape close this.</Text>
-      <View style={{ flexDirection: "row", gap: 6, alignItems: "center" }}>
-        <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: ui().up }} />
-        <Text style={{ fontSize: 12, color: ui().up }}>In transit</Text>
-      </View>
+      {/* The panel grows out of the trigger's side each time it opens. */}
+      <PopIn side={placement()} class="w-56 gap-2 rounded-xl p-4" style={ui().card}>
+        <Text style={{ fontSize: 15, fontWeight: "600", color: ui().text }}>Shipped yesterday</Text>
+        <Text style={{ fontSize: 13, color: ui().muted }}>Arriving Friday. The trigger, a press outside and Escape close this.</Text>
+        <View style={{ flexDirection: "row", gap: 6, alignItems: "center" }}>
+          <View style={{ width: 8, height: 8, borderRadius: 4, backgroundColor: ui().up }} />
+          <Text style={{ fontSize: 12, color: ui().up }}>In transit</Text>
+        </View>
+      </PopIn>
     </Popover>
   );
   const count = () => (
     <View
       onPress={() => presses.update((n) => n + 1)}
-      activeStyle={{ opacity: 0.7 }}
-      style={
-        wide()
-          ? { ...ui().raised, alignSelf: "center", borderRadius: 8, height: size.control, paddingHorizontal: 12, justifyContent: "center" }
-          : { ...ui().raised, borderRadius: 10, height: 40, alignItems: "center", justifyContent: "center" }
-      }
+      {...button("secondary", { align: "center" })}
     >
-      <Text style={{ fontSize: desktop ? 13 : 14, fontWeight: "500", color: ui().text }}>Count · pressed {presses()}×</Text>
+      <Text style={buttonText()}>Count · pressed {presses()}×</Text>
     </View>
   );
-  const log = () => <Log title="onOpenChange(open, reason)" lines={events()} minHeight={92} />;
+  const log = () => <Log title="onOpenChange({ open, reason })" lines={events()} minHeight={92} />;
 
   return (
     <View style={{ flex: 1, backgroundColor: ui().page, padding: 20, paddingTop: 24, gap: 14 }}>

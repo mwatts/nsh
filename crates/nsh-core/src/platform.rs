@@ -6,6 +6,18 @@ pub mod clipboard;
 
 use crate::geometry::{Edges, Points, Size};
 
+/// The native component of `nsh/mobile`'s `TabBar`, which the iOS and
+/// Android backends register themselves (`TabBarComponent.java`'s `NAME` keeps
+/// the same name).
+pub const TAB_BAR_COMPONENT: &str = "nsh/tab-bar";
+
+/// Whether native component `name` is NSH's own: names under `nsh/` are, and
+/// an embedding app's registration of one is refused, so it can never
+/// replace what NSH's exports render.
+pub fn is_reserved_component(name: &str) -> bool {
+    name.starts_with("nsh/")
+}
+
 /// The system appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorScheme {
@@ -18,7 +30,7 @@ pub enum ColorScheme {
 
 /// The appearance an app asks for (`nsh.json` `"appearance"`, TS
 /// `setColorScheme`): one of its own, or the system's.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, crate::ui::PropEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, crate::element::PropEnum)]
 pub enum Appearance {
     /// The system appearance (default).
     #[default]
@@ -72,11 +84,20 @@ impl Os {
     }
 
     /// The OS of a desktop backend (macOS, Windows, Linux): it has windows
-    /// and menus (`nsh/desktop`). Desktop behavior (`desktop={{…}}` props,
-    /// `platform.select({ desktop })`) also covers desktop-class browsers:
+    /// and menus (`nsh/desktop`'s `isAvailable`). Desktop behavior
+    /// (`desktop={{…}}` props, `platform.select({ desktop })`,
+    /// `platform.desktop`) also covers browsers in the desktop idiom:
     /// [`Environment::desktop`].
     pub fn is_desktop(self) -> bool {
         matches!(self, Os::MacOs | Os::Windows | Os::Linux)
+    }
+
+    /// iOS running under Mac Catalyst, in every idiom (`platform.catalyst`):
+    /// this build is Catalyst's (`target_abi = "macabi"`). Catalyst runs the
+    /// iOS backend, so it is mobile, not desktop: `ios={{…}}` props apply and
+    /// `nsh/desktop`'s window and menu APIs are not there.
+    pub fn is_catalyst(self) -> bool {
+        self == Os::Ios && cfg!(target_abi = "macabi")
     }
 }
 
@@ -100,20 +121,73 @@ pub enum Idiom {
     Phone,
     /// A tablet.
     Pad,
-    /// A Mac (Mac Catalyst).
+    /// UIKit's Mac idiom (Mac Catalyst optimized for Mac). Catalyst runs
+    /// the iOS backend, so this idiom is mobile, not [`Idiom::Desktop`].
     Mac,
     /// A TV.
     Tv,
-    /// A desktop computer (a desktop backend, or a browser with a mouse and
-    /// a wide viewport; Mac Catalyst is [`Idiom::Mac`]).
+    /// Desktop: a desktop backend (macOS, Windows, Linux), or a browser with
+    /// a mouse and a wide viewport ([`Idiom::desktop_on`]). Mac Catalyst is
+    /// [`Idiom::Pad`] or [`Idiom::Mac`], as UIKit reports.
     Desktop,
+    /// A terminal: drawn on a grid of Cells, keyboard first (the terminal
+    /// backend). The OS stays the machine's; desktop behavior applies.
+    Terminal,
 }
 
 impl Idiom {
-    /// Whether desktop behavior applies on `os` in this idiom: a desktop
-    /// OS, or a browser in the desktop idiom (TS: `platform.idiom` `"desktop"`).
+    /// Whether desktop behavior applies on `os` in this idiom, NSH's one
+    /// definition of desktop: a desktop OS (macOS, Windows, Linux), a
+    /// browser in the desktop idiom, or a terminal. `desktop={{…}}` props,
+    /// `platform.select({ desktop })` and `platform.desktop` all follow it,
+    /// and so does `platform.idiom === "desktop"` outside a terminal
+    /// ([`Idiom::reported_on`]).
     pub fn desktop_on(self, os: Os) -> bool {
-        os.is_desktop() || (os == Os::Web && self == Idiom::Desktop)
+        os.is_desktop() || (os == Os::Web && self == Idiom::Desktop) || self == Idiom::Terminal
+    }
+
+    /// The idiom apps see on `os` (TS: `platform.idiom`): [`Idiom::Terminal`]
+    /// in a terminal, else [`Idiom::Desktop`] exactly where
+    /// [`Idiom::desktop_on`] holds, so that `"desktop"` agrees with desktop
+    /// behavior whatever a platform (or a test) set. Elsewhere this idiom,
+    /// and [`Idiom::Phone`] for [`Idiom::Desktop`] on a mobile OS.
+    pub fn reported_on(self, os: Os) -> Idiom {
+        if self == Idiom::Terminal {
+            Idiom::Terminal
+        } else if self.desktop_on(os) {
+            Idiom::Desktop
+        } else if self == Idiom::Desktop {
+            Idiom::Phone
+        } else {
+            self
+        }
+    }
+}
+
+/// Whether the app is in use (`lifecycle()`), in React Native's `AppState`
+/// terms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lifecycle {
+    /// In the foreground and taking input.
+    #[default]
+    Active,
+    /// Still visible, but not taking input: another app or window has the
+    /// focus, or the system shows something over it (the app switcher, an
+    /// incoming call, Control Center).
+    Inactive,
+    /// Not visible: in the background, minimized or hidden. The system may
+    /// suspend it there.
+    Background,
+}
+
+impl Lifecycle {
+    /// Its `lifecycle()` name: `"active"`, `"inactive"` or `"background"`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Lifecycle::Active => "active",
+            Lifecycle::Inactive => "inactive",
+            Lifecycle::Background => "background",
+        }
     }
 }
 
@@ -132,7 +206,7 @@ pub struct Environment {
     pub title_bar: Edges<Points>,
     /// Height of the software keyboard over the surface; 0 when hidden.
     pub keyboard_height: Points,
-    /// Duration of the keyboard's show / hide animation in seconds.
+    /// Duration of the keyboard's show / hide animation in milliseconds.
     pub keyboard_duration: f32,
     /// Light or dark appearance.
     pub color_scheme: ColorScheme,
@@ -159,19 +233,62 @@ pub struct Environment {
     /// Command, labels use ⌘). Only read for [`Os::Web`]; the other OSes
     /// imply theirs.
     pub apple_keyboard: bool,
+    /// Ctrl stands in for Command: the keyboard cannot report Command (a
+    /// terminal on macOS without the kitty keyboard protocol), so a
+    /// `mod+` / `cmd+` shortcut takes Ctrl and labels show it as Ctrl
+    /// ([`crate::keymap::Keystroke::pressed`]).
+    pub ctrl_for_command: bool,
     /// The user's locale (number and date formats: `Intl`'s default).
     pub locale: Locale,
     /// The app embedding NSH answers `nsh/host`'s calls
     /// ([`crate::Command::HostCall`]); without it, they reject at once.
     pub host: bool,
+    /// Whether the app is in use: in the foreground, visible without the
+    /// focus, or in the background. For an embedded surface, the embedding
+    /// app's.
+    pub lifecycle: Lifecycle,
+    /// The platform picks a color from the screen
+    /// ([`crate::Command::PickScreenColor`]); without it, a pick answers
+    /// no color at once.
+    pub screen_color: bool,
+    /// The platform shows the system's open and save dialogs and opens,
+    /// reveals and trashes local paths ([`crate::Command::FileRequest`],
+    /// the desktops); without it, those requests answer at once with an
+    /// error.
+    pub file_requests: bool,
+    /// The platform recognizes speech ([`crate::Command::Speech`],
+    /// [`crate::speech`]); without it, a session ends at once
+    /// (`unavailable`) unless the core has a [`crate::speech::SpeechBackend`].
+    pub speech: bool,
+    /// The platform shows notifications ([`crate::Command::Notification`],
+    /// [`crate::notifications`]); without it, the permission is
+    /// `unavailable` and nothing shows.
+    pub notifications: bool,
+    /// The size of one Cell of a grid surface (a terminal, whose content is
+    /// whole character Cells), in points; `None` on every other surface.
+    /// With it the core lays out with its terminal algorithm, ratatui's
+    /// splits in whole Cells (x the Cell's width, y its height): a border
+    /// is one Cell and every frame is whole Cells (`docs/dev/styles.md`
+    /// "Layout in a terminal").
+    pub cell: Option<Size<Points>>,
+    /// The platform gives web views trusted input
+    /// ([`crate::Command::SendInput`], macOS); without it, the command
+    /// does nothing.
+    pub web_input: bool,
 }
 
 impl Environment {
-    /// Desktop behavior applies: a desktop OS, or a browser in the desktop
-    /// idiom (`desktop={{…}}` props, `platform.select({ desktop })`,
-    /// `platform.idiom` `"desktop"`).
+    /// Desktop behavior applies: a desktop OS, a browser in the desktop
+    /// idiom or a terminal ([`Idiom::desktop_on`]: `desktop={{…}}` props,
+    /// `platform.select({ desktop })`, `platform.desktop`, `platform.idiom`
+    /// `"desktop"` outside a terminal).
     pub fn desktop(&self) -> bool {
         self.idiom.desktop_on(self.os)
+    }
+
+    /// The idiom apps see (TS: `platform.idiom`, [`Idiom::reported_on`]).
+    pub fn reported_idiom(&self) -> Idiom {
+        self.idiom.reported_on(self.os)
     }
 }
 
@@ -182,7 +299,7 @@ impl Default for Environment {
             safe_area: Edges::default(),
             title_bar: Edges::default(),
             keyboard_height: Points(0.0),
-            keyboard_duration: 0.25,
+            keyboard_duration: 250.0,
             color_scheme: ColorScheme::Light,
             font_scale: 1.0,
             rtl: false,
@@ -193,8 +310,16 @@ impl Default for Environment {
             os_version: (0, 0),
             idiom: Idiom::Phone,
             apple_keyboard: false,
+            ctrl_for_command: false,
             locale: Locale::EN_US,
             host: false,
+            lifecycle: Lifecycle::Active,
+            screen_color: false,
+            file_requests: false,
+            speech: false,
+            notifications: false,
+            cell: None,
+            web_input: false,
         }
     }
 }
@@ -317,7 +442,7 @@ impl std::fmt::Display for Locale {
 }
 
 /// An HTTP request for the platform's network stack (made by JS `fetch`
-/// and by Rust components' [`crate::ui::ambient::fetch`]).
+/// and by Rust components' [`crate::element::fetch`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     /// Upper-case method (`GET`, `POST`, ...).
@@ -459,7 +584,56 @@ pub enum FetchOp {
 
 #[cfg(test)]
 mod tests {
-    use super::{Environment, HostEnvironment, Locale};
+    use super::{Environment, HostEnvironment, Idiom, Locale, Os};
+
+    #[test]
+    fn desktop_is_a_desktop_os_or_a_desktop_browser() {
+        let desktop = |os: Os, idiom: Idiom| Environment {
+            os,
+            idiom,
+            ..Environment::default()
+        };
+        for (os, idiom, expected) in [
+            (Os::MacOs, Idiom::Desktop, true),
+            (Os::Windows, Idiom::Desktop, true),
+            (Os::Linux, Idiom::Desktop, true),
+            // A desktop OS is desktop whatever idiom it was given.
+            (Os::Linux, Idiom::Phone, true),
+            (Os::Web, Idiom::Desktop, true),
+            (Os::Web, Idiom::Pad, false),
+            (Os::Web, Idiom::Phone, false),
+            (Os::Ios, Idiom::Phone, false),
+            (Os::Ios, Idiom::Pad, false),
+            // Mac Catalyst: the iOS backend, mobile in either idiom.
+            (Os::Ios, Idiom::Mac, false),
+            (Os::Ios, Idiom::Desktop, false),
+            (Os::Android, Idiom::Tv, false),
+        ] {
+            let env = desktop(os, idiom);
+            assert_eq!(env.desktop(), expected, "{os:?} {idiom:?}");
+            // `platform.idiom` is "desktop" exactly where desktop applies.
+            assert_eq!(
+                env.reported_idiom() == Idiom::Desktop,
+                expected,
+                "{os:?} {idiom:?}"
+            );
+        }
+        assert_eq!(desktop(Os::Ios, Idiom::Mac).reported_idiom(), Idiom::Mac);
+        assert_eq!(
+            desktop(Os::Ios, Idiom::Desktop).reported_idiom(),
+            Idiom::Phone
+        );
+        assert!(!Os::MacOs.is_catalyst() && !Os::Web.is_catalyst());
+        assert_eq!(Os::Ios.is_catalyst(), cfg!(target_abi = "macabi"));
+    }
+
+    #[test]
+    fn desktop_behavior_applies_in_the_terminal_idiom_on_any_os() {
+        for os in [Os::MacOs, Os::Windows, Os::Linux, Os::Ios, Os::Web] {
+            assert!(Idiom::Terminal.desktop_on(os), "{os:?}");
+            assert_eq!(Idiom::Terminal.reported_on(os), Idiom::Terminal, "{os:?}");
+        }
+    }
 
     #[test]
     fn a_host_environment_replaces_what_it_sets() {

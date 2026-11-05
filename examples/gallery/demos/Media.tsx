@@ -1,6 +1,6 @@
-import { signal, Text, Video, View, WebView, type WebViewNavigation, type YNode } from "nsh";
+import { signal, Text, Video, type VideoRef, View, WebView, type WebViewNavigation, type WebViewRef } from "nsh";
 import { Icon } from "../icons";
-import { Badge, Button, Caption, Card, colors, DemoPage, finish, isDark, Meter, Press, radius, RoundButton, Segmented } from "../ui";
+import { Badge, Button, Caption, Card, colors, DemoPage, finish, isDark, Meter, Press, radius, RoundButton, Segmented, terminal, TERMINAL_GAP } from "../ui";
 
 /** An inline page in the gallery's colors (for the appearance shown: the page reloads when it changes). */
 const page = () => `<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -25,7 +25,7 @@ const frame = () => ({ borderRadius: radius.control, overflow: "hidden", borderW
 function Messaging() {
   const message = signal("");
   const sent = signal(0);
-  let web!: YNode;
+  let web!: WebViewRef;
   return (
     <Card icon="media" title="Web view" subtitle="Inline HTML, with messages both ways">
       <WebView ref={web} html={page()} style={{ height: 210, backgroundColor: colors.inset, ...frame() }} onMessage={(e) => message.set(e.data)} />
@@ -45,21 +45,23 @@ function Messaging() {
 /** A round icon button, 44 pt. */
 function NavButton(props: { flip?: boolean; enabled: boolean; label: string; onPress: () => void }) {
   return (
-    <Press onPress={props.onPress} disabled={!props.enabled} accessibilityLabel={props.label} hitSlop={4}>
-      <View
-        style={{
-          width: 44,
-          height: 44,
-          borderRadius: 22,
-          backgroundColor: colors.raised,
-          ...finish.raised,
-          borderWidth: 1,
-          borderColor: colors.border,
-          alignItems: "center",
-          justifyContent: "center",
-          transform: props.flip ? [{ rotate: "180deg" }] : [],
-        }}
-      >
+    <Press
+      onPress={props.onPress}
+      disabled={!props.enabled}
+      accessibilityLabel={props.label}
+      hitSlop={4}
+      hoverStyle={finish.hover}
+      style={{
+        width: 44,
+        height: 44,
+        borderRadius: 22,
+        borderWidth: 1,
+        ...finish.raised,
+        alignItems: "center",
+        justifyContent: "center",
+      }}
+    >
+      <View style={{ transform: props.flip ? "rotate(180deg)" : "none" }}>
         <Icon name="chevron" size={18} tint={colors.text} />
       </View>
     </Press>
@@ -68,7 +70,7 @@ function NavButton(props: { flip?: boolean; enabled: boolean; label: string; onP
 
 function Site() {
   const state = signal<WebViewNavigation | null>(null);
-  let site!: YNode;
+  let site!: WebViewRef;
   const host = () => {
     const url = state()?.url ?? "";
     return url.replace(/^https?:\/\//, "").replace(/\/.*$/, "") || "…";
@@ -95,7 +97,7 @@ function Site() {
         }}
       >
         <View style={{ width: 7, height: 7, borderRadius: 3.5, backgroundColor: state()?.loading ? colors.warn : colors.up }} />
-        <Text numberOfLines={1} ellipsizeMode="middle" style={{ flex: 1, fontSize: 15, color: colors.muted }}>
+        <Text style={{ numberOfLines: 1, textOverflow: "ellipsis-middle", flex: 1, fontSize: 15, color: colors.muted }}>
           {host()}
         </Text>
       </View>
@@ -105,7 +107,8 @@ function Site() {
         style={{ height: 340, backgroundColor: colors.inset, ...frame() }}
         onNavigationStateChange={(v) => state.set(v)}
       />
-      <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+      {/* Two Cells between the buttons in a terminal, where they are words. */}
+      <View style={{ flexDirection: "row", alignItems: "center", gap: terminal ? TERMINAL_GAP : 10 }}>
         <NavButton flip label="Back" enabled={!!state()?.canGoBack} onPress={() => site.goBack()} />
         <NavButton label="Forward" enabled={!!state()?.canGoForward} onPress={() => site.goForward()} />
         <View style={{ flex: 1 }} />
@@ -124,7 +127,7 @@ function Player() {
   const duration = signal(0);
   const buffering = signal(false);
   const failed = signal(false);
-  let video!: YNode;
+  let video!: VideoRef;
   return (
     <Card
       icon="play"
@@ -144,7 +147,7 @@ function Player() {
         muted
         repeat
         controls={controls() === "system"}
-        style={{ height: 200, backgroundColor: "#000000", ...frame() }}
+        style={{ width: "100%", aspectRatio: 16 / 9, backgroundColor: "#000000", ...frame() }}
         onLoad={(e) => duration.set(e.duration)}
         onError={() => failed.set(true)}
         onBuffer={(e) => buffering.set(e.isBuffering)}
@@ -178,7 +181,10 @@ function Player() {
   );
 }
 
-export function Media() {
-  const cards = [Messaging, Site, Player];
-  return <DemoPage cards={cards} />;
+export function WebViewDemo() {
+  return <DemoPage cards={[Messaging, Site]} />;
+}
+
+export function VideoDemo() {
+  return <DemoPage cards={[Player]} columns={1} />;
 }

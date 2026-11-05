@@ -31,6 +31,7 @@
 pub mod agent;
 #[cfg(feature = "js")]
 mod driver;
+mod failure;
 // An engine on a thread of its own: not in WebAssembly, where only the
 // agent's model runs (the web's page).
 #[cfg(not(target_arch = "wasm32"))]
@@ -48,14 +49,16 @@ mod screen;
 mod selector;
 mod storage;
 mod trace;
+#[cfg(feature = "js")]
+mod values;
 
 #[cfg(feature = "bundle")]
 use std::{path::Path, sync::Arc};
 
 #[cfg(feature = "js")]
-use nsh_core::ui::Registry;
+use nsh_core::element::Registry;
 #[cfg(feature = "bundle")]
-use nsh_core::ui::description::SetDescription;
+use nsh_core::element::description::SetDescription;
 #[cfg(feature = "bundle")]
 use nsh_engine::{Bundle, EngineConfig};
 
@@ -74,11 +77,11 @@ pub use self::{
     driver::Host,
     module::{
         App, ClockOptions, ColorScheme, Entries, Expectation, NetworkOption, OpenOptions, Platform,
-        RouteOption, SPECIFIER, SafeArea, StubRequest, Testing, registry,
+        RouteOption, SPECIFIER, SafeArea, SpanStyle, StubRequest, Testing, registry,
     },
     run::{
-        Built, Compile, Entry, Failure, HostOptions, Output, StartHost, TestResult, TestRun,
-        TestStatus, run_file,
+        Built, Compile, Entry, Failure, HostOptions, HostTarget, Output, StartHost, TestResult,
+        TestRun, TestStatus, run_file,
     },
     runner::{PROTOCOL, Reply, RunnerMessage, TestRequest, runner},
 };

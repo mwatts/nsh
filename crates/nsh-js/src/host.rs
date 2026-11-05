@@ -51,6 +51,9 @@ pub(crate) struct Shared {
     pub(crate) host_bridge: RefCell<Option<Rc<dyn nsh_core::host_channel::HostBridge>>>,
     pub(crate) system_websocket:
         RefCell<Option<std::sync::Arc<dyn nsh_core::websocket::WebSocketTransport>>>,
+    /// What the host refuses the app's sockets and WebSockets with (a
+    /// test's network); `None`: they connect.
+    pub(crate) system_refuse_connections: RefCell<Option<nsh_core::element::RefuseConnections>>,
     /// Permissions and host-selected app directory for native system operations.
     pub(crate) system_access: RefCell<nsh_core::access::Access>,
     pub(crate) system_filesystem:
@@ -59,13 +62,13 @@ pub(crate) struct Shared {
     pub(crate) system_paths: RefCell<nsh_core::access::TrustedPaths>,
     /// The VM's counts of limited resources for Rust modules (`net`'s
     /// sockets), handed to their calls' `System`.
-    pub(crate) system_quotas: nsh_core::ui::Quotas,
+    pub(crate) system_quotas: nsh_core::element::Quotas,
     /// The VM's scheduler, for native transports that start its I/O runtime.
     #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pub(crate) scheduler: std::rc::Weak<Scheduler>,
     /// The VM's state of the runtime's Rust modules (`process`'s
     /// children), closed when the VM goes.
-    pub(crate) system_locals: nsh_core::ui::Locals,
+    pub(crate) system_locals: nsh_core::element::Locals,
     /// The lazy standard globals installed so far (bits of `standard::LAZY`).
     pub(crate) lazy_globals: Cell<u8>,
     /// Worker completion wakes the owning engine without polling.
@@ -119,50 +122,6 @@ pub struct Host {
     entry_depth: Cell<usize>,
 }
 
-/// A context with `JS_NewContext`'s intrinsics. With feature
-/// `bytecode-only` without the one that compiles source (`eval`, the
-/// function constructors, `Module::declare`): nothing then reaches QuickJS'
-/// parser and compiler, which the linker leaves out, and the VM runs
-/// bytecode only (the web runtime of published apps).
-fn new_context(rt: &AsyncRuntime, scheduler: Rc<Scheduler>) -> rquickjs::Result<Context> {
-    #[cfg(test)]
-    if tests::SOURCELESS.get() {
-        return sourceless_context(rt, scheduler);
-    }
-    #[cfg(not(feature = "bytecode-only"))]
-    {
-        Context::full(rt, scheduler)
-    }
-    #[cfg(feature = "bytecode-only")]
-    {
-        sourceless_context(rt, scheduler)
-    }
-}
-
-/// The context of `bytecode-only` runtimes, without the intrinsic that
-/// compiles source; tests make one in any build, so a VM setup that needs
-/// QuickJS' parser fails them, not only the web runtime.
-#[cfg(any(feature = "bytecode-only", test))]
-fn sourceless_context(rt: &AsyncRuntime, scheduler: Rc<Scheduler>) -> rquickjs::Result<Context> {
-    use rquickjs::context::intrinsic::{
-        Date, Json, MapSet, Performance, Promise, Proxy, RegExp, TypedArrays, WeakRef,
-    };
-    let cx = Context::custom::<(
-        Date,
-        RegExp,
-        Json,
-        Proxy,
-        MapSet,
-        TypedArrays,
-        Promise,
-        WeakRef,
-        Performance,
-    )>(rt, scheduler)?;
-    // SAFETY: a new, live context; rquickjs has no intrinsic for it.
-    cx.with(|cx| unsafe { rquickjs::qjs::JS_AddIntrinsicAToB(cx.as_raw().as_ptr()) });
-    Ok(cx)
-}
-
 /// How a VM is set up.
 #[derive(Debug, Clone, Default)]
 pub struct HostOptions {
@@ -171,19 +130,14 @@ pub struct HostOptions {
     /// Removes `eval` and the function constructors and freezes the shared
     /// prototypes (see `sandbox`). Off for development bundles.
     pub harden: bool,
-    /// The hardening as bytecode ([`crate::compile_harden`]), run instead
-    /// of compiling it: a runtime without QuickJS' parser
-    /// (`bytecode-only`) needs it to harden. Trusted input, like a bundle's
-    /// bytecode: only from the CLI that compiled the app.
-    pub harden_bytecode: Option<std::sync::Arc<Vec<u8>>>,
     /// The UI sets apps import as native modules
     /// (`nsh_base::registry()`, served as `nsh/base`, and an app's own).
-    pub ui_sets: Vec<nsh_core::ui::Registry>,
+    pub ui_sets: Vec<nsh_core::element::Registry>,
     /// The queue of the JS calls Rust posts (`Callback::post`,
     /// `call_async`): the engine hands the core the same one
     /// ([`nsh_core::Core::set_posts`]), which releases the calls posted
     /// during a synchronous call in order with the ops.
-    pub posts: nsh_core::ui::Posts,
+    pub posts: nsh_core::element::Posts,
     /// The URL relative request URLs (`fetch("/api")`, `new Request("x")`)
     /// resolve against: the page's on the web. `None` (native hosts):
     /// they are invalid, as there is no document they belong to.
@@ -211,7 +165,7 @@ impl Host {
         scheduler.ready(rt.set_max_stack_size(limits.stack_bytes));
         let budget = Budget::new(limits);
         scheduler.ready(rt.set_interrupt_handler(Some(budget.interrupt_handler(None))));
-        let cx = new_context(&rt, scheduler.clone())?;
+        let cx = Context::full(&rt, scheduler.clone())?;
         let shared = Rc::new(Shared {
             limits,
             scheduler: Rc::downgrade(&scheduler),
@@ -237,11 +191,7 @@ impl Host {
             // Before hardening freezes the globals.
             crate::clock::install(&cx)?;
             if options.harden {
-                match &options.harden_bytecode {
-                    // SAFETY: trusted, per the option's contract.
-                    Some(bytecode) => unsafe { sandbox::harden_from(&cx, bytecode)? },
-                    None => sandbox::harden(&cx)?,
-                }
+                sandbox::harden(&cx)?;
             }
             Ok(())
         })
@@ -372,7 +322,6 @@ impl Host {
 
     /// Actual native module exports for declaration generation. This evaluates
     /// trusted module initializers only, without running user bundles or jobs.
-    #[cfg(not(feature = "bytecode-only"))]
     pub(crate) fn standard_exports(&self) -> Result<Vec<(String, Vec<String>)>, JsError> {
         self.guarded(Phase::Load, || {
             self.cx
@@ -403,11 +352,6 @@ impl Host {
                 .map_err(|error| self.classify(error))
         })
         .unwrap_or_else(|| Err(self.stopped()))
-    }
-
-    #[cfg(feature = "bytecode-only")]
-    pub(crate) fn standard_exports(&self) -> Result<Vec<(String, Vec<String>)>, JsError> {
-        Ok(Vec::new())
     }
 
     /// Sets the handler for unhandled promise rejections: promises still
@@ -580,8 +524,8 @@ impl Host {
     /// ([`nsh_core::Core::take_events`]): a node's event to its handler, a
     /// Rust component's event to its `on<Event>` prop, a call's result to
     /// its promise (converted now).
-    pub fn deliver(&self, event: nsh_core::ui::JsEvent) {
-        if let nsh_core::ui::JsEvent::Event(id, kind, payload) = &event {
+    pub fn deliver(&self, event: nsh_core::element::JsEvent) {
+        if let nsh_core::element::JsEvent::Event(id, kind, payload) = &event {
             self.dispatch_event(*id, *kind, payload);
             return;
         }
@@ -615,11 +559,40 @@ impl Host {
                     return;
                 }
                 let payload = match (event, payload) {
-                    // `onChange` receives the text itself, as in React Native.
+                    // `onChange({ value })`: the text, in one object as every
+                    // event (`api-naming.md` "Payloads").
                     (EventKind::ChangeText, EventPayload::Text { text, .. }) => {
-                        rquickjs::String::from_str(cx.clone(), text).map(|s| s.into_value())
+                        rquickjs::Object::new(cx.clone()).and_then(|o| {
+                            o.set("value", text.as_str())?;
+                            Ok(o.into_value())
+                        })
                     }
                     (_, EventPayload::Value(value)) => payload_value(&cx, value),
+                    // `onContentSizeChange({ size })`.
+                    (EventKind::ContentSizeChange, EventPayload::Map(fields)) => {
+                        rquickjs::Object::new(cx.clone()).and_then(|o| {
+                            o.set(
+                                "size",
+                                payload_object(&cx, &EventPayload::Map(fields.clone()))?,
+                            )?;
+                            Ok(o.into_value())
+                        })
+                    }
+                    // Presses always pass their event: where the backend
+                    // does not know the pointer, at the view's origin.
+                    (
+                        EventKind::Press
+                        | EventKind::LongPress
+                        | EventKind::PressDown
+                        | EventKind::PressUp,
+                        EventPayload::None,
+                    ) => payload_object(
+                        &cx,
+                        &EventPayload::Press(nsh_core::PressEvent {
+                            clicks: 1,
+                            ..Default::default()
+                        }),
+                    ),
                     // A video's `onLoad`: `{ duration, size }` of the
                     // platforms' `duration`, `width` and `height`.
                     (EventKind::Load, EventPayload::Map(fields))
@@ -739,6 +712,13 @@ impl Host {
         transport: Option<std::sync::Arc<dyn nsh_core::websocket::WebSocketTransport>>,
     ) {
         *self.shared.system_websocket.borrow_mut() = transport;
+    }
+
+    /// Refuses the app's connections (`net` sockets and both WebSocket
+    /// APIs) with what `refuse` gives, before they reach the network: a
+    /// test's (`nsh_core::element::System::refuse_connections`).
+    pub fn set_refuse_connections(&self, refuse: Option<nsh_core::element::RefuseConnections>) {
+        *self.shared.system_refuse_connections.borrow_mut() = refuse;
     }
 
     /// Connects `nsh/host` to the embedding app: its launch parameters, and
@@ -993,8 +973,8 @@ impl Host {
         ops.retain(|op| {
             !matches!(
                 op,
-                Op::Rust(nsh_core::ui::RustOp {
-                    run: nsh_core::ui::RustCall::Post(_),
+                Op::Rust(nsh_core::element::RustOp {
+                    run: nsh_core::element::RustCall::Post(_),
                     ..
                 })
             )
@@ -1043,12 +1023,23 @@ impl Host {
 
     /// Publishes the design tokens the app is drawn with to JS (`token()`
     /// of `nsh`). Call before evaluating the bundle, then on every change.
-    pub fn set_tokens(&self, tokens: std::sync::Arc<nsh_core::ui::Tokens>) {
+    pub fn set_tokens(&self, tokens: std::sync::Arc<nsh_core::element::Tokens>) {
         self.guarded(Phase::Call, || {
             self.cx.with(|cx| {
                 crate::env::set_tokens(cx.as_raw().as_ptr(), tokens);
             });
             self.run_jobs();
+        });
+    }
+
+    /// Sets how the app's theme file makes the tokens it is drawn with
+    /// ([`nsh_core::Core::theme_tokens`]): `token()` reads them from the
+    /// entry's first statement on, before the theme reaches the core. Call
+    /// before evaluating the bundle, then when the embedding app's tokens
+    /// change.
+    pub fn set_theme_tokens(&self, theme: nsh_core::element::ThemeTokens) {
+        self.cx.with(|cx| {
+            crate::env::set_theme_tokens(cx.as_raw().as_ptr(), theme);
         });
     }
 
@@ -1094,6 +1085,22 @@ impl Host {
                 let raw = cx.as_raw().as_ptr();
                 let result =
                     crate::web::fetch_event(raw, id, event).map_err(|_| rquickjs::Error::Exception);
+                self.report(&cx, result);
+            });
+            self.run_jobs();
+        });
+    }
+
+    /// Fails request `id`, which the app's capabilities do not grant:
+    /// `message` says why, `url` is the URL refused (the request's, or a
+    /// redirect's). `fetch` rejects with a `TypeError` whose `code` is
+    /// `ERR_ACCESS_DENIED`, `permission` `"network"` and `resource` `url`.
+    pub fn fetch_refused(&self, id: RequestId, message: &str, url: &str) {
+        self.guarded(Phase::Call, || {
+            self.cx.with(|cx| {
+                let raw = cx.as_raw().as_ptr();
+                let result = crate::web::fetch_refused(raw, id, message, url)
+                    .map_err(|_| rquickjs::Error::Exception);
                 self.report(&cx, result);
             });
             self.run_jobs();
@@ -1186,12 +1193,18 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             obj.set("modifiers", modifiers_object(cx, modifiers)?)?;
             obj.set("clickCount", *clicks)?;
         }
-        EventPayload::Hover(nsh_core::HoverEvent {
-            position,
-            page_position,
-            modifiers,
-        })
-        | EventPayload::ContextMenu(nsh_core::ContextMenuEvent {
+        EventPayload::Mouse(e) => {
+            obj.set("position", point_object(cx, e.position)?)?;
+            obj.set("pagePosition", point_object(cx, e.page_position)?)?;
+            obj.set("modifiers", modifiers_object(cx, &e.modifiers)?)?;
+            // `null` with no button down, as declared (an absent field
+            // would read `undefined`).
+            match e.pressed_button {
+                Some(button) => obj.set("pressedButton", button.name())?,
+                None => obj.set("pressedButton", Value::new_null(cx.clone()))?,
+            }
+        }
+        EventPayload::ContextMenu(nsh_core::ContextMenuEvent {
             position,
             page_position,
             modifiers,
@@ -1219,16 +1232,20 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
                 obj.set("firstRect", rect(r)?)?;
             }
         }
-        EventPayload::FileDrop(uris) => {
+        EventPayload::FileDrop(uris) | EventPayload::FileDropAt { uris, .. } => {
             let list = rquickjs::Array::new(cx.clone())?;
             for (index, uri) in uris.iter().enumerate() {
                 list.set(index, uri.as_str())?;
             }
             obj.set("uris", list)?;
+            if let EventPayload::FileDropAt { page_position, .. } = payload {
+                obj.set("pagePosition", point_object(cx, *page_position)?)?;
+            }
         }
         // The bytes cross natively: each file is a `File` over them.
         EventPayload::Paste(paste) => {
             obj.set("text", paste.text.as_str())?;
+            obj.set("html", paste.html.as_str())?;
             let files = rquickjs::Array::new(cx.clone())?;
             for (index, file) in paste.files.iter().enumerate() {
                 let blob = crate::web::blob::Blob::new(file.data.clone(), file.mime.clone());
@@ -1252,6 +1269,10 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
         }
         // The core answers picks; JS never gets their files this way.
         EventPayload::Picked { id, .. } => obj.set("id", *id)?,
+        // The core answers these too.
+        EventPayload::FileRequest { id, .. } => obj.set("id", *id)?,
+        // And speech sessions' events (`Speech`'s listeners get them).
+        EventPayload::Speech { id, .. } => obj.set("id", *id)?,
         EventPayload::Native { name, data } => {
             obj.set("name", &**name)?;
             obj.set("data", json_value(cx, data)?)?;
@@ -1275,33 +1296,49 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
             }
             obj.set("lines", list)?;
         }
-        EventPayload::Layout(frame) => return Ok(bounds_object(cx, *frame)?.into_value()),
+        EventPayload::Layout(frame) => obj.set("bounds", bounds_object(cx, *frame)?)?,
         EventPayload::Pan {
             translation,
             velocity_x,
             velocity_y,
             value_x,
             value_y,
+        }
+        | EventPayload::PanCancelled {
+            translation,
+            velocity_x,
+            velocity_y,
+            value_x,
+            value_y,
         } => {
-            obj.set("translationX", translation.x.0)?;
-            obj.set("translationY", translation.y.0)?;
-            obj.set("velocityX", *velocity_x)?;
-            obj.set("velocityY", *velocity_y)?;
-            if let Some(v) = value_x {
-                obj.set("valueX", v.0)?;
-            }
-            if let Some(v) = value_y {
-                obj.set("valueY", v.0)?;
+            obj.set(
+                "cancelled",
+                matches!(payload, EventPayload::PanCancelled { .. }),
+            )?;
+            obj.set("translation", point_object(cx, *translation)?)?;
+            let velocity = rquickjs::Object::new(cx.clone())?;
+            velocity.set("x", *velocity_x)?;
+            velocity.set("y", *velocity_y)?;
+            obj.set("velocity", velocity)?;
+            // The bound values, those of the axes `pan` binds.
+            if value_x.is_some() || value_y.is_some() {
+                let value = rquickjs::Object::new(cx.clone())?;
+                if let Some(v) = value_x {
+                    value.set("x", v.0)?;
+                }
+                if let Some(v) = value_y {
+                    value.set("y", v.0)?;
+                }
+                obj.set("value", value)?;
             }
         }
-        EventPayload::Scroll(offset) => {
-            obj.set("x", offset.x.0)?;
-            obj.set("y", offset.y.0)?;
-        }
+        EventPayload::Scroll(offset) => obj.set("offset", point_object(cx, *offset)?)?,
         // The numbers JS always got (pixels are whole).
         EventPayload::Image(size) => {
-            obj.set("width", size.width.0 as f32)?;
-            obj.set("height", size.height.0 as f32)?;
+            let pixels = rquickjs::Object::new(cx.clone())?;
+            pixels.set("width", size.width.0 as f32)?;
+            pixels.set("height", size.height.0 as f32)?;
+            obj.set("size", pixels)?;
         }
         EventPayload::Error { message } => obj.set("message", message.as_str())?,
         EventPayload::Text { text, .. } => obj.set("text", text.as_str())?,
@@ -1600,59 +1637,6 @@ mod tests {
     };
 
     use super::*;
-
-    thread_local! {
-        /// Makes this thread's new VMs as `bytecode-only` runtimes make
-        /// theirs ([`sourceless_context`]).
-        pub(super) static SOURCELESS: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// A published web app's VM compiles no source: hardening comes as
-    /// bytecode and the standard modules and globals are native. Its
-    /// runtime cannot compile source at all (`bytecode-only`), so a setup
-    /// step or first use that needs QuickJS' parser would stop every
-    /// published app from starting.
-    #[test]
-    fn bytecode_only_vms_start_and_use_the_standard_apis_without_source() {
-        let imports: String = crate::standard::NAMES
-            .iter()
-            .enumerate()
-            .map(|(i, name)| format!("import * as m{i} from {name:?};\n"))
-            .collect();
-        let source = format!(
-            r#"{imports}
-            import {{ text }} from "nsh:rt";
-            for (const m of [{modules}]) if (typeof m !== "object") throw Error("module");
-            if (Buffer.from("nsh").toString("base64") !== "bnNo") throw Error("Buffer");
-            if (crypto.randomUUID().length !== 36 || typeof crypto.subtle !== "object") throw Error("crypto");
-            if (typeof process.platform !== "string" || typeof process.nextTick !== "function") throw Error("process");
-            if (typeof process.run !== "function" || typeof process.env !== "object") throw Error("process");
-            if (new URL("https://a.b/c").pathname !== "/c") throw Error("URL");
-            const socket = new WebSocket("ws://127.0.0.1:9/");
-            if (!(socket instanceof EventTarget) || socket.readyState !== WebSocket.CONNECTING) throw Error("WebSocket");
-            socket.close();
-            text("started");
-            "#,
-            modules = (0..crate::standard::NAMES.len())
-                .map(|i| format!("m{i}"))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-        let bytecode = crate::compile_bytecode(&source, true).unwrap();
-        let harden = crate::compile_harden().unwrap();
-        SOURCELESS.set(true);
-        let host = Host::with_options(HostOptions {
-            harden: true,
-            harden_bytecode: Some(Arc::new(harden)),
-            ..HostOptions::default()
-        });
-        SOURCELESS.set(false);
-        let host = host.unwrap();
-        let error = host.eval_source("export {};").unwrap_err();
-        assert!(error.message.contains("eval is not supported"), "{error}");
-        host.eval_bytecode(&bytecode).unwrap();
-        assert_eq!(reported(&host), ["started"]);
-    }
 
     #[test]
     fn strings_outside_a_text_are_reported_once_per_element() {
@@ -2089,19 +2073,20 @@ const report = (v) => text(String(v));
     }
 
     #[test]
-    fn hover_payload_has_both_positions_and_the_modifiers() {
+    fn mouse_payload_has_both_positions_the_modifiers_and_the_button() {
         let host = Host::new().unwrap();
-        let event = nsh_core::HoverEvent {
-            position: point(px(3.0), px(4.5)),
-            page_position: point(px(30.0), px(40.5)),
-            modifiers: nsh_core::keymap::Modifiers {
+        let event = nsh_core::MouseEvent::new(
+            point(px(3.0), px(4.5)),
+            point(px(30.0), px(40.5)),
+            nsh_core::keymap::Modifiers {
                 shift: true,
                 cmd: true,
                 ..Default::default()
             },
-        };
+            Some(nsh_core::MouseButton::Left),
+        );
         host.cx.with(|cx| {
-            let value = payload_object(&cx, &EventPayload::Hover(event)).unwrap();
+            let value = payload_object(&cx, &EventPayload::Mouse(event)).unwrap();
             let obj = value.as_object().unwrap();
             let num = |o: &str, k: &str| {
                 let o: rquickjs::Object = obj.get(o).unwrap();
@@ -2122,6 +2107,11 @@ const report = (v) => text(String(v));
             );
             assert!(flag("shift") && flag("platform"));
             assert!(!flag("alt") && !flag("control"));
+            assert_eq!(obj.get::<_, String>("pressedButton").unwrap(), "left");
+            let none = nsh_core::MouseEvent::default();
+            let value = payload_object(&cx, &EventPayload::Mouse(none)).unwrap();
+            let pressed: Value = value.as_object().unwrap().get("pressedButton").unwrap();
+            assert!(pressed.is_null());
         });
     }
 
@@ -2227,31 +2217,30 @@ const report = (v) => text(String(v));
             r##"import { element, prop } from "nsh:rt";
             prop(element("view"), "style", {
                 flexDirection: "row", backgroundColor: "#ff0000", bogus: 1,
-                shadowColor: "#000", shadowOffset: { width: 2, height: 6 },
-                shadowOpacity: 0.25, shadowRadius: 10,
+                boxShadow: "2px 6px 10px rgb(0 0 0 / 0.25)", textShadow: "0 1px 4px #000",
                 borderRadius: 12, borderBottomLeftRadius: 0,
-            });
-            prop(element("view"), "style", { shadowOffset: null });"##,
+            });"##,
         )
         .unwrap();
-        let styles: Vec<_> = ops(&host)
+        let style = ops(&host)
             .into_iter()
-            .filter_map(|op| match op {
+            .find_map(|op| match op {
                 Op::SetStyle { style, .. } => Some(style),
                 _ => None,
             })
-            .collect();
-        let style = &styles[0];
+            .unwrap();
         assert_eq!(format!("{:?}", style.layout.flex_direction), "Row");
         assert_eq!(style.view.background_color, nsh_core::Color(0xff00_00ff));
-        let shadow = style.view.shadow;
-        assert_eq!((shadow.offset_x.0, shadow.offset_y.0), (2.0, 6.0));
-        assert_eq!((shadow.opacity, shadow.radius.0), (0.25, 10.0));
+        let shadow = style.view.effects.as_ref().unwrap().box_shadows[0];
+        assert_eq!(
+            (shadow.offset_x.0, shadow.offset_y.0, shadow.blur.0),
+            (2.0, 6.0, 10.0)
+        );
+        assert_eq!(style.text.shadow_radius.map(|r| r.0), Some(4.0));
         assert_eq!(
             style.view.radii().to_array().map(|r| r.0),
             [12.0, 12.0, 12.0, 0.0]
         );
-        assert_eq!(styles[1].view.shadow, nsh_core::Shadow::DEFAULT);
     }
 
     /// `style={[base, props.style]}` where `props.style` is itself a list:
@@ -2543,17 +2532,7 @@ const report = (v) => text(String(v));
 
     #[test]
     fn hardened_vms_run_no_code_from_strings() {
-        // Hardened from source, and from the bytecode the CLI ships to
-        // runtimes without a parser.
-        let from_bytecode = Host::with_options(HostOptions {
-            harden: true,
-            harden_bytecode: Some(crate::compile_harden().unwrap().into()),
-            ..HostOptions::default()
-        })
-        .unwrap();
-        for host in [sandboxed(Limits::default()), from_bytecode] {
-            hardened_vm_runs_no_code_from_strings(&host);
-        }
+        hardened_vm_runs_no_code_from_strings(&sandboxed(Limits::default()));
     }
 
     fn hardened_vm_runs_no_code_from_strings(host: &Host) {

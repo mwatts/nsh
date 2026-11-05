@@ -1,11 +1,12 @@
-import { effect, Input, type JSX, Scroll, signal, Text, View } from "nsh";
-import { createAnimatedValue } from "nsh/animated";
-import { BackHandler } from "nsh/android";
-import { platform } from "nsh/device";
-import { AlertDialog, Dialog, NavPage, SafeAreaView, safeAreaInsets } from "nsh/base";
+import { effect, type JSX, Scroll, signal, Text, View } from "nsh";
+import { createAnimatedValue } from "nsh";
+import { BackHandler } from "nsh/mobile";
+import { platform } from "nsh";
+import { AlertDialog, Dialog, NavPage, Input } from "nsh/base";
+import { safeAreaInsets } from "nsh";
 import { Icon, type IconName } from "../icons";
 import { nav } from "../nav";
-import { Appear, Badge, Button, Card, colors, DemoPage, Figure, finish, header, hint, IconTile, Inset, isDark, mono, motion, PageHeader, Press, radius, Section, Stat, tints, Toggle } from "../ui";
+import { Appear, Badge, Button, Card, colors, DemoPage, density, Figure, finish, header, hint, hovered, IconTile, Inset, isDark, mono, motion, PageHeader, Press, radius, Section, Stat, tints, Toggle } from "../ui";
 import { TitleBar } from "../TitleBar";
 
 const edges = ["top", "bottom", "left", "right"] as const;
@@ -20,30 +21,30 @@ function Insets() {
   );
 }
 
-/** A row that pushes a screen: an icon, a title, the API it shows. */
+/** A row that opens a screen: an icon, a title, the API it shows, a
+ * chevron; a hairline above all but the first, the theme's hover fill. */
 function LinkRow(props: { icon: IconName; title: string; note: string; first?: boolean; onPress: () => void }) {
   return (
-    <Press onPress={props.onPress} scale={0.98} accessibilityLabel={props.title}>
+    <Press onPress={props.onPress} scale={0.99} accessibilityLabel={props.title}>
       <View
+        hoverStyle={hovered()}
         style={{
-          minHeight: 60,
+          minHeight: density.row + (platform.desktop ? 8 : 12),
           flexDirection: "row",
           alignItems: "center",
           gap: 12,
-          paddingHorizontal: 10,
-          paddingVertical: 8,
+          paddingHorizontal: density.pad,
+          paddingVertical: 6,
           borderTopWidth: props.first ? 0 : 1,
           borderTopColor: colors.line,
         }}
       >
-        <IconTile name={props.icon} size={34} />
-        <View style={{ flex: 1, gap: 2 }}>
-          <Text style={{ fontSize: 15, fontWeight: "500", color: colors.text }}>{props.title}</Text>
-          <Text numberOfLines={1} style={{ fontSize: 12, color: colors.faint, fontFamily: mono }}>
-            {props.note}
-          </Text>
+        <Icon name={props.icon} size={16} tint={colors.muted} />
+        <View style={{ flex: 1, gap: 1 }}>
+          <Text style={{ fontSize: density.body, fontWeight: "500", color: colors.text }}>{props.title}</Text>
+          <Text style={{ numberOfLines: 1, fontSize: density.note, color: colors.faint }}>{props.note}</Text>
         </View>
-        <Icon name="chevron" size={14} tint={colors.faint} />
+        <Icon name="chevron" size={12} tint={colors.faint} />
       </View>
     </Press>
   );
@@ -197,10 +198,10 @@ function Unsaved() {
   const text = signal("");
   const focused = signal(false);
   const confirm = async () => {
-    const action = await AlertDialog.show({
+    const { action } = await AlertDialog.show({
       title: "Discard your changes?",
       actions: [
-        { label: "Keep editing", role: "cancel" },
+        { label: "Keep editing", role: "cancel", id: "keep" },
         { label: "Discard", role: "destructive", id: "discard" },
       ],
     });
@@ -223,12 +224,13 @@ function Unsaved() {
         <Card icon="form" title="Draft" subtitle="popOnBack + onBackPress" right={<Badge label={text().length > 0 ? "Guarded" : "Empty"} tone={text().length > 0 ? "warn" : "neutral"} />}>
           <Input
             value={text()}
-            onChange={(v) => text.set(v)}
+            onChange={({ value }) => text.set(value)}
             onFocus={() => focused.set(true)}
             onBlur={() => focused.set(false)}
             placeholder="A draft"
             style={{
               placeholderColor: colors.faint,
+              caretColor: colors.accent,
               selectionColor: colors.accent,
               height: 48,
               paddingHorizontal: 14,
@@ -266,10 +268,18 @@ function Instant() {
   );
 }
 
+/** Padding by the insets of the root the view renders in, on every edge. */
+const safeAreaPadding = {
+  paddingTop: "env(safe-area-inset-top)",
+  paddingRight: "env(safe-area-inset-right)",
+  paddingBottom: "env(safe-area-inset-bottom)",
+  paddingLeft: "env(safe-area-inset-left)",
+} as const;
+
 function Headerless() {
   return (
     <NavPage headerVisible={false}>
-      <SafeAreaView style={{ flex: 1, backgroundColor: colors.background }}>
+      <View style={{ flex: 1, backgroundColor: colors.background, ...safeAreaPadding }}>
         <View style={{ flex: 1, padding: 16, gap: 16 }}>
           <Appear>
             <View style={{ gap: 8, paddingHorizontal: 4, paddingTop: 12 }}>
@@ -278,19 +288,19 @@ function Headerless() {
               </View>
               <Text style={{ fontSize: 30, fontWeight: "700", letterSpacing: -0.5, color: colors.text }}>No header</Text>
               <Text style={{ fontSize: 15, lineHeight: 21, color: colors.muted }}>
-                The screen owns the whole surface; a SafeAreaView keeps it clear of the status bar and the home indicator.
+                The screen owns the whole surface; padding of env(safe-area-inset-*) keeps it clear of the status bar and the home indicator.
               </Text>
             </View>
           </Appear>
           <Appear index={1}>
-            <Section title="Safe area" note="SafeAreaView">
+            <Section title="Safe area" note="env(safe-area-inset-*)">
               <Insets />
             </Section>
           </Appear>
           <View style={{ flex: 1 }} />
           <Button label="Back" onPress={() => nav.pop()} />
         </View>
-      </SafeAreaView>
+      </View>
     </NavPage>
   );
 }
@@ -345,7 +355,7 @@ const modals: { key: Exclude<Sheet, null>; title: string; note: string; icon: Ic
 /** A modal's content: what it is, its safe area, a close button. */
 function ModalBody(props: { title: string; note: string; body: string; fullScreen?: boolean; onClose: () => void }) {
   return (
-    <SafeAreaView style={{ flex: 1, backgroundColor: colors.background }}>
+    <View style={{ flex: 1, backgroundColor: colors.background, ...safeAreaPadding }}>
       <If when={props.fullScreen}><TitleBar /></If>
       <View style={{ flex: 1, padding: 16, gap: 16 }}>
         <View style={{ gap: 8, paddingHorizontal: 4, paddingTop: 8 }}>
@@ -361,7 +371,7 @@ function ModalBody(props: { title: string; note: string; body: string; fullScree
         <View style={{ flex: 1 }} />
         <Button label="Close" onPress={props.onClose} />
       </View>
-    </SafeAreaView>
+    </View>
   );
 }
 
@@ -376,7 +386,7 @@ export function Navigation() {
   effect(() => {
     if (!intercept()) return;
     // Removed with the effect when it runs again.
-    BackHandler.onBackPress(() => {
+    BackHandler.on("press", () => {
       backs.set(backs() + 1);
       return true;
     });
@@ -401,7 +411,7 @@ export function Navigation() {
         ),
         () => (
           <Card title="Pages" subtitle="Page options, pushed with nav.push" flush>
-            <Inset padding={0} gap={0}>
+            <View>
               <LinkRow first icon="text" title="Large title" note="headerLargeTitle" onPress={push(LargeTitle)} />
               <LinkRow icon="styles" title="Transparent header" note="headerTransparent" onPress={push(Transparent)} />
               <LinkRow icon="star" title="Custom header items" note="headerLeft / Title / Right" onPress={push(CustomHeader)} />
@@ -411,37 +421,13 @@ export function Navigation() {
               <LinkRow icon="gestures" title="No swipe back" note="popOnSwipe={false}" onPress={push(Locked)} />
               <LinkRow icon="form" title="Unsaved changes" note="popOnBack + onBackPress" onPress={push(Unsaved)} />
               <LinkRow icon="lists" title="A deep stack" note="push / popToRoot" onPress={push(() => <Deep depth={1} />)} />
-            </Inset>
+            </View>
           </Card>
         ),
         () => (
           <Card title="Modals" subtitle="Presentation styles and transitions" flush>
-            <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", rowGap: 8 }}>
-              <Each of={modals}>
-                {(m) => (
-                  <Press onPress={() => sheet.set(m().key)} accessibilityLabel={m().title} style={{ width: "48.5%" }}>
-                    <View
-                      style={{
-                        minHeight: 100,
-                        padding: 12,
-                        gap: 12,
-                        borderRadius: radius.inset,
-                        borderCurve: "continuous",
-                        backgroundColor: colors.inset,
-                        borderWidth: 1,
-                        borderColor: colors.line,
-                        ...finish.inset,
-                      }}
-                    >
-                      <IconTile name={m().icon} size={32} />
-                      <View style={{ gap: 2 }}>
-                        <Text style={{ fontSize: 15, fontWeight: "500", color: colors.text }}>{m().title}</Text>
-                        <Text style={{ fontSize: 13, color: colors.faint }}>{m().note}</Text>
-                      </View>
-                    </View>
-                  </Press>
-                )}
-              </Each>
+            <View>
+              <Each of={modals}>{(m, i) => <LinkRow first={i() === 0} icon={m().icon} title={m().title} note={m().note} onPress={() => sheet.set(m().key)} />}</Each>
             </View>
           </Card>
         ),
@@ -466,7 +452,7 @@ export function Navigation() {
         open={sheet() === "fullScreen" || sheet() === "pageSheet" || sheet() === "formSheet" || sheet() === "fade"}
         presentation={sheet() === "pageSheet" ? "pageSheet" : sheet() === "formSheet" ? "formSheet" : "fullScreen"}
         animation={sheet() === "fade" ? "fade" : "slide"}
-        onOpenChange={(open) => !open && close()}
+        onOpenChange={({ open }) => !open && close()}
         style={{ flex: 1 }}
       >
         <ModalBody
@@ -496,13 +482,13 @@ export function Navigation() {
           onClose={close}
         />
       </Dialog>
-      <Dialog open={sheet() === "dialog"} animation="fade" onOpenChange={(open) => !open && close()} style={{ flex: 1 }}>
+      <Dialog open={sheet() === "dialog"} animation="fade" onOpenChange={({ open }) => !open && close()} style={{ flex: 1 }}>
         <View style={{ flex: 1, backgroundColor: "rgba(0,0,0,0.62)", alignItems: "center", justifyContent: "center", padding: 16 }}>
           <View
             style={{
               alignSelf: "stretch",
               opacity: pop,
-              transform: [{ scale: pop.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1] }) }],
+              scale: pop.interpolate({ inputRange: [0, 1], outputRange: [0.9, 1] }),
             }}
           >
             <Card icon="bell" title="A dialog" subtitle='animation="fade"'>

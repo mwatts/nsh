@@ -1,7 +1,6 @@
 ---
 title: TextView
 description: "The TextView component: Markdown, HTML or a document of blocks shown with native text and views, styled part by part, for AI chat replies, articles and help pages."
-order: 26
 group: base
 demo: text-view
 ---
@@ -22,7 +21,7 @@ it. Each part takes the app's styles over these defaults: `classes` and `styles`
 
 ```rust tabs
 use nsh_base::{TextViewLinkPressEvent, text_view, theme};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 const README: &str = "# Release notes
 
@@ -101,8 +100,8 @@ are its [spans](./text.md#spans); inline code is a span with a [span background]
 
 With `selectable`, the whole document selects as one, as a web page does: a drag (or, on touch screens, a long press
 and the handles) runs from one paragraph, list item, cell or code block to the next, and Copy takes the text of them
-all. A `selectable` `TextView` is a [`SelectionArea`](./selection-area.md) of its own; inside a
-`SelectionArea`, its selection also runs on into the texts and other `TextView`s around it.
+all. A `selectable` `TextView` selects as one of its own; inside a
+[selectable view](./text-selection.md), its selection also runs on into the texts and other `TextView`s around it.
 
 What `TextView` adds is the rest: reading Markdown, HTML or a document into blocks, the views around the texts (lists,
 quotes, tables, code blocks, disclosures, footnotes), streaming, styles by part, render functions and extensions.
@@ -121,7 +120,7 @@ The content is one of three props, read in this order:
 ```rust tabs
 use nsh_base::text_view;
 use nsh_base::text_view::{Block, Document, Inline};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn shipping() -> impl IntoElement {
     text_view().html(r#"<h2>Shipping</h2><p>Orders ship in <b>2 days</b>. <a href="/faq">FAQ</a></p>"#)
@@ -161,7 +160,7 @@ class that changes a part's size sets its line height too (Tailwind's `text-*` c
 
 ```rust tabs
 use nsh_base::{TextViewPart, TextViewParts, text_view, theme};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn reply(markdown: Signal<SharedString>) -> impl IntoElement {
     provide_context(
@@ -248,8 +247,8 @@ Some nodes are several parts, which apply in order: a level 2 heading is `headin
 | `superscript`, `subscript` | `Superscript`, `Subscript` | Superscript and subscript (smaller). |
 | `link` | `Link` | Links (in the theme's `primary` color, underlined). |
 | `image` | `Image` | Images. |
-| `math` | `Math` | Formulas in text, shown as their TeX in monospace when there is no `renderMath`. |
-| `mathBlock` | `MathBlock` | Formula blocks, shown as their TeX in monospace when there is no `renderMath`. |
+| `math` | `Math` | Formulas in text, typeset when there is no `renderMath`. |
+| `mathBlock` | `MathBlock` | Formula blocks, typeset and centered when there is no `renderMath`. |
 | `table` | `Table` | Tables: `renderTableActions`' content, then the scroll view of the cells. |
 | `tableScroll` | `TableScroll` | The horizontal scroll view of a table's cells: columns fit their content when there is room, wrap down to a floor when the view is narrower, and past that the table scrolls. |
 | `tableRow` | `TableRow` | Every row of a table: a view behind its cells, for backgrounds and borders (text styles go on `tableCell`). |
@@ -279,7 +278,7 @@ content of a render function). Remove it when the reply is done.
 
 ```rust tabs
 use nsh_base::{MarkdownOptions, text_view};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 /// A reply the app appends to as chunks arrive, with `done` set at the end.
 fn reply(text: Signal<SharedString>, done: Signal<bool>) -> impl IntoElement {
@@ -314,7 +313,7 @@ function Reply(props: { stream: AsyncIterable<string> }) {
 }
 ```
 
-The caret is the app's own view, so it can blink or pulse with [`nsh/animated`](../modules/nsh-animated.md), and new
+The caret is the app's own view, so it can blink or pulse with [`nsh`'s animation API](../modules/nsh.md#animation), and new
 blocks can fade in with the app's animations.
 
 ## Links
@@ -322,11 +321,12 @@ blocks can fade in with the app's animations.
 Links are [pressable spans](./text.md#links). A press on one calls `onLinkPress` with `{ url }`; the app decides what it opens (a page of its own, a
 [`WebView`](./web-view.md), a scroll to a heading). Headings have anchors (GitHub's: `## Getting started` is
 `#getting-started`), so a link to `#getting-started` arrives as that string, and a footnote reference arrives as
-`#footnote-<label>`.
+`#footnote-<label>`. In a terminal Tab reaches each link and footnote reference in turn, and Return presses the focused
+one: `onLinkPress` hears it as it hears a press.
 
 ```rust tabs
 use nsh_base::{TextViewLinkPressEvent, text_view};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn doc(markdown: &'static str) -> impl IntoElement {
     text_view().markdown(markdown).on_link_press(|TextViewLinkPressEvent { url, .. }: &TextViewLinkPressEvent| {
@@ -351,7 +351,7 @@ fn doc(markdown: &'static str) -> impl IntoElement {
 `scroll_to_anchor` and `open_web` (`scrollToAnchor` and `nav` in TSX) stand for the app's own functions.
 
 With `links="open"`, a press on a link to another site or app (a URL with a scheme: `https:`, `mailto:`, ...) also
-opens it outside the app with [`openUrl`](../modules/nsh-device.md#openurl), under the app's `openUrl` capability,
+opens it outside the app with [`openUrl`](../modules/nsh.md#openurl), under the app's `openUrl` capability,
 after `onLinkPress` reported it; anchors in the document (`#…`) are only reported. The default, `"report"`, opens
 nothing.
 
@@ -384,11 +384,11 @@ Code blocks carry actions over their top right corner, all drawn alike: ghost bu
 hovered or pressed, shown while a pointer is over the block on desktops and always on touch screens. `copy` is built
 in: it copies the code and shows a check for a moment. Other actions are the app's: `renderCodeBlockAction` draws
 their icon and `onCodeBlockAction` reports their presses (the built-in `copy` too, after it copied). `copy` writes the
-clipboard as `nsh/clipboard` does, so it needs the app's `clipboard` capability (`nsh.json`).
+clipboard as `Clipboard` does, so it needs the app's `clipboard` capability (`nsh.json`).
 
 ```rust tabs
 use nsh_base::{TextViewCodeAction, TextViewCodeActionEvent, text_view};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn reply(markdown: Signal<SharedString>) -> impl IntoElement {
     text_view()
@@ -432,7 +432,7 @@ width:
 use nsh_base::text_view;
 use nsh_base::text_view::{CodeBlock, Image};
 use nsh_base::TextViewMath;
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn reply(markdown: Signal<SharedString>) -> impl IntoElement {
     text_view()
@@ -463,7 +463,7 @@ import { Image, View } from "nsh";
 ```
 
 `Highlighted` and `MathView` (`highlighted` and `math_view` in Rust) stand for the app's own components (a
-highlighter, a formula renderer, or a component of its Rust crate). Without `renderMath` a formula shows as its TeX in monospace (`math` and `mathBlock` parts).
+highlighter, a formula renderer, or a component of its Rust crate). Without `renderMath` `TextView` typesets a formula itself (`math` and `mathBlock` parts) with KaTeX's TeX support and fonts, in the text's color, the same on every platform; TeX it cannot read shows as its source in monospace.
 
 ## Markdown extensions
 
@@ -480,7 +480,7 @@ highlighter, a formula renderer, or a component of its Rust crate). Without `ren
 ````rust tabs
 use nsh_base::text_view::{CustomNode, Document};
 use nsh_base::{MarkdownExtension, text_view};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 const MESSAGE: &str = r#"Thanks @ada! Here are the numbers:
 
@@ -587,6 +587,8 @@ function Custom(props: { node: TextViewCustomNode }) {
 
 `BarChart` (`bar_chart` in Rust) stands for the app's own chart. The mention pattern's group is in
 `node.attributes?.["1"]` (`node.attributes["1"]` in Rust: `ada`) and the whole match in `node.text` (`@ada`). A custom node with no render function shows its content.
+A view returned for an inline node (a chip) sits in its line by its own `verticalAlign`: `align-middle`
+(`verticalAlign: "middle"`) centers it on the text, and its line keeps the paragraph's `lineHeight` unless the view is taller.
 
 ### Options
 
@@ -655,7 +657,7 @@ A copy button for a whole reply:
 
 ```rust tabs
 use nsh_base::{TextView, button};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn copy_reply(reply: Signal<SharedString>) -> impl IntoElement {
     button()
@@ -696,7 +698,7 @@ a theme of the app's, ...
 use std::ops::Range;
 
 use nsh_base::{CodeHighlighter, text_view::CodeBlock};
-use nsh_core::ui::{StyleRefinement, prelude::*};
+use nsh_core::{element::StyleRefinement, prelude::*};
 
 /// The app's highlighter (here with syntect, set up once by the app).
 fn highlight(code: &CodeBlock) -> Vec<(Range<usize>, StyleRefinement)> {
@@ -726,7 +728,7 @@ follow the light and dark appearance.
 
 ```rust
 use nsh_base::{TextViewPart, TextViewParts, theme};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 fn chat_parts() {
     provide_context(
@@ -746,7 +748,7 @@ custom nodes it makes. A view provides plugins to every `TextView` below it:
 
 ```rust
 use nsh_base::text_view::{mdast, CustomNode, Inline, MarkdownPlugin, MarkdownPlugins, ParseContext};
-use nsh_core::ui::prelude::*;
+use nsh_core::prelude::*;
 
 struct Tickers;
 
@@ -787,7 +789,7 @@ markdown-rs's syntax, and `ParseContext` reads a node's children as the parser d
 | `extensions` | `.extensions(..)` | `MarkdownExtension[]` | `[]` | The app's syntax, as custom nodes ([Markdown extensions](#markdown-extensions)). |
 | `classes` | `.classes(..)` | `TextViewClasses` | `{}` | Tailwind classes by part. |
 | `styles` | `.styles(..)` | `TextViewStyles` | `{}` | Inline styles by part (each a `StyleProp<TextStyle>`), over the classes. |
-| `selectable` | `.selectable(..)` | `boolean` | `false` | The document is selectable as one: a selection runs across its paragraphs, headings, cells and code blocks ([SelectionArea](./selection-area.md)). |
+| `selectable` | `.selectable(..)` | `boolean` | `false` | The document is selectable as one: a selection runs across its paragraphs, headings, cells and code blocks ([Text selection](./text-selection.md)). |
 | `links` | `.links(..)` | `"report" \| "open"` | `"report"` | What a press on a link does: reports it (`onLinkPress`), and with `"open"` also opens a link to another site or app outside the app ([Links](#links)). |
 | `codeBlockScrollbar` | `.code_block_scrollbar(..)` | `boolean` | `true` | Code blocks show their horizontal scroll indicator. |
 | `tableScrollbar` | `.table_scrollbar(..)` | `boolean` | `true` | Tables show their horizontal scroll indicator. |
@@ -810,7 +812,7 @@ parts with [`TextViewParts`](#typed-part-styles).
 |---|---|---|
 | `onLinkPress` | `.on_link_press(\|event: &TextViewLinkPressEvent\| ..)` | A link was pressed: `{ url }`: its URL, `#anchor` for a heading, `#footnote-<label>` for a footnote. |
 | `onCodeBlockAction` | `.on_code_block_action(\|event: &TextViewCodeActionEvent\| ..)` | A code block's action was pressed (after `copy` copied). |
-| `onImagePress` | `.on_image_press(\|image: &Image\| ..)` | An image not in a link was pressed: the image, for the app to show it larger (a zoomable viewer of its own). |
+| `onImagePress` | `.on_image_press(\|image: &Image\| ..)` | An image not in a link was pressed: `{ image }`, for the app to show it larger (a zoomable viewer of its own). |
 
 ## Accessibility
 
@@ -821,6 +823,6 @@ disclosure's summary is a button that says whether it is expanded, and images ar
 ## Related
 
 - [Text](./text.md): the element every text of `TextView` is, with its spans, links, inline attachments and selection.
-- [SelectionArea](./selection-area.md): one selection across several `TextView`s and texts.
+- [Text selection](./text-selection.md): one selection across several `TextView`s and texts.
 - [`nsh/base`](../modules/nsh-base.md): the other base components.
 - [Styling](../docs/styling.md) and [Tailwind](../docs/tailwind.md).

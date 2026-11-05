@@ -107,7 +107,7 @@ struct NodeData {
     pan_gated: bool,
     /// Values of props that may hold native animation nodes (`style`,
     /// `pan`, ...), kept alive with the view (owned).
-    retained: Vec<(&'static str, JsValue)>,
+    retained: Vec<(std::borrow::Cow<'static, str>, JsValue)>,
     /// A `<Scroll>`'s content container (`contentStyle` /
     /// `contentClass`), one of `children` that takes the others
     /// ([`DETACHED`]: none).
@@ -329,19 +329,21 @@ impl Dom {
 
 /// The methods of nodes (`ref` objects): each sends a command to the
 /// node's view, in order with the ops before it. Name, `length`, signature
-/// and documentation (the declaration of `YNode`).
+/// and documentation (declared on the refs of `declarations::REFS`).
 pub(crate) const NODE_METHODS: &[(&str, c_int, &str, &str)] = &[
     (
         "focus",
         0,
         decl!("(): void"),
-        decl!("Focuses an `<Input>` (shows the keyboard)."),
+        decl!(
+            "Focuses an `<Input>` (shows the keyboard), or gives a view that takes presses the keyboard focus where Tab stops at it (macOS, the web), as Tab does: `focus:` styles, `onFocus`. A view `focusable={false}`, disabled or hidden stays unfocused."
+        ),
     ),
     (
         "blur",
         0,
         decl!("(): void"),
-        decl!("Unfocuses an `<Input>`."),
+        decl!("Unfocuses an `<Input>`, or takes the keyboard focus off a view that takes presses."),
     ),
     (
         "setSelection",
@@ -354,7 +356,7 @@ pub(crate) const NODE_METHODS: &[(&str, c_int, &str, &str)] = &[
         2,
         decl!("(name: string, args?: unknown): void"),
         decl!(
-            "Calls command `name` of a registered native component (`nsh/native`) with `args` (any JSON value)."
+            "Calls command `name` of a registered native component (`nativeComponent` of `nsh`) with `args` (any JSON value)."
         ),
     ),
     (
@@ -436,6 +438,16 @@ pub(crate) const NODE_METHODS: &[(&str, c_int, &str, &str)] = &[
         1,
         decl!("(data: string): void"),
         decl!("`WebView`: sends `data` to the page (a `message` event on `window`)."),
+    ),
+    (
+        "sendInput",
+        1,
+        decl!(
+            "(input: { type: \"click\"; x: number; y: number } | { type: \"text\"; text: string } | { type: \"key\"; key: \"Enter\" | \"Tab\" | \"Escape\" | \"Backspace\" }): void"
+        ),
+        decl!(
+            "`WebView`: gives the page input as the user's own, so its events are trusted (`isTrusted`), which `injectJavaScript` cannot do: a click at a point of the viewport in CSS pixels (as `getBoundingClientRect()` reports), text typed into what has the page's focus, or a key. A click's events can still be on their way when the next call starts: let it settle (a frame or so) before typing after it. It takes the keyboard focus for the web view. Needs `\"webview\": { \"input\": true }` in `nsh.json`'s capabilities, also when the app declares none. macOS only for now; elsewhere it does nothing (`WebView.inputAvailable()` tells)."
+        ),
     ),
     (
         "seek",
@@ -613,11 +625,35 @@ pub(crate) fn node_id(cx: *mut JsContext, v: JsValue) -> Option<NodeId> {
 pub(crate) fn retain(cx: *mut JsContext, node: JsValue, key: &'static str, value: JsValue) {
     let p = node_ptr(cx, node);
     if !p.is_null() {
-        retain_in(cx, p, key, value);
+        retain_in(cx, p, key.into(), value);
     }
 }
 
-fn retain_in(cx: *mut JsContext, p: *mut NodeData, key: &'static str, value: JsValue) {
+/// Whether the value the node keeps under `key` is an animated value.
+fn retains_animated(cx: *mut JsContext, p: *mut NodeData, key: &str) -> bool {
+    // SAFETY: live node data; the reader gets its own reference, so no
+    // borrow is held while it reads (a getter may run JS).
+    let kept = unsafe {
+        (*p).retained
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| qjs::JS_DupValue(cx, *v))
+    };
+    let Some(kept) = kept else {
+        return false;
+    };
+    // SAFETY: a context reference for the reader, which owns `kept`.
+    let kept =
+        unsafe { Value::from_raw(Ctx::from_raw(std::ptr::NonNull::new_unchecked(cx)), kept) };
+    crate::protocol::animated_value(&kept).is_some()
+}
+
+fn retain_in(
+    cx: *mut JsContext,
+    p: *mut NodeData,
+    key: std::borrow::Cow<'static, str>,
+    value: JsValue,
+) {
     // SAFETY: live node data; the node owns a dup; the old one is freed
     // after the borrow ends (its finalizer may run).
     let old = unsafe {
@@ -1041,7 +1077,8 @@ fn content_of(cx: *mut JsContext, parent: JsValue, child: JsValue) -> JsValue {
 /// `contentStyle` / `contentClass` (React Native's
 /// content container: `flexGrow: 1` with `justifyContent: "center"`
 /// centers what is shorter than the viewport and still scrolls what is
-/// longer).
+/// longer). The browser runtime's renderer has its own
+/// (`nsh-platform-web`'s `browser/dom.rs`): a change here goes there too.
 fn scroll_content(cx: *mut JsContext, node: JsValue) -> Result<JsValue, JsValue> {
     let p = node_ptr(cx, node);
     // SAFETY: live node data, read briefly.
@@ -1078,7 +1115,7 @@ fn part_style(
     cx: *mut JsContext,
     name: &str,
     value: JsValue,
-) -> Result<Option<std::sync::Arc<nsh_core::StylePatch>>, JsValue> {
+) -> Result<Option<std::rc::Rc<nsh_core::StylePatch>>, JsValue> {
     // SAFETY: a context reference for the decoder, which reads a dup.
     let js_cx = unsafe { Ctx::from_raw(std::ptr::NonNull::new_unchecked(cx)) };
     let v = unsafe { Value::from_raw(js_cx, qjs::JS_DupValue(cx, value)) };
@@ -1086,7 +1123,7 @@ fn part_style(
     let patch = crate::protocol::style_patch(&v, &mut warnings);
     dom(cx).shared.warnings.borrow_mut().merge(warnings);
     match patch {
-        Ok(patch) => Ok((!patch.is_empty()).then(|| std::sync::Arc::new(patch))),
+        Ok(patch) => Ok((!patch.is_empty()).then(|| std::rc::Rc::new(patch))),
         Err(rquickjs::Error::Exception) => Err(qjs::JS_EXCEPTION),
         Err(e) => Err(throw_type(cx, &format!("nsh: prop `{name}`: {e}"))),
     }
@@ -1220,35 +1257,28 @@ fn set_prop(
             };
             return set_prop(cx, content, name, value, prev);
         }
-        "activeStyle" | "hoverStyle" | "focusStyle" | "disabledStyle" | "selectedStyle"
-        | "checkedStyle" | "indeterminateStyle" | "headerStyle" => {
-            let patch = part_style(cx, name, value)?;
-            let prop = match name {
-                "activeStyle" => nsh_core::Prop::ActiveStyle(patch),
-                "hoverStyle" => nsh_core::Prop::HoverStyle(patch),
-                "focusStyle" => nsh_core::Prop::FocusStyle(patch),
-                "disabledStyle" => nsh_core::Prop::DisabledStyle(patch),
-                "selectedStyle" => nsh_core::Prop::SelectedStyle(patch),
-                "checkedStyle" => nsh_core::Prop::CheckedStyle(patch),
-                "indeterminateStyle" => nsh_core::Prop::IndeterminateStyle(patch),
-                _ => nsh_core::Prop::HeaderStyle(patch),
-            };
-            return dom(cx).push(cx, Op::SetProp { id, prop });
-        }
-        "headerClass" | "contentClass" => {
-            // SAFETY: an inline tag check.
-            let names: Box<str> = if unsafe { qjs::JS_IsString(value) } {
-                string_arg(cx, value).unwrap_or_default().into()
-            } else {
-                Box::default()
-            };
-            let prop = match name {
-                "headerClass" => nsh_core::Prop::HeaderClass(names),
-                _ => nsh_core::Prop::ListContentClass(names),
-            };
-            return dom(cx).push(cx, Op::SetProp { id, prop });
-        }
+        "tooltip" if followed(cx, name, value) => return bind_prop_with(cx, node, name, value),
         _ => {}
+    }
+    if let Some(prop) = nsh_core::js::host::style_patch_prop(name) {
+        let prop = prop(part_style(cx, name, value)?);
+        return dom(cx).push(cx, Op::SetProp { id, prop });
+    }
+    // SAFETY: live node data.
+    if let Some(prop) = nsh_core::js::host::part_class_prop(name, unsafe { (*p).tag }) {
+        // SAFETY: an inline tag check.
+        let names: Box<str> = if unsafe { qjs::JS_IsString(value) } {
+            string_arg(cx, value).unwrap_or_default().into()
+        } else {
+            Box::default()
+        };
+        return dom(cx).push(
+            cx,
+            Op::SetProp {
+                id,
+                prop: prop(names),
+            },
+        );
     }
     if let Some(prop) = crate::touch::touch_prop(name) {
         return set_touch(cx, p, prop, value);
@@ -1264,22 +1294,34 @@ fn set_prop(
     {
         return set_event(cx, p, event, value);
     }
-    // Native animation nodes these props use, and a `tooltip`'s element,
-    // stay alive with the view.
+    // Native animation nodes these props use (a shader's `uniforms`
+    // hold them inside), and a `tooltip`'s element, stay alive with the view.
     if let Some(&key) = [
         "style",
         "pan",
         "pinch",
         "rotation",
         "scrollValue",
+        "pullValue",
         "stickyHeaderOffset",
+        "uniforms",
         "tooltip",
     ]
     .iter()
     .find(|k| **k == name)
     {
-        retain_in(cx, p, key, value);
+        retain_in(cx, p, key.into(), value);
     }
+    // A native component's prop may be an animated value (an object): kept
+    // under its own name until the prop changes or the view goes. Whether
+    // the value it replaces was one is read from what the node kept, so the
+    // binding goes whoever sets the prop (`nsh:rt`'s `prop` passes no
+    // previous value).
+    let was_bound = name.starts_with('$') && {
+        let bound = retains_animated(cx, p, name);
+        retain_in(cx, p, name.to_owned().into(), value);
+        bound
+    };
     // SAFETY: a context reference for the decoder, which reads `value`.
     let js_cx = unsafe { Ctx::from_raw(std::ptr::NonNull::new_unchecked(cx)) };
     let v = unsafe { Value::from_raw(js_cx, qjs::JS_DupValue(cx, value)) };
@@ -1293,12 +1335,38 @@ fn set_prop(
         // A `blob:` URL's bytes are in this VM: they go with the source.
         crate::web::blob::resolve_image_source(cx, prop);
     }
+    // A native component's prop that was an animated value and is not any
+    // more is unbound first (its new value is sent, not kept for later).
+    if was_bound
+        && let Ok(Some(Op::SetProp {
+            prop: nsh_core::Prop::ComponentProp(key, _),
+            ..
+        })) = &decoded
+    {
+        dom(cx).push(
+            cx,
+            Op::SetProp {
+                id,
+                prop: nsh_core::Prop::ComponentPropBinding(key.clone(), None),
+            },
+        )?;
+    }
     match decoded {
         Ok(Some(op)) => dom(cx).push(cx, op),
         Ok(None) => Ok(()),
         Err(rquickjs::Error::Exception) => Err(qjs::JS_EXCEPTION),
         Err(e) => Err(throw_type(cx, &format!("nsh: prop `{name}`: {e}"))),
     }
+}
+
+/// Whether `set_prop` follows `value` (borrowed) of prop `name` with a
+/// bound prop of its own: a `tooltip` given by a function (in a development
+/// bundle a component's element is its hot proxy's memo). That binding goes
+/// when the computation that set the prop runs again, so such a value is
+/// set again on every run, even unchanged.
+fn followed(cx: *mut JsContext, name: &str, value: JsValue) -> bool {
+    // SAFETY: an inline check of a borrowed value.
+    name == "tooltip" && unsafe { qjs::JS_IsFunction(cx, value) } && node_ptr(cx, value).is_null()
 }
 
 /// Sets the handler of `event` on node `p` to `value` (borrowed; not a
@@ -1563,7 +1631,11 @@ unsafe extern "C" fn bind_prop_run(
     if unsafe { qjs::JS_IsException(next) } {
         return next;
     }
-    if unsafe { qjs::JS_IsStrictEqual(cx, prev, next) } {
+    // The name is read only for an unchanged function ([`followed`]).
+    if unsafe { qjs::JS_IsStrictEqual(cx, prev, next) }
+        && !(unsafe { qjs::JS_IsFunction(cx, next) }
+            && to_string(cx, name).is_some_and(|name| followed(cx, &name, next)))
+    {
         return next;
     }
     let Some(name) = to_string(cx, name) else {
@@ -1664,7 +1736,7 @@ unsafe extern "C" fn spread_run(
             } else {
                 UNDEFINED
             };
-            let r = if qjs::JS_IsStrictEqual(cx, old, v) {
+            let r = if qjs::JS_IsStrictEqual(cx, old, v) && !followed(cx, &name_str, v) {
                 Ok(())
             } else {
                 set_prop(cx, node, &name_str, v, old)
@@ -2038,12 +2110,16 @@ fn new_array(cx: *mut JsContext, mut values: Vec<JsValue>) -> JsValue {
     unsafe { qjs::JS_NewArrayFrom(cx, values.len() as c_int, values.as_mut_ptr()) }
 }
 
-/// A run of a dynamic insert of a function: calls it, and the functions it
-/// returns, tracked by this effect. An array holding functions gets an
-/// effect of its own ([`insert_items`]), made again only when this one
-/// runs again: a component's `children` getter makes every node of the
-/// array, and a change in one of its functions (an `<If>`, a ternary)
-/// must run only that one, not the getter.
+/// A run of a dynamic insert of a function: calls it, tracked by this
+/// effect. A function it returns (what a component whose root is an
+/// `<If>` returns) gets a render effect of its own under this one, as
+/// Solid's `insertExpression` does: a change in what that function reads
+/// runs only it, never this one, which would call the expression again
+/// and make the component again. An array holding functions gets an
+/// effect of its own likewise ([`insert_items`]): a component's
+/// `children` getter makes every node of the array, and a change in one
+/// of its functions (an `<If>`, a ternary) must run only that one, not
+/// the getter.
 unsafe extern "C" fn insert_run(
     cx: *mut JsContext,
     _this: JsValue,
@@ -2055,21 +2131,22 @@ unsafe extern "C" fn insert_run(
     // SAFETY: four data values (`insert_effect`).
     let (parent, marker, value, shown) =
         unsafe { (*data, *data.add(1), *data.add(2), *data.add(3)) };
-    // SAFETY: a dup of a live value; each call's result replaces it.
+    // SAFETY: a dup of a live value; the call's result replaces it.
     let mut value = unsafe { qjs::JS_DupValue(cx, value) };
-    let mut depth = 0;
-    while unsafe { qjs::JS_IsFunction(cx, value) } && node_ptr(cx, value).is_null() {
-        if depth > MAX_DEPTH {
-            unsafe { qjs::JS_FreeValue(cx, value) };
-            return throw_type(cx, "nsh: children nested too deeply");
-        }
+    if unsafe { qjs::JS_IsFunction(cx, value) } && node_ptr(cx, value).is_null() {
         let r = unsafe { qjs::JS_Call(cx, value, UNDEFINED, 0, ptr::null_mut()) };
         unsafe { qjs::JS_FreeValue(cx, value) };
         if unsafe { qjs::JS_IsException(r) } {
             return r;
         }
         value = r;
-        depth += 1;
+        if unsafe { qjs::JS_IsFunction(cx, value) } && node_ptr(cx, value).is_null() {
+            // The nested effect shows what the function gives, in this
+            // insert's place; it goes when this effect runs again.
+            let nested = insert_effect(cx, insert_run, [parent, marker, value, shown]);
+            unsafe { qjs::JS_FreeValue(cx, value) };
+            return nested.err().unwrap_or(UNDEFINED);
+        }
     }
     let r = if unsafe { qjs::JS_IsArray(value) } && is_dynamic(cx, value, 0) {
         insert_items(cx, parent, marker, value, shown)
@@ -3010,6 +3087,15 @@ unsafe extern "C" fn setup(
             return e;
         }
     }
+    // The core makes the theme's tokens when the op above reaches it, after
+    // this turn; the first render, in this turn, reads them already.
+    let theme = arg(argc, argv, 1);
+    // SAFETY: an inline tag check.
+    if unsafe { qjs::JS_IsString(theme) }
+        && let Some(json) = string_arg(cx, theme)
+    {
+        crate::env::take_theme(cx, &json);
+    }
     // Checked by the bundler; a hand-made bundle's wrong value is ignored.
     let status_bar = string_arg(cx, arg(argc, argv, 3))
         .and_then(|json| serde_json::from_str(&json).ok())
@@ -3058,7 +3144,7 @@ pub(crate) fn handler(cx: *mut JsContext, id: NodeId, event: EventKind) -> Optio
 // --- The primitives as components -----------------------------------------------------
 
 /// A component rendering host element `tag` with its props (children too
-/// when `children`): what `nsh`'s `View`, `nsh/webview`'s `WebView`, ...
+/// when `children`): what `nsh`'s `View`, `WebView`, ...
 /// are as values. Their tags are made in place by the compiler; this is
 /// the path of `<C />` where `C` holds one.
 pub(crate) fn host_component(cx: *mut JsContext, tag: &str, children: bool) -> JsValue {
@@ -3224,9 +3310,10 @@ pub(crate) fn catch_listener_failure(cx: *mut JsContext, id: NodeId) -> bool {
 
 /// `ErrorBoundary({ fallback, children })`: its children, or its fallback
 /// once something under them failed (a component's body, a binding, an
-/// effect, a listener). `fallback(error, reset)` gets the thrown value and
-/// what renders the children again; a fallback that is not a function of
-/// arguments is shown as is. What fails in the fallback goes to the
+/// effect, a listener). A function `fallback` is called with the thrown
+/// value and what renders the children again (`fallback(error, reset)`),
+/// whatever parameters it declares; any other fallback (an element) is
+/// shown as is. What fails in the fallback goes to the
 /// boundary above.
 ///
 /// A memo shows one or the other, reading the boundary's signal (`[error]`
@@ -3288,15 +3375,10 @@ unsafe extern "C" fn boundary_run(
                 qjs::JS_FreeValue(cx, error);
                 return fallback;
             }
-            let mut length = 0i32;
-            let l = qjs::JS_GetPropertyStr(cx, fallback, c"length".as_ptr());
-            qjs::JS_ToInt32(cx, &mut length, l);
-            qjs::JS_FreeValue(cx, l);
-            if length == 0 {
-                // An element to show, as children are.
-                qjs::JS_FreeValue(cx, error);
-                return fallback;
-            }
+            // Every function is called with what failed and the reset,
+            // whatever its parameters say (`(...args) => …` and defaults
+            // count none): one that takes no arguments returns its element
+            // all the same.
             let mut rdata = [failed];
             let reset =
                 qjs::JS_NewCFunctionData(cx, Some(boundary_reset), 0, 0, 1, rdata.as_mut_ptr());
@@ -3734,6 +3816,51 @@ mod tests {
         assert_eq!(texts(&host), ["outer caught body"]);
     }
 
+    /// A function fallback is called with the error and the reset whatever
+    /// parameters it declares (`(...args)` and defaults count none); an
+    /// element is shown as is.
+    #[test]
+    fn a_function_fallback_gets_the_error_whatever_it_declares() {
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"
+            import { mount, signal, ErrorBoundary } from "nsh";
+            import { element, insert, text, component } from "nsh:rt";
+            const fail = signal(false);
+            globalThis.fail = fail;
+            const Risky = () => {
+                const t = element("text");
+                insert(t, () => { if (fail()) throw new Error("boom"); return "ok"; });
+                return t;
+            };
+            mount(() => {
+                const v = element("view");
+                insert(v, component(ErrorBoundary, {
+                    fallback: (...args) => text(`rest ${args[0].message} ${typeof args[1]}`),
+                    get children() { return component(Risky, {}); },
+                }));
+                insert(v, component(ErrorBoundary, {
+                    fallback: (error = new Error("none")) => text(`default ${error.message}`),
+                    get children() { return component(Risky, {}); },
+                }));
+                insert(v, component(ErrorBoundary, {
+                    // An element, as compiled JSX passes one: made when read.
+                    get fallback() { return text("element"); },
+                    get children() { return component(Risky, {}); },
+                }));
+                return v;
+            });
+            "#,
+        )
+        .unwrap();
+        assert_eq!(texts(&host), ["ok", "ok", "ok"]);
+        host.eval_script("fail.js", "fail.set(true)").unwrap();
+        assert_eq!(
+            texts(&host),
+            ["rest boom function", "default boom", "element"]
+        );
+    }
+
     /// A failure in a fallback goes to the boundary above; with no
     /// boundary, the failure throws as before.
     #[test]
@@ -3815,6 +3942,43 @@ mod tests {
                 "set text 16 \"c0\"",
                 "set text 8 \"a1\"",
             ]
+        );
+    }
+
+    /// A component whose root is an `<If>`, shown by a dynamic child: the
+    /// condition flipping shows the other branch and leaves the
+    /// component, and the expression that made it, as they are (Solid's
+    /// nested render effect).
+    #[test]
+    fn a_components_root_condition_does_not_make_it_again() {
+        let host = Host::new().unwrap();
+        host.eval_source(&format!(
+            r#"{REPORT}
+            import {{ mount, signal }} from "nsh";
+            import {{ element, insert, cond, component }} from "nsh:rt";
+            const on = signal(false);
+            const made = [];
+            globalThis.toggle = () => on.update((v) => !v);
+            globalThis.count = () => report(made);
+            function Panel() {{
+                made.push("panel");
+                return cond(() => on(), () => text("zoomed"), () => text("inline"));
+            }}
+            mount(() => {{
+                const v = element("view");
+                insert(v, () => {{ made.push("expression"); return component(Panel, {{}}); }});
+                return v;
+            }});
+            "#
+        ))
+        .unwrap();
+        host.eval_script("toggle.js", "toggle(); toggle(); toggle(); count()")
+            .unwrap();
+        let texts = reported(&host);
+        assert_eq!(
+            texts.last().map(String::as_str),
+            Some(r#"["expression","panel"]"#),
+            "{texts:?}"
         );
     }
 
@@ -4130,7 +4294,12 @@ mod tests {
             const i = element("input");
             i.focus();
             i.setSelection(2);
-            globalThis.keep = [s, i];
+            // A view that takes presses: the platforms move the keyboard
+            // focus to it, as Tab does.
+            const v = element("view");
+            v.focus();
+            v.blur();
+            globalThis.keep = [s, i, v];
             "#,
         )
         .unwrap();
@@ -4145,8 +4314,171 @@ mod tests {
                 "Command { id: 2, command: ScrollToIndex { index: 3, animated: true, view_position: 0%, view_offset: 0pt } }",
                 "Command { id: 4, command: Focus }",
                 "Command { id: 4, command: SetSelection { start: 2, end: 2 } }",
+                "Command { id: 6, command: Focus }",
+                "Command { id: 6, command: Blur }",
             ]
         );
+    }
+
+    #[test]
+    fn component_prop_unbinds_when_set_to_a_value() {
+        let host = Host::new().unwrap();
+        // `prop` passes no previous value: the node knows it was bound.
+        host.eval_source(
+            r#"
+            import { element, prop } from "nsh:rt";
+            import { AnimatedValue } from "nsh";
+            const n = element("native");
+            prop(n, "component", "com.example.thing");
+            prop(n, "$progress", new AnimatedValue(0));
+            prop(n, "$progress", 0.5);
+            prop(n, "$progress", 0.75);
+            "#,
+        )
+        .unwrap();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        let props: Vec<_> = ops
+            .iter()
+            .filter_map(|o| match o {
+                Op::SetProp {
+                    prop: nsh_core::Prop::ComponentPropBinding(name, node),
+                    ..
+                } if &**name == "progress" => Some(format!("bind {}", node.is_some())),
+                Op::SetProp {
+                    prop: nsh_core::Prop::ComponentProp(name, value),
+                    ..
+                } if &**name == "progress" => Some(format!("{value:?}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            props,
+            [
+                "bind true",
+                "bind false",
+                "Some(Number(0.5))",
+                "Some(Number(0.75))"
+            ],
+            "{ops:?}"
+        );
+    }
+
+    #[test]
+    fn component_prop_keeps_its_node() {
+        use nsh_core::animation::AnimationOp;
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"
+            import { element, prop } from "nsh:rt";
+            import { AnimatedValue } from "nsh";
+            globalThis.keep = (() => {
+                const n = element("native");
+                prop(n, "component", "com.example.thing");
+                prop(n, "$progress", new AnimatedValue(0).mul(2));
+                return n;
+            })();
+            "#,
+        )
+        .unwrap();
+        let mut first = Vec::new();
+        host.take_ops(&mut first);
+        assert!(
+            first.iter().any(|o| matches!(
+                o,
+                Op::SetProp {
+                    prop: nsh_core::Prop::ComponentPropBinding(name, Some(_)),
+                    ..
+                } if &**name == "progress"
+            )),
+            "{first:?}"
+        );
+        // Only the element holds the derived node (and, through it, its value).
+        host.collect_garbage();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        assert!(
+            !ops.iter()
+                .any(|o| matches!(o, Op::Animation(AnimationOp::Release { .. }))),
+            "{ops:?}"
+        );
+        // The element goes, and its nodes with it.
+        host.eval_script("drop.js", "keep = undefined").unwrap();
+        host.collect_garbage();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        assert!(
+            ops.iter()
+                .any(|o| matches!(o, Op::Animation(AnimationOp::Release { .. }))),
+            "{ops:?}"
+        );
+    }
+
+    /// A `tooltip` given by a memo (a component's element in a development
+    /// bundle: its hot proxy's) is the element the memo gives, and follows it.
+    #[test]
+    fn a_tooltip_given_by_a_memo_follows_it() {
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"
+            import { computed, signal } from "nsh";
+            import { element, prop } from "nsh:rt";
+            const tips = [element("view"), element("view")];
+            const shown = signal(0);
+            prop(element("view"), "tooltip", computed(() => tips[shown()]));
+            shown.set(1);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(tooltips(&host), ["Node(2)", "Node(4)"]);
+    }
+
+    /// A tooltip memo stays followed when what set it runs again with the
+    /// same memo: a spread after another of its props changed, a bound prop
+    /// after something else it read did. Each run sets the memo's element
+    /// again (the core keeps it as it is).
+    #[test]
+    fn a_tooltip_memo_is_followed_after_what_set_it_ran_again() {
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"
+            import { computed, signal } from "nsh";
+            import { bindProp, element, spread } from "nsh:rt";
+            const tips = [element("view"), element("view")];
+            const shown = signal(0);
+            const id = signal("a");
+            const tip = computed(() => tips[shown()]);
+            spread(element("view"), {
+                get testID() { return id(); },
+                get tooltip() { return tip; },
+            });
+            bindProp(element("view"), "tooltip", () => (id(), tip));
+            id.set("b");
+            shown.set(1);
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            tooltips(&host),
+            [
+                "Node(2)", "Node(2)", "Node(2)", "Node(2)", "Node(4)", "Node(4)"
+            ]
+        );
+    }
+
+    /// The tooltips the ops since the last call set.
+    fn tooltips(host: &Host) -> Vec<String> {
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        ops.into_iter()
+            .filter_map(|o| match o {
+                Op::SetProp {
+                    prop: nsh_core::Prop::Tooltip(content),
+                    ..
+                } => Some(format!("{content:?}")),
+                _ => None,
+            })
+            .collect()
     }
 
     #[test]

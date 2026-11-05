@@ -38,11 +38,14 @@ final class TextLayouts {
         final int weight;
         final boolean italic;
         final Typeface typeface;
+        /** The font's file, for fallback chains of registered fonts. */
+        final File file;
 
-        Face(int weight, boolean italic, Typeface typeface) {
+        Face(int weight, boolean italic, Typeface typeface, File file) {
             this.weight = weight;
             this.italic = italic;
             this.typeface = typeface;
+            this.file = file;
         }
     }
 
@@ -62,7 +65,7 @@ final class TextLayouts {
             Typeface typeface = Typeface.createFromFile(file);
             synchronized (FAMILIES) {
                 List<Face> faces = FAMILIES.computeIfAbsent(family, k -> new ArrayList<>());
-                faces.add(new Face(weight, italic, typeface));
+                faces.add(new Face(weight, italic, typeface, file));
             }
             // Resolutions made before this font existed are stale.
             synchronized (RESOLVED) {
@@ -91,47 +94,165 @@ final class TextLayouts {
         return resolved;
     }
 
+    /**
+     * The typeface of a `fontFamily` list (`"Brand, 'Noto Sans SC', sans-serif"`):
+     * the first family Android has, registered, generic or installed. When
+     * that one is registered, the list's registered families after it are
+     * its fallbacks for the characters it lacks (Android 10+), before the
+     * system's.
+     */
     private static Typeface resolve(String family, int weight, boolean italic) {
-        Typeface base = null;
-        if (family != null) {
-            synchronized (FAMILIES) {
-                List<Face> faces = FAMILIES.get(family);
-                if (faces != null) {
-                    Face best = null;
-                    int bestScore = Integer.MAX_VALUE;
-                    for (Face f : faces) {
-                        int score = Math.abs(f.weight - weight) + (f.italic == italic ? 0 : 1000);
-                        if (score < bestScore) {
-                            best = f;
-                            bestScore = score;
-                        }
-                    }
-                    if (best != null) {
-                        // Exact faces are used as is; others are synthesized.
-                        if (best.weight == weight && best.italic == italic) return best.typeface;
-                        base = best.typeface;
-                    }
+        List<Family> names = families(family);
+        for (int i = 0; i < names.size(); i++) {
+            Face face = registered(names.get(i).name, weight, italic);
+            if (face != null) {
+                Typeface chained = chained(face, names.subList(i + 1, names.size()), weight, italic);
+                if (chained != null) return chained;
+                // Exact faces are used as is; others are synthesized.
+                if (face.weight == weight && face.italic == italic) return face.typeface;
+                return Typeface.create(face.typeface, clamp(weight), italic);
+            }
+            Typeface base = installed(names.get(i));
+            if (base != null) return Typeface.create(base, clamp(weight), italic);
+        }
+        return Typeface.create(Typeface.DEFAULT, clamp(weight), italic);
+    }
+
+    /**
+     * The families of a `fontFamily` list, trimmed and unquoted, in order: a
+     * quoted name runs to its closing quote, commas and all (`'ACME, Inc'`),
+     * as `nsh_core::font_families` reads it. A quoted name is always a
+     * family's name, never a generic family (`"serif"`), as in CSS.
+     */
+    private static List<Family> families(String list) {
+        List<Family> out = new ArrayList<>();
+        if (list == null) return out;
+        int i = 0, n = list.length();
+        while (i < n) {
+            while (i < n && Character.isWhitespace(list.charAt(i))) i++;
+            if (i >= n) break;
+            char c = list.charAt(i);
+            String name;
+            int comma;
+            boolean quoted = c == '"' || c == '\'';
+            if (quoted) {
+                // To the closing quote (or the end, unclosed); what follows it
+                // up to the next comma is not part of the name.
+                int end = list.indexOf(c, i + 1);
+                if (end < 0) end = n;
+                name = list.substring(i + 1, end).trim();
+                comma = list.indexOf(',', Math.min(end + 1, n));
+            } else {
+                comma = list.indexOf(',', i);
+                name = list.substring(i, comma < 0 ? n : comma).trim();
+            }
+            i = comma < 0 ? n : comma + 1;
+            if (!name.isEmpty()) out.add(new Family(name, quoted));
+        }
+        return out;
+    }
+
+    /** A family of a `fontFamily` list; `quoted` names are never generic. */
+    private static final class Family {
+        final String name;
+        final boolean quoted;
+
+        Family(String name, boolean quoted) {
+            this.name = name;
+            this.quoted = quoted;
+        }
+    }
+
+    /** The registered face of `family` nearest to the weight and style, or null. */
+    private static Face registered(String family, int weight, boolean italic) {
+        synchronized (FAMILIES) {
+            List<Face> faces = FAMILIES.get(family);
+            if (faces == null) return null;
+            Face best = null;
+            int bestScore = Integer.MAX_VALUE;
+            for (Face f : faces) {
+                int score = Math.abs(f.weight - weight) + (f.italic == italic ? 0 : 1000);
+                if (score < bestScore) {
+                    best = f;
+                    bestScore = score;
                 }
             }
-            if (base == null) {
-                // CSS generic families (`font-mono`, `font-serif`).
-                switch (family) {
-                    case "system-ui": case "sans-serif": case "ui-sans-serif": case "-apple-system":
-                        base = Typeface.DEFAULT;
-                        break;
-                    case "monospace": case "ui-monospace":
-                        base = Typeface.MONOSPACE;
-                        break;
-                    case "serif": case "ui-serif":
-                        base = Typeface.SERIF;
-                        break;
-                    default:
-                        base = Typeface.create(family, Typeface.NORMAL);
+            return best;
+        }
+    }
+
+    /** A generic or installed family's typeface, or null when Android has none. */
+    private static Typeface installed(Family name) {
+        String family = name.name;
+        // CSS generic families (`font-mono`, `font-serif`), unquoted.
+        switch (name.quoted ? "" : family) {
+            case "system-ui": case "sans-serif": case "ui-sans-serif": case "-apple-system":
+            case "BlinkMacSystemFont":
+                return Typeface.DEFAULT;
+            case "monospace": case "ui-monospace":
+                return Typeface.MONOSPACE;
+            case "serif": case "ui-serif":
+                return Typeface.SERIF;
+            default:
+                if (family.isEmpty()) return null;
+                Typeface typeface = Typeface.create(family, Typeface.NORMAL);
+                // A family Android does not have is its default typeface.
+                return typeface == null || typeface.equals(Typeface.DEFAULT) ? null : typeface;
+        }
+    }
+
+    /**
+     * `primary` with the registered families of `rest` as its fallbacks,
+     * then the system's (the first generic family of `rest`, else
+     * sans-serif); null before Android 10, when there is nothing to chain
+     * (no such families and a sans-serif system fallback), or when a font
+     * file does not load.
+     */
+    private static Typeface chained(Face primary, List<Family> rest, int weight, boolean italic) {
+        if (android.os.Build.VERSION.SDK_INT < 29 || primary.file == null) return null;
+        List<Face> others = new ArrayList<>();
+        String system = "sans-serif";
+        boolean generic = false;
+        for (Family family : rest) {
+            Face face = registered(family.name, weight, italic);
+            if (face != null && face.file != null && face != primary) {
+                others.add(face);
+            } else if (!generic && !family.quoted) {
+                switch (family.name) {
+                    case "monospace": case "ui-monospace": system = "monospace"; generic = true; break;
+                    case "serif": case "ui-serif": system = "serif"; generic = true; break;
+                    case "system-ui": case "sans-serif": case "ui-sans-serif": generic = true; break;
+                    default: break;
                 }
             }
         }
-        if (base == null) base = Typeface.DEFAULT;
-        return Typeface.create(base, Math.max(1, Math.min(1000, weight)), italic);
+        // A trailing generic family still sets the system fallback.
+        if (others.isEmpty() && system.equals("sans-serif")) return null;
+        try {
+            Typeface.CustomFallbackBuilder builder = new Typeface.CustomFallbackBuilder(fontFamily(primary));
+            for (Face face : others) builder.addCustomFallback(fontFamily(face));
+            builder.setSystemFallback(system);
+            builder.setStyle(new android.graphics.fonts.FontStyle(clamp(weight),
+                    italic ? android.graphics.fonts.FontStyle.FONT_SLANT_ITALIC
+                            : android.graphics.fonts.FontStyle.FONT_SLANT_UPRIGHT));
+            return builder.build();
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** A registered face as a font family of one font (Android 10+). */
+    private static android.graphics.fonts.FontFamily fontFamily(Face face) throws java.io.IOException {
+        android.graphics.fonts.Font font = new android.graphics.fonts.Font.Builder(face.file)
+                .setWeight(clamp(face.weight))
+                .setSlant(face.italic ? android.graphics.fonts.FontStyle.FONT_SLANT_ITALIC
+                        : android.graphics.fonts.FontStyle.FONT_SLANT_UPRIGHT)
+                .build();
+        return new android.graphics.fonts.FontFamily.Builder(font).build();
+    }
+
+    private static int clamp(int weight) {
+        return Math.max(1, Math.min(1000, weight));
     }
 
     // Span ints: start, end, weight, flags, color, decoration color, family,
@@ -351,13 +472,28 @@ final class TextLayouts {
                 direction);
     }
 
+    /**
+     * A width in dp to whole pixels, down ({@code up} false) or up. Layout
+     * lands widths on device pixels (a text measured 64 pixels is 64 / 2.625
+     * dp), but a width that went through the layout's arithmetic (a box's
+     * width less its padding) comes back a hair off: 63.99999 pixels, which
+     * floored is a pixel narrower than the text and breaks its last word onto
+     * a line of its own. Within a thousandth of a pixel is that pixel.
+     */
+    private static int toPixels(float dp, float density, boolean up) {
+        float px = dp * density;
+        int nearest = Math.round(px);
+        if (Math.abs(px - nearest) < 1e-3f) return nearest;
+        return (int) (up ? Math.ceil(px) : Math.floor(px));
+    }
+
     /** Size in dp, packed as two float bit patterns (width high). */
     static long measure(Object prepared, float maxWidthDp) {
         Prepared p = (Prepared) prepared;
         int width = p.desired();
         if (!Float.isNaN(maxWidthDp)) {
             // Text that fits lays out as at its natural width: same layout.
-            width = Math.min(width, (int) Math.floor(maxWidthDp * p.density));
+            width = Math.min(width, toPixels(maxWidthDp, p.density, false));
         }
         StaticLayout layout = p.layout(width);
         // Without an ellipsis StaticLayout ignores maxLines: count the lines
@@ -377,7 +513,7 @@ final class TextLayouts {
     /** The final layout, in px, for a box of the given dp size. */
     static Object layout(Object prepared, float widthDp, float heightDp) {
         Prepared p = (Prepared) prepared;
-        int width = (int) Math.ceil(widthDp * p.density);
+        int width = toPixels(widthDp, p.density, true);
         // Left-aligned LTR text that fits draws the same in a wider box:
         // keep the measured layout. Not text a paragraph span aligns to the
         // right: laid out at its natural width, it would stay on the left.
@@ -459,6 +595,259 @@ final class TextLayouts {
         return out;
     }
 
+    // Hit testing of a final layout: the caret at a point, a caret's box and the
+    // boxes of a range (`TextEngine::hit_test`, `caret_rect` and `range_rects`).
+    // The engine thread asks through JNI in dp; the UI thread (TextBox,
+    // SelectableView, TestAgent) asks the same methods in px (`density` 1), so one
+    // implementation answers both. Coordinates are the layout's own, which is the
+    // content box: the layouts are made without padding and TextBox draws them
+    // translated to the box's corner.
+
+    /** A hit: the offset in the low 32 bits, bit 32 for a caret at the end of a wrapped line. */
+    private static long packHit(int offset, boolean upstream) {
+        return (upstream ? 1L << 32 : 0L) | (offset & 0xffffffffL);
+    }
+
+    /** The offset (UTF-16) of a {@link #hitTest} result. */
+    static int hitOffset(long hit) {
+        return (int) hit;
+    }
+
+    /**
+     * Whether a {@link #hitTest} result is the end of a wrapped line, on that
+     * line (`Affinity::Upstream`): its offset is the next line's start too.
+     */
+    static boolean hitUpstream(long hit) {
+        return (hit >>> 32) != 0;
+    }
+
+    /**
+     * The caret nearest ({@code x}, {@code y}) of a final layout, as {@link
+     * #hitOffset} and {@link #hitUpstream} read it: on the line at that height
+     * (the first above the text, the last below it), at the caret edge nearest x
+     * (bidirectional text in visual order). A point past the end of a wrapped
+     * line gives its end, upstream; a line that ends in a break character stops
+     * before it. {@code density}: px per unit of {@code x} and {@code y}.
+     */
+    static long hitTest(Object layout, float x, float y, float density) {
+        if (!(layout instanceof Layout)) return 0;
+        Layout l = (Layout) layout;
+        int lines = l.getLineCount();
+        if (lines == 0) return 0;
+        x *= density;
+        y *= density;
+        int line = l.getLineForVertical((int) y);
+        // Android's nearest caret. On a line that is not the text's last it stops
+        // before the line's last character (to Android the line's end is the next
+        // line's start), which also keeps it before a break character.
+        int offset = l.getOffsetForHorizontal(line, x);
+        int end = l.getLineEnd(line);
+        if (line < lines - 1 && end > l.getLineStart(line) && breakStart(l, line) == end
+                && l.isRtlCharAt(end - 1) == (l.getParagraphDirection(line) == Layout.DIR_RIGHT_TO_LEFT)) {
+            // A wrapped line whose last character is at the line's far edge: the
+            // end of the line, its other edge, is the nearer caret from past the
+            // character's middle on. Lines that end in the other direction keep
+            // Android's caret: the nearest one on screen.
+            float endX = wrappedEndX(l, line);
+            if (offset == l.getOffsetForHorizontal(line, endX)
+                    && Math.abs(x - endX) < Math.abs(x - l.getPrimaryHorizontal(offset))) {
+                return packHit(end, true);
+            }
+        }
+        return packHit(offset, false);
+    }
+
+    /**
+     * The caret at {@code offset} (UTF-16) of a final layout, a box without
+     * width as high as its line: x, y, height; empty without lines.
+     * {@code upstream}: at the end of a wrapped line, the caret on that line
+     * rather than at the start of the next. {@code density}: px per unit of the
+     * result.
+     */
+    static float[] caretRect(Object layout, int offset, boolean upstream, float density) {
+        if (!(layout instanceof Layout)) return new float[0];
+        Layout l = (Layout) layout;
+        if (l.getLineCount() == 0) return new float[0];
+        offset = Math.max(0, Math.min(offset, l.getText().length()));
+        int line = l.getLineForOffset(offset);
+        if (upstream && line > 0 && offset == l.getLineStart(line)) line--;
+        // Never after a break character; the end of a wrapped line is not an
+        // offset of its own to Android.
+        int at = Math.min(offset, breakStart(l, line));
+        float x = at == l.getLineEnd(line) && line < l.getLineCount() - 1
+                ? wrappedEndX(l, line)
+                : l.getPrimaryHorizontal(at);
+        int top = l.getLineTop(line);
+        return new float[] {x / density, top / density, (l.getLineBottom(line) - top) / density};
+    }
+
+    /**
+     * The boxes of the characters {@code start}..{@code end} (UTF-16) of a final
+     * layout, line high: per line one for each stretch of adjacent characters
+     * (bidirectional text splits a range), through the line's end where the
+     * range goes on past it; x, y, width, height each. Break characters and what
+     * an ellipsis replaced have none. {@code density}: px per unit of the result.
+     */
+    static float[] rangeRects(Object layout, int start, int end, float density) {
+        if (!(layout instanceof Layout)) return new float[0];
+        Layout l = (Layout) layout;
+        start = Math.max(0, start);
+        end = Math.min(end, l.getText().length());
+        int lines = l.getLineCount();
+        if (start >= end || lines == 0) return new float[0];
+        Boxes boxes = new Boxes();
+        for (int line = l.getLineForOffset(start); line < lines; line++) {
+            int lineStart = l.getLineStart(line);
+            if (lineStart >= end) break;
+            int a = Math.max(start, lineStart), b = Math.min(end, breakStart(l, line));
+            int first = boxes.count;
+            if (l.getEllipsisCount(line) > 0) {
+                int ellipsis = lineStart + l.getEllipsisStart(line);
+                addRuns(l, line, a, Math.min(b, ellipsis), boxes);
+                addRuns(l, line, Math.max(a, ellipsis + l.getEllipsisCount(line)), b, boxes);
+            } else {
+                addRuns(l, line, a, b, boxes);
+            }
+            boxes.merge(first);
+        }
+        return boxes.rects(density);
+    }
+
+    /**
+     * Where a line's break begins: its end, or before the character that ends
+     * it (a newline, a carriage return, a line or paragraph separator; "\r\n"
+     * as one). Carets stay before it.
+     */
+    private static int breakStart(Layout l, int line) {
+        int start = l.getLineStart(line), end = l.getLineEnd(line);
+        if (end <= start) return end;
+        CharSequence text = l.getText();
+        char c = text.charAt(end - 1);
+        if (c != '\n' && c != '\r' && c != '\u0085' && c != '\u2028' && c != '\u2029') return end;
+        return c == '\n' && end - 1 > start && text.charAt(end - 2) == '\r' ? end - 2 : end - 1;
+    }
+
+    /**
+     * The x of the end of a line that wrapped, past its last character and the
+     * white space that hangs after it: the far edge of the line in its
+     * paragraph's direction, as far from where Android starts the line as the
+     * line is wide.
+     */
+    private static float wrappedEndX(Layout l, int line) {
+        float width = l.getLineWidth(line);
+        float start = l.getPrimaryHorizontal(l.getLineStart(line));
+        return l.getParagraphDirection(line) == Layout.DIR_RIGHT_TO_LEFT ? start - width : start + width;
+    }
+
+    /**
+     * The carets of {@code offset} on a line: Android's primary and secondary
+     * ones, which differ where the direction changes (the end of one run, the
+     * start of the next). A wrapped line's end is one of its own.
+     */
+    private static float[] edges(Layout l, int line, int offset) {
+        if (offset == l.getLineEnd(line) && line < l.getLineCount() - 1) return new float[] {wrappedEndX(l, line)};
+        float primary = l.getPrimaryHorizontal(offset), secondary = l.getSecondaryHorizontal(offset);
+        return primary == secondary ? new float[] {primary} : new float[] {primary, secondary};
+    }
+
+    /** The boxes of the characters {@code a}..{@code b} of a line: one per run of one direction. */
+    private static void addRuns(Layout l, int line, int a, int b, Boxes out) {
+        float top = l.getLineTop(line), bottom = l.getLineBottom(line);
+        int i = a;
+        while (i < b) {
+            boolean rtl = l.isRtlCharAt(i);
+            int j = i + 1;
+            while (j < b && l.isRtlCharAt(j) == rtl) j++;
+            // The run's first character starts at one of the carets before it and its
+            // last ends at one of those after it: the left edge is the first's and the
+            // right edge the last's (the other way round right to left).
+            float[] before = edges(l, line, i), after = edges(l, line, j);
+            if (!addBox(rtl ? after : before, rtl ? before : after, top, bottom, out)
+                    && j == l.getLineEnd(line) && line < l.getLineCount() - 1) {
+                // A last run against the paragraph's direction does not end at the line's
+                // end: its far edge is among the carets before it.
+                float[] all = new float[before.length + after.length];
+                System.arraycopy(before, 0, all, 0, before.length);
+                System.arraycopy(after, 0, all, before.length, after.length);
+                addBox(all, all, top, bottom, out);
+            }
+            i = j;
+        }
+    }
+
+    /**
+     * Adds the narrowest box from one of {@code lefts} to one of {@code rights}:
+     * carets of other runs, which lie outside this one, make wider ones. False
+     * when there is none (no width).
+     */
+    private static boolean addBox(float[] lefts, float[] rights, float top, float bottom, Boxes out) {
+        float width = Float.MAX_VALUE, left = 0, right = 0;
+        for (float lo : lefts) {
+            for (float hi : rights) {
+                if (hi > lo && hi - lo < width) {
+                    width = hi - lo;
+                    left = lo;
+                    right = hi;
+                }
+            }
+        }
+        if (width == Float.MAX_VALUE) return false;
+        out.add(left, top, right, bottom);
+        return true;
+    }
+
+    /** Boxes being collected (left, top, right, bottom, px). */
+    private static final class Boxes {
+        float[] v = new float[16];
+        int count;
+
+        void add(float left, float top, float right, float bottom) {
+            if ((count + 1) * 4 > v.length) v = java.util.Arrays.copyOf(v, v.length * 2);
+            int o = count++ * 4;
+            v[o] = left;
+            v[o + 1] = top;
+            v[o + 2] = right;
+            v[o + 3] = bottom;
+        }
+
+        /** Joins the boxes from {@code first} on that touch (those of one line), left to right. */
+        void merge(int first) {
+            for (int i = first + 1; i < count; i++) {
+                for (int j = i; j > first && v[(j - 1) * 4] > v[j * 4]; j--) {
+                    for (int k = 0; k < 4; k++) {
+                        float t = v[j * 4 + k];
+                        v[j * 4 + k] = v[(j - 1) * 4 + k];
+                        v[(j - 1) * 4 + k] = t;
+                    }
+                }
+            }
+            int out = first;
+            for (int i = first; i < count; i++) {
+                // Runs measured from different carets meet within a rounding error.
+                if (out > first && v[i * 4] <= v[(out - 1) * 4 + 2] + 0.5f) {
+                    v[(out - 1) * 4 + 2] = Math.max(v[(out - 1) * 4 + 2], v[i * 4 + 2]);
+                } else {
+                    System.arraycopy(v, i * 4, v, out * 4, 4);
+                    out++;
+                }
+            }
+            count = out;
+        }
+
+        /** x, y, width, height of each box, in units of {@code density} px. */
+        float[] rects(float density) {
+            float[] out = new float[count * 4];
+            for (int i = 0; i < count; i++) {
+                int o = i * 4;
+                out[o] = v[o] / density;
+                out[o + 1] = v[o + 1] / density;
+                out[o + 2] = (v[o + 2] - v[o]) / density;
+                out[o + 3] = (v[o + 3] - v[o + 1]) / density;
+            }
+            return out;
+        }
+    }
+
     /**
      * An attachment's placeholder: its size, placed in its line by its
      * `verticalAlign` (as `TextAttachment::ascent` in nsh-core places it, with
@@ -470,6 +859,8 @@ final class TextLayouts {
         final int width, height, align;
         /** How far its top is above the baseline (px; negative: below), set by {@link #getSize}. */
         int ascent;
+        /** The ascent and descent of the font around it (px, as {@link Paint.FontMetricsInt}), set by {@link #getSize}. */
+        int fontAscent, fontDescent;
 
         Attachment(int width, int height, int align) {
             this.width = width;
@@ -498,8 +889,10 @@ final class TextLayouts {
                     }
                 }
             }
+            Paint.FontMetricsInt own = paint.getFontMetricsInt();
+            fontAscent = own.ascent;
+            fontDescent = own.descent;
             if (fm != null) {
-                Paint.FontMetricsInt own = paint.getFontMetricsInt();
                 fm.ascent = Math.min(own.ascent, -Math.max(0, ascent));
                 fm.top = Math.min(own.top, fm.ascent);
                 fm.descent = Math.max(own.descent, height - ascent);
@@ -608,7 +1001,10 @@ final class TextLayouts {
         private final int height;
 
         ExactLineHeight(float height) {
-            this.height = (int) Math.ceil(height);
+            // To the nearest pixel, as a TextView's lineHeight in dp is
+            // (getDimensionPixelSize): rounded up, 21 dp at 2.625 is 56
+            // pixels, a third of a point taller than the design's line.
+            this.height = Math.max(1, Math.round(height));
         }
 
         @Override
@@ -616,6 +1012,28 @@ final class TextLayouts {
                                  Paint.FontMetricsInt fm) {
             int current = fm.descent - fm.ascent;
             if (current <= 0) return;
+            Attachment[] attachments = text instanceof Spanned
+                    ? ((Spanned) text).getSpans(start, end, Attachment.class)
+                    : null;
+            if (attachments != null && attachments.length > 0) {
+                // A line holding attachments: the text's box (its font with
+                // the line height spread around it) joined with what each
+                // attachment reaches above and below the baseline, so the
+                // line grows only where one is taller (a replaced inline box
+                // in CSS) instead of being cut to the line height.
+                int ascent = 0, descent = 0;
+                for (Attachment a : attachments) {
+                    int extra = height - (a.fontDescent - a.fontAscent);
+                    int top = extra / 2;
+                    ascent = Math.min(ascent, Math.min(a.fontAscent - top, -Math.max(0, a.ascent)));
+                    descent = Math.max(descent, Math.max(a.fontDescent + extra - top, a.height - a.ascent));
+                }
+                fm.ascent = ascent;
+                fm.top = ascent;
+                fm.descent = descent;
+                fm.bottom = descent;
+                return;
+            }
             int extra = height - current;
             int top = extra / 2;
             fm.ascent -= top;

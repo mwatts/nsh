@@ -28,7 +28,7 @@ fn existing_attachment_literals_and_engines_remain_compatible() {
         width: Points(10.0),
         height: Points(20.0),
     };
-    // Enumerate the old fields: alignment must not migrate the source break
+    // Enumerate the fields: alignment must not migrate the source break
     // from TextAttachment to AttributedText.
     let mut text = AttributedText {
         text: String::new(),

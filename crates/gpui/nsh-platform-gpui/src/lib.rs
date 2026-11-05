@@ -5,8 +5,8 @@
 //! - Each node is an [`view::NshView`], a retained view the core placed at
 //!   its frame. A surface is one GPUI element ([`render::SurfaceElement`])
 //!   that paints the whole tree with GPUI's primitives (quads, shadows,
-//!   paths, glyphs, images): shadows and background, the content (text,
-//!   image, canvas), the children, the border, then the items the view
+//!   paths, glyphs, images): shadows and background, the content (shader,
+//!   text, image, canvas), the children, the border, then the items the view
 //!   hosts (text editors, headers).
 //! - The engine runs on its own thread ([`nsh_engine::Engine`]); each
 //!   commit is one closure sent to GPUI's main thread ([`rt`],
@@ -36,6 +36,7 @@ mod decor;
 #[cfg(feature = "dev")]
 pub mod dev;
 mod events;
+mod file_drop;
 mod geom;
 mod image;
 mod input;
@@ -47,7 +48,8 @@ mod navigation;
 mod render;
 mod rt;
 mod scroll;
-mod selection_area;
+mod selectable_view;
+mod shader;
 mod stats;
 mod surface;
 mod synth;
@@ -64,8 +66,8 @@ mod tests;
 pub use gpui;
 pub use nsh_base::{Theme, ThemeError};
 pub use nsh_core::{
+    element::{AdaptiveColor, Color, Hsla, Rgba},
     platform::{Appearance, Locale},
-    ui::{AdaptiveColor, Color, Hsla, Rgba},
 };
 pub use nsh_engine::{
     App, AppError, AppErrorKind, Bundle, ByteSize, CacheLocation, CacheOptions, CachePolicy,

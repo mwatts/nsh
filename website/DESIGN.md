@@ -1,7 +1,7 @@
 # Website design
 
 Rules for `website/`, so later changes stay coherent. The site follows the
-gallery's design language (`examples/gallery/ui.tsx`): graphite surfaces lit
+shared example UI's design language (`examples/nsh-gallery-ui`): graphite surfaces lit
 from above, one citrus accent, tinted status colours — neutral and refined,
 the look of the UI nsh draws.
 
@@ -25,13 +25,17 @@ the look of the UI nsh draws.
    prose; `nsh` stays as it is in code, commands and URLs.
 3. **Specifics over adjectives.** Every capability card names something a
    reader can check in the repository: a crate, an element, a module, a
-   command (`Taffy`, `<List>`, `nsh/animated`, `nsh publish`). Claims track
+   command (`Taffy`, `<List>`, `Animated`, `nsh publish`). Claims track
    `README.md` and `AGENTS.md`; update the copy when they change.
 4. **Restraint carries the design.** Hierarchy comes from type scale, weight,
    hairlines and surface depth (card, inset, raised), not colour fills. The
    only gradients are the surfaces' own top-to-bottom light.
 
 ## Colour
+
+The shared source is `examples/nsh-gallery-ui/theme.json`, with surfaces in `finishes.json`. The website
+loads their generated CSS through `virtual:nsh-gallery-ui.css`; its own semantic variables alias those values.
+The NSH gallery and runnable demos consume the same files.
 
 Tokens live in `src/styles/global.css`: `:root` holds the dark theme,
 `html.light` its light variant. A pre-paint script in `BaseLayout.astro`
@@ -95,14 +99,44 @@ The values below are the dark theme's.
   in docs they scroll inside `.diagram-scroll` rather than shrink below
   640px.
 - Radii: cards 16px, insets 12px, controls 10px.
-- The logo is the app icon's mark (`public/logo.svg`, inline in
-  `Logo.astro`): a citrus arch holding a light dot (on the light theme a
-  deeper citrus arch and a dark dot, `--logo-*`). The favicon
-  (`favicon.svg`) is the mark itself on a transparent background, its
-  colours switching with `prefers-color-scheme` inside the SVG;
-  `apple-touch-icon.png` and `icon-512.png` (og:image) are the light mark on
-  a plain `#f3f3ef` square. The graphite app icon is the gallery's, not
-  the site's.
+- The logo (`public/logo.svg`, inline in `Logo.astro`) is the banners' mark:
+  the shell as a lit citrus tube holding a bead, drawn in SVG layers that
+  hold at favicon size, its colours the theme's `--logo-*` (a deeper citrus
+  and a dark bead on the light theme). The favicon (`favicon.svg`) is the
+  mark on a transparent background, its colours switching with
+  `prefers-color-scheme` inside the SVG; `apple-touch-icon.png` and
+  `icon-512.png` are the light mark on a plain `#f3f3ef` square. The gallery's
+  app icon is `public/brand/nsh-app-icon-dark.png`: the mark on a top-lit
+  graphite ground.
+- The brand page (`/brand`, linked from the footer): the logo, solid logos,
+  app icons, README banners, social previews and link preview, downloadable
+  from `public/brand/`.
+- The link preview (`public/og-image.png`, 1200×630, `og:image` and the
+  large Twitter card on every page) is the mark as a lit citrus tube inside
+  seven glass arches, rendered with NSH's own `<Shader>` on a soft grey-green
+  wash, with the name, slogan and platforms in Figtree.
+
+## Controls
+
+Every control is a component of `src/components/ui/`, after shadcn/ui:
+`Button` (variants `default` — the citrus primary —, `secondary` — raised —,
+`outline`, `ghost`, `destructive`, `link`; sizes `xs`, `sm`, `default`, `lg`
+and the square `icon-*`), `ButtonGroup`, `Input` (with an `icon` slot, an
+input group), `Label`, `Select` (a trigger like an input and a listbox popup,
+driven by `src/lib/ui/select.ts`), `Badge`, `Toggle`, `ToggleGroup` /
+`ToggleGroupItem` (variant `segmented` for switches between views, `outline`
+with `spacing` for filter chips, `count` for a quiet number), `TabsList` /
+`TabsTrigger`. As shadcn's components do, they mark their parts with
+`data-slot` and their look with `data-variant` / `data-size`, and their state
+is ARIA (`aria-pressed`, `aria-checked`, `aria-selected`, `aria-expanded`):
+the look is one file, `src/styles/ui.css`, shadcn's class lists applied to
+those selectors, with shadcn's tokens (`primary`, `secondary`, `accent`,
+`muted`, `border`, `input`, `ring`, ...) mapped onto the gallery's theme and
+the surfaces given its finishes (raised, hover, pressed, the citrus `light`,
+field, track, menu). HTML written as a string (`src/lib/demo.js`,
+`src/lib/remark-code-tabs.js`, buttons a script adds) uses the same
+attributes. A page never styles a control itself: it places it (margins,
+widths) and picks a variant; a new kind of control is a new component.
 
 ## Typography
 
@@ -141,31 +175,41 @@ chrome) and follows the page's theme (the player's `?theme=`, then a
 message on every change); the gallery's palette has both. The caption says
 what runs; Replay reloads it, which plays the scenario again. Entrance
 motion only, 620ms `cubic-bezier(.16, 1, .3, 1)`. The copied chat imports
-`./clipboard`, a no-op, because this runtime has no `nsh/clipboard` yet;
+`./clipboard`, a no-op, because this runtime has no `Clipboard` yet;
 the playground lists every demo but this one (it compiles single files).
 
-Behind the hero, `HeroField.astro` draws the dot grid on a 2D canvas, mostly
-dark and quiet: every dot has a seeded size, brightness and twinkle, and a
-slowly drifting value-noise field decides where the grid shimmers. Near the
-pointer (or the last touch) a few dots light up more than their
-neighbours inside a noise-perturbed reach that trails the pointer a little,
-over a small faint halo (140 px, peak alpha 0.06); the field is faint over
-the copy. It pauses off
-screen and in hidden tabs, draws one static frame with reduced motion,
-never takes pointer events, and costs about 0.2 ms a frame (`?fieldperf`
-logs it).
+Behind the hero, `HeroField.astro` draws the night sky from inside a galaxy
+with a fragment shader (WebGL, two passes: the clouds' field into a texture
+of a texel every 11 px, then the sky per pixel, sampling it). The hero's sky
+darkens toward the night, fading out along its bottom into the page. The
+nebula takes the site's own colors, slate blue and grey by region and teal in
+a few clouds, the primary's green tinting them and lighting their ridged
+wisps, which lie in belts as Jupiter's clouds do; darker reaches open here
+and there. Its light opens between the copy and the device from the first
+frame, dims behind the device, and is softly capped. The stars are crisp
+round discs (gravity bends the space they sit in, never their shape) in the
+blue, teal, red, orange and violet besides white, most faint and a few bright, the
+brightest, white or blue-white, with long diffraction spikes; some wear a tilted ring, some have
+companions orbiting them. They crowd where the clouds are, with a fine grain
+of star dust, gather in clusters and leave voids; they drift slowly, nearer
+ones faster, and now and then a meteor crosses. Presses act
+on gravity: a held press is a small mass that bends the starlight toward
+it; released, it sends a gentle wave that carries the stars outward as it
+passes before they settle back, and turns their drift to a new heading. The
+sky shows across the hero, about half as strong behind the copy, every mask
+a smooth gradient. The colors are the `--hero-*` tokens. It moves all the
+time, pauses off screen and in hidden tabs, draws one still frame and takes
+no presses with reduced motion, never takes pointer events itself, and
+draws nothing without WebGL (`?fieldperf` logs its frame time).
 
 ## Demo frames
 
 - Demos (`demos/*.tsx`), the hero's chat and the playground follow the
   page's theme: the player starts with `?theme=` and gets a message on every
   change (`themeDemos` in `src/lib/demo-client.ts`), and demos read their
-  colours from `demos/palette.ts` (`ui()`, over `colorScheme()`) inside JSX,
-  so they switch live. The playground inlines that file into a demo that
-  imports it; its Dark switch follows the page until changed.
-  `demos/nsh.json` gives Rust components both appearances
-  (`demos/graphite-theme.json`). Never custom Tailwind colour names: the
-  playground compiles without `nsh.json`.
+  colours from `demos/palette.ts`, an adapter of `examples/nsh-gallery-ui`, inside JSX. Its palette reads the
+  shared theme's tokens, so it switches live. The playground includes the shared modules in isolated scopes and
+  applies their `theme.json` before the first render. `demos/nsh.json` references that same file for normal builds.
 - A demo is shown in a **frame** (`.phone`, `frameBar()` in
   `src/lib/demo.js`): a card with the card finish, a slim bar (an icon tile,
   the file name, a "Live" badge) and the app on an inset surface, no device

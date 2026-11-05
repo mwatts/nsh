@@ -11,29 +11,11 @@
 /// nsh's own native ES modules, which bundles compiled with nsh's JSX
 /// compiler import (served by `nsh-js`, left as imports by the bundler):
 /// `nsh`, the API apps write against; `nsh:rt`, the renderer compiled JSX
-/// calls; `nsh/device` and `nsh/accessibility`, the environment; the
-/// platforms' and host elements' modules. Registries add theirs
-/// (`Registry::specifier`: `nsh/base`, an app's set) or
-/// the functions of nsh's own (`nsh/image`, `nsh/android`).
-pub const NATIVE_MODULES: &[&str] = &[
-    "nsh",
-    "nsh:rt",
-    "nsh/device",
-    "nsh/accessibility",
-    "nsh/android",
-    "nsh/ios",
-    "nsh/desktop",
-    "nsh/webview",
-    "nsh/video",
-    "nsh/native",
-    "nsh/gesture",
-    "nsh/animated",
-    "nsh/canvas",
-    "nsh/list",
-    "nsh/image",
-    "nsh/host",
-    "nsh/keymap",
-];
+/// calls; `nsh/desktop` and `nsh/mobile`, the platforms' APIs. Registries
+/// add theirs (`Registry::specifier`: `nsh/base`, an app's set) or the
+/// functions of nsh's own (`Image.getSize` on `nsh`, `nsh/mobile`'s
+/// `BackHandler`).
+pub const NATIVE_MODULES: &[&str] = &["nsh", "nsh:rt", "nsh/desktop", "nsh/mobile"];
 
 /// The exact gpui-shell standard catalog, using canonical bare specifiers.
 /// Privileged entries route through NSH capability adapters.
@@ -55,6 +37,12 @@ pub const STANDARD_MODULES: &[&str] = &[
 pub fn is_standard_module(name: &str) -> bool {
     STANDARD_MODULES.contains(&name)
 }
+
+/// The globals the standard module `crypto` defines: Web Crypto's `crypto`
+/// and its classes. A runtime built without `crypto` (`nsh-js`'s feature)
+/// has none of them, so code that names one needs a runtime with it (the
+/// bundler's `NativeUse::global_crypto`).
+pub const CRYPTO_GLOBALS: &[&str] = &["crypto", "Crypto", "SubtleCrypto", "CryptoKey"];
 
 /// The module name of an app's bundle (its entry chunk): stack traces show
 /// `bundle.js:LINE:COL`, and the chunks of a split bundle import it as
@@ -95,6 +83,42 @@ pub use limits::{HostLimits, Limits};
 #[cfg(test)]
 mod tests {
     #[test]
+    fn renderers_decode_state_styles_and_part_classes_by_one_table() {
+        use super::host::{part_class_prop, style_patch_prop};
+        use crate::{Prop, Tag};
+        for (name, expected) in [
+            ("activeStyle", Prop::ActiveStyle(None)),
+            ("hoverStyle", Prop::HoverStyle(None)),
+            ("focusStyle", Prop::FocusStyle(None)),
+            ("disabledStyle", Prop::DisabledStyle(None)),
+            ("selectedStyle", Prop::SelectedStyle(None)),
+            ("checkedStyle", Prop::CheckedStyle(None)),
+            ("indeterminateStyle", Prop::IndeterminateStyle(None)),
+            ("expandedStyle", Prop::ExpandedStyle(None)),
+            ("pressedStyle", Prop::PressedStyle(None)),
+            ("focusWithinStyle", Prop::FocusWithinStyle(None)),
+            ("headerStyle", Prop::HeaderStyle(None)),
+        ] {
+            assert_eq!(
+                style_patch_prop(name).map(|prop| prop(None)),
+                Some(expected),
+                "{name}"
+            );
+        }
+        assert!(style_patch_prop("style").is_none());
+        assert_eq!(
+            part_class_prop("headerClass", Some(Tag::Screen)).map(|prop| prop("bg-red-500".into())),
+            Some(Prop::HeaderClass("bg-red-500".into()))
+        );
+        assert_eq!(
+            part_class_prop("contentClass", Some(Tag::List)).map(|prop| prop("p-1".into())),
+            Some(Prop::ListContentClass("p-1".into()))
+        );
+        assert!(part_class_prop("contentClass", Some(Tag::Scroll)).is_none());
+        assert!(part_class_prop("class", Some(Tag::View)).is_none());
+    }
+
+    #[test]
     fn the_declarations_match_the_tables() {
         let canvas = super::canvas::declarations();
         assert!(
@@ -107,9 +131,11 @@ mod tests {
         let style = super::style::declarations();
         // Every property the core parses has a type, in its interface.
         for (name, ts) in [
-            ("boxShadow", "string"),
+            ("boxShadow", "string | BoxShadowLayer[]"),
+            ("textShadow", "string | TextShadowLayer[]"),
             ("gridTemplateColumns", "string"),
-            ("transform", "TransformStep[]"),
+            ("transform", "string | TransformStep[]"),
+            ("rotate", "string | number | AnimatedNode"),
             ("tintColor", "ColorValue"),
             (
                 "display",
@@ -119,21 +145,32 @@ mod tests {
             assert!(style.contains(&format!("  {name}?: {ts};")), "{name}");
         }
         assert!(!style.contains("backdropMaterial"));
+        // Style keys, not props.
+        for key in [
+            "numberOfLines",
+            "textOverflow",
+            "userSelect",
+            "pointerEvents",
+        ] {
+            assert!(style.contains(&format!("  {key}?: ")), "{key}");
+        }
         let text = style.find("export interface TextStyle").unwrap();
         assert!(style[text..].contains("  textDecorationStyle?:"));
         // Each host prop and event in the interface of the elements it is for.
         let elements = super::host::declarations();
         for (interface, prop) in [
-            ("HostProps", "  pointerEvents?: PointerEvents;"),
-            ("HostProps", "  onPress?: (e?: PressEvent) => void;"),
-            ("HostProps", "  onLongPress?: (e?: PressEvent) => void;"),
-            ("HostProps", "  onPressDown?: (e?: PressEvent) => void;"),
-            ("HostProps", "  onPressUp?: (e?: PressEvent) => void;"),
-            ("HostProps", "  onLayout?: (bounds: Bounds) => void;"),
+            ("HostProps", "  onPress?: (e: PressEvent) => void;"),
+            ("HostProps", "  onLongPress?: (e: PressEvent) => void;"),
+            ("HostProps", "  onPressDown?: (e: PressEvent) => void;"),
+            ("HostProps", "  onPressUp?: (e: PressEvent) => void;"),
+            ("HostProps", "  onLayout?: (e: { bounds: Bounds }) => void;"),
             ("AndroidHostProps", "  elevation?: number;"),
             ("IOSHostProps", "  backdropMaterial?: BackdropMaterial;"),
             ("InputHostProps", "  keyboardType?: KeyboardType;"),
-            ("InputHostProps", "  onChange?: (text: string) => void;"),
+            (
+                "InputHostProps",
+                "  onChange?: (e: { value: string }) => void;",
+            ),
             (
                 "InputHostProps",
                 "  onSubmit?: (e: { text: string }) => void;",
@@ -145,10 +182,13 @@ mod tests {
                 "IOSInputHostProps",
                 "  keyboardAppearance?: KeyboardAppearance;",
             ),
-            ("ImageHostProps", "  onLoad?: (e: Size) => void;"),
+            (
+                "ImageHostProps",
+                "  onLoad?: (e: { size: PixelSize }) => void;",
+            ),
             (
                 "VideoHostProps",
-                "  onLoad?: (e: { duration: number; size: Size }) => void;",
+                "  onLoad?: (e: { duration: number; size: PixelSize }) => void;",
             ),
             ("VideoHostProps", "  audioSession?: AudioSession;"),
             (

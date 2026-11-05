@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Receiver;
 use nsh_base::{Anchor, ToastStackState, ToastTransitionStatus, popover, toast, toast_stack};
 use nsh_core::{
-    ApproxTextEngine, Bounds, MountBatch, MountItem, NodeId, Points, ROOT_ID, Size,
-    ui::{Root, prelude::*},
+    ApproxTextEngine, Bounds, MountBatch, MountItem, NodeId, Points, ROOT_ID, Size, element::Root,
+    prelude::*,
 };
 use nsh_engine::{App, Engine, EngineConfig, Environment};
 
@@ -40,6 +40,7 @@ fn config(app: App) -> EngineConfig {
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Environment::default(),
@@ -56,6 +57,7 @@ fn config(app: App) -> EngineConfig {
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     }
 }
 

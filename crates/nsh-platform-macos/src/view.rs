@@ -9,9 +9,10 @@
 //!
 //! What a view looks like is mostly Core Animation: its layer's background,
 //! corners, border and shadow, and sublayers for the rest
-//! ([`crate::decor`]). Text and canvas drawings are drawn into the layer by
-//! `drawRect:` (CoreText / Core Graphics); other views use `updateLayer`
-//! and get no backing store.
+//! ([`crate::decor`]). Every view uses `updateLayer` and gets no backing
+//! store; text and canvas drawings (CoreText / Core Graphics) go into a
+//! content sublayer whose delegate draws them (`drawLayer:inContext:`,
+//! [`NshView::redraw`]).
 //!
 //! Children are subviews of the view, or of its container when it has one:
 //! scroll views always do, and a view that clips its children and casts a
@@ -36,16 +37,17 @@ use nsh_core::{
 use objc2::{
     AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
     rc::Retained,
-    runtime::{AnyObject, ProtocolObject},
+    runtime::{AnyObject, ProtocolObject, Sel},
+    sel,
 };
 use objc2_app_kit::{
     NSDragOperation, NSDraggingDestination, NSDraggingInfo, NSEvent, NSEventType, NSResponder,
     NSTrackingArea, NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy,
     NSWindowOrderingMode,
 };
-use objc2_core_foundation::{CGFloat, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CGAffineTransform, CGFloat, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGContext;
-use objc2_foundation::{NSObject, NSObjectProtocol, NSPoint, NSRect};
+use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSPoint, NSRect};
 use objc2_quartz_core::{CALayer, CALayerDelegate, CATransform3D};
 
 use crate::surface::{Surface, quiet};
@@ -115,9 +117,9 @@ pub(crate) struct ViewState {
     /// Touch, accessibility and test properties.
     pub(crate) props: Box<ViewProps>,
     /// States to report (`TrackStates`), and the current ones.
-    pub(crate) tracked: u8,
+    pub(crate) tracked: u16,
     /// Current interaction states (pressed, hovered, focused).
-    pub(crate) states: u8,
+    pub(crate) states: u16,
     /// Extra translation (sticky list cells, screen transitions).
     pub(crate) shift: (f32, f32),
     /// Extra opacity (screen and modal transitions).
@@ -130,6 +132,8 @@ pub(crate) struct ViewState {
     pub(crate) image: Option<crate::image::ImageState>,
     /// Canvas content.
     pub(crate) canvas: Option<crate::canvas::CanvasState>,
+    /// What a shader draws under the children ([`crate::shader`]).
+    pub(crate) shader: Option<crate::shader::ShaderState>,
     /// Text field (input views).
     pub(crate) input: Option<std::rc::Rc<crate::text_input::InputState>>,
     /// Hosted AppKit views.
@@ -163,6 +167,7 @@ impl ViewState {
             text: None,
             image: None,
             canvas: None,
+            shader: None,
             input: None,
             natives: Vec::new(),
             overflow: None,
@@ -188,16 +193,6 @@ impl ViewState {
         self.anim.opacity.unwrap_or(self.style.opacity) * self.fade * live * filters
     }
 
-    /// Its shadow, with animated color, opacity and radius.
-    pub(crate) fn shadow(&self) -> nsh_core::Shadow {
-        let mut s = self.style.shadow;
-        let a = &self.anim;
-        s.color = a.shadow_color.unwrap_or(s.color);
-        s.opacity = a.shadow_opacity.unwrap_or(s.opacity);
-        s.radius = a.shadow_radius.unwrap_or(s.radius);
-        s
-    }
-
     /// Its borders, with an animated color.
     pub(crate) fn borders(&self) -> nsh_core::Borders {
         let mut b = self.style.borders;
@@ -221,7 +216,7 @@ impl ViewState {
             )
     }
 
-    /// True if it draws content with `drawRect:` (text, canvas).
+    /// True if it draws content into its content layer (text, canvas).
     pub(crate) fn draws(&self) -> bool {
         self.text.is_some() || self.canvas.is_some()
     }
@@ -356,17 +351,43 @@ define_class!(
             };
             let c = Some(cx);
             CGContext::save_g_state(c);
+            // The layer's space, in points, is the context's base space:
+            // y down where its contents are flipped.
+            let mut base = CGAffineTransform {
+                a: 1.0,
+                b: 0.0,
+                c: 0.0,
+                d: 1.0,
+                tx: 0.0,
+                ty: 0.0,
+            };
             if !layer.contentsAreFlipped() {
                 // Drawing is top down, as in a flipped view.
                 CGContext::translate_ctm(c, 0.0, layer.bounds().size.height);
                 CGContext::scale_ctm(c, 1.0, -1.0);
+                base.d = -1.0;
             }
             crate::text::draw(cx, &state);
             // What Core Animation redraws (all of it, or a canvas's part
             // that animated values changed), top down.
             let dirty = CGContext::clip_bounding_box(c);
-            crate::canvas::draw(cx, &state, dirty);
+            let (size, scale) = (layer.bounds().size, layer.contentsScale());
+            let asynchronous = layer.drawsAsynchronously();
+            if crate::fps::measuring() && state.canvas.is_some() {
+                let start = std::time::Instant::now();
+                crate::canvas::draw(cx, &state, dirty, size, scale, asynchronous, base);
+                crate::fps::drew_canvas(start.elapsed());
+            } else {
+                crate::canvas::draw(cx, &state, dirty, size, scale, asynchronous, base);
+            }
             CGContext::restore_g_state(c);
+            // Where the next paint happens (`canvas.rs`): Core Animation's
+            // threads for a canvas painting often, at once for the rest.
+            if let Some(canvas) = &state.canvas
+                && canvas.draws_asynchronously() != asynchronous
+            {
+                layer.setDrawsAsynchronously(!asynchronous);
+            }
         }
 
         // Nothing nsh changes animates implicitly.
@@ -518,7 +539,7 @@ define_class!(
             // A click outside a field that edits leaves the focus in it, as
             // desktop apps do (`blur()` and Escape still hand it over).
             let view = NshView(self.retain());
-            (view.id() == ROOT_ID || crate::input::is_key_control(&view))
+            (view.id() == ROOT_ID || crate::input::is_key_stop(&view))
                 && self.keyboard_surface().is_some_and(|s| {
                     !(crate::text_input::editing(&s) && clicking(self.mtm()))
                 })
@@ -529,7 +550,12 @@ define_class!(
             // SAFETY: NSView's standard responder transition.
             let accepted: bool = unsafe { msg_send![super(self), becomeFirstResponder] };
             if accepted && let Some(surface) = self.keyboard_surface() {
-                crate::input::set_state(&surface, &NshView(self.retain()), nsh_core::tailwind::state::FOCUSED, true);
+                let view = NshView(self.retain());
+                crate::input::set_state(&surface, &view, nsh_core::tailwind::state::FOCUSED, true);
+                // The stops Tab reaches report it, as inputs do.
+                if view.id() != ROOT_ID {
+                    surface.event(view.id(), nsh_core::EventKind::Focus, nsh_core::EventPayload::None);
+                }
             }
             accepted
         }
@@ -539,7 +565,12 @@ define_class!(
             // SAFETY: NSView's standard responder transition.
             let accepted: bool = unsafe { msg_send![super(self), resignFirstResponder] };
             if accepted && let Some(surface) = self.keyboard_surface() {
-                crate::input::set_state(&surface, &NshView(self.retain()), nsh_core::tailwind::state::FOCUSED, false);
+                let view = NshView(self.retain());
+                crate::input::set_state(&surface, &view, nsh_core::tailwind::state::FOCUSED, false);
+                // The stops Tab reaches report it, as inputs do.
+                if view.id() != ROOT_ID {
+                    surface.event(view.id(), nsh_core::EventKind::Blur, nsh_core::EventPayload::None);
+                }
             }
             accepted
         }
@@ -646,7 +677,7 @@ define_class!(
         }
 
         /// The Edit menu's Select All (Cmd+A): a selectable text's or a
-        /// selection area's.
+        /// selectable view's.
         #[unsafe(method(selectAll:))]
         fn select_all(&self, _sender: Option<&AnyObject>) {
             if let Some(surface) = self.surface() {
@@ -670,6 +701,29 @@ define_class!(
             }
         }
 
+        // `AXPress`: what accessibility clients press a button with.
+        #[unsafe(method(accessibilityPerformPress))]
+        fn accessibility_perform_press(&self) -> bool {
+            self.keyboard_surface().is_some_and(|surface| {
+                crate::input::accessibility_press(&surface, &NshView(self.retain()))
+            })
+        }
+
+        // AppKit offers `AXPress` on every view that implements it: only
+        // on the views it presses.
+        #[unsafe(method(isAccessibilitySelectorAllowed:))]
+        fn is_accessibility_selector_allowed(&self, selector: Sel) -> bool {
+            if selector == sel!(accessibilityPerformPress) {
+                self.ivars().state.try_borrow().is_ok()
+                    && self.keyboard_surface().is_some_and(|surface| {
+                        crate::input::takes_accessibility_press(&surface, &NshView(self.retain()))
+                    })
+            } else {
+                // SAFETY: NSView's own answer.
+                unsafe { msg_send![super(self), isAccessibilitySelectorAllowed: selector] }
+            }
+        }
+
         #[unsafe(method(keyUp:))]
         fn key_up(&self, event: &NSEvent) {
             let handled = self
@@ -685,13 +739,34 @@ define_class!(
         fn set_frame_size(&self, size: CGSize) {
             // SAFETY: NSView's own resize.
             unsafe { msg_send![super(self), setFrameSize: size] }
+            // The root resized by its window or host (the rest also moves
+            // in [`NshView::place`]).
+            crate::sight::moved();
             if let Some(surface) = self.surface() {
                 surface.resized(size.width as f32, size.height as f32);
             }
         }
 
+        // None while VoiceOver must not reach the children
+        // ([`crate::access::hides_children`]), else AppKit's.
+        #[unsafe(method_id(accessibilityChildren))]
+        fn accessibility_children(&self) -> Option<Retained<NSArray>> {
+            let hides = self
+                .ivars()
+                .state
+                .try_borrow()
+                .is_ok_and(|s| crate::access::hides_children(&s));
+            if hides {
+                Some(NSArray::new())
+            } else {
+                // SAFETY: NSView's own children.
+                unsafe { msg_send![super(self), accessibilityChildren] }
+            }
+        }
+
         #[unsafe(method(viewDidMoveToSuperview))]
         fn view_did_move_to_superview(&self) {
+            crate::sight::moved();
             // AppKit resets the layer's geometry when it attaches the
             // view: views placed before they were inserted lose their
             // transforms.
@@ -700,12 +775,29 @@ define_class!(
 
         #[unsafe(method(viewDidMoveToWindow))]
         fn view_did_move_to_window(&self) {
+            crate::sight::moved();
             NshView(self.retain()).set_layer_geometry();
             NshView(self.retain()).rescale();
             if let Some(surface) = self.surface() {
                 self.install_tracking();
                 crate::system::window_changed(&surface);
             }
+        }
+
+        // Hidden or shown, itself or with an ancestor (AppKit tells every
+        // view under it): what was out of sight under it may show.
+        #[unsafe(method(viewDidHide))]
+        fn view_did_hide(&self) {
+            crate::sight::moved();
+            // SAFETY: NSView's own handling.
+            unsafe { msg_send![super(self), viewDidHide] }
+        }
+
+        #[unsafe(method(viewDidUnhide))]
+        fn view_did_unhide(&self) {
+            crate::sight::moved();
+            // SAFETY: NSView's own handling.
+            unsafe { msg_send![super(self), viewDidUnhide] }
         }
 
         #[unsafe(method(viewDidChangeEffectiveAppearance))]
@@ -726,7 +818,7 @@ define_class!(
 );
 
 impl ViewObj {
-    // Only the root stores a surface. A focused pressable child uses its
+    // Only the root stores a surface. A focused child (a Tab stop) uses its
     // ancestors for keyboard handling; drawing and pointer hooks stay root-only.
     fn keyboard_surface(&self) -> Option<std::rc::Rc<Surface>> {
         if let Some(surface) = self.surface() {
@@ -1006,6 +1098,11 @@ impl NshView {
         self.ivars().state.borrow_mut()
     }
 
+    /// Its state, to change, unless it is borrowed.
+    pub(crate) fn try_state_mut(&self) -> Option<RefMut<'_, ViewState>> {
+        self.ivars().state.try_borrow_mut().ok()
+    }
+
     /// Node id.
     pub(crate) fn id(&self) -> NodeId {
         self.state().id
@@ -1120,6 +1217,7 @@ impl NshView {
     pub(crate) fn changed(&self) {
         self.restyle();
         self.redraw();
+        crate::shader::ui_changed(self);
     }
 
     /// Its style changed: the decoration is applied again (the content is
@@ -1136,6 +1234,12 @@ impl NshView {
     /// changed the mark.
     pub(crate) fn set_stale(&self, stale: bool) -> bool {
         self.ivars().stale.replace(stale) != stale
+    }
+
+    /// Whether its content changed out of sight and waits to show
+    /// ([`crate::mount::Mounter::draw_when_shown`]).
+    pub(crate) fn is_stale(&self) -> bool {
+        self.ivars().stale.get()
     }
 
     /// Draws its content (text, canvas) again, if it draws any.
@@ -1165,11 +1269,12 @@ impl NshView {
         layer.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*drawer)));
         layer.setAnchorPoint(CGPoint::new(0.0, 0.0));
         layer.setNeedsDisplayOnBoundsChange(true);
-        // Canvases are drawn on Core Animation's threads (paths and
-        // gradients are costly; measured on the Stocks demo, main-thread
-        // time per frame went from 3.5 to 1.8 ms); text is cheap to draw
-        // and drawn at once, which was faster.
-        layer.setDrawsAsynchronously(self.state().canvas.is_some());
+        // Drawn at once: text is cheap to draw, which measured faster than
+        // asynchronously, and a canvas moves to Core Animation's threads
+        // once it paints often (`canvas.rs`; paths and gradients are
+        // costly: on the Stocks demo main-thread time per frame went from
+        // 3.5 to 1.8 ms).
+        layer.setDrawsAsynchronously(false);
         layer.setContentsScale(self.backing_scale());
         // Above the decoration behind it (fills, gradients, inset
         // shadows), below the children and the borders in front.
@@ -1201,6 +1306,7 @@ impl NshView {
     /// Part of what it draws changed (`rect`, in its own coordinates, y
     /// down): only that is drawn again (a canvas's animated values).
     pub(crate) fn redraw_rect(&self, rect: nsh_core::Bounds<nsh_core::Points>) {
+        crate::shader::ui_changed(self);
         let Some(layer) = self.content_layer() else {
             return;
         };
@@ -1218,31 +1324,33 @@ impl NshView {
     }
 
     /// Whether any of it can be seen: in a window, not hidden, and not
-    /// entirely outside what its ancestors show (a list row out of sight).
+    /// entirely clipped away by its ancestors (a list row out of sight).
+    /// Only ancestors that clip their children (`overflow: hidden`, scroll
+    /// views, stacks, ...) and the root (the window shows only it) cut it
+    /// off: what overflows any other ancestor shows, as in CSS (a label
+    /// centered on a zero-width anchor).
     pub(crate) fn shown(&self) -> bool {
-        let ns = self.ns();
-        if ns.window().is_none() || ns.isHiddenOrHasHiddenAncestor() {
-            return false;
+        thread_local! {
+            /// Kept for its allocations: animated canvases in sight ask on
+            /// every frame.
+            static SIGHTS: RefCell<crate::sight::Sights<NshView>> = RefCell::default();
         }
-        // `visibleRect` follows the bounds as AppKit has them committed;
-        // while a scroll offset shows as a layer transform the truth is
-        // the scroll state, so the clip is each ancestor's effective
-        // viewport — the same walk, scroll-state origins instead
-        // ([`crate::scroll::bounds_origin`]; a plain view's is (0, 0)).
-        // Ancestor transforms are not applied: nearly all are identity,
-        // and a transformed clip at most defers or draws early.
-        // Placed frames (`ns().frame()`: a sticky shift and mirroring
-        // applied), not the logical ones, for the view and its ancestors
-        // alike: the clip spaces are the ancestors' containers'.
-        let ancestors = std::iter::successors(self.parent_view(), NshView::parent_view)
-            .map(|p| (placed(p.ns().frame()), crate::scroll::bounds_origin(&p)));
-        clip_shows(placed(ns.frame()), ancestors)
+        SIGHTS.with(|sights| match sights.try_borrow_mut() {
+            Ok(mut sights) => {
+                sights.clear();
+                let shown = sights.shows(&Views, self);
+                sights.clear();
+                shown
+            }
+            Err(_) => crate::sight::Sights::default().shows(&Views, self),
+        })
     }
 
     /// Its frame, transform or shift changed: places it again.
     pub(crate) fn moved(&self) {
         self.place();
         crate::decor::apply(self);
+        crate::shader::ui_changed(self);
     }
 
     /// Places the view at its frame (with its parent's mirroring and its
@@ -1270,6 +1378,9 @@ impl NshView {
         };
         if !root && self.ns().frame() != rect {
             self.ns().setFrame(rect);
+            // A transform or opacity alone (an endless animation) does
+            // not count: views out of sight stay so ([`crate::sight`]).
+            crate::sight::moved();
             self.size_container();
             crate::native::resized(self);
             self.place_natives();
@@ -1421,75 +1532,58 @@ impl NshView {
     }
 }
 
-/// A rectangle as `(x0, y0, x1, y1)`.
-type Span = (f32, f32, f32, f32);
+/// The views as [`crate::sight`] reads them ([`NshView::shown`],
+/// [`crate::mount::Mounter::revisit`]).
+///
+/// `visibleRect` follows the bounds as AppKit has them committed; while a
+/// scroll offset shows as a layer transform the truth is the scroll state,
+/// so each ancestor's content shows from its scroll-state origin
+/// ([`crate::scroll::bounds_origin`]; a plain view's is (0, 0)). Ancestor
+/// transforms are not applied: nearly all are identity, and a transformed
+/// clip at most defers or draws early. Frames are the placed ones
+/// (`ns().frame()`: a sticky shift and mirroring applied), not the logical
+/// ones, for the view and its ancestors alike: the clip spaces are the
+/// ancestors' containers'. Hidden views are AppKit's (a screen under the
+/// top one), looked at once per view a pass resolves; the containers
+/// between a view and its parent are never hidden.
+pub(crate) struct Views;
 
-fn placed(f: NSRect) -> Span {
-    let (x, y) = (f.origin.x as f32, f.origin.y as f32);
-    (x, y, x + f.size.width as f32, y + f.size.height as f32)
-}
+impl crate::sight::Tree for Views {
+    type Node = NshView;
 
-/// Whether `rect` (in its parent's content space) is not clipped away by
-/// `ancestors`, innermost first: each one's placed frame (in its own
-/// parent's content space) and the origin its content shows from (a
-/// scroll view's offset, (0, 0) otherwise).
-fn clip_shows(rect: Span, ancestors: impl IntoIterator<Item = (Span, (f32, f32))>) -> bool {
-    let (mut x0, mut y0, mut x1, mut y1) = rect;
-    for (frame, (ox, oy)) in ancestors {
-        let (w, h) = (frame.2 - frame.0, frame.3 - frame.1);
-        x0 = x0.max(ox);
-        y0 = y0.max(oy);
-        x1 = x1.min(ox + w);
-        y1 = y1.min(oy + h);
-        if x1 <= x0 || y1 <= y0 {
-            return false;
-        }
-        // Into the grandparent's content space: the offset origin shows
-        // at the frame's origin.
-        x0 += frame.0 - ox;
-        x1 += frame.0 - ox;
-        y0 += frame.1 - oy;
-        y1 += frame.1 - oy;
+    fn key(&self, node: &NshView) -> usize {
+        Retained::as_ptr(&node.0) as usize
     }
-    true
+
+    fn parent(&self, node: &NshView) -> Option<NshView> {
+        node.parent_view()
+    }
+
+    fn hidden(&self, node: &NshView) -> bool {
+        node.ns().isHidden()
+    }
+
+    fn top_shown(&self, node: &NshView) -> bool {
+        let ns = node.ns();
+        ns.window().is_some() && !ns.isHiddenOrHasHiddenAncestor()
+    }
+
+    fn frame(&self, node: &NshView) -> crate::sight::Span {
+        crate::sight::placed(node.ns().frame())
+    }
+
+    fn content(&self, node: &NshView) -> ((f32, f32), bool) {
+        let clips = {
+            let s = node.state();
+            s.clips() || s.id == ROOT_ID
+        };
+        (crate::scroll::bounds_origin(node), clips)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_row_shows_through_the_scroll_offset() {
-        let screen = ((0.0, 0.0, 400.0, 800.0), (0.0, 0.0));
-        let row = (0.0, 0.0, 400.0, 40.0);
-        let list = |y| ((0.0, 0.0, 400.0, 600.0), (0.0, y));
-        assert!(clip_shows(row, [list(0.0), screen]));
-        assert!(!clip_shows(row, [list(1000.0), screen]));
-    }
-
-    #[test]
-    fn a_text_in_a_pinned_sticky_header_shows() {
-        // The header's logical frame is at the top of the content; scrolled
-        // 1000 points, it is placed (shifted) at 1000, where the list shows.
-        let text = (8.0, 8.0, 200.0, 32.0);
-        let header = ((0.0, 1000.0, 400.0, 1040.0), (0.0, 0.0));
-        let list = ((0.0, 0.0, 400.0, 600.0), (0.0, 1000.0));
-        assert!(clip_shows(text, [header, list]));
-        let logical = ((0.0, 0.0, 400.0, 40.0), (0.0, 0.0));
-        assert!(!clip_shows(text, [logical, list]));
-    }
-
-    #[test]
-    fn a_text_in_a_mirrored_cell_shows() {
-        // A 400-point mirrored list scrolled 500 points: its bounds origin is
-        // -500, and the cell at logical x 600 is placed at 400 - 600 - 90.
-        let text = (10.0, 10.0, 80.0, 70.0);
-        let list = ((0.0, 0.0, 400.0, 80.0), (-500.0, 0.0));
-        let cell = ((-290.0, 0.0, -200.0, 80.0), (0.0, 0.0));
-        assert!(clip_shows(text, [cell, list]));
-        let logical = ((600.0, 0.0, 690.0, 80.0), (0.0, 0.0));
-        assert!(!clip_shows(text, [logical, list]));
-    }
 
     #[test]
     fn scripted_wheels_are_the_event_handled() {

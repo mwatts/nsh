@@ -87,6 +87,20 @@ pub trait NativeComponent {
     fn command(&mut self, name: &str, args: &JsonValue) {
         let _ = (name, args);
     }
+
+    /// Prop `name`, bound to an animated value, moved to `value` (on the
+    /// frames it changes, without JS). By default, [`Self::set_prop`] with
+    /// a JSON number.
+    fn set_animated_number(&mut self, name: &str, value: f64) {
+        let json = serde_json::Number::from_f64(value).map_or(JsonValue::Null, JsonValue::Number);
+        self.set_prop(name, Some(&json));
+    }
+
+    /// Prop `name`, bound to an animated color, moved to `argb`
+    /// (`0xAARRGGBB`). By default, [`Self::set_prop`] with a JSON number.
+    fn set_animated_color(&mut self, name: &str, argb: u32) {
+        self.set_prop(name, Some(&JsonValue::from(argb)));
+    }
 }
 
 /// What a component can tell its app. Cheap to clone; usable from any
@@ -153,8 +167,14 @@ impl std::fmt::Debug for Components {
 }
 
 impl Components {
-    /// Registers `factory` under `name` (replacing an earlier one).
+    /// Registers `factory` under `name` (replacing an earlier one). Names
+    /// under `nsh/` are NSH's own: registering one logs a warning and
+    /// changes nothing.
     pub fn register(&self, name: &str, factory: ComponentFactory) {
+        if nsh_core::platform::is_reserved_component(name) {
+            log::warn!("native component `{name}` is not registered: names under `nsh/` are NSH's");
+            return;
+        }
         self.factories.borrow_mut().insert(name.into(), factory);
         self.missing.borrow_mut().remove(name);
     }
@@ -418,6 +438,36 @@ pub(crate) fn page_of(_widget: &gtk::Widget) -> Option<gtk::Widget> {
 /// it (`crate::input`).
 pub(crate) const UNSCROLLABLE: &str = "nsh-unscrollable";
 
+/// Whether view `id` holds a made component (its animated props wait until
+/// it does).
+pub(crate) fn has_component(surface: &Surface, id: NodeId) -> bool {
+    matches!(
+        surface.native.hosts.borrow().get(&id),
+        Some(Host::Component(Some(_)))
+    )
+}
+
+/// Bound props that moved (`Animator::write_components`): handed to their
+/// components.
+pub(crate) fn component_animated(
+    surface: &Surface,
+    moved: Vec<(NodeId, Arc<str>, nsh_core::animation::AnimatedPropValue)>,
+) {
+    use nsh_core::animation::AnimatedPropValue;
+    for (id, name, value) in moved {
+        // Taken out while the app's code runs, so it may reach the surface.
+        let Some(mut component) = take_component(surface, id) else {
+            continue;
+        };
+        match value {
+            AnimatedPropValue::Number(n) => component.set_animated_number(&name, n),
+            AnimatedPropValue::Color(argb) => component.set_animated_color(&name, argb),
+            _ => {}
+        }
+        put_component(surface, id, component);
+    }
+}
+
 fn take_component(surface: &Surface, id: NodeId) -> Option<Box<dyn NativeComponent>> {
     match surface.native.hosts.borrow_mut().get_mut(&id) {
         Some(Host::Component(component)) => component.take(),
@@ -501,7 +551,9 @@ fn locate(source: &str, base: Option<&AssetBase>) -> Option<Location> {
     if let Some(path) = source.strip_prefix("asset:/") {
         let path = path.trim_start_matches('/');
         return match base {
-            Some(AssetBase::Directory(dir)) => Some(Location::Path(dir.join(path))),
+            Some(dirs @ (AssetBase::Directory(_) | AssetBase::Directories(_))) => {
+                dirs.file(path).map(Location::Path)
+            }
             Some(AssetBase::Http(url)) => Some(Location::Uri(format!(
                 "{}/{path}",
                 url.trim_end_matches('/')
@@ -572,6 +624,26 @@ struct VideoHost {
     props: Option<VideoProps>,
     /// Reports `onProgress`.
     progress: Option<glib::SourceId>,
+    /// The stream's signal handlers, disconnected when it closes.
+    handlers: Vec<glib::SignalHandlerId>,
+}
+
+/// Whether freeing a stream that has made its video sink would end GTK's own
+/// EGL display, after which the window never draws again: on Wayland, the sink
+/// of GTK before 4.24.2 leaves the display GStreamer wraps marked as
+/// GStreamer's, so GStreamer terminates it with the sink (GTK issue 8456).
+fn closing_ends_gtk_egl() -> bool {
+    !gtk_marks_egl_foreign((
+        gtk::major_version(),
+        gtk::minor_version(),
+        gtk::micro_version(),
+    )) && gtk::gdk::Display::default()
+        .is_some_and(|display| display.type_().name() == "GdkWaylandDisplay")
+}
+
+/// Whether this GTK's video sink leaves GTK's EGL display alone when it goes.
+fn gtk_marks_egl_foreign(version: (u32, u32, u32)) -> bool {
+    version >= (4, 24, 2)
 }
 
 impl VideoHost {
@@ -587,6 +659,7 @@ impl VideoHost {
             status: Rc::default(),
             props: None,
             progress: None,
+            handlers: Vec::new(),
         }
     }
 
@@ -655,42 +728,56 @@ impl VideoHost {
         self.emitter
             .emit(EventKind::LoadStart, || EventPayload::None);
         let (emitter, status) = (self.emitter.clone(), self.status.clone());
-        stream.connect_prepared_notify(move |stream| loaded(stream, &emitter, &status));
+        self.handlers
+            .push(stream.connect_prepared_notify(move |stream| loaded(stream, &emitter, &status)));
         // The picture's size is known with the first frame, which may come
         // after `prepared`.
         let (emitter, status) = (self.emitter.clone(), self.status.clone());
-        stream.connect_invalidate_size(move |stream| {
-            if let Some(stream) = stream.downcast_ref::<gtk::MediaFile>() {
-                loaded(stream, &emitter, &status);
-            }
-        });
+        self.handlers
+            .push(stream.connect_invalidate_size(move |stream| {
+                if let Some(stream) = stream.downcast_ref::<gtk::MediaFile>() {
+                    loaded(stream, &emitter, &status);
+                }
+            }));
         let emitter = self.emitter.clone();
-        stream.connect_ended_notify(move |stream| {
-            if stream.is_ended() {
-                emitter.emit(EventKind::End, || EventPayload::None);
-            }
-        });
+        self.handlers
+            .push(stream.connect_ended_notify(move |stream| {
+                if stream.is_ended() {
+                    emitter.emit(EventKind::End, || EventPayload::None);
+                }
+            }));
         let (emitter, status) = (self.emitter.clone(), self.status.clone());
         let name = source.to_owned();
-        stream.connect_error_notify(move |stream| {
-            let Some(err) = stream.error() else { return };
-            if status.failed.replace(true) {
-                return;
-            }
-            // Nothing plays: no progress, and the app hears it stopped.
-            stream.set_playing(false);
-            let message = media_error(err.message());
-            log::warn!(target: "js", "video {name}: {message}");
-            status.set_buffering(&emitter, false);
-            emitter.emit(EventKind::Error, || error(message));
-        });
+        self.handlers
+            .push(stream.connect_error_notify(move |stream| {
+                let Some(err) = stream.error() else { return };
+                if status.failed.replace(true) {
+                    return;
+                }
+                // Nothing plays: no progress, and the app hears it stopped.
+                stream.set_playing(false);
+                let message = media_error(err.message());
+                log::warn!(target: "js", "video {name}: {message}");
+                status.set_buffering(&emitter, false);
+                emitter.emit(EventKind::Error, || error(message));
+            }));
         self.stream = Some(stream);
     }
 
-    /// Stops and drops the stream.
+    /// Stops and drops the stream, or keeps it paused where dropping it would
+    /// stop the window drawing.
     fn close(&mut self) {
-        if let Some(stream) = self.stream.take() {
-            stream.set_playing(false);
+        let handlers = std::mem::take(&mut self.handlers);
+        let Some(stream) = self.stream.take() else {
+            return;
+        };
+        stream.set_playing(false);
+        for handler in handlers {
+            stream.disconnect(handler);
+        }
+        if closing_ends_gtk_egl() {
+            std::mem::forget(stream);
+        } else {
             stream.clear();
         }
     }
@@ -831,6 +918,15 @@ fn error(message: String) -> EventPayload {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gtk_marks_its_egl_display_foreign_from_4_24_2() {
+        assert!(!gtk_marks_egl_foreign((4, 14, 5)));
+        assert!(!gtk_marks_egl_foreign((4, 24, 1)));
+        assert!(gtk_marks_egl_foreign((4, 24, 2)));
+        assert!(gtk_marks_egl_foreign((4, 25, 0)));
+        assert!(gtk_marks_egl_foreign((5, 0, 0)));
+    }
 
     #[test]
     fn locates_sources() {

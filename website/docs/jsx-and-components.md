@@ -27,7 +27,7 @@ The **host elements** are each backed by a native view. Rust makes them with the
 | `when(..)`, `each(..)` | `<If>`, `<Each>` | Control flow, no view of its own | [Control flow](../elements/control-flow.md) |
 
 ```rust tabs
-use nsh_core::ui::prelude::*;   // view, text, image, scroll, input, virtual_list, ..., when, each
+use nsh_core::prelude::*;   // view, text, image, scroll, input, virtual_list, ..., when, each
 ```
 
 ```tsx tabs
@@ -36,7 +36,7 @@ import { Image, mount, Text, View } from "nsh";
 
 In Rust, styles are typed methods named as Tailwind's utilities are (`.px_4()`, `.rounded_lg()`, `.bg(..)`), and
 listeners are methods too (`.on_press(..)`); platform-only settings have methods of their own. In TSX, props keep
-their camelCase names (`onPress`, `numberOfLines`, `backgroundColor`); every element accepts `style`, `class` /
+their camelCase names (`onPress`, `allowFontScaling`, `backgroundColor`); every element accepts `style`, `class` /
 `classList` ([Tailwind](./tailwind.md)), `ref`, touch handlers, accessibility props and `testID`, and platform-only
 props go in `ios={{…}}` and `android={{…}}`, where only the current platform's object is sent:
 
@@ -319,7 +319,7 @@ For long or infinite lists, use [`List`](./lists.md) (`virtual_list` in Rust): i
 
 ## Refs
 
-A ref names a host element for imperative calls: `focus()`, `blur()`, `scroll_to()` / `scrollTo()`, `scroll_to_index()` / `scrollToIndex()`, `measure()` ([where a view is](./touch-and-gestures.md#where-a-view-is-measure)), ... In Rust, `element_ref()` makes one and `.element_ref(&handle)` puts it on an element; in TSX, `ref` gives you the element's native node, a `YNode`:
+A ref names a host element for imperative calls: `focus()`, `blur()`, `scroll_to()` / `scrollTo()`, `scroll_to_index()` / `scrollToIndex()`, `measure()` ([where a view is](./touch-and-gestures.md#where-a-view-is-measure)), ... In Rust, `element_ref()` makes one and `.element_ref(&handle)` puts it on an element; in TSX, `ref` gives you the element's ref, whose type is the element's own (`InputRef` here, `ViewRef` for a `View`; see [ref methods](../elements/index.md#ref-methods)):
 
 ```rust tabs
 fn search() -> impl IntoElement {
@@ -331,11 +331,12 @@ fn search() -> impl IntoElement {
 ```
 
 ```tsx tabs
-import type { YNode } from "nsh";
-import { Input, Text, View } from "nsh";
+import type { InputRef } from "nsh";
+import { Text, View } from "nsh";
+import { Input } from "nsh/base";
 
 function Search() {
-  let input: YNode | undefined;
+  let input: InputRef | undefined;
   return (
     <View>
       <Input ref={input} placeholder="Search" />
@@ -354,9 +355,9 @@ A Rust ref is a `Copy` handle; its calls go to the element that carries it, and 
 - a [signal](./reactivity.md) is set to it, so what reads the signal follows it;
 - a function is called with it (`<Scroll ref={(node) => (scroller = node)} />`).
 
-A `const` or an import holds a signal or a function, as in `const input = signal<YNode>()` with `<Input ref={input} />` and `input()?.focus()`; one holding anything else is reported when the element is made, with what to write.
+A `const` or an import holds a signal or a function, as in `const input = signal<InputRef>()` with `<Input ref={input} />` and `input()?.focus()`; one holding anything else is reported when the element is made, with what to write.
 
-The ref is set when the element is created, before the component returns, so it is available in [effects](./reactivity.md#effect) and event handlers. Calls are sent to the view in order with the changes made before them. `SafeAreaView`, `KeyboardAvoidingView` and the Rust components of your own crate accept `ref` too (in Rust `component_ref()`, put on the element with `.component_ref(&r)`: `safe_area_view().component_ref(&r)`).
+The ref is set when the element is created, before the component returns, so it is available in [effects](./reactivity.md#effect) and event handlers. Calls are sent to the view in order with the changes made before them. The base components and the Rust components of your own crate accept `ref` too (in Rust `component_ref()`, put on the element with `.component_ref(&r)`: `dialog().component_ref(&r)`).
 
 ## Spreading props
 
@@ -365,7 +366,8 @@ In Rust, a parent calls the setters of the props it needs and the rest keep thei
 In TSX, spread an object of props onto an element or a component with `{...props}`. Getters stay getters, so spread props keep following what they read. To take some props for yourself and pass the rest on, use `split`:
 
 ```tsx
-import { Input, type InputProps, split, Text, View } from "nsh";
+import { split, Text, View } from "nsh";
+import { Input, type InputProps } from "nsh/base";
 
 function Field(props: InputProps & { label: string }) {
   const [own, rest] = split(props, ["label"]);
@@ -377,7 +379,7 @@ function Field(props: InputProps & { label: string }) {
   );
 }
 
-<Field label="Email" value={email()} onChange={(t) => email.set(t)} keyboardType="email-address" />
+<Field label="Email" value={email()} onChange={({ value }) => email.set(value)} keyboardType="email-address" />
 ```
 
 `split(props, keys)` returns `[picked, rest]`, both still reading through to the original props (destructuring `{ label, ...rest } = props` would read every prop once). Element props that come later in the JSX win over earlier ones.

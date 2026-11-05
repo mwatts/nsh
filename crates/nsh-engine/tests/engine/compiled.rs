@@ -65,6 +65,7 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Default::default(),
@@ -81,6 +82,7 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -154,7 +156,8 @@ fn a_single_file_app_on_the_native_modules() {
 }
 
 const NAVIGATION: &str = r#"import { mount, signal, Text, View } from "nsh";
-import { Dialog, NavPage, NavStack, createNavStack, safeAreaInsets } from "nsh/base";
+import { Dialog, NavPage, NavStack, createNavStack } from "nsh/base";
+import { safeAreaInsets } from "nsh";
 
 type Route = { name: string };
 const nav = createNavStack<Route>([{ name: "home" }]);
@@ -177,7 +180,7 @@ mount(() => (
         </NavPage>
       )}
     </NavStack>
-    <Dialog open={open()} onOpenChange={(o) => open.set(o)}>
+    <Dialog open={open()} onOpenChange={({ open: o }) => open.set(o)}>
       <Text>in modal</Text>
     </Dialog>
   </View>
@@ -227,6 +230,7 @@ fn start_app_with(app: &str, header_heights: (Points, Points)) -> (Engine, Recei
         trace: false,
         network: None,
         websocket: None,
+        refuse_connections: None,
         filesystem: None,
         assets: None,
         environment: Default::default(),
@@ -243,6 +247,7 @@ fn start_app_with(app: &str, header_heights: (Points, Points)) -> (Engine, Recei
         clipboard: None,
         host: Default::default(),
         picker: None,
+        speech: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -432,8 +437,8 @@ fn screens_and_modals_build_their_content_once() {
 }
 
 const CHILDREN_SIBLINGS: &str = r#"
-import { Input, mount, signal, Text, View } from "nsh";
-import { KeyboardAvoidingView } from "nsh/base";
+import { mount, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
 
 function Wrap(props: { children?: any }) {
   return <View>{props.children}</View>;
@@ -442,10 +447,10 @@ function Wrap(props: { children?: any }) {
 const saved = signal(false);
 mount(() => (
   <View>
-    <KeyboardAvoidingView>
+    <View class="pb-[env(keyboard-inset-height)]">
       <Input testID="a" />
       <If when={saved()}><Text>saved a</Text></If>
-    </KeyboardAvoidingView>
+    </View>
     <Wrap>
       <Input testID="b" />
       {saved() ? <Text>saved b</Text> : null}
@@ -495,7 +500,8 @@ fn a_changing_child_leaves_its_siblings() {
 }
 
 const BRANCH_EXPRESSION: &str = r#"
-import { Input, mount, signal, Text, View } from "nsh";
+import { mount, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
 
 const wide = signal(true);
 const saved = signal(false);
@@ -656,19 +662,20 @@ fn an_if_hands_its_function_child_the_value() {
 }
 
 const REFS: &str = r#"
-import { Input, mount, signal, Text, View, type YNode } from "nsh";
+import { mount, signal, Text, View, type InputRef, type ViewRef } from "nsh";
+import { Input } from "nsh/base";
 import { Stepper, type StepperRef } from "test/ui";
 
-function Field(props: { ref?: (node: YNode) => void }) {
+function Field(props: { ref?: (node: InputRef) => void }) {
   return <Input ref={props.ref} />;
 }
 
-let assigned: YNode | undefined;
-const held = signal<YNode | undefined>(undefined);
-const fields: { input?: YNode; [key: string]: YNode | undefined } = {};
+let assigned: ViewRef | undefined;
+const held = signal<InputRef | undefined>(undefined);
+const fields: { input?: InputRef; [key: string]: InputRef | undefined } = {};
 const key = () => "computed";
-let called: YNode | undefined;
-let forwarded: YNode | undefined;
+let called: ViewRef | undefined;
+let forwarded: InputRef | undefined;
 const stepper = signal<StepperRef | undefined>(undefined);
 const report = signal("");
 
@@ -710,7 +717,8 @@ fn refs_reach_variables_signals_fields_and_functions() {
 }
 
 const CONTENT_SIZE: &str = r#"
-import { Input, mount, signal, Text, View } from "nsh";
+import { mount, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
 
 const size = signal("none");
 mount(() => (
@@ -718,7 +726,7 @@ mount(() => (
     <Input
       placeholder="A much longer placeholder"
       style={{ width: 300, height: 40 }}
-      onContentSizeChange={(e) => size.set(`${e.width}x${e.height}`)}
+      onContentSizeChange={({ size: e }) => size.set(`${e.width}x${e.height}`)}
     />
     <Text>{`size ${size()}`}</Text>
   </View>
@@ -857,7 +865,7 @@ mount(() => (
       backdropClass="bg-black/50"
       onOpen={() => add("open")}
       onCancel={() => add("cancel")}
-      onOpenChange={(o, reason) => { add(`change ${o} ${reason}`); open.set(o); }}
+      onOpenChange={({ open: o, reason }) => { add(`change ${o} ${reason}`); open.set(o); }}
     >
       <Text>in dialog</Text>
     </Dialog>
@@ -975,7 +983,7 @@ mount(() => (
       class="bg-white p-4"
       backdropStyle={backdrop() ? { backgroundColor: "#00000080" } : undefined}
       onCancel={() => add("cancel")}
-      onOpenChange={(o, reason) => add(`change ${o} ${reason}`)}
+      onOpenChange={({ open: o, reason }) => add(`change ${o} ${reason}`)}
       onClose={() => add("close")}
     >
       <Text>in dialog</Text>
@@ -1208,7 +1216,8 @@ fn pages_place_their_header_without_a_native_one() {
     assert_eq!(config.header_height, px(44.0));
 }
 
-const INPUT_AND_LIST: &str = r#"import { mount, signal, Input, Text, View } from "nsh";
+const INPUT_AND_LIST: &str = r#"import { mount, signal, Text, View } from "nsh";
+import { Input } from "nsh/base";
 import { List } from "nsh";
 
 const items = signal<number[]>([]);
@@ -1219,7 +1228,7 @@ mount(() => (
     <Text>{log()}</Text>
     <Input
       testID="field"
-      onChange={(text) => log.set(`change ${text}`)}
+      onChange={({ value: text }) => log.set(`change ${text}`)}
       onSubmit={(e) => log.set(`submit ${e.text}`)}
     />
     <Text onPress={() => items.set([1, 2])}>fill</Text>
@@ -1317,7 +1326,7 @@ mount(() => (
 "#;
 
 /// `setRoutes` keeps the page of a route that stays; pages, stacks,
-/// dialogs and their backdrops take test ids.
+/// dialogs and their backdrops take test ids; a backdrop is no Tab stop.
 #[test]
 fn set_routes_keeps_pages_that_stay_and_parts_take_test_ids() {
     let (_engine, rx) = start_app(SET_ROUTES);
@@ -1349,4 +1358,16 @@ fn set_routes_keeps_pages_that_stay_and_parts_take_test_ids() {
     ] {
         assert!(ids.iter().any(|i| i == wanted), "{wanted} in {ids:?}");
     }
+    // The backdrop's presses are the pointer's: it is no stop of Tab,
+    // which would hold the dialog's focus where Return closes it.
+    let backdrop = batches
+        .iter()
+        .flat_map(|b| b.items.iter())
+        .find_map(|i| match i {
+            MountItem::ViewProps { props, .. } if props.test_id.as_deref() == Some("backdrop") => {
+                Some(props.focusable)
+            }
+            _ => None,
+        });
+    assert_eq!(backdrop, Some(Some(false)), "the backdrop is no Tab stop");
 }

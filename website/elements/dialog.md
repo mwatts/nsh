@@ -1,7 +1,6 @@
 ---
 title: Dialog
 description: "The Dialog component: a modal surface over everything else, for full-screen flows, sheets and dialogs the app styles."
-order: 21
 group: base
 demo: el-dialog
 ---
@@ -17,8 +16,8 @@ The dialog owns its behavior and leaves its look to the app: its styles style th
 children), and in TSX `backdropClass` / `backdropStyle` add a backdrop behind it.
 
 ```rust tabs
-use nsh_base::{button, dialog, safe_area_view};
-use nsh_core::ui::prelude::*;
+use nsh_base::{button, dialog};
+use nsh_core::prelude::*;
 
 /// A blue button with a white label.
 fn primary(label: &'static str, on_press: impl Fn() + 'static) -> impl IntoElement {
@@ -47,9 +46,11 @@ fn example() -> impl IntoElement {
                 .flex_1()
                 .bg(white())
                 .child(
-                    safe_area_view()
+                    view()
                         .flex_1()
-                        .p_5()
+                        .px_5()
+                        .pt_safe_area_plus(px(20.0))
+                        .pb_safe_area_plus(px(20.0))
                         .gap_3()
                         .child(text("A sheet").text_2xl().font_weight(FontWeight::BOLD))
                         .child(primary("Close", move || open.set(false))),
@@ -60,7 +61,7 @@ fn example() -> impl IntoElement {
 
 ```tsx tabs
 import { signal, Text, View } from "nsh";
-import { Button, Dialog, SafeAreaView } from "nsh/base";
+import { Button, Dialog } from "nsh/base";
 
 function Example() {
   const open = signal(false);
@@ -69,13 +70,21 @@ function Example() {
       <Button onPress={() => open.set(true)} class="items-center rounded-lg bg-blue-600 px-4 py-3 active:opacity-70">
         <Text class="font-semibold text-white">Open</Text>
       </Button>
-      <Dialog open={open()} presentation="pageSheet" onOpenChange={(next) => open.set(next)} class="flex-1 bg-white">
-        <SafeAreaView style={{ flex: 1, padding: 20, gap: 12 }}>
+      <Dialog open={open()} presentation="pageSheet" onOpenChange={(e) => open.set(e.open)} class="flex-1 bg-white">
+        <View
+          style={{
+            flex: 1,
+            gap: 12,
+            paddingHorizontal: 20,
+            paddingTop: "calc(env(safe-area-inset-top) + 20px)",
+            paddingBottom: "calc(env(safe-area-inset-bottom) + 20px)",
+          }}
+        >
           <Text style={{ fontSize: 24, fontWeight: "700" }}>A sheet</Text>
           <Button onPress={() => open.set(false)} class="items-center rounded-lg bg-blue-600 px-4 py-3 active:opacity-70">
             <Text class="font-semibold text-white">Close</Text>
           </Button>
-        </SafeAreaView>
+        </View>
       </Dialog>
     </View>
   );
@@ -84,10 +93,10 @@ function Example() {
 
 In TSX, the dialog is shown while `open` is not `false` and closed when it becomes `false`. In Rust, it is presented
 while it is in the view and dismissed when it leaves it, so `when` holds it. Either way it gives its content the dialog's
-safe-area insets, which [`SafeAreaView`](./safe-area-view.md) and `safeAreaInsets()` (`cx.insets()` in a Rust
+safe-area insets, which the [`env(safe-area-inset-*)`](./safe-area.md) variables and `safeAreaInsets()` (`cx.insets()` in a Rust
 component) inside it read. [`Button`](./button.md), also from `nsh/base`, is a press target styled by the app.
 
-`nsh_core::ui::prelude` also has an older, deprecated `dialog` function: import `nsh_base::dialog` by name, as above,
+`nsh_core::prelude` also has an older, deprecated `dialog` function: import `nsh_base::dialog` by name, as above,
 and the explicit import takes its place. For the system's alert or action sheet, use
 [`AlertDialog`](./alert-dialog.md).
 
@@ -97,6 +106,7 @@ and the explicit import takes its place. For the system's alert or action sheet,
 |---|---|---|---|---|
 | `open` | in the view while open (`when(open, ..)`) | `boolean` | `true` | Shown while true. |
 | `animation` | `.animation(ModalAnimation::Fade)` | `"slide" \| "fade" \| "none"` | `"slide"` | How it comes in and goes. |
+| `transitionShader` | `.transition_shader(TransitionShader::new(program))` | `{ source: string; uniforms?: Record<string, ShaderUniform>; duration?: number }` | none | It comes in and goes through a WGSL shader in place of its `animation`: `shade(uv)` reads what is behind as `sample_from` and the dialog as `sample_to` while `nsh.progress` runs from 0 to 1 over `duration` milliseconds (350 by default), and from 1 back to 0 as it closes. When the system asks for less motion, it takes its own `animation`. See [Shader](./shader.md). |
 | `presentation` | `.presentation(ModalPresentation::PageSheet)` | `"fullScreen" \| "pageSheet" \| "formSheet"` | `"fullScreen"` | Its form on iOS: `fullScreen` covers the screen with a clear background; `pageSheet` and `formSheet` are system sheets that keep what is behind visible (`formSheet` is a smaller centered sheet on large screens). |
 | `closeOnEscape` | `.close_on_escape(..)` | `boolean` | `true` | Escape and the Android back button close it natively. |
 | `closeOnBackdropPress` | `.close_on_backdrop_press(..)` | `boolean` | `true` | A press on the backdrop closes it. |
@@ -105,7 +115,7 @@ and the explicit import takes its place. For the system's alert or action sheet,
 | `onOpen` | `.on_open(..)` | `() => void` | | It finished appearing. |
 | `onClose` | `.on_close(..)` | `() => void` | | It went away: the user closed it, or the app removed it. |
 | `onCancel` | `.on_cancel(..)` | `() => void` | | The user tried to close it (Escape, back, a backdrop press, a swipe down), whether or not a `closeOn*` flag let it close. |
-| `onOpenChange` | `.on_cancel(..)` | `(open: boolean, reason: "cancel" \| "backdropPress" \| "swipe") => void` | | The user closed it: keep `open` in sync here. In Rust, `on_cancel` removes the dialog from the view. |
+| `onOpenChange` | `.on_cancel(..)` | `(e: { open: boolean; reason: "cancel" \| "backdropPress" \| "swipe" }) => void` | | The user closed it: keep `open` in sync here. In Rust, `on_cancel` removes the dialog from the view. |
 | `class`, `style` | `Styled` methods | `string`, `StyleProp<ViewStyle>` | | The popup: the view holding the children. |
 | `backdropClass`, `backdropStyle` | a child view filling the dialog | `string`, `StyleProp<ViewStyle>` | | A backdrop filling the dialog behind the popup, present when either is set. |
 | `children` | `.child(..)` | `JSX.Element` | | The content. |
@@ -122,7 +132,7 @@ and the explicit import takes its place. For the system's alert or action sheet,
 
 The dialog's state is the app's. When the user closes the dialog (Escape, the Android back button, a press on the
 backdrop, a sheet swiped down), it closes natively and tells the app, which sets its state to match: TSX's
-`onOpenChange(false, reason)`, Rust's `on_cancel`. In TSX, while `open` stays `true` the dialog stays closed, and it
+`onOpenChange({ open: false, reason })`, Rust's `on_cancel`. In TSX, while `open` stays `true` the dialog stays closed, and it
 opens again when `open` goes from `false` to `true`.
 
 Each `closeOn*` flag is read natively when the user acts, since the main thread never waits for the app's code. To
@@ -204,7 +214,7 @@ when(confirm, move || {
 <Dialog
   open={confirm()}
   animation="fade"
-  onOpenChange={(next) => confirm.set(next)}
+  onOpenChange={({ open }) => confirm.set(open)}
   backdropClass="bg-black/40"
   class="m-auto w-80 gap-3 rounded-2xl bg-white p-5"
 >

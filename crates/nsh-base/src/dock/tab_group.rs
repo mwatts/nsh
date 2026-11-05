@@ -35,8 +35,9 @@ use std::{
 
 use nsh_core::{
     AccessibilityState,
+    element::{LayoutAnimation, LayoutCurve, LayoutTransition},
     geometry::{Bounds, Point, Points},
-    ui::{LayoutAnimation, LayoutCurve, LayoutTransition, prelude::*},
+    prelude::*,
 };
 
 use super::{
@@ -191,14 +192,26 @@ fn animate_indicator(fade: bool) {
     });
 }
 
+/// The alpha of the accent band under a terminal's drop indicator: as
+/// faint as the terminal's bands go.
+const DROP_WASH: f32 = 0.12;
+
 /// The drop indicator: while a drag would land on a group, over the part
 /// of its content frame the panel would take (all of it to merge, a half
-/// to split). It is an overlay in the root view, placed with the frame
-/// the drag measured, so it is drawn above everything in the area: the
-/// handles' lines, which lie over the edges of the groups beside them,
-/// never cover its edges, and no frame clips it. It moves from place to
+/// to split). It is an overlay in the root view, under the drag preview
+/// (mounted again after it, `dock_area.rs` `drag_preview`), placed with
+/// the frame the drag measured, so it is drawn above everything in the
+/// area: the handles' lines, which lie over the edges of the groups beside
+/// them, never cover its edges, and no frame clips it. It moves from place to
 /// place, across groups too. The compact presentation has none.
+///
+/// In a terminal it is the region's outline, one Cell in the accent (the
+/// hue of the focus ring) around it, over a faint band of the accent: a
+/// mark laid over what the region shows, whose text stays readable under
+/// it, not a surface. None of the app's parts are drawn, and it jumps from
+/// Cell to Cell.
 pub(crate) fn drop_indicator(a: AreaCx) -> AnyElement {
+    let terminal = crate::terminal::is_terminal();
     let target = computed(move || {
         if a.compact.get() {
             return None;
@@ -223,11 +236,20 @@ pub(crate) fn drop_indicator(a: AreaCx) -> AnyElement {
             effect(move || {
                 let now = place();
                 let before = shown.replace(now);
-                if before != now {
+                if before != now && !terminal {
                     animate_indicator(before.is_none());
                 }
             });
+            // Once its overlay is shown (laid out, so opened in a commit
+            // before): the drag preview is mounted again, in a later commit,
+            // above it.
+            let opened = Cell::new(false);
             overlay()
+                .on_layout(move |_: &Bounds<Points>| {
+                    if !opened.replace(true) {
+                        a.indicator_shown.update(|n| *n = n.wrapping_add(1));
+                    }
+                })
                 .pointer_events(PointerEvents::None)
                 .focusable(false)
                 .style_with(move |s| match place() {
@@ -238,9 +260,20 @@ pub(crate) fn drop_indicator(a: AreaCx) -> AnyElement {
                         .h(p.size.height),
                     None => s,
                 })
-                .app_class(a.props.drop_indicator_class)
-                .inline_style(a.props.drop_indicator_style)
+                .map(|v| match terminal {
+                    true => v
+                        .border(px(1.0))
+                        .border_color(crate::terminal::ACCENT)
+                        .bg(crate::terminal::ACCENT.alpha(DROP_WASH))
+                        .rounded(px(4.0)),
+                    false => v
+                        .app_class(a.props.drop_indicator_class)
+                        .inline_style(a.props.drop_indicator_style),
+                })
                 .child(dynamic(move || {
+                    if terminal {
+                        return None;
+                    }
                     let target = target.get()?;
                     let value = DockDropIndicator {
                         group: target.group.as_u64(),
@@ -277,7 +310,8 @@ pub(crate) fn tab(
                 .retain(|(p, r)| !(*p == panel && *r == me));
         });
     }
-    let desktop = is_desktop();
+    // A terminal's pointer is a mouse: it has no fingers.
+    let desktop = is_desktop() || crate::terminal::is_terminal();
     // A pointer (a mouse, a trackpad, a pen over the screen) hovers the
     // tab before it presses it, and a finger never does: a press of a
     // hovering pointer, or any press on the desktops, arms the drag at
@@ -303,10 +337,10 @@ pub(crate) fn tab(
         .inline_style(a.props.tab_style)
         .element_ref(&me)
         .on_press(move || a.select(&pressed))
-        .on_hover_in(move || {
+        .on_mouse_enter(move |_: &MouseEvent| {
             hovered.replace(true);
         })
-        .on_hover_out(move || {
+        .on_mouse_leave(move |_: &MouseEvent| {
             hovered.replace(false);
         })
         .on_press_down(move || {
@@ -361,7 +395,7 @@ fn slot_at(
     let mut others: Vec<&(PanelId, Bounds<Points>)> =
         tabs.iter().filter(|(p, _)| p != panel).collect();
     let key = |b: &Bounds<Points>| if across { b.center().y } else { b.center().x };
-    others.sort_by(|x, y| key(&x.1).0.total_cmp(&key(&y.1).0));
+    crate::sort::sort_by(&mut others, |x, y| key(&x.1).0.total_cmp(&key(&y.1).0));
     let pointer = if across { at.y } else { at.x };
     let index = others.iter().filter(|(_, b)| key(b) < pointer).count();
     (index, others.into_iter().map(|(p, _)| p.clone()).collect())

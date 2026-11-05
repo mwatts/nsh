@@ -138,6 +138,58 @@ pub trait NativeComponent {
     fn command(&mut self, name: &str, args: &JsonValue) {
         let _ = (name, args);
     }
+
+    /// Prop `name`, bound to an animated value, moved to `value` (on the
+    /// frames it changes, without JS). By default, [`Self::set_prop`] with
+    /// a JSON number.
+    fn set_animated_number(&mut self, name: &str, value: f64) {
+        let json = serde_json::Number::from_f64(value).map_or(JsonValue::Null, JsonValue::Number);
+        self.set_prop(name, Some(&json));
+    }
+
+    /// Prop `name`, bound to an animated color, moved to `argb`
+    /// (`0xAARRGGBB`). By default, [`Self::set_prop`] with a JSON number.
+    fn set_animated_color(&mut self, name: &str, argb: u32) {
+        self.set_prop(name, Some(&JsonValue::from(argb)));
+    }
+
+    /// A wheel or touchpad scroll over the component (an image viewer
+    /// zooms with it). True when it took it; otherwise the scroll views
+    /// around it scroll, as they do by default. Presses, moves and
+    /// releases go to its view's handlers (`onPress`, `onMouseMove`).
+    fn wheel(&mut self, event: &Wheel) -> bool {
+        let _ = event;
+        false
+    }
+}
+
+/// A wheel or touchpad scroll over a component ([`NativeComponent::wheel`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
+pub struct Wheel {
+    /// Where the pointer is (points, the component's coordinates).
+    pub x: f32,
+    /// Where, vertically.
+    pub y: f32,
+    /// How far to scroll the content (points; positive toward the end:
+    /// right, down), as scroll views do.
+    pub dx: f32,
+    /// How far, vertically.
+    pub dy: f32,
+    /// The same in wheel notches (a mouse wheel's clicks): fractions from
+    /// precision touchpads and high-resolution wheels.
+    pub notches_x: f32,
+    /// In notches, vertically.
+    pub notches_y: f32,
+    /// From a precision touchpad or a high-resolution wheel (not whole
+    /// notches).
+    pub precise: bool,
+    /// Shift held.
+    pub shift: bool,
+    /// Ctrl held.
+    pub ctrl: bool,
+    /// Alt held.
+    pub alt: bool,
 }
 
 /// What a component can tell its app. Cheap to clone; usable from any
@@ -217,8 +269,14 @@ impl std::fmt::Debug for Components {
 }
 
 impl Components {
-    /// Registers `factory` under `name` (replacing an earlier one).
+    /// Registers `factory` under `name` (replacing an earlier one). Names
+    /// under `nsh/` are NSH's own: registering one logs a warning and
+    /// changes nothing.
     pub fn register(&self, name: &str, factory: ComponentFactory) {
+        if nsh_core::platform::is_reserved_component(name) {
+            log::warn!("native component `{name}` is not registered: names under `nsh/` are NSH's");
+            return;
+        }
         self.factories.borrow_mut().insert(name.into(), factory);
         self.missing.borrow_mut().remove(name);
     }
@@ -490,6 +548,36 @@ fn web_item(surface: &Surface, id: NodeId) -> Option<Rc<web::WebItem>> {
     }
 }
 
+/// Whether view `id` holds a made component (its animated props wait until
+/// it does).
+pub(crate) fn has_component(surface: &Surface, id: NodeId) -> bool {
+    component_item(surface, id).is_some_and(|item| item.component.borrow().is_some())
+}
+
+/// Bound props that moved (`Animator::write_components`): handed to their
+/// components.
+pub(crate) fn component_animated(
+    surface: &Surface,
+    moved: Vec<(NodeId, Arc<str>, nsh_core::animation::AnimatedPropValue)>,
+) {
+    use nsh_core::animation::AnimatedPropValue;
+    for (id, name, value) in moved {
+        let Some(item) = component_item(surface, id) else {
+            continue;
+        };
+        // Taken out while the app's code runs, so it may reach the surface.
+        let Some(mut component) = item.component.borrow_mut().take() else {
+            continue;
+        };
+        match value {
+            AnimatedPropValue::Number(n) => component.set_animated_number(&name, n),
+            AnimatedPropValue::Color(argb) => component.set_animated_color(&name, argb),
+            _ => {}
+        }
+        item.put(component);
+    }
+}
+
 fn component_item(surface: &Surface, id: NodeId) -> Option<Rc<ComponentItem>> {
     match surface.native.hosts.borrow().get(&id) {
         Some(Host::Component(item)) => Some(item.clone()),
@@ -584,6 +672,37 @@ impl Hosted for ComponentItem {
             return;
         };
         self.placement.apply(&surface, self.id, hwnd, rect);
+    }
+
+    fn wheel(&self, x: f32, y: f32, event: &crate::input::WheelEvent) -> bool {
+        // Not while its own code runs (it asked for something that scrolls).
+        let Ok(mut component) = self.component.try_borrow_mut() else {
+            return false;
+        };
+        let Some(component) = component.as_mut() else {
+            return false;
+        };
+        let notch = crate::window::lines_per_notch() * 16.0;
+        component.wheel(&Wheel::new(x, y, event, notch))
+    }
+}
+
+impl Wheel {
+    /// `event` at `(x, y)` (component coordinates), `notch` points to a
+    /// notch.
+    fn new(x: f32, y: f32, event: &crate::input::WheelEvent, notch: f32) -> Self {
+        Wheel {
+            x,
+            y,
+            dx: event.dx,
+            dy: event.dy,
+            notches_x: event.dx / notch,
+            notches_y: event.dy / notch,
+            precise: event.precise,
+            shift: event.modifiers.shift,
+            ctrl: event.modifiers.ctrl,
+            alt: event.modifiers.alt,
+        }
     }
 }
 
@@ -757,7 +876,9 @@ fn locate(source: &str, base: Option<&AssetBase>) -> Option<Location> {
     if let Some(path) = source.strip_prefix("asset:/") {
         let path = path.trim_start_matches('/');
         return match base {
-            Some(AssetBase::Directory(dir)) => Some(Location::Path(dir.join(path))),
+            Some(dirs @ (AssetBase::Directory(_) | AssetBase::Directories(_))) => {
+                dirs.file(path).map(Location::Path)
+            }
             Some(AssetBase::Http(url)) => Some(Location::Url(format!(
                 "{}/{path}",
                 url.trim_end_matches('/')
@@ -895,5 +1016,39 @@ mod tests {
         assert!(components.factory(&"com.example.map".into()).is_some());
         assert!(components.factory(&"com.example.none".into()).is_none());
         assert_eq!(format!("{components:?}"), r#"{"com.example.map"}"#);
+    }
+
+    #[test]
+    fn wheel_counts_notches() {
+        use crate::input::{Modifiers, WheelEvent};
+        // A notch up with three lines of 16 points to a notch, Ctrl held.
+        let event = WheelEvent {
+            x: 300.0,
+            y: 200.0,
+            dx: 0.0,
+            dy: -48.0,
+            precise: false,
+            modifiers: Modifiers {
+                ctrl: true,
+                ..Modifiers::default()
+            },
+            time: 0.0,
+        };
+        let wheel = Wheel::new(12.0, 34.0, &event, 48.0);
+        assert_eq!((wheel.x, wheel.y), (12.0, 34.0));
+        assert_eq!((wheel.dx, wheel.dy), (0.0, -48.0));
+        assert_eq!((wheel.notches_x, wheel.notches_y), (0.0, -1.0));
+        assert!(wheel.ctrl && !wheel.shift && !wheel.alt && !wheel.precise);
+        // A touchpad's fraction of a notch, sideways.
+        let event = WheelEvent {
+            dx: 12.0,
+            dy: 0.0,
+            precise: true,
+            modifiers: Modifiers::default(),
+            ..event
+        };
+        let wheel = Wheel::new(0.0, 0.0, &event, 48.0);
+        assert_eq!((wheel.notches_x, wheel.notches_y), (0.25, 0.0));
+        assert!(wheel.precise && !wheel.ctrl);
     }
 }

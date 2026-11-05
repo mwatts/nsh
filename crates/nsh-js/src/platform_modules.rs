@@ -1,8 +1,9 @@
 //! The small runtime modules: `nsh/android`
-//! (`isAvailable`, `BackHandler.onBackPress` over the registry's module),
-//! `nsh/ios` (`isAvailable`, `InputAccessoryView`), `nsh/webview` and
-//! `nsh/video` (their host elements as components, which the compiler
-//! makes in place for their tags), `nsh/native` (`nativeComponent`: the
+//! (`isAvailable`, `BackHandler.on("press", …)` over the registry's module),
+//! `nsh/ios` (`isAvailable`, `InputAccessoryView`), `nsh/mobile`
+//! (`isAvailable`, with the registry's `TabBar`), `nsh`'s `WebView` and
+//! `Video` (their host elements as components, which the compiler makes
+//! in place for their tags), `nsh/native` (`nativeComponent`: the
 //! JS face of components the embedding app registers natively;
 //! `nativeModule`: the exports of a UI set it registers, reached by name at
 //! run time) and `nsh/host` (`available()` and the host's events over the
@@ -31,7 +32,7 @@ const UNDEFINED: JsValue = qjs::JS_UNDEFINED;
 /// The modules' part of a context's state.
 #[derive(Default)]
 pub(crate) struct PlatformModules {
-    /// `BackHandler.onBackPress` listeners, in order (id, owned
+    /// `BackHandler.on("press", …)` listeners, in order (id, owned
     /// function).
     back: RefCell<Vec<(u32, JsValue)>>,
     /// `host.on` listeners, in order (id, event, owned function).
@@ -111,16 +112,16 @@ unsafe extern "C" fn nothing(
 /// `BackHandler`: the registry's module (`exitApp`) with listeners of the
 /// hardware back button.
 fn back_handler(cx: *mut JsContext) -> JsValue {
-    let handler = crate::components::runtime_module(cx, "nsh/android", "BackHandler")
+    let handler = crate::components::runtime_module(cx, "nsh/mobile", "BackHandler")
         // SAFETY: a new object when the runtime has none.
         .unwrap_or_else(|| unsafe { qjs::JS_NewObject(cx) });
-    let add = reactive::new_function(cx, c"onBackPress", add_back_listener, 1);
+    let add = reactive::new_function(cx, c"on", add_back_listener, 2);
     // SAFETY: the object takes the function.
-    unsafe { qjs::JS_SetPropertyStr(cx, handler, c"onBackPress".as_ptr(), add) };
+    unsafe { qjs::JS_SetPropertyStr(cx, handler, c"on".as_ptr(), add) };
     handler
 }
 
-/// `BackHandler.onBackPress(f)`: a function that removes the listener,
+/// `BackHandler.on("press", f)`: a function that removes the listener,
 /// which goes by itself with the owner it was added under (the component
 /// rendering), or when hot module replacement runs the module that added
 /// it again.
@@ -130,10 +131,16 @@ unsafe extern "C" fn add_back_listener(
     argc: c_int,
     argv: *mut JsValue,
 ) -> JsValue {
-    let f = arg(argc, argv, 0);
+    if dom::string_arg(cx, arg(argc, argv, 0)).as_deref() != Some("press") {
+        // SAFETY: throws on a live context.
+        return unsafe {
+            qjs::JS_ThrowTypeError(cx, c"BackHandler.on: the event is \"press\"".as_ptr())
+        };
+    }
+    let f = arg(argc, argv, 1);
     // SAFETY: an inline check.
     if !unsafe { qjs::JS_IsFunction(cx, f) } {
-        return unsafe { qjs::JS_ThrowTypeError(cx, c"onBackPress: a function".as_ptr()) };
+        return unsafe { qjs::JS_ThrowTypeError(cx, c"BackHandler.on: a function".as_ptr()) };
     }
     let m = modules(cx);
     let id = m.next.get() + 1;
@@ -244,31 +251,24 @@ unsafe extern "C" fn on_back_press(
 }
 
 /// The hand-written exports of `nsh/android` (with the registry's).
-pub(crate) const ANDROID_EXPORTS: &[Item] = &[
-    (
-        "isAvailable",
-        Export::Value(|cx| boolean(os(cx) == Os::Android)),
-        Ts::value("True on Android.", "boolean"),
+pub(crate) const ANDROID_EXPORTS: &[Item] = &[(
+    "BackHandler",
+    Export::Value(back_handler),
+    Ts::value(
+        "The Android back button: its listeners run after modals and before\nstacks.",
+        "BackHandlerModule & BackListeners",
     ),
-    (
-        "BackHandler",
-        Export::Value(back_handler),
-        Ts::value(
-            "The Android back button: its listeners run after modals and before\nstacks.",
-            "BackHandlerModule & BackListeners",
-        ),
-    ),
-];
+)];
 
 /// `nsh/android`'s types (with the runtime registry's modules).
 pub(crate) const ANDROID_TYPES: &str = r#"/** The back button's listeners. */
 export interface BackListeners {
-  /** Listens to the back button: `listener` returns true when it handled
-   * the press; the most recently added listener runs first, after modals
-   * and before stacks. Without a listener that handles it, the top stack
-   * pops, else the app exits. The returned function stops listening; a
-   * listener added while a component renders stops with the component. */
-  onBackPress(listener: () => boolean | void): () => void;
+  /** Listens to the back button's `press`: `listener` returns true when it
+   * handled the press; the most recently added listener runs first, after
+   * modals and before stacks. Without a listener that handles it, the top
+   * stack pops, else the app exits. The returned function stops listening;
+   * a listener added while a component renders stops with the component. */
+  on(event: "press", listener: () => boolean | void): () => void;
 }
 "#;
 
@@ -277,7 +277,7 @@ export interface BackListeners {
 /// `host`: the registry's module (`call`) with `available()` and the
 /// listeners of the host's events.
 fn host_module(ctx: *mut JsContext) -> JsValue {
-    let host = crate::components::runtime_module(ctx, "nsh/host", "host")
+    let host = crate::components::runtime_module(ctx, "nsh", "host")
         // SAFETY: a new object when the runtime has none.
         .unwrap_or_else(|| unsafe { qjs::JS_NewObject(ctx) });
     let natives: [(&CStr, reactive::Native, c_int); 2] = [
@@ -303,7 +303,8 @@ unsafe extern "C" fn host_available(
     boolean(crate::env::current(ctx).host || crate::host_channel::available(ctx))
 }
 
-/// `host.on(event, listener)`: `{ remove() }`.
+/// `host.on(event, listener)`: a function that stops listening (the
+/// SDK's `on` over it ties both to the owner, `host_channel::extend`).
 unsafe extern "C" fn add_host_listener(
     ctx: *mut JsContext,
     _this: JsValue,
@@ -337,18 +338,12 @@ unsafe extern "C" fn add_host_listener(
             return e;
         }
     }
-    let remove = native(
+    native(
         ctx,
         remove_host_listener,
         0,
         &mut [qjs::JS_NewFloat64(id as f64)],
-    );
-    // SAFETY: a new object taking the function.
-    unsafe {
-        let o = qjs::JS_NewObject(ctx);
-        qjs::JS_SetPropertyStr(ctx, o, c"remove".as_ptr(), remove);
-        o
-    }
+    )
 }
 
 unsafe extern "C" fn remove_host_listener(
@@ -463,28 +458,29 @@ pub(crate) const HOST_EXPORTS: &[Item] = &[(
     ),
 )];
 
+/// The hand-written exports of `nsh/mobile` (with the registry's
+/// `TabBar`).
+pub(crate) const MOBILE_EXPORTS: &[Item] = &[(
+    "isAvailable",
+    Export::Value(|cx| boolean(matches!(os(cx), Os::Ios | Os::Android))),
+    Ts::value("True on iOS (and Mac Catalyst) and Android.", "boolean"),
+)];
+
 /// `nsh/ios`.
-pub(crate) const IOS_EXPORTS: &[Item] = &[
-    (
-        "isAvailable",
-        Export::Value(|cx| boolean(os(cx) == Os::Ios)),
-        Ts::value("True on iOS (and Mac Catalyst).", "boolean"),
+pub(crate) const IOS_EXPORTS: &[Item] = &[(
+    "InputAccessoryView",
+    Export::Value(|cx| {
+        if os(cx) == Os::Ios {
+            dom::host_component(cx, "inputaccessory", true)
+        } else {
+            reactive::new_function(cx, c"InputAccessoryView", nothing, 1)
+        }
+    }),
+    Ts::function(
+        "A bar over the keyboard of the inputs whose `inputAccessoryViewID` is its\n`nativeID` (iOS's `inputAccessoryView`): as wide as the window and as tall\nas its content, moving with the keyboard natively. It renders nothing where\nit is placed in the tree, and nothing at all on Android.",
+        &["(props: InputAccessoryViewProps): JSX.Element"],
     ),
-    (
-        "InputAccessoryView",
-        Export::Value(|cx| {
-            if os(cx) == Os::Ios {
-                dom::host_component(cx, "inputaccessory", true)
-            } else {
-                reactive::new_function(cx, c"InputAccessoryView", nothing, 1)
-            }
-        }),
-        Ts::function(
-            "A bar over the keyboard of the inputs whose `inputAccessoryViewID` is its\n`nativeID` (iOS's `inputAccessoryView`): as wide as the window and as tall\nas its content, moving with the keyboard natively. It renders nothing where\nit is placed in the tree, and nothing at all on Android.",
-            &["(props: InputAccessoryViewProps): YNode | null"],
-        ),
-    ),
-];
+)];
 
 /// `nsh/ios`'s types.
 pub(crate) const IOS_TYPES: &str = r#"export interface InputAccessoryViewProps {
@@ -496,37 +492,50 @@ pub(crate) const IOS_TYPES: &str = r#"export interface InputAccessoryViewProps {
 }
 "#;
 
-/// `nsh/webview`.
+/// `nsh`'s `WebView`: the web view element as a component carrying the
+/// functions of the runtime's module (`inputAvailable`).
 pub(crate) const WEBVIEW_EXPORTS: &[Item] = &[(
     "WebView",
-    Export::Value(|cx| dom::host_component(cx, "webview", false)),
+    Export::Value(|cx| {
+        let webview = dom::host_component(cx, "webview", false);
+        crate::components::add_runtime_functions(cx, webview, "nsh", "WebView");
+        webview
+    }),
     Ts::value(
-        "A web page (WKWebView / android.webkit.WebView); its `ref` has\n`reload()`, `goBack()`, `goForward()`, `stopLoading()`,\n`injectJavaScript(script)` and `postMessage(data)`.",
-        "(props: WebViewProps) => YNode",
+        "A web page (WKWebView / android.webkit.WebView); its `ref` has\n`reload()`, `goBack()`, `goForward()`, `stopLoading()`,\n`injectJavaScript(script)`, `postMessage(data)` and `sendInput(input)`;\n`WebView.inputAvailable()` says whether `sendInput` works here.",
+        "((props: WebViewProps) => JSX.Element) & WebViewModule",
     ),
 )];
 
-/// `nsh/webview`'s types.
+/// `WebView`'s types.
 pub(crate) const WEBVIEW_TYPES: &str = r#"export type { WebViewNavigation };
 
-export interface WebViewProps extends Omit<ViewProps, "children" | "ios" | "desktop">, WebViewHostProps {
-  ios?: IOSWebViewHostProps;
-  desktop?: DesktopWebViewHostProps;
+export interface WebViewProps extends Omit<ViewProps, "children" | "ios" | "desktop" | "ref">, WebViewHostProps {
+  ref?: WebViewRef | ((node: WebViewRef) => void);
+  ios?: IOSWebViewProps;
+  desktop?: DesktopWebViewProps;
 }
+
+/** A web view's iOS-only props: every element's and its own. */
+export interface IOSWebViewProps extends IOSProps, IOSWebViewHostProps {}
+
+/** A web view's desktop-only props: every element's and its own. */
+export interface DesktopWebViewProps extends DesktopProps, DesktopWebViewHostProps {}
 "#;
 
-/// `nsh/video`.
+/// `nsh`'s `Video`.
 pub(crate) const VIDEO_EXPORTS: &[Item] = &[(
     "Video",
     Export::Value(|cx| dom::host_component(cx, "video", false)),
     Ts::value(
         "A video player (AVPlayer / MediaPlayer); its `ref` has `seek(seconds)`.",
-        "(props: VideoProps) => YNode",
+        "(props: VideoProps) => JSX.Element",
     ),
 )];
 
-/// `nsh/video`'s types.
-pub(crate) const VIDEO_TYPES: &str = r#"export interface VideoProps extends Omit<ViewProps, "children">, VideoHostProps {
+/// `Video`'s types.
+pub(crate) const VIDEO_TYPES: &str = r#"export interface VideoProps extends Omit<ViewProps, "children" | "ref">, VideoHostProps {
+  ref?: VideoRef | ((node: VideoRef) => void);
   src: string;
 }
 "#;
@@ -722,7 +731,7 @@ pub(crate) const NATIVE_EXPORTS: &[Item] = &[
         Ts::function(
             "A component for the native component the embedding app registered as\n`name` (Swift `NshAppView.register(component:)`, Java\n`NshView.registerComponent`). It is laid out like a view, at the size its\nstyle gives it, else at the size the component reports. Its `ref` calls\ncommands: `ref.command(\"zoomTo\", { level: 3 })`. Where nothing is\nregistered under `name`, it renders an empty view.",
             &[
-                "<P extends object = {}, E extends object = {}>(name: string, spec: NativeComponentSpec<P, E>): (props: NativeComponentProps<P, E>) => YNode",
+                "<P extends object = {}, E extends object = {}>(name: string, spec: NativeComponentSpec<P, E>): (props: NativeComponentProps<P, E>) => JSX.Element",
             ],
         ),
     ),
@@ -741,13 +750,16 @@ pub(crate) const NATIVE_TYPES: &str = r#"/** Handlers of a native component's ev
 export type NativeEventHandlers<E> = { [K in keyof E & string as `on${Capitalize<K>}`]?: (data: E[K]) => void };
 
 /** The props of a native component: a view's (style, classes, layout,
- * accessibility, `ref`), its own `P` and handlers of its events `E`. */
-export type NativeComponentProps<P, E> = Omit<ViewProps, "children"> & P & NativeEventHandlers<E>;
+ * accessibility, `ref`), its own `P` and handlers of its events `E`. Each
+ * number or string (color) prop may also be an animated value: the
+ * platform then pushes its value (a number or a color) to the component
+ * on every frame it changes, without JS. */
+export type NativeComponentProps<P, E> = Omit<ViewProps, "children" | "ref"> & { ref?: NativeComponentRef | ((node: NativeComponentRef) => void) } & { [K in keyof P]: NonNullable<P[K]> extends number | string ? P[K] | AnimatedNode : P[K] } & NativeEventHandlers<E>;
 
 /** What a native component takes and emits. */
 export interface NativeComponentSpec<P, E> {
   /** Its own props: sent to the component (any JSON value), each when it
-   * changes. */
+   * changes; an animated value is pushed on every frame it changes. */
   props: readonly (keyof P & string)[];
   /** The events it emits. */
   events?: readonly (keyof E & string)[];
