@@ -231,6 +231,11 @@ enum Pumped {
 /// click: the platforms' default double-click time.
 const CLICK_INTERVAL: Duration = Duration::from_millis(500);
 
+/// How far a press may land from the last, along each axis, to count as
+/// its next click: GTK's default double-click distance, and the iOS
+/// backend's `CLICK_DISTANCE`.
+const CLICK_DISTANCE: f32 = 5.0;
+
 /// An app on a headless engine ([`start`]) and what it shows ([`Screen`]),
 /// driven by steps: press views, type into inputs, scroll, go back, wait
 /// for what it shows.
@@ -309,9 +314,10 @@ pub struct Headless {
     /// The embedding app's channel with the app (`EngineConfig::host`),
     /// which the test plays.
     host: nsh_engine::HostChannel,
-    /// The last press: its view and when, for counting a double press as
-    /// the platforms do ([`CLICK_INTERVAL`]).
-    last_press: Option<(NodeId, nsh_core::time::Instant, u32)>,
+    /// The last press: its view, when, where (in the root) and its click
+    /// count, for counting a double press as the platforms do
+    /// ([`CLICK_INTERVAL`], [`CLICK_DISTANCE`]).
+    last_press: Option<(NodeId, nsh_core::time::Instant, Point<Points>, u32)>,
     /// Where the app's `nsh/host` calls go (the web page's host).
     #[cfg(feature = "js")]
     host_calls: Option<HostCalls>,
@@ -1486,8 +1492,10 @@ impl Headless {
 
     /// A press at `page` (in the root) in `view`, else at the view's
     /// center, in that view and in the root, with `modifiers` held.
-    /// Presses on one view within [`CLICK_INTERVAL`] of each other count
-    /// up (`clicks` 2 is a double press), as the platforms count them.
+    /// Presses on one view within [`CLICK_INTERVAL`] and [`CLICK_DISTANCE`]
+    /// of each other count up (`clicks` 2 is a double press), as the
+    /// platforms count them: a press elsewhere on the same view (another
+    /// cell of a canvas) is a first click.
     /// In a terminal a press gives the stop it is on the focus. `None`
     /// when the view has no bounds.
     fn press_payload(
@@ -1508,14 +1516,19 @@ impl Headless {
             return EventPayload::None;
         };
         let now = self.clock.now();
+        let page = page.unwrap_or_else(|| bounds.center());
         let clicks = match self.last_press {
-            Some((last, at, clicks)) if last == view && now.duration_since(at) < CLICK_INTERVAL => {
+            Some((last, at, from, clicks))
+                if last == view
+                    && now.duration_since(at) < CLICK_INTERVAL
+                    && (page.x - from.x).abs().0 <= CLICK_DISTANCE
+                    && (page.y - from.y).abs().0 <= CLICK_DISTANCE =>
+            {
                 clicks + 1
             }
             _ => 1,
         };
-        self.last_press = Some((view, now, clicks));
-        let page = page.unwrap_or_else(|| bounds.center());
+        self.last_press = Some((view, now, page, clicks));
         EventPayload::Press(PressEvent {
             position: page - bounds.origin,
             page_position: page,
@@ -2187,6 +2200,40 @@ mod tests {
         app.wait_for("text:seen: at 10 12 in 10 22").unwrap();
         app.press("id:pad").unwrap();
         app.wait_for("text:seen: at 40 20 in 40 30").unwrap();
+    }
+
+    /// A pad that shows the click count of the last press on it.
+    #[component]
+    fn ClickCount() -> impl IntoElement {
+        let seen = signal(0_u32);
+        view()
+            .child(view().test_id("pad").w(px(200.0)).h(px(40.0)).on(
+                EventKind::Press,
+                move |p: &EventPayload| {
+                    if let EventPayload::Press(e) = p {
+                        seen.set(e.clicks);
+                    }
+                },
+            ))
+            .child(text(move || format!("clicks: {}", seen.get())))
+    }
+
+    /// Two quick presses on one view count as a double press only when the
+    /// second lands near the first, as the platforms count them (GTK's
+    /// double-click distance): a press on another part of the same view (a
+    /// canvas's other cell) is a first click.
+    #[test]
+    fn a_quick_press_far_from_the_last_is_a_first_click() {
+        let mut config = EngineConfig::new(Root::of::<ClickCount>());
+        config.clock = Clock::manual(std::time::SystemTime::UNIX_EPOCH);
+        let mut app = Headless::start(config).unwrap();
+        app.first_render().unwrap();
+        app.press_at("id:pad", point(px(10.0), px(10.0))).unwrap();
+        app.wait_for("text:clicks: 1").unwrap();
+        app.press_at("id:pad", point(px(150.0), px(10.0))).unwrap();
+        assert!(app.shows("clicks: 1"), "{:?}", app.screen().texts());
+        app.press_at("id:pad", point(px(152.0), px(13.0))).unwrap();
+        assert!(app.shows("clicks: 2"), "{:?}", app.screen().texts());
     }
 
     #[component]
