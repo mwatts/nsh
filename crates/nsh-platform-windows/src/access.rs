@@ -29,7 +29,9 @@
 //! `accessibilityRole`'s, `Text` for text views, `Button` for views with
 //! press handlers, `Image` for labelled images, `Group` for other labelled
 //! views), its `testID` as the automation id, its `accessibilityHint` as
-//! help text, and the patterns its role and state call for: Invoke
+//! help text, its `accessibilityDescription` as its full description
+//! (ARIA's `aria-description`, as browsers expose it), and the patterns
+//! its role and state call for: Invoke
 //! (presses; [`activate`] sends the press as a tap would, or the
 //! `activate` action), Toggle (`accessibilityState.checked`),
 //! ExpandCollapse (`expanded`), SelectionItem (tabs, radios, options,
@@ -154,6 +156,12 @@ pub(crate) enum Control {
     Tree,
     /// `UIA_TreeItemControlTypeId`.
     TreeItem,
+    /// A pane read as "dialog", with `UIA_IsDialogPropertyId` (ARIA's
+    /// `dialog`, as browsers map it).
+    Dialog,
+    /// A pane read as "alert dialog", with `UIA_IsDialogPropertyId`
+    /// (ARIA's `alertdialog`).
+    AlertDialog,
 }
 
 impl Control {
@@ -227,6 +235,8 @@ impl Control {
             Control::Switch => "toggle switch",
             Control::Timer => "timer",
             Control::Grid => "grid",
+            Control::Dialog => "dialog",
+            Control::AlertDialog => "alert dialog",
             _ => return None,
         })
     }
@@ -251,11 +261,14 @@ struct Spec {
     /// content is followed through its texts' changes).
     name: Option<Arc<str>>,
     help: Option<String>,
+    /// The full description (`accessibilityDescription`).
+    description: Option<Arc<str>>,
     disabled: bool,
     selected: bool,
     checked: Option<Checked>,
     expanded: Option<bool>,
     busy: bool,
+    invalid: bool,
     /// The current value of a range.
     now: Option<f32>,
     live: LiveRegion,
@@ -317,6 +330,8 @@ pub(crate) fn control_for(a: &Accessibility, kind: ViewKind, pressable: bool) ->
         Role::Navigation => Control::Navigation,
         Role::Tree => Control::Tree,
         Role::TreeItem => Control::TreeItem,
+        Role::Dialog => Control::Dialog,
+        Role::AlertDialog => Control::AlertDialog,
     })
 }
 
@@ -350,12 +365,13 @@ fn part_of(view: &NshView) -> Part {
     view.try_state().map_or(Part::Hidden, |s| part(&s))
 }
 
-/// The elements under `view` (it excluded), in reading order, as the
+/// The elements under `view` (it excluded), in reading order (a scroll
+/// view's content as it is on screen), as the
 /// children of the element `view` is (or the root): plain containers are
 /// looked through, hidden subtrees skipped, and inside a grouping element
 /// its content is folded into it.
 pub(crate) fn children(view: &NshView, grouping: bool, out: &mut Vec<NshView>) {
-    view.with_children(|kids| {
+    view.with_children_in_reading_order(|kids| {
         for child in kids {
             match part_of(child) {
                 Part::Hidden => {}
@@ -440,7 +456,8 @@ pub(crate) fn name_of(view: &NshView) -> Option<String> {
         return Some(label.to_string());
     }
     if let Some(t) = &s.text {
-        return Some(t.text.text.clone());
+        // Hidden runs are not read.
+        return Some(t.text.visible_text().into_owned());
     }
     let grouping = match part(&s) {
         Part::Element(c) => groups(&s, c),
@@ -475,7 +492,8 @@ fn content_name(view: &NshView, out: &mut String) {
                     .accessibility
                     .label
                     .as_deref()
-                    .or(s.text.as_ref().map(|t| t.text.text.as_str())),
+                    .map(std::borrow::Cow::Borrowed)
+                    .or_else(|| s.text.as_ref().map(|t| t.text.visible_text())),
             };
             match own {
                 Some(text) => {
@@ -536,13 +554,15 @@ fn spec_of(s: &ViewState) -> Spec {
         name: a
             .label
             .clone()
-            .or_else(|| s.text.as_ref().map(|t| Arc::from(t.text.text.as_str()))),
+            .or_else(|| s.text.as_ref().map(|t| Arc::from(&*t.text.visible_text()))),
         help: help_of(a, control),
+        description: a.description.clone(),
         disabled: a.state.disabled,
         selected: a.state.selected,
         checked: toggled(a),
         expanded: a.state.expanded,
         busy: a.state.busy,
+        invalid: a.state.invalid,
         now: a.value.as_ref().and_then(|v| v.now),
         live: a.live_region,
     }
@@ -656,10 +676,10 @@ fn update(surface: &Rc<Surface>, view: &NshView) -> bool {
             let old = s.access.text.replace(drawn.text.clone());
             if let Some(old) = old
                 && !Arc::ptr_eq(&old, &drawn.text)
-                && old.text != drawn.text.text
+                && old.visible_text() != drawn.text.visible_text()
             {
                 text_changed = true;
-                text = Some(drawn.text.text.clone());
+                text = Some(drawn.text.visible_text().into_owned());
             }
         }
         if s.access.spec.as_deref() == Some(&spec) && !text_changed {
@@ -701,6 +721,8 @@ pub(crate) struct Exposed {
     pub(crate) name: Option<Arc<str>>,
     /// The help text.
     pub(crate) help: Option<String>,
+    /// The full description.
+    pub(crate) description: Option<Arc<str>>,
     /// Enabled.
     pub(crate) enabled: bool,
     /// Selected.
@@ -711,6 +733,8 @@ pub(crate) struct Exposed {
     pub(crate) expanded: Option<bool>,
     /// Busy.
     pub(crate) busy: bool,
+    /// The content does not pass the app's checks.
+    pub(crate) invalid: bool,
     /// A range's value.
     pub(crate) now: Option<f32>,
 }
@@ -719,11 +743,13 @@ fn exposed_of(s: &Spec) -> Exposed {
     Exposed {
         name: s.name.clone(),
         help: s.help.clone(),
+        description: s.description.clone(),
         enabled: !s.disabled,
         selected: s.selected,
         checked: s.checked,
         expanded: s.expanded,
         busy: s.busy,
+        invalid: s.invalid,
         now: s.now,
     }
 }
@@ -798,6 +824,11 @@ pub(crate) fn focused(surface: &Surface) -> Option<NshView> {
     if let Some(field) = crate::text_input::focused(surface) {
         return Some(field);
     }
+    // A focusable custom view with the keyboard focus is the focused
+    // element too, in its own window.
+    if let Some(view) = crate::keyboard::focused_any(surface) {
+        return Some(view);
+    }
     let id = FOCUS.with_borrow(|f| f.get(&surface.key()).copied())?;
     let view = surface.view(id)?;
     match exposed(&view) {
@@ -853,14 +884,17 @@ fn action_or_press(surface: &Surface, view: &NshView, name: &str, press: bool) -
     }
 }
 
-/// `WM_GETOBJECT`: the root of the provider tree for UI Automation.
+/// `WM_GETOBJECT`: the root of window `window`'s provider tree for UI
+/// Automation (`ROOT_ID`: the main window; each window of the app's own
+/// exposes the tree of its dialog root).
 pub(crate) fn get_object(
     surface: &Rc<Surface>,
+    window: NodeId,
     hwnd: HWND,
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
-    uia::get_object(surface, hwnd, wparam, lparam)
+    uia::get_object(surface, window, hwnd, wparam, lparam)
 }
 
 #[cfg(test)]
@@ -1010,7 +1044,7 @@ mod tests {
     ///   └ 22 text "Footer"
     fn tree() -> (NshView, Vec<NshView>) {
         let root = view(0, ViewKind::View, Accessibility::default());
-        root.set_invalidate(Rc::new(|_| {}));
+        root.set_invalidate(Rc::new(|_, _| {}));
         let plain = view(2, ViewKind::View, Accessibility::default());
         let title = text(4, "Title");
         let button = pressable(6, Accessibility::default());
@@ -1105,6 +1139,35 @@ mod tests {
         assert_eq!(ids(&element_children(&root, true)), [4, 6, 22]);
     }
 
+    /// A list's recycled cells are read in the order they show, not in the
+    /// order they were made (bound to rows further down as the list
+    /// scrolled): a scroll view's content is read as it is on screen.
+    #[test]
+    fn a_scroll_views_content_is_read_in_screen_order() {
+        let root = view(0, ViewKind::View, Accessibility::default());
+        root.set_invalidate(Rc::new(|_, _| {}));
+        let list = view(2, ViewKind::Scroll, Accessibility::default());
+        list.insert_before(&root, None);
+        for (id, y) in [(4, 160.0), (6, 200.0), (8, 80.0), (10, 120.0)] {
+            let cell = pressable(id, Accessibility::default());
+            cell.state_mut().frame = crate::geom::rect(0.0, y, 100.0, 40.0);
+            cell.insert_before(&list, None);
+        }
+        assert_eq!(ids(&element_children(&list, false)), [8, 10, 4, 6]);
+        // Elsewhere the tree's order stays.
+        assert_eq!(ids(&element_children(&root, true)), [2]);
+        // A list in its parent's viewport is a plain view, looked through:
+        // its cells are read in screen order too.
+        list.unparent();
+        let page = view(12, ViewKind::View, Accessibility::default());
+        page.state_mut().props.screen_order = Some(nsh_core::geometry::Axis::Vertical);
+        page.insert_before(&root, None);
+        for cell in list.child_views() {
+            cell.insert_before(&page, None);
+        }
+        assert_eq!(ids(&element_children(&root, true)), [8, 10, 4, 6]);
+    }
+
     #[test]
     fn names() {
         let (_root, all) = tree();
@@ -1147,6 +1210,15 @@ mod tests {
         assert_eq!(range_of(&button, Control::Button), None);
         assert_eq!(
             help_of(&button, Some(Control::Button)).as_deref(),
+            Some("3 of 10. Plays")
+        );
+        // The description is the full description, not part of the help.
+        let described = Accessibility {
+            description: Some("The whole album".into()),
+            ..button.clone()
+        };
+        assert_eq!(
+            help_of(&described, Some(Control::Button)).as_deref(),
             Some("3 of 10. Plays")
         );
         // Defaults: 0 to 100; the value is clamped; no value, no range.
@@ -1208,6 +1280,8 @@ mod tests {
             (Role::TreeItem, Control::TreeItem),
             (Role::MenuItemCheckbox, Control::MenuItem),
             (Role::MenuItemRadio, Control::MenuItem),
+            (Role::Dialog, Control::Dialog),
+            (Role::AlertDialog, Control::AlertDialog),
         ] {
             assert_eq!(
                 control_for(&with_role(role), ViewKind::View, false),

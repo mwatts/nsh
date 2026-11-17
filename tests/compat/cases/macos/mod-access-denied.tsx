@@ -56,11 +56,15 @@ function App() {
             `Clipboard: ${clipboard[1]}`,
             `Clipboard denied: ${clipboard.filter((r) => r === clipboard[1]).length} of ${clipboard.length}`,
             `Picker: ${await settle(() => Picker.pickImages())}`,
+            `Picker files: ${await settle(() => Picker.pickFiles())}`,
             `Open: ${await settle(() => openUrl("https://example.com/docs"))}`,
             `Image size: ${await settle(() => Image.getSize("https://example.com/a.png"))}`,
             `Image prefetch: ${await settle(() => Image.prefetch("https://example.com/b.png"))}`,
             `Fetch: ${await settle(() => fetch("https://example.com/data"))}`,
             `WebSocket: ${await settle(() => connect("ws://example.com/feed"))}`,
+            `WebSocket credentials: ${await settle(() => connect("ws://example.com/feed", {
+              headers: { Cookie: "session=fixture", Authorization: "Bearer fixture" },
+            }))}`,
             `Global WebSocket: ${await refused("ws://example.com/feed")}`,
           ]);
         }}

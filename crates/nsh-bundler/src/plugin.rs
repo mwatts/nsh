@@ -26,6 +26,9 @@ use crate::compile::{NativeModules, compile_native};
 pub(crate) struct NshPlugin {
     /// Paths in error messages are shown relative to this directory.
     pub(crate) root: PathBuf,
+    /// What `asset:/` URLs and the bundle's assets are named relative to:
+    /// the app's directory (`Bundle::asset_root`), canonical.
+    pub(crate) asset_root: PathBuf,
     /// The first compile error, already formatted. Rolldown wraps plugin
     /// errors in its own report; the bundler shows this one instead.
     pub(crate) error: Arc<Mutex<Option<String>>>,
@@ -63,10 +66,39 @@ pub(crate) struct ThemeSetup {
     pub(crate) appearance: Option<&'static str>,
     /// `"statusBar"`, checked, as JSON: the status bar's default.
     pub(crate) status_bar: Option<String>,
+    /// The app's translations (`locales/`) and the language data it ships
+    /// (`"locales"`), as the runtime's `i18n` takes them: a module of their
+    /// own the entry imports first ([`I18N_MODULE`]).
+    pub(crate) i18n: Option<String>,
+    /// What `appInfo()` reports (JSON): handed to the runtime by a module
+    /// of its own the entry imports first ([`APP_MODULE`]).
+    pub(crate) app: String,
 }
+
+/// The module that hands the runtime the app's information (`appInfo()`),
+/// imported first by the entry, before the modules that may read it.
+pub(crate) const APP_MODULE: &str = "virtual:nsh-app";
+const APP_ID: &str = "\0nsh-app";
+
+/// The module that hands the runtime the app's translations and language
+/// data, imported first by the entry so that it runs before any other
+/// module's code.
+pub(crate) const I18N_MODULE: &str = "virtual:nsh-i18n";
+const I18N_ID: &str = "\0nsh-i18n";
 
 /// File types imported as image assets.
 pub(crate) const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "webp", "heic", "svg"];
+
+/// File types imported as audio: the formats `Sound` and `AudioPlayer`
+/// play on every platform (`docs/dev/audio-design.md`).
+pub(crate) const AUDIO_EXTENSIONS: &[&str] = &["wav", "m4a", "aac", "mp3"];
+
+/// File types imported as video: the formats `Video` plays.
+pub(crate) const VIDEO_EXTENSIONS: &[&str] = &["mp4", "mov", "m4v", "webm"];
+
+/// The suffix that imports any file as its `asset:/` URL
+/// (`import data from "./data.bin?url"`), as Vite's does.
+pub(crate) const URL_SUFFIX: &str = "?url";
 
 /// File types imported as fonts.
 pub(crate) const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "woff", "woff2"];
@@ -77,21 +109,9 @@ fn has_extension(path: &Path, extensions: &[&str]) -> bool {
         .is_some_and(|e| extensions.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
-/// The family name a font registers under: the typographic family (name
-/// 16) when present, else the legacy family (name 1). A WOFF or WOFF2 font
-/// is read from what it holds.
+/// The family name a font registers under ([`nsh_core::font_family`]).
 fn font_family(data: &[u8]) -> Result<String, String> {
-    let data = nsh_core::font_data(data)?;
-    let face = ttf_parser::Face::parse(&data, 0).map_err(|e| e.to_string())?;
-    let name = |id| {
-        face.names()
-            .into_iter()
-            .filter(|n| n.name_id == id && n.is_unicode())
-            .find_map(|n| n.to_string())
-    };
-    name(ttf_parser::name_id::TYPOGRAPHIC_FAMILY)
-        .or_else(|| name(ttf_parser::name_id::FAMILY))
-        .ok_or_else(|| "the font has no family name".to_owned())
+    nsh_core::font_family(data)
 }
 
 /// An SVG imported as `rel`: its size in points, as the native backends
@@ -106,9 +126,10 @@ fn svg_asset(rel: &str, data: &[u8]) -> Result<(Size<Points>, Vec<String>), nsh_
     Ok((size, warnings))
 }
 
-/// What an SVG holds that browsers draw and the native backends'
-/// rasterizer leaves out: text, animation (SMIL elements, CSS animations),
-/// embedded images and HTML (`<foreignObject>`).
+/// What an SVG holds that browsers draw and the native image rasterizer
+/// leaves out: animation (SMIL elements, CSS animations), an `<image>` that
+/// references a file, a URL or a nested SVG document, and HTML
+/// (`<foreignObject>`). Inline raster `data:` images draw natively.
 fn svg_browser_only(data: &[u8]) -> Vec<&'static str> {
     let Ok(text) = std::str::from_utf8(data) else {
         return Vec::new();
@@ -120,14 +141,18 @@ fn svg_browser_only(data: &[u8]) -> Vec<&'static str> {
     let Ok(doc) = roxmltree::Document::parse_with_options(text, options) else {
         return Vec::new();
     };
-    let (mut texts, mut animation, mut images, mut html) = (false, false, false, false);
+    let (mut animation, mut images, mut html) = (false, false, false);
     for node in doc.descendants().filter(|n| n.is_element()) {
         match node.tag_name().name() {
-            "text" => texts = true,
             "animate" | "animateColor" | "animateMotion" | "animateTransform" | "set" => {
                 animation = true
             }
-            "image" => images = true,
+            "image" => {
+                let href = node
+                    .attribute("href")
+                    .or_else(|| node.attribute(("http://www.w3.org/1999/xlink", "href")));
+                images |= !href.is_some_and(inline_raster);
+            }
             "foreignObject" => html = true,
             "style" => {
                 animation |= node
@@ -140,15 +165,13 @@ fn svg_browser_only(data: &[u8]) -> Vec<&'static str> {
         animation |= node.attribute("style").is_some_and(css_animates);
     }
     let mut found = Vec::new();
-    if texts {
-        found.push("its <text> shows in browsers; native platforms draw the SVG without it");
-    }
     if animation {
         found.push("its animation plays in browsers; native platforms draw the SVG still");
     }
     if images {
         found.push(
-            "its <image> elements show in browsers; native platforms draw the SVG without them",
+            "its <image> elements that reference files, URLs or SVG documents show only in \
+             browsers; native platforms draw inline raster data images",
         );
     }
     if html {
@@ -158,6 +181,25 @@ fn svg_browser_only(data: &[u8]) -> Vec<&'static str> {
         );
     }
     found
+}
+
+/// Whether an `<image>` href is an inline raster `data:` image, the only
+/// kind the native rasterizer loads.
+fn inline_raster(href: &str) -> bool {
+    let Some(rest) = href.strip_prefix("data:") else {
+        return false;
+    };
+    // The MIME is trimmed and lowercased, as usvg's data URL parser reads it.
+    let mime = rest
+        .split([';', ','])
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    matches!(
+        mime.as_str(),
+        "image/png" | "image/jpeg" | "image/jpg" | "image/gif" | "image/webp"
+    )
 }
 
 /// Whether CSS (a style sheet or a `style` attribute) animates: a
@@ -213,6 +255,25 @@ fn has_density(path: &Path) -> bool {
     stem.rsplit_once('@')
         .and_then(|(_, d)| d.strip_suffix('x'))
         .is_some_and(|d| d.parse::<f64>().is_ok())
+}
+
+/// `path` from `base` (`../shared/logo.png`), `/`-separated, for messages;
+/// `path` itself when they share no root (another drive).
+fn relative(path: &Path, base: &Path) -> String {
+    let parts: Vec<_> = path.components().collect();
+    let from: Vec<_> = base.components().collect();
+    let common = parts.iter().zip(&from).take_while(|(a, b)| a == b).count();
+    if common == 0 {
+        return path.to_string_lossy().replace('\\', "/");
+    }
+    std::iter::repeat_n(Cow::Borrowed(".."), from.len() - common)
+        .chain(
+            parts[common..]
+                .iter()
+                .map(|c| c.as_os_str().to_string_lossy()),
+        )
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// The pixel-density variants of image `path` (a file without a density
@@ -286,7 +347,16 @@ impl NshPlugin {
             None => "null".to_owned(),
         };
         let setup = &self.tailwind;
-        (setup.json.is_some()
+        let app = (!setup.app.is_empty()).then(|| format!("import {APP_MODULE:?};\n"));
+        let i18n = setup
+            .i18n
+            .is_some()
+            .then(|| format!("import {I18N_MODULE:?};\n"));
+        let i18n = match (app, i18n) {
+            (None, None) => None,
+            (app, i18n) => Some(app.unwrap_or_default() + &i18n.unwrap_or_default()),
+        };
+        let call = (setup.json.is_some()
             || setup.ui.is_some()
             || setup.appearance.is_some()
             || setup.status_bar.is_some())
@@ -298,7 +368,11 @@ impl NshPlugin {
                 json(&setup.appearance.map(str::to_owned)),
                 json(&setup.status_bar)
             )
-        })
+        });
+        match (i18n, call) {
+            (None, None) => None,
+            (i18n, call) => Some(i18n.unwrap_or_default() + &call.unwrap_or_default()),
+        }
     }
 
     /// Records `message` as the build's error (shown as it is).
@@ -310,13 +384,73 @@ impl NshPlugin {
         anyhow!(message)
     }
 
-    /// `path` relative to the app's directory with `/` separators, as asset
-    /// URLs, module ids and messages name it on every system.
+    /// `path` relative to the entry's directory with `/` separators, as
+    /// module ids and messages name it on every system (asset URLs:
+    /// [`NshPlugin::ship`]).
     fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .unwrap_or(path)
             .to_string_lossy()
             .replace('\\', "/")
+    }
+
+    /// Ships the asset `path` with the app and names it (its `asset:/` URL
+    /// without the scheme): its path in the app's directory, `/`-separated
+    /// on every system. A file outside it fails the build: the files an app
+    /// imports ship with it, and a package holds only its directory.
+    fn ship(&self, path: &Path) -> anyhow::Result<String> {
+        // Inside once real, always: a link in the app to a file outside it
+        // (a pixel-density variant found beside an image, which the
+        // resolver never saw) ships nothing a package could hold, and the
+        // CLI's `asset_in_root` refuses links out too.
+        let real = dunce::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let Ok(real_rel) = real.strip_prefix(&self.asset_root) else {
+            let shown = match path.strip_prefix(&self.asset_root) {
+                Ok(rel) => format!(
+                    "`{}` links to {}, which",
+                    rel.to_string_lossy().replace('\\', "/"),
+                    real.display()
+                ),
+                Err(_) => format!("`{}`", relative(path, &self.asset_root)),
+            };
+            return Err(self.refuse(format!(
+                "{shown} is outside the app's directory {}: the files an app imports ship with it, so move it inside",
+                self.asset_root.display()
+            )));
+        };
+        // Named as imported or found when that path is in the app, so a
+        // variant that links elsewhere in it keeps its image's name
+        // (`logo@2x.png`, which hosts derive from `logo.png`); else as
+        // real (the resolver's own spelling, a drive letter's case).
+        let rel = path
+            .strip_prefix(&self.asset_root)
+            .ok()
+            .filter(|rel| {
+                rel.components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+            })
+            .unwrap_or(real_rel);
+        let name = rel
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/");
+        // As named: the bundle lists it relative to the root.
+        let file = self.asset_root.join(rel);
+        self.assets.lock().expect("assets lock").push(file);
+        Ok(name)
+    }
+
+    /// A module whose default export is the `asset:/` URL of `path`, which
+    /// ships with the app.
+    fn url_module(&self, path: &Path) -> anyhow::Result<HookLoadOutput> {
+        let name = self.ship(path)?;
+        let code = format!("export default {:?};", format!("asset:/{name}"));
+        Ok(HookLoadOutput {
+            code: code.into(),
+            module_type: Some(ModuleType::Js),
+            ..Default::default()
+        })
     }
 
     fn fail(&self, path: &Path, detail: &str) -> anyhow::Error {
@@ -374,6 +508,12 @@ impl Plugin for NshPlugin {
         args: &HookResolveIdArgs<'_>,
     ) -> HookResolveIdReturn {
         let spec = args.specifier;
+        if spec == I18N_MODULE && self.tailwind.i18n.is_some() {
+            return Ok(Some(HookResolveIdOutput::from_id(I18N_ID)));
+        }
+        if spec == APP_MODULE && !self.tailwind.app.is_empty() {
+            return Ok(Some(HookResolveIdOutput::from_id(APP_ID)));
+        }
         if self.modules.contains(spec) {
             // Hot factories keep external import() expressions. Preloading
             // their namespaces would turn an optional native API into an
@@ -413,6 +553,29 @@ impl Plugin for NshPlugin {
                 modules.join(", ")
             )));
         }
+        if let Some(file) = spec.strip_suffix(URL_SUFFIX) {
+            let path = if Path::new(file).is_absolute() {
+                PathBuf::from(file)
+            } else if file.starts_with("./") || file.starts_with("../") {
+                let dir = args
+                    .importer
+                    .and_then(|i| Path::new(i).parent())
+                    .unwrap_or(&self.root);
+                dir.join(file)
+            } else {
+                return Err(self.refuse(format!(
+                    "{from}`{spec}`: a `{URL_SUFFIX}` import names its file by a relative path"
+                )));
+            };
+            if !path.is_file() {
+                return Err(self.refuse(format!("{from}`{spec}`: no such file")));
+            }
+            let path = dunce::canonicalize(&path).unwrap_or(path);
+            return Ok(Some(HookResolveIdOutput::from_id(format!(
+                "{}{URL_SUFFIX}",
+                path.to_string_lossy()
+            ))));
+        }
         // Rolldown may otherwise replace unsupported Node builtins with browser
         // shims. These are absent from the reference runtime catalog.
         if ["events", "assert", "util", "string_decoder", "fs"].contains(&spec)
@@ -426,6 +589,34 @@ impl Plugin for NshPlugin {
     }
 
     async fn load(&self, _cx: SharedLoadPluginContext, args: &HookLoadArgs<'_>) -> HookLoadReturn {
+        if args.id == I18N_ID
+            && let Some(json) = &self.tailwind.i18n
+        {
+            let code = format!(
+                "import {{ i18n }} from \"nsh:rt\";\ni18n({});",
+                serde_json::Value::String(json.clone())
+            );
+            return Ok(Some(HookLoadOutput {
+                code: code.into(),
+                module_type: Some(ModuleType::Js),
+                ..Default::default()
+            }));
+        }
+        if args.id == APP_ID && !self.tailwind.app.is_empty() {
+            // `setup`'s fifth argument; a runtime that predates it ignores it.
+            let code = format!(
+                "import {{ setup }} from \"nsh:rt\";\nsetup(null, null, null, null, {});",
+                serde_json::Value::String(self.tailwind.app.clone())
+            );
+            return Ok(Some(HookLoadOutput {
+                code: code.into(),
+                module_type: Some(ModuleType::Js),
+                ..Default::default()
+            }));
+        }
+        if let Some(file) = args.id.strip_suffix(URL_SUFFIX) {
+            return Ok(Some(self.url_module(Path::new(file))?));
+        }
         let path = Path::new(args.id);
         let rel = self.rel(path);
         if has_extension(path, FONT_EXTENSIONS) {
@@ -434,19 +625,21 @@ impl Plugin for NshPlugin {
             let data = std::fs::read(path).map_err(|e| self.fail(path, &e.to_string()))?;
             let family = font_family(&data)
                 .map_err(|e| self.fail(path, &format!("cannot read font: {e}")))?;
-            self.assets
-                .lock()
-                .expect("assets lock")
-                .push(path.to_path_buf());
+            let name = self.ship(path)?;
             let code = format!(
                 "import {{ font }} from \"nsh:rt\";\nexport default font({uri:?}, {family:?});",
-                uri = format!("asset:/{rel}"),
+                uri = format!("asset:/{name}"),
             );
             return Ok(Some(HookLoadOutput {
                 code: code.into(),
                 module_type: Some(ModuleType::Js),
                 ..Default::default()
             }));
+        }
+        if has_extension(path, AUDIO_EXTENSIONS) || has_extension(path, VIDEO_EXTENSIONS) {
+            // An audio or video import is its URL, for `Sound.load`,
+            // `AudioPlayer` and `Video`'s `src`; the file ships with the app.
+            return Ok(Some(self.url_module(path)?));
         }
         if !has_extension(path, IMAGE_EXTENSIONS) {
             return Ok(None);
@@ -484,13 +677,12 @@ impl Plugin for NshPlugin {
             }
             ((w.to_string(), h.to_string()), variants)
         };
-        {
-            let mut assets = self.assets.lock().expect("assets lock");
-            assets.push(path.to_path_buf());
-            assets.extend(variants.iter().map(|(_, p)| p.clone()));
+        let name = self.ship(path)?;
+        for (_, variant) in &variants {
+            self.ship(variant)?;
         }
         let scales: Vec<f32> = variants.iter().map(|(s, _)| *s).collect();
-        let code = image_module(&format!("asset:/{rel}"), (w, h), &scales);
+        let code = image_module(&format!("asset:/{name}"), (w, h), &scales);
         Ok(Some(HookLoadOutput {
             code: code.into(),
             module_type: Some(ModuleType::Js),
@@ -598,6 +790,7 @@ mod tests {
             minify: false,
             split: false,
             ui_sets: Vec::new(),
+            ..Default::default()
         })
     }
 
@@ -616,6 +809,198 @@ mod tests {
     fn svg(body: &str) -> Vec<u8> {
         format!(r#"<svg xmlns="http://www.w3.org/2000/svg" width="10" height="10">{body}</svg>"#)
             .into_bytes()
+    }
+
+    /// An audio import is its `asset:/` URL, and the file ships.
+    #[test]
+    fn an_audio_import_is_its_url_and_ships() {
+        let dir = std::env::temp_dir().join(format!("nsh-audio-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sounds")).unwrap();
+        std::fs::write(dir.join("sounds/tap.wav"), b"RIFF").unwrap();
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { Sound, mount, View } from \"nsh\";\nimport tap from \"./sounds/tap.wav\";\nSound.load(tap);\nmount(() => <View />);\n",
+        )
+        .unwrap();
+        let bundle = bundled(&dir);
+        assert!(
+            bundle.code.contains("\"asset:/sounds/tap.wav\""),
+            "{}",
+            bundle.code
+        );
+        assert_eq!(assets(&bundle), ["sounds/tap.wav"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The entry hands the runtime the app's information first, from
+    /// `nsh.json`, a release build saying it is one, and the version and
+    /// build a package gives in place of `nsh.json`'s.
+    #[test]
+    fn the_entry_hands_over_the_apps_information_first() {
+        let dir = std::env::temp_dir().join(format!("nsh-app-info-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("nsh.json"),
+            r#"{ "name": "Notes", "id": "com.example.notes", "version": "1.2.0", "build": 4 }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("early.ts"),
+            "import { appInfo } from \"nsh\";\nexport const early = appInfo();\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { mount, Text } from \"nsh\";\nimport { early } from \"./early\";\nmount(() => <Text>{early.version}</Text>);\n",
+        )
+        .unwrap();
+        let info = |code: &str| {
+            let at = code.find("setup(null, null, null, null, ").expect(code);
+            let early = code.find("appInfo()").expect(code);
+            assert!(at < early, "the information comes first: {code}");
+            let json: String = serde_json::from_str(
+                code[at + "setup(null, null, null, null, ".len()..]
+                    .split(");")
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+            serde_json::from_str::<serde_json::Value>(&json).unwrap()
+        };
+        let options = |development: bool| BundleOptions {
+            entry: dir.join("App.tsx"),
+            minify: !development,
+            development,
+            ..Default::default()
+        };
+        let development = info(&bundle(&options(true)).unwrap().code);
+        assert_eq!(
+            development,
+            serde_json::json!({
+                "id": "com.example.notes", "name": "Notes", "version": "1.2.0", "build": 4,
+                "development": true,
+            })
+        );
+        let mut release = options(false);
+        // A nested entry still reads the app's root configuration.
+        std::fs::create_dir_all(dir.join("screens")).unwrap();
+        std::fs::write(
+            dir.join("screens/Home.tsx"),
+            "import { mount, Text } from \"nsh\";\nimport { early } from \"../early\";\nmount(() => <Text>{early.version}</Text>);\n",
+        )
+        .unwrap();
+        let nested = BundleOptions {
+            entry: dir.join("screens/Home.tsx"),
+            ..options(true)
+        };
+        assert_eq!(info(&bundle(&nested).unwrap().code), development);
+        release.app = crate::AppInfo {
+            id: Some("com.acme.renamed".into()),
+            version: Some("2.0.0".into()),
+            build: Some(9),
+            ..Default::default()
+        };
+        // Minified: the JSON as the minifier quotes it.
+        let release = bundle(&release).unwrap().code.replace('\\', "");
+        for part in [
+            r#""id":"com.acme.renamed""#,
+            r#""version":"2.0.0""#,
+            r#""build":9"#,
+            r#""development":false"#,
+        ] {
+            assert!(release.contains(part), "{part}: {release}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A video import is its `asset:/` URL, and the file ships.
+    #[test]
+    fn a_video_import_is_its_url_and_ships() {
+        let dir = std::env::temp_dir().join(format!("nsh-video-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("media")).unwrap();
+        std::fs::write(dir.join("media/intro.mp4"), b"mp4").unwrap();
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { mount, Video } from \"nsh\";\nimport intro from \"./media/intro.mp4\";\nmount(() => <Video src={intro} />);\n",
+        )
+        .unwrap();
+        let bundle = bundled(&dir);
+        assert!(
+            bundle.code.contains("\"asset:/media/intro.mp4\""),
+            "{}",
+            bundle.code
+        );
+        assert_eq!(assets(&bundle), ["media/intro.mp4"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `?url` import is the file's `asset:/` URL, whatever its type, and
+    /// the file ships; a JSON file so imported is not bundled.
+    #[test]
+    fn a_url_import_is_its_url_and_ships() {
+        let dir = std::env::temp_dir().join(format!("nsh-url-import-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::create_dir_all(dir.join("screens")).unwrap();
+        std::fs::write(dir.join("data/model.bin"), b"\0\x01").unwrap();
+        std::fs::write(
+            dir.join("data/cities.json"),
+            b"{\"secret\":\"in-the-file\"}",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("screens/Home.tsx"),
+            "import model from \"../data/model.bin?url\";\nimport cities from \"../data/cities.json?url\";\nexport const urls = [model, cities];\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { mount, Text } from \"nsh\";\nimport { urls } from \"./screens/Home\";\nmount(() => <Text>{urls.join()}</Text>);\n",
+        )
+        .unwrap();
+        let bundle = bundled(&dir);
+        assert!(
+            bundle.code.contains("\"asset:/data/model.bin\""),
+            "{}",
+            bundle.code
+        );
+        assert!(
+            bundle.code.contains("\"asset:/data/cities.json\""),
+            "{}",
+            bundle.code
+        );
+        assert!(!bundle.code.contains("in-the-file"), "{}", bundle.code);
+        assert_eq!(assets(&bundle), ["data/cities.json", "data/model.bin"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `?url` import names a file that is there, by a relative path.
+    #[test]
+    fn a_url_import_needs_a_file() {
+        let dir =
+            std::env::temp_dir().join(format!("nsh-url-import-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { mount, Text } from \"nsh\";\nimport data from \"./data.bin?url\";\nmount(() => <Text>{data}</Text>);\n",
+        )
+        .unwrap();
+        let error = try_bundle(&dir)
+            .expect_err("a missing file fails")
+            .to_string();
+        assert!(error.contains("`./data.bin?url`: no such file"), "{error}");
+        std::fs::write(
+            dir.join("App.tsx"),
+            "import { mount, Text } from \"nsh\";\nimport data from \"some-package/data.bin?url\";\nmount(() => <Text>{data}</Text>);\n",
+        )
+        .unwrap();
+        let error = try_bundle(&dir).expect_err("a bare name fails").to_string();
+        assert!(error.contains("by a relative path"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -755,14 +1140,86 @@ mod tests {
         );
     }
 
+    /// A pixel-density variant that links out of the app fails the build,
+    /// as an import of the file it links to would: found beside the image,
+    /// it is in the app by name only, and no package could ship it.
+    #[cfg(unix)]
+    #[test]
+    fn a_variant_linking_out_of_the_app_is_refused() {
+        let dir = app("link-out", "a.png", &[("a.png", (40, 30))]);
+        let outside = dir.with_file_name(format!(
+            "{}-a@2x.png",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&outside, png(80, 60)).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("img/a@2x.png")).unwrap();
+        for error in [
+            try_bundle(&dir).unwrap_err().plain,
+            crate::bundle_hot(&dir.join("App.tsx"), &[])
+                .unwrap_err()
+                .plain,
+        ] {
+            assert!(error.contains("`img/a@2x.png` links to "), "{error}");
+            assert!(error.contains("is outside the app's directory"), "{error}");
+        }
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// An imported image that links out of the app fails the build too
+    /// (the resolver hands over the file it links to).
+    #[cfg(unix)]
+    #[test]
+    fn an_image_linking_out_of_the_app_is_refused() {
+        let dir = app("image-out", "a.png", &[]);
+        let outside = dir.with_file_name(format!(
+            "{}-a.png",
+            dir.file_name().unwrap().to_string_lossy()
+        ));
+        std::fs::write(&outside, png(40, 30)).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("img/a.png")).unwrap();
+        let error = try_bundle(&dir).unwrap_err().plain;
+        assert!(error.contains("is outside the app's directory"), "{error}");
+        let _ = std::fs::remove_file(outside);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A variant linking to a file elsewhere in the app ships under its
+    /// image's name, which hosts derive the variant's URL from, not the
+    /// name of the file it links to.
+    #[cfg(unix)]
+    #[test]
+    fn a_variant_linking_inside_the_app_keeps_its_name() {
+        let dir = app("link-in", "a.png", &[("a.png", (40, 30))]);
+        std::fs::create_dir_all(dir.join("hires")).unwrap();
+        std::fs::write(dir.join("hires/big.png"), png(80, 60)).unwrap();
+        std::os::unix::fs::symlink("../hires/big.png", dir.join("img/a@2x.png")).unwrap();
+        let built = bundled(&dir);
+        assert!(
+            built.code.contains("url: \"asset:/img/a.png\""),
+            "{}",
+            built.code
+        );
+        assert!(built.code.contains("scales: [1, 2]"), "{}", built.code);
+        assert_eq!(assets(&built), ["img/a.png", "img/a@2x.png"]);
+        let hot = crate::bundle_hot(&dir.join("App.tsx"), &[]).unwrap();
+        let names: Vec<String> = hot
+            .assets
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert_eq!(names, ["img/a.png", "img/a@2x.png"]);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn svg_import_warns_about_what_browsers_alone_draw() {
         let warnings = |body| svg_asset("icons/a.svg", &svg(body)).unwrap().1;
         assert!(warnings(r#"<rect width="5" height="5"/>"#).is_empty());
-        let text = warnings("<text>NSH</text>");
-        assert_eq!(text.len(), 1);
-        assert!(text[0].starts_with("icons/a.svg: "), "{text:?}");
-        assert!(text[0].contains("<text>"), "{text:?}");
+        assert!(
+            warnings("<text>NSH</text>").is_empty(),
+            "text draws natively"
+        );
         for animated in [
             r#"<rect width="5" height="5"><animate attributeName="x" to="5" dur="1s"/></rect>"#,
             r#"<rect width="5" height="5"><animateTransform attributeName="transform" type="rotate" to="90" dur="1s"/></rect>"#,
@@ -789,15 +1246,30 @@ mod tests {
         ] {
             assert!(warnings(still).is_empty(), "{still}");
         }
-        let images = warnings(r#"<image href="data:image/png;base64,AAAA" width="5" height="5"/>"#);
+        let images = warnings(
+            r#"<image href="logo.png" width="5" height="5"/><image href="data:image/svg%2Bxml,%3Csvg/%3E" width="5" height="5"/>"#,
+        );
         assert_eq!(images.len(), 1);
+        assert!(images[0].starts_with("icons/a.svg: "), "{images:?}");
         assert!(images[0].contains("<image>"), "{images:?}");
+        for href in [
+            "data:image/png;base64,AAAA",
+            "data: IMAGE/PNG;base64,AAAA",
+            "data:image/PNG,AAAA",
+        ] {
+            let body = format!(r#"<image href="{href}" width="5" height="5"/>"#);
+            let found = svg_asset("icons/a.svg", &svg(&body)).unwrap().1;
+            assert!(
+                found.is_empty(),
+                "inline raster images draw natively: {href}: {found:?}"
+            );
+        }
         let html = warnings(r#"<foreignObject width="5" height="5"><p>NSH</p></foreignObject>"#);
         assert_eq!(html.len(), 1);
         assert!(html[0].contains("<foreignObject>"), "{html:?}");
         assert_eq!(
             warnings("<text>a</text><set/><image/><foreignObject/>").len(),
-            4
+            3
         );
     }
 

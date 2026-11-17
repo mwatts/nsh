@@ -111,7 +111,11 @@ quotes, tables, code blocks, disclosures, footnotes), streaming, styles by part,
 The content is one of three props, read in this order:
 
 - **`markdown`**: CommonMark with GitHub's additions (tables, task lists, strikethrough, autolinks, footnotes, alerts),
-  formulas (`$…$` and `$$…$$`) and HTML inside the Markdown.
+  formulas (`$…$` and `$$…$$`) and HTML inside the Markdown. Emphasis beside Chinese, Japanese and Korean text
+  reads as the CJK-friendly amendment to CommonMark reads it, so `**涨幅：**5%` is bold up to the colon, and a bare
+  URL ends where CJK text or a curly quote starts: `https://example.com。下一句` links `https://example.com`. A URL
+  written in angle brackets (`<https://zh.wikipedia.org/wiki/中文>`) or as a link keeps every character.
+  A tag that names no HTML element and no `tag` extension (`<US tech>`, `<公司名>`) shows as written.
 - **`html`**: HTML as a reader shows it. Text, structure and inline formatting come through; scripts, styles, form
   controls and hidden elements stay out. A fragment or a whole page both work (a page shows its body).
 - **`document`**: blocks the app builds or keeps: plain objects in TSX, `nsh_base::text_view::Document` in Rust
@@ -269,8 +273,12 @@ Some nodes are several parts, which apply in order: a level 2 heading is `headin
 
 Pass the reply as it grows, with `options={{ streaming: true }}` (`MarkdownOptions { streaming: true, .. }` in Rust). The end of a text that is still arriving often leaves
 syntax open (`**bold`, `` `code ``, `[a link](htt`, a table whose header just arrived); streaming shows it as it will
-look once closed, so the reader never sees stray `**` or `[`. Blocks are kept by position: the blocks that are complete
-keep their views, and only the block being written is made again, so a long reply stays cheap to update.
+look once closed, so the reader never sees stray `**` or `[`. A last line whose meaning the next characters decide
+appears once its line ends: a list marker alone, a `-` or `=` line under a paragraph, a code fence's opening line or a
+closer half typed, so each list item, heading and code block appears as what it will be. A `*` inside a word (`a*b`)
+stays as written. Once the reply ends (`streaming` off), the text is read as written. Blocks are kept by position: the
+blocks that are complete are read once and keep their views, and each update reads and makes again only the block
+being written, so a long reply stays cheap to update.
 
 `streamingCaret` follows the end of the document: inline at the end of the last text, wherever the last block ends (a
 paragraph, a list item, a code block, a table's last cell), else on a line of its own after the last block (a rule,
@@ -322,7 +330,9 @@ Links are [pressable spans](./text.md#links). A press on one calls `onLinkPress`
 [`WebView`](./web-view.md), a scroll to a heading). Headings have anchors (GitHub's: `## Getting started` is
 `#getting-started`), so a link to `#getting-started` arrives as that string, and a footnote reference arrives as
 `#footnote-<label>`. In a terminal Tab reaches each link and footnote reference in turn, and Return presses the focused
-one: `onLinkPress` hears it as it hears a press.
+one: `onLinkPress` hears it as it hears a press. The event also has the modifier keys held when the press began
+(`modifiers`, as a press's), so an app can open a Command-click (Control off macOS) in the browser and route a plain
+one itself; a press from the keyboard or an assistive technology holds none.
 
 ```rust tabs
 use nsh_base::{TextViewLinkPressEvent, text_view};
@@ -364,6 +374,14 @@ text_view().markdown(doc).links(TextViewLinks::Open)
 ```tsx tabs
 <TextView markdown={doc} links="open" />
 ```
+
+On the desktops and the web in the desktop idiom, the pointer resting on a link shows where it goes, below the
+pointer: the link's title, when it has one (`[docs](https://example.com/docs "The guide")`, an HTML link's `title`),
+over its destination in the theme's `muted-foreground`, on one line. A URL shows as it is parsed, its scheme, host and
+port always whole (an international host in its ASCII form, so a look-alike letter shows as what it is), a long path
+cut in the middle; a path or an anchor of the document (`#…`) shows as written. An image in a link shows the link's
+destination and title the same way, below the image. It is the same check as a
+[Link's](./link.md#where-it-goes).
 
 ## Render functions
 
@@ -461,6 +479,10 @@ import { Image, View } from "nsh";
   renderMath={(math) => <MathView tex={math.tex} display={math.display} />}
 />
 ```
+
+An image that stands on its own (a paragraph or a table cell of images) is laid out in a box as wide as the text:
+`w-full` fills that width, `max-w-full` keeps a wider image inside it, and an image of a fixed width keeps it, at the
+start of the line. An image in a line of text keeps the size it asks for.
 
 `Highlighted` and `MathView` (`highlighted` and `math_view` in Rust) stand for the app's own components (a
 highlighter, a formula renderer, or a component of its Rust crate). Without `renderMath` `TextView` typesets a formula itself (`math` and `mathBlock` parts) with KaTeX's TeX support and fonts, in the text's color, the same on every platform; TeX it cannot read shows as its source in monospace.
@@ -597,7 +619,7 @@ same fields (`MarkdownOptions { streaming: true, ..Default::default() }`):
 
 | Key | Type | Default | Description |
 |---|---|---|---|
-| `math` | `boolean` | `true` | Formulas: `$…$` in text, `$$…$$` blocks. |
+| `math` | `boolean` | `true` | Formulas: `$…$` and `\(…\)` in text, `$$…$$` and `\[…\]` blocks. Escaped brackets around a reference number or CJK words (`\[1\]\[3\]`, `\[注\]`) show as text. |
 | `html` | `boolean` | `true` | HTML inside the Markdown is read as the `html` prop reads it; `false` shows it as text. |
 | `alerts` | `boolean` | `true` | GitHub's alerts: `> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`. |
 | `frontmatter` | `boolean` | `false` | YAML front matter (`---` … `---` first) becomes a custom node `frontmatter` whose `text` is the YAML. |
@@ -619,7 +641,7 @@ the types of `nsh_base::text_view` (`Document`, `Block`, `Inline`, `CodeBlock`, 
 | `heading` | `level` (1–6), `content`, `anchor?` |
 | `blockquote` | `children`, `alert?` (`"note"`, `"tip"`, `"important"`, `"warning"`, `"caution"`) |
 | `list` | `ordered?`, `start?`, `loose?`, `items` (`{ checked?, children }`) |
-| `codeBlock` | `language?`, `meta?`, `code` |
+| `codeBlock` | `language?`, `meta?`, `code`, `id?`, `content?`, `wrap?` |
 | `math` | `tex` |
 | `table` | `align?` (`"none"`, `"left"`, `"center"`, `"right"` per column), `head` (cells), `rows?` (rows of cells); a cell is `{ content }` |
 | `rule` | |
@@ -642,6 +664,8 @@ the types of `nsh_base::text_view` (`Document`, `Block`, `Inline`, `CodeBlock`, 
 A document also has `footnotes?`: `{ label, index, children }`, shown after the blocks in the order of their first
 reference. An app can store replies as documents, build them from its own data, or mix in custom nodes that
 `renderCustom` shows.
+
+A code block's `id` is the app's: `onCodeBlockAction` hands the block back with it, so an action knows which block it acts on. `wrap: true` fits the code to the view instead of scrolling it sideways. `content` is the code as inline content (the app's annotations: emphasis, highlights, custom nodes shown as their content in the `custom` part); it shows in place of the highlighted code when its plain text is `code`, so what shows is what copying takes.
 
 ### Parsing and plain text
 
@@ -810,9 +834,19 @@ parts with [`TextViewParts`](#typed-part-styles).
 
 | Event | Rust | Description |
 |---|---|---|
-| `onLinkPress` | `.on_link_press(\|event: &TextViewLinkPressEvent\| ..)` | A link was pressed: `{ url }`: its URL, `#anchor` for a heading, `#footnote-<label>` for a footnote. |
+| `onLinkPress` | `.on_link_press(\|event: &TextViewLinkPressEvent\| ..)` | A link was pressed: `{ url, modifiers }`: its URL, `#anchor` for a heading, `#footnote-<label>` for a footnote, and the modifier keys held. |
 | `onCodeBlockAction` | `.on_code_block_action(\|event: &TextViewCodeActionEvent\| ..)` | A code block's action was pressed (after `copy` copied). |
+| `onSelectionChange` | `.on_selection_change(\|event: &TextViewSelectionEvent\| ..)` | The selection of a `selectable` `TextView` changed: `{ text, start, bounds, pageBounds }`, the selected text as Copy takes it and its box, `""` once nothing is selected ([Reading the selection](./text-selection.md#reading-the-selection)). Inside a selectable view the outer view reports instead. |
+
+## Methods
+
+`ref` gives `TextViewRef` (`TextViewApi` in Rust, through `component_ref::<TextView>()`). Methods return a `Promise` in JS.
+
+| Method | Rust | Description |
+|---|---|---|
+| `selectedText({ format? })` | `selected_text(Option<TextSelectionOptions>)` | The selection of a `selectable` view: `format` `"plain"` (default, as Copy takes it), `"markdown"` or `"html"`, the selected nodes rebuilt; the source as written when all of it is selected ([As Markdown or HTML](./text-selection.md#as-markdown-or-html)). `""` when nothing is selected. |
 | `onImagePress` | `.on_image_press(\|image: &Image\| ..)` | An image not in a link was pressed: `{ image }`, for the app to show it larger (a zoomable viewer of its own). |
+| `onTaskPress` | `.on_task_press(\|event: &TextViewTaskPressEvent\| ..)` | The box of a task item was pressed: `{ index, checked }`, which task of the document (from 0, in reading order) and the state the press asks for. The document does not change: the app gives the view its edited source. |
 
 ## Accessibility
 

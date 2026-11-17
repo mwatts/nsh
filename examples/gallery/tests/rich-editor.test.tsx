@@ -28,7 +28,7 @@ test("Tab and Shift-Tab indent list items, and the toolbar edits the shown edito
   // follows the session's new state.
   await app.keyboard.press("tab");
   await app.waitFor("▪");
-  await app.press("role:button[Undo]");
+  await app.press("id:toolbar >> role:button[Undo]");
   await app.waitFor("▪", { state: "gone" });
   expect(app.shows(ITEM)).toBe(true);
 });
@@ -99,8 +99,8 @@ test("Backspace after the caret moves deletes one character", async () => {
 
 /** The words the line under the editor counts. */
 function words(app: { texts(): string[] }): number {
-  const line = app.texts().find((t) => /^\d+ words · \d+ characters$/.test(t)) ?? "";
-  return Number(line.split(" ")[0]);
+  const line = app.texts().find((t) => /^\d+\swords · \d+\scharacters$/.test(t)) ?? "";
+  return Number(line.split(/\s/)[0]);
 }
 
 test("HTML copied from a page keeps its formatting when pasted", async () => {
@@ -118,7 +118,7 @@ test("HTML copied from a page keeps its formatting when pasted", async () => {
   // paragraph is a block of its own; marks keep their formatting.
   // Four words more: "Pasted title" and "Some strong words", whose last
   // joins the word after the caret.
-  await app.waitFor(`text:/^${before + 4} words · /`);
+  await app.waitFor(`text:/^${before + 4}\\swords · /`);
   const texts = app.texts();
   expect(texts.some((t) => t.endsWith("Pasted title"))).toBe(true);
   expect(texts.some((t) => t.startsWith("Some strong words"))).toBe(true);

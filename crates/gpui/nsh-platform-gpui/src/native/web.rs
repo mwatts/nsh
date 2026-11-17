@@ -6,7 +6,9 @@
 //! ([`WebItem::prepaint`]), and props and commands wait for it. Settings
 //! wry only takes when it builds (the injected scripts, the user agent,
 //! `javascriptEnabled`) make it anew when they change; a new source loads
-//! in the same one.
+//! in the same one. `incognito` is wry's incognito mode: a non-persistent
+//! `WKWebsiteDataStore` on macOS, an InPrivate controller on Windows, an
+//! ephemeral web context on Linux.
 //!
 //! - **Linux**: WebKitGTK 4.1 on GTK 3, which only embeds into X11
 //!   windows: GPUI must run on X11 (or Xwayland). GTK is started on its X11
@@ -202,6 +204,8 @@ mod imp {
 
     use gpui::{App, Bounds, ContentMask, HitboxBehavior, Pixels, Window};
     use nsh_core::{Command, EventKind, EventPayload, NodeId, PayloadValue, WebProps, WebSource};
+    #[cfg(windows)]
+    use raw_window_handle::HasWindowHandle;
 
     use super::{BRIDGE, Navigation, STATE, after_content, always_allowed, post_message};
     use crate::{
@@ -211,6 +215,23 @@ mod imp {
         view::{Hosted, NshView},
     };
 
+    /// `load()`'s headers, for the document request only (wry adds them
+    /// to no subresource or later navigation). `WebLoad` already refused
+    /// names that are not tokens and values with line breaks.
+    fn headers(load: &nsh_core::WebLoad) -> wry::http::HeaderMap {
+        use wry::http::{HeaderMap, HeaderName, HeaderValue};
+        let mut map = HeaderMap::new();
+        for (name, value) in &load.headers {
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_bytes(value.as_bytes()),
+            ) {
+                map.append(name, value);
+            }
+        }
+        map
+    }
+
     /// What wry only takes when it builds a web view.
     #[derive(Clone, PartialEq)]
     struct BuildKey {
@@ -218,6 +239,7 @@ mod imp {
         injected_js_before: Option<Arc<str>>,
         user_agent: Option<Arc<str>>,
         javascript_enabled: bool,
+        incognito: bool,
     }
 
     impl BuildKey {
@@ -227,6 +249,7 @@ mod imp {
                 injected_js_before: p.injected_js_before.clone(),
                 user_agent: p.user_agent.clone(),
                 javascript_enabled: p.javascript_enabled,
+                incognito: p.incognito,
             }
         }
     }
@@ -257,6 +280,29 @@ mod imp {
         }
     }
 
+    /// What a build keeps beside the web view (Linux: its composition
+    /// surface).
+    #[cfg(target_os = "linux")]
+    type Native = Option<linux::NativeSurface>;
+    #[cfg(not(target_os = "linux"))]
+    type Native = ();
+
+    /// GPUI's window by its handle, for a build outside the app.
+    #[cfg(windows)]
+    struct Parent(raw_window_handle::RawWindowHandle);
+
+    #[cfg(windows)]
+    impl HasWindowHandle for Parent {
+        fn window_handle(
+            &self,
+        ) -> Result<raw_window_handle::WindowHandle<'_>, raw_window_handle::HandleError> {
+            // SAFETY: the window outlives this build: it runs on the main
+            // thread right after the prepaint that read the handle, and GPUI
+            // closes windows on this thread.
+            Ok(unsafe { raw_window_handle::WindowHandle::borrow_raw(self.0) })
+        }
+    }
+
     /// A web view: its props and, once built, its wry web view.
     pub(crate) struct WebItem {
         emitter: Emitter,
@@ -277,6 +323,9 @@ mod imp {
         scale: Cell<f32>,
         /// The page's navigation state as last reported.
         nav: RefCell<Navigation>,
+        /// A build waits to run outside GPUI's app (Windows).
+        #[cfg(windows)]
+        building: Cell<bool>,
     }
 
     impl WebItem {
@@ -293,6 +342,8 @@ mod imp {
                 geometry: Cell::new(None),
                 scale: Cell::new(0.0),
                 nav: RefCell::default(),
+                #[cfg(windows)]
+                building: Cell::new(false),
             })
         }
 
@@ -341,7 +392,7 @@ mod imp {
         }
 
         /// `reload()`, `goBack()`, `goForward()`, `stopLoading()`,
-        /// `injectJavaScript()` and `postMessage()`.
+        /// `injectJavaScript()`, `postMessage()` and `load()`.
         pub(crate) fn command(&self, command: &Command) {
             let webview = self.built.borrow().as_ref().map(|b| b.webview.clone());
             let Some(webview) = webview else {
@@ -357,6 +408,7 @@ mod imp {
                 Command::StopLoading => webview.evaluate_script("window.stop();"),
                 Command::InjectJavaScript(js) => webview.evaluate_script(js),
                 Command::PostMessage(data) => webview.evaluate_script(&post_message(data)),
+                Command::Load(load) => webview.load_url_with_headers(&load.src, headers(load)),
                 _ => Ok(()),
             };
             if let Err(err) = result {
@@ -379,7 +431,20 @@ mod imp {
             if self.built.borrow().is_none() && self.failed.get().is_none() {
                 let props = self.props.borrow().clone();
                 if let Some(props) = props {
-                    self.build(&props, window, cx);
+                    #[cfg(target_os = "linux")]
+                    self.build(&props, |b| linux::build(b, window, cx));
+                    #[cfg(target_os = "macos")]
+                    self.build(&props, |b| {
+                        let _ = cx;
+                        b.build_as_child(&*window)
+                            .map(|w| (w, ()))
+                            .map_err(|e| (e.to_string(), "WebView could not be made"))
+                    });
+                    #[cfg(windows)]
+                    {
+                        let _ = (props, cx);
+                        self.build_outside_app(window);
+                    }
                 }
             }
             let built = self.built.borrow();
@@ -406,11 +471,59 @@ mod imp {
             }
         }
 
-        /// Builds the web view for `p` in `window`.
-        fn build(self: &Rc<Self>, p: &WebProps, window: &mut Window, cx: &mut App) {
+        /// Builds the web view outside GPUI's app, soon (#2110): WebView2
+        /// pumps the thread's messages while it makes its controller, which
+        /// runs GPUI's pending foreground tasks, and those update the app,
+        /// which a prepaint holds. The next prepaint places it.
+        #[cfg(windows)]
+        fn build_outside_app(self: &Rc<Self>, window: &mut Window) {
+            if self.building.replace(true) {
+                return;
+            }
+            let handle = match HasWindowHandle::window_handle(&*window) {
+                Ok(h) => h.as_raw(),
+                Err(err) => {
+                    self.building.set(false);
+                    self.failed.set(Some("WebView is not available"));
+                    log::warn!(target: "js", "web views cannot show: {err}");
+                    return;
+                }
+            };
+            let item = Rc::downgrade(self);
+            crate::rt::outside_app(move || {
+                let Some(item) = item.upgrade() else { return };
+                item.building.set(false);
+                if item.built.borrow().is_some() || item.failed.get().is_some() {
+                    return;
+                }
+                let Some(props) = item.props.borrow().clone() else {
+                    return;
+                };
+                let parent = Parent(handle);
+                item.build(&props, |b| {
+                    b.build_as_child(&parent)
+                        .map(|w| (w, ()))
+                        .map_err(|e| (e.to_string(), "WebView could not be made"))
+                });
+                if let Some(surface) = item.surface.upgrade() {
+                    surface.invalidate();
+                }
+                crate::rt::on_app(|_| {});
+            });
+        }
+
+        /// Builds the web view for `p` with `make`.
+        fn build(
+            self: &Rc<Self>,
+            p: &WebProps,
+            make: impl FnOnce(
+                wry::WebViewBuilder<'_>,
+            ) -> Result<(wry::WebView, Native), (String, &'static str)>,
+        ) {
             let key = BuildKey::of(p);
             let mut builder = wry::WebViewBuilder::new()
                 .with_visible(false)
+                .with_incognito(p.incognito)
                 .with_initialization_script_for_main_only(BRIDGE, true);
             if let Some(js) = &p.injected_js_before {
                 builder = builder.with_initialization_script_for_main_only(&**js, true);
@@ -440,17 +553,7 @@ mod imp {
             };
             builder = self.listen(builder);
 
-            #[cfg(target_os = "linux")]
-            let made = linux::build(builder, window, cx);
-            #[cfg(not(target_os = "linux"))]
-            let made = {
-                let _ = cx;
-                builder
-                    .build_as_child(&*window)
-                    .map(|w| (w, ()))
-                    .map_err(|e| (e.to_string(), "WebView could not be made"))
-            };
-            match made {
+            match make(builder) {
                 Ok((webview, _native)) => {
                     #[cfg(target_os = "linux")]
                     linux::made();
@@ -484,6 +587,16 @@ mod imp {
                     if !WARNED.swap(true, Ordering::Relaxed) {
                         log::warn!(target: "js", "web views cannot show: {why}");
                     }
+                    // The app hears it and shows what it has instead.
+                    self.emitter.emit(EventKind::Error, || {
+                        EventPayload::Map(vec![
+                            ("message", PayloadValue::Str(why)),
+                            (
+                                "code",
+                                PayloadValue::Str(nsh_core::element::codes::UNAVAILABLE.into()),
+                            ),
+                        ])
+                    });
                     self.failed.set(Some(shown));
                     self.queued.borrow_mut().clear();
                 }

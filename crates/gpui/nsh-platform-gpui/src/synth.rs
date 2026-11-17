@@ -3,30 +3,38 @@
 //! ([`crate::input`]), keys and text ([`crate::text_input`]), and pictures
 //! of the window. The agent of `nsh test --target gpui` acts with them
 //! ([`crate::agent`]).
+//!
+//! A test step's own key ([`press_keys`]) is a source like GPUI's: the
+//! step names the keystroke explicitly, so the press and release go
+//! through the same router a window's keys do ([`crate::input::window_key`])
+//! with a raw key built from that keystroke (`code` is empty, and the
+//! step generates exactly the down and up it names). The programmatic keys
+//! the agent presses for a step (`selectAll`, a line break, `clear`) take
+//! [`press`]: they are the platform's action, not a key a user typed, and
+//! send no raw notification.
 
 use std::{cell::Cell, rc::Rc, time::Duration};
 
-use gpui::{App, AsyncApp, Window, WindowHandle};
+use gpui::{AnyWindowHandle, App, AppContext as _, AsyncApp, Window};
 
 #[cfg(feature = "dev")]
 use crate::input::{KeyEvent, Modifiers};
-use crate::{app::AppView, surface::Surface};
+#[cfg(feature = "dev")]
+use crate::surface::Surface;
 
-/// Runs `f` with the window's surface on the main thread, then redraws
-/// what changed. `None` when the window is gone.
-pub(crate) fn with_surface<R>(
-    window: WindowHandle<AppView>,
+/// Runs `f` in window `window` (the main one or one of the app's own) on
+/// the main thread, then redraws what changed. `None` when it is gone.
+fn in_window<R>(
+    window: AnyWindowHandle,
     cx: &mut AsyncApp,
-    f: impl FnOnce(&Rc<Surface>, &mut Window, &mut App) -> R,
+    f: impl FnOnce(&mut Window, &mut App) -> R,
 ) -> Option<R> {
-    window
-        .update(cx, |view, window, cx| {
-            let surface = view.surface().clone();
-            let r = f(&surface, window, cx);
-            crate::rt::flush(cx);
-            r
-        })
-        .ok()
+    cx.update_window(window, |_, window, cx| {
+        let r = f(window, cx);
+        crate::rt::flush(cx);
+        r
+    })
+    .ok()
 }
 
 pub(crate) async fn sleep(cx: &mut AsyncApp, ms: u64) {
@@ -37,13 +45,14 @@ pub(crate) async fn sleep(cx: &mut AsyncApp, ms: u64) {
 
 /// Waits until the window drew a frame with everything changed so far
 /// (false when the window closed). A window that draws no frames (hidden,
-/// minimized) is given up on after a second.
-pub(crate) async fn drawn(window: WindowHandle<AppView>, cx: &mut AsyncApp) -> bool {
+/// minimized) is given up on after a second; a background app's (covered
+/// by the app in use) is drawn then.
+pub(crate) async fn drawn(window: AnyWindowHandle, cx: &mut AsyncApp) -> bool {
     // Next-frame callbacks run before their frame is drawn: the second
     // one runs once the frame the first one asked for is drawn.
     let done = Rc::new(Cell::new(false));
     let flag = done.clone();
-    let Some(()) = with_surface(window, cx, move |_, window, _| {
+    let Some(()) = in_window(window, cx, move |window, _| {
         window.refresh();
         window.on_next_frame(move |window, _| {
             window.on_next_frame(move |_, _| flag.set(true));
@@ -54,8 +63,15 @@ pub(crate) async fn drawn(window: WindowHandle<AppView>, cx: &mut AsyncApp) -> b
     let start = std::time::Instant::now();
     while !done.get() {
         if start.elapsed() > Duration::from_secs(1) {
-            log::warn!("test: the window draws no frames");
-            break;
+            if !cx.update(|cx| crate::window::in_background(cx)) {
+                log::warn!("test: the window draws no frames");
+                break;
+            }
+            // Covered by other windows (a background app's under the app
+            // the user works in), hidden or minimized: drawn here, so its
+            // frame has everything changed so far.
+            log::debug!("test: the window draws no frames; drawing it");
+            return in_window(window, cx, |window, cx| window.draw(cx).clear(cx)).is_some();
         }
         sleep(cx, 4).await;
     }
@@ -63,7 +79,72 @@ pub(crate) async fn drawn(window: WindowHandle<AppView>, cx: &mut AsyncApp) -> b
 }
 
 #[cfg(feature = "dev")]
-pub(crate) fn press(surface: &Rc<Surface>, vk: u16, modifiers: Modifiers) {
+/// Presses and releases the key a test step names (`keyboard.press`/`up`,
+/// `app.press`): the step's explicit keystroke is the source, so the key
+/// goes through the router real keys do ([`crate::input::window_key`]) with
+/// the raw key built from it ([`crate::keys::RawKey::requested`], no
+/// DOM code, a down then an up as the step generates them). A
+/// printable key nothing took types its character, as GPUI's input handler
+/// would. True when the press was taken.
+pub(crate) fn press_keys(surface: &Rc<Surface>, stroke: &nsh_core::keymap::Keystroke) -> bool {
+    let m = stroke.modifiers;
+    let modifiers = Modifiers {
+        shift: m.shift,
+        ctrl: m.ctrl,
+        alt: m.alt,
+        meta: m.cmd,
+    };
+    let vk = stroke.key.virtual_key().unwrap_or(0);
+    let handled = crate::input::window_key(
+        surface,
+        KeyEvent {
+            vk,
+            down: true,
+            repeat: false,
+            modifiers,
+        },
+        Some(crate::keys::RawKey::requested(stroke, true)),
+    );
+    // Unhandled printable keys type their character, as GPUI's input
+    // handler would get it.
+    if !handled
+        && !(modifiers.ctrl || modifiers.alt || modifiers.meta)
+        && let Some(ch) = typed(stroke)
+    {
+        crate::text_input::char_input(surface, &ch.to_string());
+    }
+    crate::input::window_key(
+        surface,
+        KeyEvent {
+            vk,
+            down: false,
+            repeat: false,
+            modifiers,
+        },
+        Some(crate::keys::RawKey::requested(stroke, false)),
+    );
+    handled
+}
+
+#[cfg(feature = "dev")]
+/// The character `stroke` types on the US layout, when it types one.
+fn typed(stroke: &nsh_core::keymap::Keystroke) -> Option<char> {
+    match stroke.key {
+        nsh_core::keymap::Key::Char(c) if stroke.modifiers.shift => {
+            Some(nsh_core::keymap::shifted(c))
+        }
+        nsh_core::keymap::Key::Char(c) => Some(c),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "dev")]
+/// Presses and releases a programmatic key `vk` in the surface's input
+/// root, as the platform's own action (a menu role, a line break, select
+/// all): no raw notification follows, as no key source reported it. True
+/// when the press was taken.
+pub(crate) fn press(surface: &Rc<Surface>, vk: u16, modifiers: Modifiers) -> bool {
+    let mut taken = false;
     for down in [true, false] {
         let handled = crate::input::key(
             surface,
@@ -74,31 +155,41 @@ pub(crate) fn press(surface: &Rc<Surface>, vk: u16, modifiers: Modifiers) {
                 modifiers,
             },
         );
+        if down {
+            taken = handled;
+        }
         // Unhandled printable keys type their character, as GPUI's input
         // handler would get it.
         if down && !handled && !modifiers.ctrl && !modifiers.alt && !modifiers.meta {
             let ch = match vk {
                 0x20 => Some(' '),
-                0x30..=0x39 => char::from_u32(vk as u32),
-                0x41..=0x5A => char::from_u32(if modifiers.shift { vk } else { vk + 32 } as u32),
-                _ => None,
+                // The US layout's character, Shift's for `shift+8` (`*`).
+                _ => match nsh_core::keymap::Key::from_virtual_key(vk) {
+                    Some(nsh_core::keymap::Key::Char(c)) if modifiers.shift => {
+                        Some(nsh_core::keymap::shifted(c))
+                    }
+                    Some(nsh_core::keymap::Key::Char(c)) => Some(c),
+                    _ => None,
+                },
             };
             if let Some(ch) = ch {
                 crate::text_input::char_input(surface, &ch.to_string());
             }
         }
     }
+    taken
 }
 
-/// Draws what changed and takes the window's content, in device pixels,
-/// with its size in points. `None` when the window closed.
+/// Draws what changed in window `window` (the main one or one of the
+/// app's own) and takes its content, in device pixels, with its size in
+/// points. `None` when the window closed.
 pub(crate) async fn frame(
-    window: WindowHandle<AppView>,
+    window: AnyWindowHandle,
     cx: &mut AsyncApp,
 ) -> Option<anyhow::Result<(::image::RgbaImage, gpui::Size<gpui::Pixels>)>> {
     #[cfg(target_os = "linux")]
     {
-        let watch = match with_surface(window, cx, |_, window, _| x11::Watch::new(window))? {
+        let watch = match in_window(window, cx, |window, _| x11::Watch::new(window))? {
             Ok(watch) => watch,
             Err(err) => return Some(Err(err)),
         };
@@ -107,16 +198,14 @@ pub(crate) async fn frame(
         }
         watch.presented(cx).await;
         let frame = watch.capture();
-        with_surface(window, cx, |_, window, _| {
-            Ok((frame?, window.viewport_size()))
-        })
+        in_window(window, cx, |window, _| Ok((frame?, window.viewport_size())))
     }
     #[cfg(not(target_os = "linux"))]
     {
         if !drawn(window, cx).await {
             return None;
         }
-        with_surface(window, cx, |_, window, _| {
+        in_window(window, cx, |window, _| {
             Ok((capture(window)?, window.viewport_size()))
         })
     }
@@ -131,10 +220,10 @@ pub(crate) async fn frame(
 /// Windows the frame is GPUI's offscreen image, which needs the `shot`
 /// feature. `Err` when the window has closed or the frame cannot be read.
 pub fn screenshot(
-    handle: WindowHandle<AppView>,
+    handle: gpui::WindowHandle<crate::AppView>,
     cx: &mut AsyncApp,
 ) -> gpui::Task<Result<Vec<u8>, String>> {
-    cx.spawn(async move |cx| match frame(handle, cx).await {
+    cx.spawn(async move |cx| match frame(handle.into(), cx).await {
         None => Err("the window is gone".to_owned()),
         Some(Err(err)) => Err(format!("{err:#}")),
         Some(Ok((frame, content))) => {
@@ -168,7 +257,7 @@ pub(crate) fn capture(_window: &mut Window) -> anyhow::Result<::image::RgbaImage
     anyhow::bail!("shots need nsh-platform-gpui's feature `shot`")
 }
 
-/// Shots on Linux: the window read from the X server.
+/// Shots on Linux: a redirected pixmap, independent of window stacking.
 #[cfg(target_os = "linux")]
 pub(crate) mod x11 {
     use std::time::{Duration, Instant};
@@ -179,6 +268,7 @@ pub(crate) mod x11 {
         connection::{Connection, RequestConnection},
         protocol::{
             Event,
+            composite::{ConnectionExt as _, Redirect},
             present::{self, ConnectionExt as _},
             xproto::{ConnectionExt as _, ImageFormat, ImageOrder},
         },
@@ -208,7 +298,20 @@ pub(crate) mod x11 {
                 RawWindowHandle::Xcb(h) => h.window.get(),
                 _ => bail!("shots need X11 (run with `WAYLAND_DISPLAY=`)"),
             };
+            Self::connect(id)
+        }
+
+        fn connect(id: u32) -> anyhow::Result<Watch> {
             let (conn, _) = x11rb::connect(None).context("cannot connect to the X server")?;
+            // Automatic redirection keeps normal presentation, but retains all
+            // of our pixels even where another window covers us. GetImage on
+            // the window itself has undefined pixels in those regions.
+            conn.composite_query_version(0, 2)?
+                .reply()
+                .context("shots need X Composite 0.2 (use Xvfb or Xwayland -shm)")?;
+            conn.composite_redirect_window(id, Redirect::AUTOMATIC)?
+                .check()
+                .context("cannot redirect the window for a screenshot")?;
             let has = |name| {
                 conn.extension_information(name)
                     .is_ok_and(|info| info.is_some())
@@ -292,8 +395,14 @@ pub(crate) mod x11 {
             let geometry = conn.get_geometry(self.window)?.reply()?;
             let attributes = conn.get_window_attributes(self.window)?.reply()?;
             let (w, h) = (geometry.width, geometry.height);
+            // Name after drawing: a resize replaces the redirected backing
+            // pixmap. The connection owns the name and releases it on drop,
+            // along with our automatic redirection, including on errors.
+            let pixmap = conn.generate_id()?;
+            conn.composite_name_window_pixmap(self.window, pixmap)?
+                .check()?;
             let reply = conn
-                .get_image(ImageFormat::Z_PIXMAP, self.window, 0, 0, w, h, !0)?
+                .get_image(ImageFormat::Z_PIXMAP, pixmap, 0, 0, w, h, !0)?
                 .reply()?;
             let setup = conn.setup();
             let bpp = setup
@@ -353,6 +462,92 @@ pub(crate) mod x11 {
             ];
         }
         out
+    }
+    #[cfg(test)]
+    mod tests {
+        use x11rb::protocol::xproto::{
+            ChangeGCAux, ConfigureWindowAux, CreateGCAux, CreateWindowAux, Rectangle, WindowClass,
+        };
+
+        use super::*;
+
+        /// Run on a bare Xvfb so GetImage of a covered window cannot rely
+        /// on a desktop compositor retaining the obscured pixels for us.
+        #[test]
+        #[ignore = "needs an X11 display with Composite (xvfb-run -a)"]
+        fn screenshot_keeps_obscured_pixels_and_follows_resize() -> anyhow::Result<()> {
+            let (conn, screen) = x11rb::connect(None)?;
+            let root = &conn.setup().roots[screen];
+            let create = |color| -> anyhow::Result<u32> {
+                let id = conn.generate_id()?;
+                conn.create_window(
+                    root.root_depth,
+                    id,
+                    root.root,
+                    0,
+                    0,
+                    48,
+                    32,
+                    0,
+                    WindowClass::INPUT_OUTPUT,
+                    root.root_visual,
+                    &CreateWindowAux::new()
+                        .background_pixel(color)
+                        .override_redirect(1),
+                )?
+                .check()?;
+                conn.map_window(id)?.check()?;
+                Ok(id)
+            };
+            let window = create(0)?;
+            let watch = Watch::connect(window)?;
+            let gc = conn.generate_id()?;
+            conn.create_gc(gc, window, &CreateGCAux::new().foreground(0xff0000))?
+                .check()?;
+            let paint = || -> anyhow::Result<()> {
+                conn.poly_fill_rectangle(
+                    window,
+                    gc,
+                    &[Rectangle {
+                        x: 0,
+                        y: 0,
+                        width: 48,
+                        height: 32,
+                    }],
+                )?
+                .check()?;
+                Ok(())
+            };
+            paint()?;
+            let before = watch.capture()?;
+            assert_eq!(before.dimensions(), (48, 32));
+            assert!(before.pixels().all(|p| p.0 == [255, 0, 0, 255]));
+            let cover = create(0x0000ff)?;
+            // The root really shows the blue cover, not our red window.
+            let root_pixels = conn
+                .get_image(ImageFormat::Z_PIXMAP, root.root, 0, 0, 48, 32, !0)?
+                .reply()?;
+            let cover_pixels = conn
+                .get_image(ImageFormat::Z_PIXMAP, cover, 0, 0, 48, 32, !0)?
+                .reply()?;
+            assert_eq!(root_pixels.data, cover_pixels.data);
+            assert_eq!(watch.capture()?, before);
+            // Production starts its screenshot connection while the window
+            // may already be covered. Redraw into a newly redirected pixmap.
+            drop(watch);
+            let watch = Watch::connect(window)?;
+            paint()?;
+            assert_eq!(watch.capture()?, before);
+            conn.configure_window(window, &ConfigureWindowAux::new().width(24).height(16))?
+                .check()?;
+            conn.change_gc(gc, &ChangeGCAux::new().foreground(0x00ff00))?
+                .check()?;
+            paint()?;
+            let resized = watch.capture()?;
+            assert_eq!(resized.dimensions(), (24, 16));
+            assert!(resized.pixels().all(|p| p.0 == [0, 255, 0, 255]));
+            Ok(())
+        }
     }
 }
 

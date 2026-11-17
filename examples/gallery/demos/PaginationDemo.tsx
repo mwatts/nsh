@@ -1,26 +1,28 @@
 import { platform, signal, Text, View } from "nsh";
 import { Menu, MenuItem, Pagination, type PaginationItemState } from "nsh/base";
-import { Appear, Button, Caption, Card, colors, DemoPage, density, Icon, mono, PopIn, popupSurface, Segmented, terminal, Toggle } from "../ui";
+import { Appear, Button, Caption, Card, colors, DemoPage, density, desktop, Icon, menuItemLabel, menuItemLook, mono, Segmented, terminal, paginationArrows, paginationItemClass, LabeledToggle, ghostOutdent, menuPopup } from "../ui";
 
 // `nsh/base`'s `Pagination` owns which pages show (the first and the last,
 // the current one's neighbours, ellipses for the rest), the presses,
 // Previous and Next going disabled at the ends, the keyboard focus and the
 // navigation landmark; the page is the app's. The look is the gallery's,
-// all in `itemClass`: quiet items that the current page lights in the brand
-// color (`selected:`), fading between pages with `transition-colors`, the
-// ends dimmed (`disabled:`); the items show the component's own numbers
-// and labels, so a page change only changes texts and states. The archive
-// alone draws its items (`renderItem`), for the menu its ellipses open.
+// in `itemClass`: quiet items, the current page lit as a primary button,
+// citrus under dark text (`selected:`), fading between pages with
+// `transition-colors`, the ends dimmed (`disabled:`); the items show the
+// page numbers and Previous / Next as chevrons (`paginationArrows`), so a
+// row fits a phone's width. The archive draws its own items (`renderItem`), for the
+// menu its ellipses open.
 // The rows of a page fade in when it changes. Nothing moves with reduced
 // motion.
 
 const pointer = platform.desktop;
 
-/** Every item's look: the current page `selected:`, the ends `disabled:`. */
-const itemClass =
-  "min-w-8 h-8 px-2 flex-row items-center justify-center gap-1 rounded-md text-sm text-foreground " +
-  "transition-colors duration-200 motion-reduce:transition-none hover:bg-hover active:opacity-70 " +
-  "selected:bg-brand selected:text-on-brand disabled:opacity-35 focus:outline-2 focus:outline-ring";
+/** Every item's look (`paginationItemClass`): the current page `selected:`,
+ * the ends `disabled:`; outlined on a touch screen and in a compact pager. */
+const itemClass = paginationItemClass();
+const outlined = paginationItemClass({ outlined: true });
+/** The archive's items: 28 wide at least and narrower padding, so a row of nine with five-digit pages fits one line. */
+const tightItem = itemClass.replace("min-w-8", "min-w-7").replace("px-2", "px-1");
 
 /** `n` with thousands separators, the same on every platform. */
 const grouped = (n: number) => String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ",");
@@ -32,22 +34,16 @@ function hiddenPages(start: number, end: number, current: number) {
   return Array.from({ length: to - from }, (_, i) => from + i);
 }
 
-const sheet = pointer
-  ? undefined
-  : { backgroundColor: colors.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, paddingHorizontal: 10, paddingTop: 10, paddingBottom: 34 };
-
-/** An ellipsis that opens a menu of the pages it hides (`gpui-component`'s dropdown). */
+/** An ellipsis that opens a menu of the pages it hides (`gpui-component`'s
+ * dropdown): up to 100 rows, so the menu scrolls (as the Menu demo's long
+ * menu), the arrow keys moving through its rows and into view. */
 function JumpMenu(props: { start: number; end: number; current: number; onPick: (page: number) => void }) {
   const pages = () => hiddenPages(props.start, props.end, props.current);
   const list = (
     <Each of={pages()}>
       {(page) => (
-        <MenuItem
-          onSelect={() => props.onPick(page())}
-          hoverStyle={{ backgroundColor: colors.inset }}
-          style={{ height: pointer ? 28 : 44, paddingHorizontal: 10, justifyContent: "center", borderRadius: 6 }}
-        >
-          <Text style={{ fontSize: density.body, color: colors.text, fontVariant: ["tabular-nums"] }}>{grouped(page())}</Text>
+        <MenuItem onSelect={() => props.onPick(page())} {...menuItemLook()}>
+          <Text style={{ ...menuItemLabel(), fontVariant: ["tabular-nums"] }}>{grouped(page())}</Text>
         </MenuItem>
       )}
     </Each>
@@ -56,22 +52,18 @@ function JumpMenu(props: { start: number; end: number; current: number; onPick: 
     <Menu
       offset={4}
       margin={8}
-      popupStyle={sheet}
-      backdropStyle={{ backgroundColor: "rgba(0,0,0,0.45)" }}
+      {...menuPopup({ minWidth: 80 })}
       trigger={
         <View
           accessibilityLabel={`Pages ${grouped(props.start)} to ${grouped(props.end - 1)}`}
-          class="min-w-8 h-8 items-center justify-center rounded-md hover:bg-hover"
+          // The whole item, its padding too, opens the menu: 44 points on a touch screen.
+          class={`${pointer ? "min-w-8" : "min-w-11"} -mx-2 self-stretch items-center justify-center rounded-md px-2 hover:bg-hover`}
         >
           <Text style={{ color: colors.muted, fontSize: density.body }}>…</Text>
         </View>
       }
     >
-      {pointer ? (
-        <PopIn style={{ ...popupSurface(), minWidth: 80, maxHeight: 240 }}>{list}</PopIn>
-      ) : (
-        <View style={{ maxHeight: 360 }}>{list}</View>
-      )}
+      {list}
     </Menu>
   );
 }
@@ -108,13 +100,16 @@ export function PaginationDemo() {
           <Pagination
             page={page()}
             totalPages={pages}
-            visiblePages={7}
+            // Seven pages where the card is wide, five in a phone-wide one,
+            // so the row and its chevrons fit on one line.
+            visiblePages={desktop() ? 7 : 5}
             compact={!pointer}
             accessibilityLabel="Search results pages"
             previousAccessibilityLabel="Previous"
             nextAccessibilityLabel="Next"
-            class={pointer ? "gap-1 flex-wrap" : "items-center justify-between self-stretch"}
-            itemClass={pointer ? itemClass : `${itemClass} px-3 h-10 border border-border`}
+            class={pointer ? "gap-0.5 flex-nowrap" : "items-center justify-between self-stretch"}
+            itemClass={pointer ? itemClass : outlined}
+            renderItem={paginationArrows}
             onChange={({ page: next }) => page.set(next)}
           >
           <If when={!pointer}>
@@ -141,7 +136,7 @@ export function PaginationDemo() {
     const last = () => Math.min(page() * per(), orders);
     const shown = () => Array.from({ length: Math.min(4, last() - first() + 1) }, (_, i) => first() + i);
     return (
-      <Card title="Table footer" subtitle="Newest orders first; a page size that keeps the first row in view">
+      <Card title="Table footer" subtitle="Newest first; the first row stays in view">
         <View style={{ gap: 2 }}>
           <Each of={shown()} key={(n) => n}>
             {(n) => (
@@ -176,7 +171,8 @@ export function PaginationDemo() {
             nextAccessibilityLabel="Older"
             compact={!pointer}
             class={pointer ? "gap-1" : "items-center justify-between self-stretch"}
-            itemClass={pointer ? itemClass : `${itemClass} px-3 h-10 border border-border`}
+            itemClass={pointer ? itemClass : outlined}
+            renderItem={paginationArrows}
             onChange={({ page: next }) => page.set(next)}
           >
           <If when={!pointer}>
@@ -206,7 +202,8 @@ export function PaginationDemo() {
           previousAccessibilityLabel="Previous chapter"
           nextAccessibilityLabel="Next chapter"
           class="items-center justify-between"
-          itemClass={`${itemClass} px-3 h-10 border border-border`}
+          itemClass={outlined}
+          renderItem={paginationArrows}
           onChange={({ page: next }) => page.set(next)}
         >
           <Text style={{ fontSize: density.body, color: colors.muted, fontVariant: ["tabular-nums"] }}>{`${page()} / ${chapters.length}`}</Text>
@@ -218,7 +215,9 @@ export function PaginationDemo() {
   function Archive() {
     const pages = 10000;
     const page = signal(5000);
-    const visible = signal<"5" | "7" | "9">("7");
+    // Five pages fit a two-column card's width at five-digit page numbers;
+    // more wrap to a second row.
+    const visible = signal<"5" | "7" | "9">("5");
     const offline = signal(false);
     const log = signal<string[]>([]);
     const go = (next: number) => {
@@ -236,25 +235,15 @@ export function PaginationDemo() {
       if (terminal) return <Text style={{ color: colors.muted }}>{item.kind === "previous" ? "‹" : "›"}</Text>;
       return (
         <View style={item.kind === "previous" ? { transform: [{ rotate: "180deg" }] } : undefined}>
-          <Icon name="chevron" size={14} tint={colors.muted} />
+          <Icon name="chevron" size={14} tint={colors.text} />
         </View>
       );
     };
     return (
       <Card
         title="Ten thousand pages"
-        subtitle="An ellipsis opens the pages it hides; the same few items however many pages"
-        right={
-          // The terminal's switch is a glyph: its label beside it says what it turns on.
-          platform.idiom === "terminal" ? (
-            <View style={{ flexDirection: "row", gap: 8 }}>
-              <Text style={{ fontSize: 12, color: colors.muted }}>Offline</Text>
-              <Toggle value={offline()} onChange={(v) => offline.set(v)} label="Offline" />
-            </View>
-          ) : (
-            <Toggle value={offline()} onChange={(v) => offline.set(v)} label="Offline" />
-          )
-        }
+        subtitle="An ellipsis opens the pages it hides"
+        right={<LabeledToggle label="Offline" value={offline()} onChange={(v) => offline.set(v)} />}
       >
         <If when={pointer}>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
@@ -271,8 +260,8 @@ export function PaginationDemo() {
           previousAccessibilityLabel="Previous archive page"
           nextAccessibilityLabel="Next archive page"
           compact={!pointer}
-          class={pointer ? "gap-1 flex-wrap" : "items-center justify-between self-stretch"}
-          itemClass={pointer ? itemClass : `${itemClass} px-3 h-10 border border-border`}
+          class={pointer ? "gap-0.5 flex-nowrap" : "items-center justify-between self-stretch"}
+          itemClass={pointer ? tightItem : outlined}
           renderItem={draw}
           onChange={({ page: next }) => go(next)}
         >
@@ -280,12 +269,12 @@ export function PaginationDemo() {
           <Text style={{ fontSize: density.body, color: colors.muted, fontVariant: ["tabular-nums"] }}>{`${grouped(page())} / ${grouped(pages)}`}</Text>
         </If>
         </Pagination>
-        <View style={{ flexDirection: "row", gap: 8 }}>
+        <View style={{ flexDirection: "row", gap: 8, ...ghostOutdent("left", "small") }}>
           <Button label="First page" variant="ghost" size="small" disabled={offline() || page() === 1} onPress={() => go(1)} />
           <Button label="Last page" variant="ghost" size="small" disabled={offline() || page() === pages} onPress={() => go(pages)} />
         </View>
         <Caption label={offline() ? "Offline: no presses, no focus, dimmed for screen readers" : `Page ${grouped(page())} of ${grouped(pages)}`} />
-        <View style={{ gap: 2, minHeight: 48 }}>
+        <View style={{ gap: 2, display: log().length ? "flex" : "none" }}>
           <Each of={log()}>
             {(line, i) => <Text style={{ fontSize: 12, fontFamily: mono, color: i() === 0 ? colors.text : colors.faint }}>{line()}</Text>}
           </Each>

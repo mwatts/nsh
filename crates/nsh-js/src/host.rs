@@ -58,6 +58,9 @@ pub(crate) struct Shared {
     pub(crate) system_access: RefCell<nsh_core::access::Access>,
     pub(crate) system_filesystem:
         RefCell<Option<std::sync::Arc<dyn nsh_core::filesystem::FileSystem>>>,
+    pub(crate) system_updater: RefCell<Option<std::sync::Arc<dyn nsh_core::runtime::UpdaterHost>>>,
+    /// The core's address (`UrlScheme.url()`).
+    pub(crate) system_app_url: RefCell<nsh_core::url_scheme::AppUrlCell>,
     pub(crate) system_data_dir: RefCell<Option<std::path::PathBuf>>,
     pub(crate) system_paths: RefCell<nsh_core::access::TrustedPaths>,
     /// The VM's counts of limited resources for Rust modules (`net`'s
@@ -558,6 +561,11 @@ impl Host {
                     }
                     return;
                 }
+                // Windows: their handles and listeners are native.
+                if let (EventKind::Window, EventPayload::Window(window)) = (event, payload) {
+                    crate::window::platform_event(cx.as_raw().as_ptr(), id, window);
+                    return;
+                }
                 let payload = match (event, payload) {
                     // `onChange({ value })`: the text, in one object as every
                     // event (`api-naming.md` "Payloads").
@@ -627,6 +635,18 @@ impl Host {
                 self.report(&cx, result);
             });
             self.run_jobs();
+        });
+    }
+
+    /// Whether `<Each>` leaves the rows the core may cull unrendered, as
+    /// placeholders, until the core asks for them (`content_culling`);
+    /// off by default. Set before evaluating the bundle.
+    pub fn set_lazy_rows(&self, lazy: bool) {
+        self.cx.with(|cx| {
+            // SAFETY: the state of this host's context.
+            unsafe { &(*crate::state::state(cx.as_raw().as_ptr())).dom }
+                .lazy_rows
+                .set(lazy);
         });
     }
 
@@ -704,6 +724,16 @@ impl Host {
         filesystem: Option<std::sync::Arc<dyn nsh_core::filesystem::FileSystem>>,
     ) {
         *self.shared.system_filesystem.borrow_mut() = filesystem;
+    }
+
+    /// Installs what `nsh/updater` runs on.
+    pub fn set_updater(&self, updater: Option<std::sync::Arc<dyn nsh_core::runtime::UpdaterHost>>) {
+        *self.shared.system_updater.borrow_mut() = updater;
+    }
+
+    /// Shares the core's address with the VM's modules (`UrlScheme.url()`).
+    pub fn set_app_url(&self, app_url: nsh_core::url_scheme::AppUrlCell) {
+        *self.shared.system_app_url.borrow_mut() = app_url;
     }
 
     /// Installs the host WebSocket transport.
@@ -1021,6 +1051,56 @@ impl Host {
         });
     }
 
+    /// Publishes the displays to JS (`nsh/desktop`'s `displays()`). Call
+    /// before evaluating the bundle where there are displays, then on every
+    /// change; without a call they are none.
+    pub fn set_displays(&self, displays: &[nsh_core::desktop::Display]) {
+        self.guarded(Phase::Call, || {
+            self.cx.with(|cx| {
+                let raw = cx.as_raw().as_ptr();
+                let result = match crate::env::set_displays(raw, displays) {
+                    Ok(()) => Ok(()),
+                    Err(()) => Err(rquickjs::Error::Exception),
+                };
+                self.report(&cx, result);
+            });
+            self.run_jobs();
+        });
+    }
+
+    /// Publishes whether the platform's performance monitor measures to JS
+    /// (`nsh`'s `fpsEnabled()`). Call on every change; without a call it is
+    /// off.
+    pub fn set_fps_enabled(&self, enabled: bool) {
+        self.guarded(Phase::Call, || {
+            self.cx.with(|cx| {
+                let raw = cx.as_raw().as_ptr();
+                let result = match crate::env::set_fps_enabled(raw, enabled) {
+                    Ok(()) => Ok(()),
+                    Err(()) => Err(rquickjs::Error::Exception),
+                };
+                self.report(&cx, result);
+            });
+            self.run_jobs();
+        });
+    }
+
+    /// Publishes what the performance monitor measured last to JS (`nsh`'s
+    /// `perfStats()`): `None` while it does not measure.
+    pub fn set_perf_stats(&self, stats: Option<&nsh_core::platform::PerfStats>) {
+        self.guarded(Phase::Call, || {
+            self.cx.with(|cx| {
+                let raw = cx.as_raw().as_ptr();
+                let result = match crate::env::set_perf_stats(raw, stats) {
+                    Ok(()) => Ok(()),
+                    Err(()) => Err(rquickjs::Error::Exception),
+                };
+                self.report(&cx, result);
+            });
+            self.run_jobs();
+        });
+    }
+
     /// Publishes the design tokens the app is drawn with to JS (`token()`
     /// of `nsh`). Call before evaluating the bundle, then on every change.
     pub fn set_tokens(&self, tokens: std::sync::Arc<nsh_core::element::Tokens>) {
@@ -1115,12 +1195,28 @@ impl Host {
             .map_or(0, |rt| self.scheduler.ready(rt.memory_usage()).obj_count)
     }
 
+    /// The JS heap's size in bytes and its live objects (diagnostics: a
+    /// walk of the heap, so not for every frame).
+    pub fn heap_usage(&self) -> (u64, u64) {
+        self.rt.borrow().as_ref().map_or((0, 0), |rt| {
+            let m = self.scheduler.ready(rt.memory_usage());
+            (m.malloc_size.max(0) as u64, m.obj_count.max(0) as u64)
+        })
+    }
+
     /// Runs the cycle collector. Call when idle so released nodes are
     /// reported promptly.
     pub fn collect_garbage(&self) {
         self.guarded(Phase::Call, || {
             self.scheduler
                 .ready(self.rt.borrow().as_ref().expect("live VM").run_gc());
+            // What the collection released: the graph gives back the slots
+            // of nodes that are gone.
+            self.cx.with(|cx| {
+                // SAFETY: the state of this host's context; no other borrow
+                // of the graph is live between calls into JS.
+                unsafe { crate::reactive::graph(cx.as_raw().as_ptr()) }.compact();
+            });
             self.run_jobs();
         });
     }
@@ -1203,15 +1299,51 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
                 Some(button) => obj.set("pressedButton", button.name())?,
                 None => obj.set("pressedButton", Value::new_null(cx.clone()))?,
             }
+            // The button that changed here (`onMouseUp`'s), or `null` on a
+            // move.
+            match e.button {
+                Some(button) => obj.set("button", button.name())?,
+                None => obj.set("button", Value::new_null(cx.clone()))?,
+            }
+            obj.set("pointerType", e.pointer_type.name())?;
+            obj.set("pressure", e.pressure)?;
+            obj.set("tiltX", e.tilt_x)?;
+            obj.set("tiltY", e.tilt_y)?;
         }
-        EventPayload::ContextMenu(nsh_core::ContextMenuEvent {
-            position,
-            page_position,
-            modifiers,
-        }) => {
-            obj.set("position", point_object(cx, *position)?)?;
-            obj.set("pagePosition", point_object(cx, *page_position)?)?;
-            obj.set("modifiers", modifiers_object(cx, modifiers)?)?;
+        EventPayload::Key(event) => {
+            obj.set("key", event.key.as_str())?;
+            obj.set("code", event.code.as_str())?;
+            obj.set("modifiers", modifiers_object(cx, &event.modifiers)?)?;
+            obj.set("repeat", event.repeat)?;
+            obj.set("defaultPrevented", event.default_prevented)?;
+        }
+        EventPayload::Wheel(e) => {
+            obj.set("position", point_object(cx, e.position)?)?;
+            obj.set("pagePosition", point_object(cx, e.page_position)?)?;
+            let (x, y) = e.delta.xy();
+            let delta = rquickjs::Object::new(cx.clone())?;
+            delta.set("x", x)?;
+            delta.set("y", y)?;
+            obj.set("delta", delta)?;
+            obj.set("deltaMode", e.delta.mode_name())?;
+            obj.set("modifiers", modifiers_object(cx, &e.modifiers)?)?;
+        }
+        EventPayload::Pinch(e) => {
+            obj.set("position", point_object(cx, e.position)?)?;
+            obj.set("pagePosition", point_object(cx, e.page_position)?)?;
+            obj.set("delta", e.delta.0)?;
+            obj.set("phase", e.phase.name())?;
+            obj.set("modifiers", modifiers_object(cx, &e.modifiers)?)?;
+        }
+        EventPayload::ContextMenu(e) => {
+            obj.set("position", point_object(cx, e.position)?)?;
+            obj.set("pagePosition", point_object(cx, e.page_position)?)?;
+            obj.set("modifiers", modifiers_object(cx, &e.modifiers)?)?;
+            // `null` when no pointer asked, as declared.
+            match e.pointer_type {
+                Some(pointer) => obj.set("pointerType", pointer.name())?,
+                None => obj.set("pointerType", Value::new_null(cx.clone()))?,
+            }
         }
         EventPayload::Selection(e) => {
             obj.set("start", e.start)?;
@@ -1234,10 +1366,13 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
         }
         EventPayload::FileDrop(uris) | EventPayload::FileDropAt { uris, .. } => {
             let list = rquickjs::Array::new(cx.clone())?;
+            let types = rquickjs::Array::new(cx.clone())?;
             for (index, uri) in uris.iter().enumerate() {
                 list.set(index, uri.as_str())?;
+                types.set(index, nsh_core::platform::file_mime_type(uri))?;
             }
             obj.set("uris", list)?;
+            obj.set("mimeTypes", types)?;
             if let EventPayload::FileDropAt { page_position, .. } = payload {
                 obj.set("pagePosition", point_object(cx, *page_position)?)?;
             }
@@ -1271,8 +1406,14 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
         EventPayload::Picked { id, .. } => obj.set("id", *id)?,
         // The core answers these too.
         EventPayload::FileRequest { id, .. } => obj.set("id", *id)?,
+        // And offscreen canvas renders.
+        EventPayload::CanvasImage { id, .. } => obj.set("id", *id)?,
         // And speech sessions' events (`Speech`'s listeners get them).
         EventPayload::Speech { id, .. } => obj.set("id", *id)?,
+        // And sounds' and players' events (their objects' listeners).
+        EventPayload::Audio { id, .. } => obj.set("id", *id)?,
+        // Handled natively (`crate::window`).
+        EventPayload::Window(_) => return Ok(Value::new_undefined(cx.clone())),
         EventPayload::Native { name, data } => {
             obj.set("name", &**name)?;
             obj.set("data", json_value(cx, data)?)?;
@@ -1368,6 +1509,10 @@ fn payload_object<'js>(cx: &Ctx<'js>, payload: &EventPayload) -> rquickjs::Resul
                 o.set("locationX", p.location.x.0)?;
                 o.set("locationY", p.location.y.0)?;
                 o.set("changed", p.changed)?;
+                o.set("pointerType", p.pointer_type.name())?;
+                o.set("pressure", p.pressure)?;
+                o.set("tiltX", p.tilt_x)?;
+                o.set("tiltY", p.tilt_y)?;
                 o.set("timestamp", touch.timestamp)?;
                 points.set(i, o)?;
             }
@@ -2112,6 +2257,95 @@ const report = (v) => text(String(v));
             let value = payload_object(&cx, &EventPayload::Mouse(none)).unwrap();
             let pressed: Value = value.as_object().unwrap().get("pressedButton").unwrap();
             assert!(pressed.is_null());
+            let changed: Value = value.as_object().unwrap().get("button").unwrap();
+            assert!(changed.is_null());
+        });
+    }
+
+    #[test]
+    fn released_mouse_payload_has_its_button() {
+        let host = Host::new().unwrap();
+        let event = nsh_core::MouseEvent::released(
+            point(px(5.0), px(6.5)),
+            point(px(50.0), px(60.5)),
+            nsh_core::keymap::Modifiers {
+                shift: true,
+                ..Default::default()
+            },
+            nsh_core::MouseButton::Right,
+        );
+        host.cx.with(|cx| {
+            let value = payload_object(&cx, &EventPayload::Mouse(event)).unwrap();
+            let obj = value.as_object().unwrap();
+            let num = |o: &str, k: &str| {
+                let o: rquickjs::Object = obj.get(o).unwrap();
+                o.get::<_, f64>(k).unwrap()
+            };
+            let flag = |k: &str| {
+                let m: rquickjs::Object = obj.get("modifiers").unwrap();
+                m.get::<_, bool>(k).unwrap()
+            };
+            assert_eq!(
+                (
+                    num("position", "x"),
+                    num("position", "y"),
+                    num("pagePosition", "x"),
+                    num("pagePosition", "y")
+                ),
+                (5.0, 6.5, 50.0, 60.5)
+            );
+            assert!(flag("shift"));
+            assert_eq!(obj.get::<_, String>("button").unwrap(), "right");
+            let pressed: Value = obj.get("pressedButton").unwrap();
+            assert!(pressed.is_null());
+        });
+    }
+
+    #[test]
+    fn pinch_payload_is_as_declared() {
+        let host = Host::new().unwrap();
+        let event = nsh_core::PinchEvent::new(
+            point(px(1.0), px(2.0)),
+            point(px(11.0), px(22.0)),
+            nsh_core::geometry::Percentage(0.25),
+            nsh_core::PinchPhase::Start,
+            Default::default(),
+        );
+        host.cx.with(|cx| {
+            let value = payload_object(&cx, &EventPayload::Pinch(event)).unwrap();
+            let obj = value.as_object().unwrap();
+            assert_eq!(obj.get::<_, f64>("delta").unwrap(), 0.25);
+            assert_eq!(obj.get::<_, String>("phase").unwrap(), "start");
+            let page: rquickjs::Object = obj.get("pagePosition").unwrap();
+            assert_eq!(page.get::<_, f64>("y").unwrap(), 22.0);
+            let modifiers: rquickjs::Object = obj.get("modifiers").unwrap();
+            assert!(!modifiers.get::<_, bool>("shift").unwrap());
+        });
+    }
+
+    #[test]
+    fn mouse_payload_has_pen_fields() {
+        let host = Host::new().unwrap();
+        let mouse = nsh_core::MouseEvent::new(
+            point(px(1.0), px(2.0)),
+            point(px(1.0), px(2.0)),
+            Default::default(),
+            Some(nsh_core::MouseButton::Left),
+        );
+        let pen = mouse.with_pointer(nsh_core::PointerType::Pen, 0.75, 30.0, -15.0);
+        host.cx.with(|cx| {
+            let value = payload_object(&cx, &EventPayload::Mouse(mouse)).unwrap();
+            let obj = value.as_object().unwrap();
+            assert_eq!(obj.get::<_, String>("pointerType").unwrap(), "mouse");
+            // A device without pressure: the DOM's 0.5 with a button down.
+            assert_eq!(obj.get::<_, f64>("pressure").unwrap(), 0.5);
+            assert_eq!(obj.get::<_, f64>("tiltX").unwrap(), 0.0);
+            let value = payload_object(&cx, &EventPayload::Mouse(pen)).unwrap();
+            let obj = value.as_object().unwrap();
+            assert_eq!(obj.get::<_, String>("pointerType").unwrap(), "pen");
+            assert_eq!(obj.get::<_, f64>("pressure").unwrap(), 0.75);
+            assert_eq!(obj.get::<_, f64>("tiltX").unwrap(), 30.0);
+            assert_eq!(obj.get::<_, f64>("tiltY").unwrap(), -15.0);
         });
     }
 
@@ -2145,14 +2379,15 @@ const report = (v) => text(String(v));
     #[test]
     fn context_menu_payload_has_both_positions() {
         let host = Host::new().unwrap();
-        let event = nsh_core::ContextMenuEvent {
-            position: point(px(1.0), px(2.0)),
-            page_position: point(px(11.0), px(22.0)),
-            modifiers: nsh_core::keymap::Modifiers {
+        let event = nsh_core::ContextMenuEvent::new(
+            point(px(1.0), px(2.0)),
+            point(px(11.0), px(22.0)),
+            nsh_core::keymap::Modifiers {
                 ctrl: true,
                 ..Default::default()
             },
-        };
+            Some(nsh_core::PointerType::Mouse),
+        );
         host.cx.with(|cx| {
             let value = payload_object(&cx, &EventPayload::ContextMenu(event)).unwrap();
             let obj = value.as_object().unwrap();
@@ -2172,6 +2407,57 @@ const report = (v) => text(String(v));
             let m: rquickjs::Object = obj.get("modifiers").unwrap();
             assert!(m.get::<_, bool>("control").unwrap());
             assert!(!m.get::<_, bool>("platform").unwrap());
+            assert_eq!(obj.get::<_, String>("pointerType").unwrap(), "mouse");
+            let keyboard = nsh_core::ContextMenuEvent::new(
+                event.position,
+                event.page_position,
+                event.modifiers,
+                None,
+            );
+            let value = payload_object(&cx, &EventPayload::ContextMenu(keyboard)).unwrap();
+            let pointer: Value = value.as_object().unwrap().get("pointerType").unwrap();
+            assert!(pointer.is_null());
+        });
+    }
+
+    #[test]
+    fn file_drag_entry_delivers_metadata_before_drop_and_keeps_no_argument_handlers() {
+        let host = Host::new().unwrap();
+        host.eval_source(
+            r#"
+            import { element, prop } from "nsh:rt";
+            globalThis.seen = [];
+            const target = element("view");
+            prop(target, "onFileDragEnter", (e) => seen.push("enter " + e.uris.join(";") + " " + e.mimeTypes.join(";")));
+            prop(target, "onFileDragLeave", () => seen.push("leave"));
+            prop(target, "onFileDrop", (e) => seen.push("drop " + e.uris.join(";")));
+            const old = element("view");
+            prop(old, "onFileDragEnter", () => seen.push("old"));
+        "#,
+        )
+        .unwrap();
+        let first = EventPayload::FileDrop(vec![
+            "file:///tmp/a%20b.png".into(),
+            "file:///tmp/%E4%B8%AD.txt".into(),
+        ]);
+        let next = EventPayload::FileDrop(vec!["file:///tmp/next.png".into()]);
+        host.dispatch_event(2, EventKind::FileDragEnter, &first);
+        host.dispatch_event(2, EventKind::FileDragLeave, &EventPayload::None);
+        host.dispatch_event(2, EventKind::FileDragEnter, &next);
+        host.dispatch_event(2, EventKind::FileDrop, &next);
+        host.dispatch_event(4, EventKind::FileDragEnter, &first);
+        host.cx.with(|cx| {
+            let seen: Vec<String> = cx.globals().get("seen").unwrap();
+            assert_eq!(
+                seen,
+                [
+                    "enter file:///tmp/a%20b.png;file:///tmp/%E4%B8%AD.txt image/png;text/plain",
+                    "leave",
+                    "enter file:///tmp/next.png image/png",
+                    "drop file:///tmp/next.png",
+                    "old"
+                ]
+            );
         });
     }
 
@@ -2186,6 +2472,8 @@ const report = (v) => text(String(v));
             let value = payload_object(&cx, &EventPayload::FileDrop(uris.clone())).unwrap();
             let actual: Vec<String> = value.as_object().unwrap().get("uris").unwrap();
             assert_eq!(actual, uris);
+            let types: Vec<String> = value.as_object().unwrap().get("mimeTypes").unwrap();
+            assert_eq!(types, ["text/plain", ""]);
         });
     }
 
@@ -2270,11 +2558,55 @@ const report = (v) => text(String(v));
         assert_eq!(style.view.opacity, 0.5);
     }
 
+    /// `Intl` names local time by the zone it formats it in, whichever the
+    /// environment reports (a test's, which moves no local time): the
+    /// zone `resolvedOptions()` gives formats as local time does, at any
+    /// instant. On a machine outside UTC the reported `UTC` is not local
+    /// time; on one in UTC, `+08:00` is not. It holds under any `TZ`:
+    /// `Asia/Singapore` (+07:30 at epoch 0), `JST-9`, and
+    /// `CET-1CEST,M3.5.0,M10.5.0/3`, whose summer instant shows a zone
+    /// named by one offset.
+    #[test]
+    fn names_the_zone_it_formats_local_time_in() {
+        let host = Host::new().unwrap();
+        let script = format!(
+            r#"{REPORT}
+            const options = {{
+              year: "numeric", month: "2-digit", day: "2-digit",
+              hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+            }};
+            const local = new Intl.DateTimeFormat("en-US", options);
+            const zone = local.resolvedOptions().timeZone;
+            const named = new Intl.DateTimeFormat("en-US", {{ ...options, timeZone: zone }});
+            // 1970 (Singapore at +07:30), a northern summer and winter.
+            const instants = [0, 1720000000000, 1736000000000];
+            const differ = instants.filter((t) => named.format(t) !== local.format(t));
+            report(differ.length === 0 ? "agrees" : `${{zone}}: ${{differ.map((t) => named.format(t) + " vs " + local.format(t))}}`);
+            "#
+        );
+        for zone in ["UTC", "+08:00", "Asia/Tokyo"] {
+            let mut env = Environment::default();
+            env.locale_settings.time_zone = nsh_core::platform::TimeZone::parse(zone).unwrap();
+            host.set_environment(&env);
+            host.eval_source(&script).unwrap();
+        }
+        assert_eq!(reported(&host), ["agrees", "agrees", "agrees"]);
+    }
+
     /// `Intl` and the `toLocaleString`s format natively, in the device's
     /// locale by default.
     #[test]
-    fn intl_formats_numbers_and_dates() {
+    fn formats_numbers_and_dates() {
         let host = Host::new().unwrap();
+        // What a bundle listing these languages registers (`nsh:rt`'s
+        // `i18n`): the runtime has English only.
+        let mut languages = serde_json::Map::new();
+        for lang in ["de", "fr", "ja", "ko"] {
+            let data = nsh_i18n::language_data(lang).unwrap();
+            languages.insert(lang.into(), serde_json::from_str(data).unwrap());
+        }
+        host.cx
+            .with(|cx| crate::web::add_languages(cx.as_raw().as_ptr(), languages));
         host.eval_source(&format!(
             r#"{REPORT}
             report((1234567.891).toLocaleString());
@@ -2435,6 +2767,61 @@ const report = (v) => text(String(v));
             .filter(|op| matches!(op, Op::Create { .. }))
             .count();
         assert_eq!(created, 1);
+        assert!(host.fatal().is_none());
+    }
+
+    #[test]
+    fn an_interrupt_inside_find_keeps_the_elements_alive() {
+        // An interrupt inside QuickJS's `find` family must not free the
+        // arrays' elements (quickjs-ng #1826), or a later call crashes the
+        // VM. `views[0]` and the second, offset run of each method make the
+        // interrupt land in the method itself.
+        let mut host = sandboxed(Limits {
+            call_budget: Duration::ZERO,
+            ..Limits::default()
+        });
+        let errors = Rc::new(RefCell::new(Vec::new()));
+        let seen = errors.clone();
+        host.set_error_handler(Box::new(move |e| seen.borrow_mut().push(e.message.clone())));
+        host.eval_source(
+            r#"import { element, prop } from "nsh:rt";
+            const methods = ["find", "findIndex", "findLast", "findLastIndex"];
+            globalThis.kept = methods.map(() => ({}));
+            globalThis.weak = kept.map((element) => new WeakRef(element));
+            globalThis.items = kept.map((element) => new Array(100000).fill(element));
+            const press = (handler) => {
+                const view = element("view");
+                prop(view, "onPress", handler);
+                return view;
+            };
+            const nothing = () => {};
+            globalThis.views = [press(() => { for (;;) {} })];
+            methods.forEach((method, i) => {
+                views.push(press(() => items[i][method](() => false)));
+                views.push(press(() => (nothing(), items[i][method](() => false))));
+            });"#,
+        )
+        .unwrap();
+        ops(&host);
+        // Views 2 (the loop), then 4 to 18: two per method.
+        for view in (4..=18).step_by(2) {
+            host.dispatch_event(2, EventKind::Press, &EventPayload::None);
+            host.dispatch_event(view, EventKind::Press, &EventPayload::None);
+        }
+        let errors = errors.borrow().clone();
+        assert_eq!(errors.len(), 16, "{errors:?}");
+        assert!(
+            errors.iter().all(|e| e.contains("budget of 0 ms")),
+            "{errors:?}"
+        );
+        // The arrays let their elements go; `kept` still holds them.
+        host.eval_source("items = null;").unwrap();
+        host.collect_garbage();
+        host.eval_source(&format!(
+            "{REPORT}report(weak.map((w, i) => w.deref() === kept[i]).join());"
+        ))
+        .unwrap();
+        assert_eq!(reported(&host), ["true,true,true,true"]);
         assert!(host.fatal().is_none());
     }
 
@@ -2767,6 +3154,36 @@ const report = (v) => text(String(v));
         assert!(err.message.contains("top level"), "{}", err.message);
         assert!(rejections(&logs::take()).is_empty());
         assert_eq!(host.pending_rejections(), 0);
+    }
+
+    #[test]
+    fn collecting_gives_back_the_graph_slots_of_a_tree_that_is_gone() {
+        let host = Host::new().unwrap();
+        let slots = |host: &Host| {
+            host.cx.with(|cx| {
+                // SAFETY: the host's state; no JS runs meanwhile.
+                unsafe { crate::reactive::graph(cx.as_raw().as_ptr()) }.slots()
+            })
+        };
+        host.collect_garbage();
+        let (_, before) = slots(&host);
+        host.eval_source(
+            r#"import { cond } from "nsh:rt";
+            import { computed, signal } from "nsh";
+            const shown = signal(true);
+            const branch = cond(() => shown(), () => {
+                for (let i = 0; i < 20000; i++) computed(() => i)();
+                return null;
+            });
+            branch();
+            globalThis.hide = () => { shown.set(false); branch(); };"#,
+        )
+        .unwrap();
+        assert!(slots(&host).1 >= before + 20000);
+        host.eval_script("hide.js", "hide();").unwrap();
+        host.collect_garbage();
+        let (_, after) = slots(&host);
+        assert!(after < before + 100, "{before} → {after} slots");
     }
 
     #[test]

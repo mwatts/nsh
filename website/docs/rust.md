@@ -46,6 +46,10 @@ nsh run                        # this machine's backend; --target ios, android, 
 nsh package --target web       # or ios, ios-simulator, android, macos, linux, windows
 ```
 
+Build with [huacnlee/cargo](https://github.com/huacnlee/cargo), the Cargo NSH is developed with: a drop-in fork that builds each dependency once for all your
+projects and Git worktrees and keeps its build directory under a size limit on its own, with nothing to configure
+([Installation](./installation.md#for-apps-written-in-rust)).
+
 `src/lib.rs` holds the app: components, state, handlers, tasks.
 
 ```rust
@@ -136,12 +140,18 @@ Windows, Linux, GPUI and iOS.
 Code for every platform, the web included, uses NSH's services: `fetch` for HTTP
 ([Networking](./networking.md#from-rust-components)), `timer`, `set_timeout` and `set_interval` for waiting,
 `nsh_core::time::Instant` and `nsh_core::time::unix_ms()` for the clock. `background` and `blocking` run work on the
-native targets' threads.
+native targets' threads. `run_on_main_thread(f)` runs `f` on the platform's main thread, for APIs that only work there
+(AppKit's status items, UIKit): after the views of the current turn are mounted, and its result is a future to await
+on the engine thread. A module function that is not `async` calls `cx.run_on_main_thread(f)`. On the web and in
+headless tests `f` runs on the engine thread at the end of the commit, and on the native platforms later, while the
+engine goes on: await the result to know that `f` ran. `f` returns a value, and the code that awaits it writes signals
+and calls NSH's functions with it.
 
 ## Desktop title bars
 
-Rust apps draw their own title bars with `nsh_core::element::desktop`. Call
-`set_title_bar(TitleBarStyle::Hidden, Some(height))`, mark the bar's background
+Rust apps draw their own title bars with `nsh_core::element::desktop`. Set the
+window's `title_bar` attribute to `TitleBarStyle::Hidden` with
+`current_window().set(..)`, mark the bar's background
 with `.window_drag(true)`, and reserve the native window controls' space with
 `title_bar()`. Its `top` is the bar's height, and `left` and `right` are the widths
 occupied by the system controls. Reading it subscribes to changes, including full
@@ -150,12 +160,18 @@ behavior; `.window_drag(false)` keeps a child out of its parent's drag region.
 
 ```rust
 use nsh_core::{
-    desktop::TitleBarStyle,
-    element::{desktop::{close_window, set_title_bar, title_bar}}, prelude::*,
+    desktop::{TitleBarOptions, TitleBarStyle, WindowAttributes, WindowControl},
+    element::desktop::{current_window, title_bar},
+    prelude::*,
 };
 
 fn window_bar() -> impl IntoElement {
-    set_title_bar(TitleBarStyle::Hidden, Some(px(42.0)));
+    let mut bar = TitleBarOptions::default();
+    bar.style = TitleBarStyle::Hidden;
+    bar.height = Some(px(42.0));
+    let mut attributes = WindowAttributes::default();
+    attributes.title_bar = Some(bar);
+    current_window().set(attributes);
     view()
         .h(px(42.0))
         .flex_row()
@@ -164,14 +180,16 @@ fn window_bar() -> impl IntoElement {
         .pl(move || title_bar().left + px(12.0))
         .pr(move || title_bar().right + px(12.0))
         .child(text("My app").flex_1())
-        .child(text("Close").window_drag(false).on_press(close_window))
+        .child(text("Close").window_control(WindowControl::Close))
 }
 ```
 
-`set_title_bar(TitleBarStyle::Default, None)` restores the system title bar.
-`close_window()` follows the embedding host's normal window-close behavior.
-The module has the window's other functions (`set_title`, `minimize`,
-`toggle_full_screen`, ...) and the menus (`set_application_menu`,
+A title bar with `TitleBarStyle::Default` restores the system's. A view with
+`.window_control(..)` is the window's minimize, maximize or close button: the
+platform carries out its press, and a close goes through the window's
+`close_on_press`. The `WindowRef` has the window's other requests
+(`set_mode`, `minimize`, `set_bounds`, `close`, ...), `window()` opens windows of
+the app's own, and the module has the menus (`set_application_menu`,
 `popup_menu`) too: [nsh/desktop](../modules/nsh-desktop.md).
 
 ## Files and folders
@@ -212,6 +230,41 @@ fn open_notes() {
     });
 }
 ```
+
+## Signing in on the web
+
+`open_auth_session` opens a provider's sign-in page (an OAuth authorization URL) and
+answers with the callback URL it redirects to: iOS shows it in an
+`ASWebAuthenticationSession` sheet (`.ephemeral(true)` keeps it apart from the user's
+Safari data), Android in a Custom Tab, other platforms in the system browser. Outside
+iOS the callback comes back as a link of a scheme the app claims (`nsh.json`
+`schemes`); the session takes it, so `next_url_scheme_open` never hears it. The
+answer is `Completed(url)` or `Cancelled` (the user closed the page or came back to
+the app without signing in); a session with nothing to bring its callback back fails
+with `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM`. The page's URL needs the `openUrl`
+capability, as `open_url` does.
+
+```rust
+use nsh_core::{
+    auth_session::{AuthSessionOutcome, AuthSessionRequest},
+    prelude::*,
+};
+
+fn sign_in(authorize_url: String) {
+    let session = open_auth_session(AuthSessionRequest::new(authorize_url, "myapp"));
+    spawn(async move {
+        match session.await {
+            Ok(AuthSessionOutcome::Completed(callback)) => log::info!("signed in: {callback}"),
+            Ok(_) => {} // Cancelled.
+            Err(error) => log::warn!("no sign-in page: {error}"),
+        }
+    });
+}
+```
+
+In tests, `Headless::on_auth_session` gives the platform an in-app session and ends
+each one with the outcome given; without it the page is in `opened_urls()` and
+`open_with_url` delivers the callback.
 
 ## Extending a Rust app with TSX
 
@@ -353,8 +406,8 @@ prop keeps its value and the rest of the component renders.
 A function or a member runs the way its Rust signature says. One that is not `async` runs inside the TSX call and
 returns its value (`Portfolio.total()` is a number, `ledger.balance` a property): it computes and keeps state. An
 `async fn` returns a Promise and runs as a task with NSH's services (`fetch`, `timer`, dialogs). A module function
-taking `cx: &mut ModuleCx` reaches the platform in order with the UI (a toast, the status bar), and so does a
-component's ref method; their return type decides what TSX gets: one returning `()` gives `void`, with no reply
+taking `cx: &mut ModuleCx` reaches the platform in order with the UI (a toast, the status bar) and may `spawn` a
+task, which runs to its end. A component's ref method also reaches the platform in order with the UI; their return type decides what TSX gets: one returning `()` gives `void`, with no reply
 (TSX calls it and moves on); one returning `Result<(), E>` gives `Promise<void>`, which rejects with the `Err`'s
 message (the call runs with the UI's changes, after the TSX call returned, so the Promise carries its error; one
 nobody awaits or catches is logged as an [unhandled rejection](./dev-server-and-debugging.md#logs)); one
@@ -477,6 +530,29 @@ test("a tap counts", async () => {
   await app.press("Tap");
   expect(app.texts()).toContain("Count: 1");
 });
+```
+
+Text is laid out with an estimate of its width (every character `0.55 ×` the font size) unless the test starts the
+app with `Headless::start_with_text_engine`, which takes a function making the platform's text engine on the engine's
+thread (`nsh_platform_macos::CoreTextEngine`, `nsh_platform_windows::DWriteTextEngine`), so text measures as it does on
+screen. `app.screen().layout_nodes()` returns the views on screen in tree order as layout placed them (`LayoutNode`:
+kind, test id, parent, bounds in the root's points before transforms, whether it is hidden or clips, a scroll view's
+axis and content size in `scroll`, a text view's text and the box it was laid out in in `text`), so a test can check
+that nothing passes its parent, is cut by a view that clips, or is too wide for its text. Both are Rust API of
+`nsh_testing`, for `cargo test`.
+
+A web app's routing is tested on its page: `Headless::start_at_page(config, "https://example.test/app/")` starts the
+app on the web at that address, and `app.browser()` is the browser around it, with the history the web keeps (an
+entry per page a stack pushes and per open dialog, the app's `set_app_url_with(url, HistoryBehavior::Push)` addresses)
+and the user's moves through it: `back()`, `forward()`, `go(delta)` and `type_address("#inbox")`, which the app hears
+as on the web (`next_app_url_change`, `next_url_scheme_open`); `entries()`, `index()` and `url()` read the history.
+
+```rust
+let mut app = Headless::start_at_page(config, "https://example.test/app/").unwrap();
+app.press("Message").unwrap(); // pushes a page and sets `?m=1`
+assert_eq!(app.browser().url(), Some("https://example.test/app/?m=1"));
+app.browser().back().unwrap(); // pops the page
+app.browser().type_address("#inbox").unwrap(); // an `Address` change
 ```
 
 A TSX entry is built with `nsh-testing`'s feature `bundle` as `nsh run` builds it, against the UI sets its hosts

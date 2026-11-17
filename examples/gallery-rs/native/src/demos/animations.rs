@@ -73,6 +73,7 @@ const fn spring(k: f32, c: f32) -> Spring {
         damping: c,
         mass: 1.0,
         velocity: None,
+        frame_rate: None,
     }
 }
 
@@ -1108,7 +1109,7 @@ const PRESETS: [(&str, LayoutAnimation); 3] = [
     (
         "Spring",
         LayoutAnimation::all(LayoutTransition::new(
-            LayoutCurve::Spring { damping: 0.7 },
+            LayoutCurve::FittedSpring { damping_ratio: 0.7 },
             420.0,
         )),
     ),

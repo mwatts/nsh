@@ -45,6 +45,7 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         })),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -56,7 +57,7 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         // Nothing registered: Rust renders its components by type.
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -66,6 +67,10 @@ fn start() -> (Engine, Receiver<MountBatch>) {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -122,6 +127,7 @@ fn a_rust_app_starts_in_its_appearance() {
         app: App::Rust(Root::of::<WithCard>().appearance(nsh_core::platform::Appearance::Dark)),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -132,7 +138,7 @@ fn a_rust_app_starts_in_its_appearance() {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -142,6 +148,10 @@ fn a_rust_app_starts_in_its_appearance() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let _engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -181,6 +191,7 @@ fn rust_components_navigate_with_native_stacks() {
         app: App::Rust(Root::of::<Navigation>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -191,7 +202,7 @@ fn rust_components_navigate_with_native_stacks() {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -201,6 +212,10 @@ fn rust_components_navigate_with_native_stacks() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -274,6 +289,7 @@ fn rust_components_pass_content_to_rust_components() {
         app: App::Rust(Root::of::<WithCard>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -284,7 +300,7 @@ fn rust_components_pass_content_to_rust_components() {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -294,6 +310,10 @@ fn rust_components_pass_content_to_rust_components() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -377,6 +397,7 @@ fn rust_components_take_the_back_button() {
         app: App::Rust(Root::of::<BackCounter>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -387,7 +408,7 @@ fn rust_components_take_the_back_button() {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -397,6 +418,10 @@ fn rust_components_take_the_back_button() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let first = rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -533,6 +558,7 @@ fn rust_components_hear_layouts_and_scrolls() {
         app: App::Rust(Root::of::<Measured>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -543,7 +569,7 @@ fn rust_components_hear_layouts_and_scrolls() {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -553,6 +579,10 @@ fn rust_components_hear_layouts_and_scrolls() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     // Until `until` shows; the scroll view's id on the way.
@@ -612,6 +642,7 @@ fn nested_components_in_list_rows_reach_the_list_owner() {
         app: App::Rust(Root::of::<ButtonRows>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -622,7 +653,7 @@ fn nested_components_in_list_rows_reach_the_list_owner() {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -632,6 +663,10 @@ fn nested_components_in_list_rows_reach_the_list_owner() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let mut parents = std::collections::HashMap::new();
@@ -678,6 +713,7 @@ fn content_a_component_does_not_place_is_not_shown() {
         app: App::Rust(Root::of::<WithSheet>()),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -688,7 +724,7 @@ fn content_a_component_does_not_place_is_not_shown() {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -698,6 +734,10 @@ fn content_a_component_does_not_place_is_not_shown() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     let mut parents: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();

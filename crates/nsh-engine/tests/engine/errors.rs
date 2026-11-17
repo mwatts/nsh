@@ -36,6 +36,7 @@ fn config(bundle: Bundle, limits: nsh_engine::Limits) -> EngineConfig {
         app: nsh_engine::App::Js(bundle),
         viewport: Size::new(px(100.0), px(100.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -46,7 +47,7 @@ fn config(bundle: Bundle, limits: nsh_engine::Limits) -> EngineConfig {
         limits,
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -56,6 +57,10 @@ fn config(bundle: Bundle, limits: nsh_engine::Limits) -> EngineConfig {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     }
 }
 
@@ -105,6 +110,7 @@ fn bundle_app(name: &str, minify: bool, source: &str) -> nsh_bundler::Bundle {
         minify,
         split: false,
         ui_sets: vec![nsh_base::registry().into()],
+        ..Default::default()
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -121,6 +127,7 @@ fn first_error(bundle: Bundle) -> String {
         app: nsh_engine::App::Js(bundle),
         viewport: Size::new(px(100.0), px(100.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -131,7 +138,7 @@ fn first_error(bundle: Bundle) -> String {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -141,6 +148,10 @@ fn first_error(bundle: Bundle) -> String {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let _engine = Engine::start(config, || ApproxTextEngine, sink).unwrap();
     rx.recv_timeout(Duration::from_secs(5))

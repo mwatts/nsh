@@ -3,10 +3,10 @@
 //! and runtime errors on screen.
 //!
 //! The dev client runs on its own thread (it reconnects with a backoff
-//! when the server goes away); each of its events hops to the main thread
-//! with [`crate::window::invoke`], which needs `Send` closures, so the
-//! session's state lives in a thread-local map and events find it by key
-//! (as the engine's batches find their surface).
+//! when the server goes away); each of its events hops to the UI thread of
+//! the surface with [`crate::window::UiThread::invoke`], which needs `Send`
+//! closures, so the session's state lives in a thread-local map and events
+//! find it by key (as the engine's batches find their surface).
 //!
 //! The status line and the error overlay are items the root view hosts
 //! ([`Hosted`]): drawn above the whole app, modals included, with Direct2D
@@ -104,7 +104,7 @@ pub fn init_logging() {
 }
 
 thread_local! {
-    /// The dev sessions of this (main) thread, by key.
+    /// The dev sessions of this thread, by key.
     static SESSIONS: RefCell<FxHashMap<u64, Rc<RefCell<DevUi>>>> = RefCell::default();
 }
 
@@ -144,6 +144,10 @@ struct DevUi {
     latest: Option<(u64, u64, Bundle)>,
     status: Option<Rc<StatusLine>>,
     error: Option<Rc<ErrorOverlay>>,
+    /// The window waits for the app's options to show: it shows when the
+    /// first app comes, unless they say it starts hidden, or an error does
+    /// ([`app_came`], [`show_error`]).
+    held: bool,
 }
 
 /// What the status line says.
@@ -182,6 +186,7 @@ pub(crate) fn start(view: &Rc<AppView>, url: String) {
         latest: None,
         status: None,
         error: None,
+        held: true,
     }));
     SESSIONS.with(|s| s.borrow_mut().insert(key, ui.clone()));
     show_status(&ui, Status::Connecting(&url));
@@ -221,17 +226,20 @@ pub(crate) fn start(view: &Rc<AppView>, url: String) {
     // model the agent's steps see, from the first bundle on (posted
     // messages keep their order, so it comes before the bundle).
     let key_of_surface = surface.key();
+    // The surface's UI thread, taken here: the dev client's and the
+    // agent's threads post back to it.
+    let thread = surface.ui_thread();
     let tester = nsh_testing::agent::Tester::new(move |model| {
-        crate::window::invoke(move || {
+        thread.invoke(move || {
             if let Some(surface) = crate::surface::Surface::by_key(key_of_surface) {
                 surface.set_test_model(Some(model));
             }
         });
-        Box::new(crate::agent::WindowsNative::new(key_of_surface))
+        Box::new(crate::agent::WindowsNative::new(key_of_surface, thread))
     });
     let tests = tester.clone();
     let started = DevClient::start(url, host, move |event| {
-        // Taken off the main thread: a step waits for what it does there.
+        // Taken off the UI thread: a step waits for what it does there.
         let Some(event) = tests.event(event) else {
             return;
         };
@@ -242,7 +250,7 @@ pub(crate) fn start(view: &Rc<AppView>, url: String) {
         }
         // Posted messages arrive in the order they were posted, so events
         // keep theirs.
-        crate::window::invoke(move || {
+        thread.invoke(move || {
             if let Some(ui) = session(key) {
                 handle(&ui, event);
             }
@@ -356,7 +364,9 @@ fn handle(ui: &Rc<RefCell<DevUi>>, event: DevEvent) {
             };
             let Some(view) = view else { return };
             hide_error(ui);
-            view.load(App::Rust(root));
+            let app = App::Rust(root);
+            app_came(ui, &view, &app);
+            view.load(app);
         }
         DevEvent::Building => show_status(ui, Status::Building),
         DevEvent::BuildFailed(message) => {
@@ -376,6 +386,7 @@ fn handle(ui: &Rc<RefCell<DevUi>>, event: DevEvent) {
             capabilities,
             app_id,
             limits,
+            window,
         } => {
             hide_status(ui);
             let mut bundle = match format {
@@ -400,6 +411,10 @@ fn handle(ui: &Rc<RefCell<DevUi>>, event: DevEvent) {
             if let Some(map) = source_map {
                 bundle = bundle.with_source_map(map);
             }
+            // nsh.json `window`: the engine sends its attributes to the
+            // window with the first frame; its size, position and mode are
+            // taken the first time a session loads.
+            bundle = bundle.with_main_window(window.as_deref());
             bundle = match bundle
                 .with_app_id(app_id.as_deref())
                 .with_capabilities_json(capabilities.as_deref())
@@ -423,8 +438,15 @@ fn handle(ui: &Rc<RefCell<DevUi>>, event: DevEvent) {
             let Some(view) = view else { return };
             log::info!("loading build {version}");
             hide_error(ui);
+            if running.is_none_or(|(s, _)| s != session)
+                && let Some(window) = &bundle.main_window
+            {
+                view.place_main_window(window, None);
+            }
             view.set_limits(limits);
-            view.load(App::Js(bundle));
+            let app = App::Js(bundle);
+            app_came(ui, &view, &app);
+            view.load(app);
         }
         DevEvent::Patch {
             session,
@@ -524,11 +546,42 @@ fn hide_status(ui: &RefCell<DevUi>) {
     }
 }
 
+/// `app` came: the window, held until its options came, shows unless they
+/// say it starts hidden (nsh.json `window.defaultVisible: false`), as the
+/// app's package shows it.
+fn app_came(ui: &RefCell<DevUi>, view: &AppView, app: &App) {
+    if !std::mem::take(&mut ui.borrow_mut().held) {
+        return;
+    }
+    if app
+        .main_window()
+        .is_none_or(nsh_core::desktop::MainWindowOptions::visible_at_launch)
+    {
+        view.show();
+    } else {
+        log::info!("the main window starts hidden (nsh.json window.defaultVisible: false)");
+    }
+}
+
 /// Shows `title` and `message` over the whole app; a click dismisses it.
 /// `prose` wraps the message to the view; otherwise its lines are kept
-/// (code frames, stack traces) and cut at the right edge.
+/// (code frames, stack traces) and cut at the right edge. A hidden window
+/// shows with it.
 fn show_error(ui: &Rc<RefCell<DevUi>>, title: &str, message: &str, prose: bool) {
     hide_error(ui);
+    let held = std::mem::take(&mut ui.borrow_mut().held);
+    let view = ui.borrow().view.upgrade();
+    // A hidden window, held for the app or hidden by it (one hidden since
+    // launch whose startup failed: a tray app before its icon came), shows
+    // the error, so it is seen.
+    if let Some(view) = view {
+        use windows::Win32::UI::WindowsAndMessaging::IsWindowVisible;
+        // SAFETY: a plain query on the app's live window.
+        let visible = unsafe { IsWindowVisible(view.hwnd()) }.as_bool();
+        if held || !visible {
+            view.show();
+        }
+    }
     let mut state = ui.borrow_mut();
     state.error = Some(Rc::new(ErrorOverlay {
         key: state.key,
@@ -903,6 +956,8 @@ impl Hosted for ErrorOverlay {
         if event.kind == PointerKind::Up {
             // Not while input still walks the root's items.
             let key = self.key;
+            // Pointer handlers run on the surface's UI thread.
+            let ui = crate::window::UiThread::current();
             let size = self.layout.borrow().as_ref().map(|l| l.size);
             if let Some(size) = size {
                 let (x, y, w, h) = copy_rect(size);
@@ -913,7 +968,7 @@ impl Hosted for ErrorOverlay {
                     }
                     self.copied.set(true);
                     // Drawn again with its new label.
-                    crate::window::invoke(move || {
+                    ui.invoke(move || {
                         if let Some(ui) = session(key) {
                             let ui = ui.borrow();
                             place(&ui, root_size(&ui));
@@ -922,7 +977,7 @@ impl Hosted for ErrorOverlay {
                     return true;
                 }
             }
-            crate::window::invoke(move || {
+            ui.invoke(move || {
                 if let Some(ui) = session(key) {
                     hide_error(&ui);
                 }

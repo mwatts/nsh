@@ -462,8 +462,14 @@ pub(crate) const HOST_EXPORTS: &[Item] = &[(
 /// `TabBar`).
 pub(crate) const MOBILE_EXPORTS: &[Item] = &[(
     "isAvailable",
-    Export::Value(|cx| boolean(matches!(os(cx), Os::Ios | Os::Android))),
-    Ts::value("True on iOS (and Mac Catalyst) and Android.", "boolean"),
+    Export::Value(|cx| {
+        let env = crate::env::current(cx);
+        boolean(matches!(env.os, Os::Ios | Os::Android) && env.tab_bar)
+    }),
+    Ts::value(
+        "True on iOS (and Mac Catalyst) and Android, unless a platform built outside NSH\nshows no system tab bar there.",
+        "boolean",
+    ),
 )];
 
 /// `nsh/ios`.
@@ -493,7 +499,8 @@ pub(crate) const IOS_TYPES: &str = r#"export interface InputAccessoryViewProps {
 "#;
 
 /// `nsh`'s `WebView`: the web view element as a component carrying the
-/// functions of the runtime's module (`inputAvailable`).
+/// functions of the runtime's module (`available`, `evaluateAvailable`,
+/// `inputAvailable`).
 pub(crate) const WEBVIEW_EXPORTS: &[Item] = &[(
     "WebView",
     Export::Value(|cx| {
@@ -502,7 +509,7 @@ pub(crate) const WEBVIEW_EXPORTS: &[Item] = &[(
         webview
     }),
     Ts::value(
-        "A web page (WKWebView / android.webkit.WebView); its `ref` has\n`reload()`, `goBack()`, `goForward()`, `stopLoading()`,\n`injectJavaScript(script)`, `postMessage(data)` and `sendInput(input)`;\n`WebView.inputAvailable()` says whether `sendInput` works here.",
+        "A web page (WKWebView / android.webkit.WebView); its `ref` has\n`reload()`, `goBack()`, `goForward()`, `stopLoading()`,\n`injectJavaScript(script)`, `evaluate(script, options)`, `postMessage(data)`,\n`sendInput(input)` and `load({ src, headers })`;\n`WebView.available()` says whether a web view shows a page here,\n`WebView.evaluateAvailable()` whether `evaluate` works here, and\n`WebView.inputAvailable()` whether `sendInput` works here.",
         "((props: WebViewProps) => JSX.Element) & WebViewModule",
     ),
 )];
@@ -555,19 +562,24 @@ unsafe extern "C" fn native_component(
     native(cx, render_native, 1, &mut data)
 }
 
-/// The strings of array `spec[key]`.
-fn names(cx: *mut JsContext, spec: JsValue, key: &CStr) -> Vec<String> {
+/// The strings of array `spec[key]`; `None` (an exception pending) when
+/// the array's length throws or is longer than [`dom::MAX_ARRAY_ITEMS`].
+fn names(cx: *mut JsContext, spec: JsValue, key: &CStr) -> Option<Vec<String>> {
     let mut out = Vec::new();
     // SAFETY: reads of live values; every value got is freed.
     unsafe {
         if !qjs::JS_IsObject(spec) {
-            return out;
+            return Some(out);
         }
         let list = qjs::JS_GetPropertyStr(cx, spec, key.as_ptr());
-        let mut len: i64 = 0;
-        if qjs::JS_IsArray(list) && qjs::JS_GetLength(cx, list, &mut len) == 0 {
-            for i in 0..len.max(0) {
-                let v = qjs::JS_GetPropertyInt64(cx, list, i);
+        if qjs::JS_IsArray(list) {
+            // Read natively: a sparse array is as long as it says.
+            let Some(len) = dom::checked_len(cx, list) else {
+                qjs::JS_FreeValue(cx, list);
+                return None;
+            };
+            for i in 0..len {
+                let v = qjs::JS_GetPropertyUint32(cx, list, i);
                 if let Some(s) = dom::string_arg(cx, v) {
                     out.push(s);
                 }
@@ -576,7 +588,7 @@ fn names(cx: *mut JsContext, spec: JsValue, key: &CStr) -> Vec<String> {
         }
         qjs::JS_FreeValue(cx, list);
     }
-    out
+    Some(out)
 }
 
 fn handler_name(event: &str) -> String {
@@ -598,8 +610,12 @@ unsafe extern "C" fn render_native(
     // SAFETY: two data values (name, spec).
     let (name, spec) = unsafe { (*data, *data.add(1)) };
     let props = arg(argc, argv, 0);
-    let own = names(cx, spec, c"props");
-    let events = names(cx, spec, c"events");
+    let Some(own) = names(cx, spec, c"props") else {
+        return qjs::JS_EXCEPTION;
+    };
+    let Some(events) = names(cx, spec, c"events") else {
+        return qjs::JS_EXCEPTION;
+    };
     let node = match dom::create_element(cx, Tag::Native) {
         Ok(node) => node,
         Err(e) => return e,

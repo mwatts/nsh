@@ -7,15 +7,22 @@ use nsh_core::{
     color::Hsla,
     element::{Renderer, Style, StyleRefinement},
     geometry::{DefiniteLength, Length},
+    keymap::Modifiers,
     prelude::*,
 };
 
 use super::{
     Alert, Block, CodeBlock, ColumnAlign, CustomNode, Document, Image, ImageLength, Inline,
     ListItem, MarkdownExtension, MarkdownOptions, MarkdownPlugins, Parser, Table,
+    markdown::{Incremental, Parsed, SharedBlock},
     parts::{TextViewClasses, TextViewPart as Part, TextViewParts, TextViewStyles},
+    selection::{Reported, Source, TextSelectionOptions, selected},
 };
-use crate::{terminal::is_terminal, theme::theme};
+use crate::{
+    link_hint::{HintAt, link_hint},
+    terminal::is_terminal,
+    theme::theme,
+};
 
 /// The props of [`TextView`].
 #[derive(Debug, Clone, Copy, PartialEq, Props)]
@@ -136,10 +143,72 @@ pub enum TextViewEvent {
     /// viewer of its own).
     #[args(image)]
     ImagePress(Image),
+    /// The box of a task item was pressed: which task of
+    /// the document, and the state the press asks for. The document does
+    /// not change: the app gives the view its edited source.
+    #[args(event)]
+    TaskPress(TextViewTaskPressEvent),
     /// An action of a code block was pressed (after the built-in `copy`
     /// copied): its id and the code block.
     #[args(event)]
     CodeBlockAction(TextViewCodeActionEvent),
+    /// The selection of a `selectable` text view changed: the selected
+    /// text, as a copy gives it, empty once nothing is selected (to quote
+    /// a part of a reply). Inside another `selectable` view the outer
+    /// view's selection is the one there is, and it reports it.
+    #[args(event)]
+    SelectionChange(TextViewSelectionEvent),
+}
+
+/// The methods of a [`TextView`]'s ref.
+pub struct TextViewApi {
+    document: Memo<Parsed>,
+    props: TextViewProps,
+    reported: Rc<std::cell::RefCell<Reported>>,
+}
+
+#[methods]
+impl TextViewApi {
+    /// The selected part of a `selectable` view, in `options.format`: its
+    /// text as a copy gives it (`plain`, the default), or the selected
+    /// nodes as Markdown or HTML (the source as written when all of it is
+    /// selected). Empty when nothing is selected; inside another
+    /// `selectable` view, the outer view holds the selection and this
+    /// view's is empty.
+    pub fn selected_text(&self, options: Option<TextSelectionOptions>) -> String {
+        let format = options.unwrap_or_default().format;
+        let reported = self.reported.borrow();
+        if reported.text.is_empty() {
+            return String::new();
+        }
+        let source = if let Some(md) = self.props.markdown.get_untracked() {
+            Source::Markdown(md.to_string())
+        } else if let Some(html) = self.props.html.get_untracked() {
+            Source::Html(html.to_string())
+        } else {
+            Source::None
+        };
+        self.document
+            .with_untracked(|doc| selected(&doc.document(), &source, &reported, format))
+    }
+}
+
+/// The selection of a [`TextView`] changed (`onSelectionChange`).
+#[derive(Debug, Clone, Default, PartialEq, JsObject)]
+#[non_exhaustive]
+pub struct TextViewSelectionEvent {
+    /// The selected text, as a copy gives it (blocks joined by line
+    /// breaks); empty when nothing is selected.
+    pub text: SharedString,
+    /// Where it starts in the view's whole text (UTF-16 units), when the
+    /// platform knows it.
+    pub start: Option<u32>,
+    /// The box around it in the view, while something is selected and the
+    /// platform knows it.
+    pub bounds: Option<Bounds<Points>>,
+    /// The same box in the root view the view is in, as of the event (an
+    /// `Overlay`'s `anchor`).
+    pub page_bounds: Option<Bounds<Points>>,
 }
 
 /// An action of the code blocks of a [`TextView`] (`codeBlockActions`).
@@ -175,6 +244,20 @@ pub struct TextViewLinkPressEvent {
     /// The link's URL (`#anchor` for a heading of the document,
     /// `#footnote-<label>` for a footnote).
     pub url: SharedString,
+    /// The modifier keys held when the press began: none when the
+    /// keyboard or an assistive technology pressed the link.
+    pub modifiers: Modifiers,
+}
+
+/// A press on a task item's box of a [`TextView`] (`onTaskPress`).
+#[derive(Debug, Clone, Default, PartialEq, JsObject)]
+#[non_exhaustive]
+pub struct TextViewTaskPressEvent {
+    /// Which task item of the document, counted from 0 in reading order
+    /// (its footnotes' after its blocks').
+    pub index: u32,
+    /// The state the press asks for: the opposite of the one shown.
+    pub checked: bool,
 }
 
 /// A press on a code block's action (`onCodeBlockAction`).
@@ -204,10 +287,15 @@ pub struct TextViewCodeActionEvent {
 /// actions, formulas, images. Made for replies streamed by AI models:
 /// blocks are kept by position, so only those that changed are made
 /// again, and `streaming_caret` follows the end of the text.
-#[component]
+#[component(methods = TextViewApi)]
 pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElement {
     let plugins = use_context::<MarkdownPlugins>().unwrap_or_default();
     let parser_plugins = plugins.clone();
+    // What was read of the Markdown last: a text that grew at its end (a
+    // reply still arriving) is read from where it can still change, and
+    // the blocks before are the ones made earlier, shared, so comparing
+    // the documents and the rows compares pointers there.
+    let read = std::cell::RefCell::new(Incremental::default());
     let document = computed(move || {
         let parser = || {
             Parser::new()
@@ -216,21 +304,56 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
                 .plugins(&parser_plugins)
         };
         if let Some(markdown) = props.markdown.get() {
-            parser().markdown(&markdown)
-        } else if let Some(html) = props.html.get() {
-            parser().html(&html)
+            return read.borrow_mut().parse(&parser(), &markdown);
+        }
+        read.borrow_mut().clear();
+        if let Some(html) = props.html.get() {
+            parser().html(&html).into()
         } else {
-            props.document.get().unwrap_or_default()
+            props.document.get().unwrap_or_default().into()
         }
     });
-    let blocks = computed(move || {
-        document.with(|d| d.blocks.iter().cloned().enumerate().collect::<Vec<_>>())
+    // The rows' items carry what a row needs of the blocks around it, so a
+    // row hears of a change by its own item alone: an update of a long
+    // document runs nothing per row but that item's comparison.
+    let rows = computed(move || {
+        document.with(|d| {
+            let terminal = is_terminal();
+            let count = d.blocks.len();
+            // The last block before this one that shows (`shown_before`).
+            let mut shown = None;
+            let mut tasks = 0;
+            d.blocks
+                .iter()
+                .enumerate()
+                .map(|(index, block)| {
+                    let before = Before::of(shown);
+                    if !terminal || !blank_in_terminal(block) {
+                        shown = Some(&**block);
+                    }
+                    let tasks_before = tasks;
+                    tasks += block.tasks();
+                    Row {
+                        index,
+                        tasks_before,
+                        block: block.clone(),
+                        before,
+                        last: index + 1 == count,
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
     });
-    let count = computed(move || blocks.with(Vec::len));
     let footnotes = computed(move || document.with(|d| d.footnotes.clone()));
     let plugins = Rc::new(plugins);
     let row_plugins = plugins.clone();
     let math_loaded = signal(false);
+    let reported = Rc::new(std::cell::RefCell::new(Reported::default()));
+    cx.methods(TextViewApi {
+        document,
+        props,
+        reported: reported.clone(),
+    });
     view()
         .flex_col()
         .gap(px(BLOCK_GAP))
@@ -240,6 +363,18 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
         // Selectable: its texts share one selection, block to block (inside
         // a `selectable` view, the outer one's).
         .selectable(props.selectable)
+        .on_text_selection_change(move |e: &nsh_core::element::TextSelectionEvent| {
+            *reported.borrow_mut() = Reported {
+                text: e.text.clone(),
+                start: e.start,
+            };
+            cx.emit(TextViewEvent::SelectionChange(TextViewSelectionEvent {
+                text: e.text.clone().into(),
+                start: e.start,
+                bounds: e.bounds,
+                page_bounds: e.page_bounds,
+            }));
+        })
         .map(|mut el| {
             if let Some(parts) = use_context::<TextViewParts>() {
                 let style = std::mem::take(el.style());
@@ -254,29 +389,19 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
                 .with(|s| s.root.as_ref().map(|s| s.0.clone()).unwrap_or_default())
         })
         .child(each(
-            blocks,
+            rows,
             // By position and kind: the block a stream is writing keeps its
             // row, and its row alone is made again.
-            |(index, block): &(usize, Block)| (*index, block.kind().to_owned()),
-            move |item, index| {
+            |row: &Row| (row.index, row.block.kind().to_owned()),
+            move |row, _| {
                 let plugins = row_plugins.clone();
-                // A memo: a block added after this one runs it again only
-                // when this one stops being the last.
-                let last = computed(move || index.get() + 1 == count.get());
-                // A memo as well: what comes before decides a heading's
-                // room above it.
-                let before = computed(move || {
-                    let i = index.get();
-                    blocks.with(|b| {
-                        Before::of(shown_before(b[..i.min(b.len())].iter().map(|(_, b)| b)))
-                    })
-                });
                 // A node as the row's root: an `Each` keeps rows by their
                 // root's key, which a region has none of.
                 view().child(dynamic(move || {
                     let cx = Cx::read(&props, cx, plugins.clone(), math_loaded);
-                    let (i, block) = item.get();
-                    cx.block(&block, &i.to_string(), last.get(), before.get())
+                    let row = row.get();
+                    cx.task.set(row.tasks_before);
+                    cx.block(&row.block, &row.index.to_string(), row.last, row.before)
                 }))
             },
         ))
@@ -286,6 +411,8 @@ pub fn TextView(props: TextViewProps, cx: Scope<TextViewEvent>) -> impl IntoElem
                 return None;
             }
             let cx = Cx::read(&props, cx, plugins.clone(), math_loaded);
+            cx.task
+                .set(document.with(|d| d.blocks.iter().map(|b| b.tasks()).sum()));
             // A terminal's blank row before them, as before a block.
             let footnotes = view()
                 .flex_col()
@@ -398,12 +525,15 @@ struct Cx {
     /// How many lists the blocks being made are in (a copy keeps the depth
     /// it was made at, for content made later).
     list_depth: std::cell::Cell<u8>,
+    /// Which task item of the document the next one made is (a copy keeps
+    /// its place, for content made later).
+    task: std::cell::Cell<u32>,
     /// The line height of the text being made, which images in it are
     /// sized by.
     line: std::cell::Cell<f32>,
-    /// The URL of the link the content being made is in: a press on an
-    /// image there is the link's.
-    link: std::cell::RefCell<Option<SharedString>>,
+    /// The URL and title of the link the content being made is in: a press
+    /// on an image there is the link's, and its hint the link's.
+    link: std::cell::RefCell<Option<LinkTo>>,
     highlighter: Option<CodeHighlighter>,
     links: TextViewLinks,
     scope: Scope<TextViewEvent>,
@@ -436,6 +566,7 @@ impl Cx {
             highlighter: use_context::<CodeHighlighter>(),
             caret_placed: Rc::default(),
             list_depth: std::cell::Cell::new(0),
+            task: std::cell::Cell::new(0),
             line: std::cell::Cell::new(BODY_SIZE * BODY_LINE),
             link: std::cell::RefCell::new(None),
             links: props.links.get(),
@@ -453,11 +584,12 @@ impl Cx {
 
     /// What a press on a link to `url` does: reported, and opened outside
     /// the app when `links` says so.
-    fn link_press(&self, url: SharedString) -> impl Fn() + Clone + 'static {
+    fn link_press(&self, url: SharedString) -> impl Fn(&PressEvent) + Clone + 'static {
         let (scope, links) = (self.scope, self.links);
-        move || {
+        move |press: &PressEvent| {
             scope.emit(TextViewEvent::LinkPress(TextViewLinkPressEvent {
                 url: url.clone(),
+                modifiers: press.modifiers,
             }));
             if links == TextViewLinks::Open && !url.starts_with('#') {
                 // Whether it opened is the platform's to show; a refused
@@ -685,7 +817,9 @@ impl Cx {
                     )
                     .into_element(),
                 // Typeset, centered, scrolling sideways when wider than
-                // the view.
+                // the view. In a text, as the one thing in its line, so a
+                // selection takes it in as it does an inline formula
+                // (#2121).
                 None if let Some(formula) = self.formula(tex, true, BODY_SIZE * 1.1) => self
                     .part(
                         scroll().horizontal().scrollbar(false).child(
@@ -694,8 +828,15 @@ impl Cx {
                                 .justify_center()
                                 .min_w(relative(1.0))
                                 .py(px(BODY_SIZE * 0.25))
-                                .label(tex.clone())
-                                .child(formula),
+                                .child(
+                                    text("").when(self.selectable, |t| t.select_text()).child(
+                                        view()
+                                            .flex_row()
+                                            .align_middle()
+                                            .label(tex.clone())
+                                            .child(formula),
+                                    ),
+                                ),
                         ),
                         Part::MathBlock,
                     )
@@ -791,6 +932,30 @@ impl Cx {
         let digits = (start as usize + n.saturating_sub(1)).to_string().len();
         let rows = items.iter().enumerate().map(|(i, item)| {
             let key = format!("{key}.{i}");
+            // A press on a task's box reports it; the item's first line
+            // names the box to an assistive technology.
+            let press = item.checked.map(|checked| {
+                let index = self.task.get();
+                let scope = self.scope;
+                let mut label = String::new();
+                if let Some(Block::Paragraph { content }) = item.children.first() {
+                    super::document::inline_text(content, &mut label);
+                }
+                let press = move || {
+                    scope.emit(TextViewEvent::TaskPress(TextViewTaskPressEvent {
+                        index,
+                        checked: !checked,
+                    }))
+                };
+                (label, press)
+            });
+            if item.checked.is_some() {
+                self.task.set(self.task.get() + 1);
+            }
+            let pressable = move |marker: View| match press.clone() {
+                Some((label, press)) => marker.label(label).on_press(press),
+                None => marker,
+            };
             let marker = match item.checked {
                 // A ballot box and a space before the content.
                 Some(checked) if terminal => {
@@ -865,7 +1030,7 @@ impl Cx {
                     } else {
                         marker.border_color(move || theme().muted_foreground)
                     };
-                    self.parts(marker, &parts).into_element()
+                    self.parts(pressable(marker), &parts).into_element()
                 }
                 None => {
                     let marker = if ordered {
@@ -1038,13 +1203,17 @@ impl Cx {
                     .map(|(i, action)| self.code_action(action, code, &format!("{key}.{i}"))),
             )
         });
-        // The app's highlighter, else the built-in one (which may color the
-        // code a moment after it shows), else plain.
-        let body = match &self.highlighter {
-            Some(h) => text("").children(h.spans(code)),
-            None => match super::highlight::built_in(code) {
-                Some(spans) => text("").children(spans),
-                None => text(code.code.clone()),
+        // The block's own annotated content, else the app's highlighter, else
+        // the built-in one (which may color the code a moment after it
+        // shows), else plain.
+        let body = match annotated(code) {
+            Some(content) => self.span(content, key),
+            None => match &self.highlighter {
+                Some(h) => text("").children(h.spans(code)),
+                None => match super::highlight::built_in(code) {
+                    Some(spans) => text("").children(spans),
+                    None => text(code.code.clone()),
+                },
             },
         };
         // The padding is the code's, inside the scroll view: the code
@@ -1066,15 +1235,20 @@ impl Cx {
             .bg(move || theme().muted)
             .text_size(px(CODE_SIZE))
             .line_height(px(CODE_SIZE * CODE_LINE));
+        let body = self.part(body, Part::CodeBlockCode);
+        let content = if code.wrap {
+            body.w_full().min_w_0().into_element()
+        } else {
+            self.part(
+                scroll().horizontal().scrollbar(self.code_scroll_indicator),
+                Part::CodeBlockScroll,
+            )
+            .child(body)
+            .into_element()
+        };
         // The actions last, so they are drawn over the code.
         self.part(block, Part::CodeBlock)
-            .child(
-                self.part(
-                    scroll().horizontal().scrollbar(self.code_scroll_indicator),
-                    Part::CodeBlockScroll,
-                )
-                .child(self.part(body, Part::CodeBlockCode)),
-            )
+            .child(content)
             .child(header)
             .into_element()
     }
@@ -1153,10 +1327,9 @@ impl Cx {
         // The Cells the text is wide, once laid out: the columns fit them
         // (their cells wrapping), or the table scrolls.
         let room = signal(0usize);
-        let widths = move || fit_columns(&natural, room.get());
+        let widths = computed(move || fit_columns(&natural, room.get()));
         let ruled = |ends: [char; 3]| {
-            let widths = widths.clone();
-            text(move || SharedString::from(table_rule(&widths(), ends)))
+            text(move || widths.with(|widths| SharedString::from(table_rule(widths, ends))))
                 .number_of_lines(1u32)
                 .text_color(move || theme().border)
                 .into_element()
@@ -1196,8 +1369,9 @@ impl Cx {
                 let end = tail && r == last_row && c + span == columns;
                 let key = format!("{key}.{r}.{c}");
                 // The columns it spans and the ` │ ` between them.
-                let widths = widths.clone();
-                let cells = move || widths()[c..c + span].iter().sum::<usize>() + 3 * (span - 1);
+                let cells = move || {
+                    widths.with(|widths| widths[c..c + span].iter().sum::<usize>() + 3 * (span - 1))
+                };
                 let t = self.paragraph(content, &key, end);
                 let t = match align(c) {
                     ColumnAlign::Center => t.text_center(),
@@ -1272,7 +1446,6 @@ impl Cx {
             .rounded(px(6.0))
             .items_center()
             .justify_center()
-            .cursor_pointer()
             .hover(|s| s.bg(hovered))
             .active(|s| s.bg(pressed))
             .role(AccessibilityRole::Button)
@@ -1461,11 +1634,18 @@ impl Cx {
                 .child(self.paragraph(summary, &format!("{key}.s"), false).flex_1()),
             Part::Summary,
         );
-        // The content is made each time it opens.
+        // The content is made each time it opens, its tasks counted from
+        // the same place each time; what follows counts on after them.
         let cx = self.clone();
+        let first_task = self.task.get();
+        self.task
+            .set(first_task + children.iter().map(Block::tasks).sum::<u32>());
         let children = children.to_vec();
         let key = key.to_owned();
-        let body = move || cx.blocks(view().flex_col().gap(px(BLOCK_GAP)), &children, &key, tail);
+        let body = move || {
+            cx.task.set(first_task);
+            cx.blocks(view().flex_col().gap(px(BLOCK_GAP)), &children, &key, tail)
+        };
         self.part(view().flex_col().gap(px(ITEM_GAP * 2.0)), Part::Details)
             .child(summary)
             .child(when(move || shown.get(), body))
@@ -1577,9 +1757,23 @@ impl Cx {
                 content,
             } => {
                 let url = SharedString::from(url.clone());
-                let outer = self.link.replace(Some(url.clone()));
+                let outer = self
+                    .link
+                    .replace(Some((url.clone(), title.clone().map(SharedString::from))));
                 let span = self.span(content, key);
                 self.link.replace(outer);
+                // Where it goes, shown while the pointer rests on it (an
+                // `#anchor` of the document and a path too: every
+                // destination shows; a terminal links the text to it).
+                let hint = (!is_terminal()).then(|| {
+                    let href = url.clone();
+                    let title = title.clone().map(SharedString::from);
+                    link_hint(
+                        move || Some(href.clone()),
+                        move || title.clone(),
+                        HintAt::Pointer,
+                    )
+                });
                 let el = span
                     .text_color(move || theme().primary)
                     .underline()
@@ -1590,6 +1784,7 @@ impl Cx {
                     // tight line's box hides the underline (#447).
                     .role(AccessibilityRole::Link)
                     .when_some(title.clone(), |t, title| t.hint(title))
+                    .when_some(hint, |t, hint| t.child(hint))
                     .on_press(self.link_press(url));
                 self.part(el, Part::Link).into_element()
             }
@@ -1644,9 +1839,10 @@ impl Cx {
                         .text_size(rems(0.75))
                         .text_color(move || theme().primary)
                         .role(AccessibilityRole::Link)
-                        .on_press(move || {
+                        .on_press(move |press: &PressEvent| {
                             scope.emit(TextViewEvent::LinkPress(TextViewLinkPressEvent {
                                 url: url.clone(),
+                                modifiers: press.modifiers,
                             }))
                         }),
                     Part::FootnoteReference,
@@ -1683,32 +1879,42 @@ impl Cx {
 
     /// Images that stand alone (a paragraph or a cell with no text), one
     /// under another.
-    fn image_column(&self, images: &[(&Image, Option<&str>)], key: &str) -> View {
+    fn image_column(&self, images: &[(&Image, Option<LinkRef<'_>>)], key: &str) -> View {
         view()
             .flex_col()
             .items_start()
             .children(images.iter().enumerate().map(|(i, (image, link))| {
-                let link = link.map(|l| SharedString::from(l.to_owned()));
+                let link = link.map(|(url, title)| {
+                    (
+                        SharedString::from(url.to_owned()),
+                        title.map(|t| SharedString::from(t.to_owned())),
+                    )
+                });
                 self.image(image, link, ImageFlow::Block, &format!("{key}.{i}"))
             }))
     }
 
-    /// Image `image`, in a link to `link` if it is in one (a press on it is
-    /// the link's), sized as `flow` says.
-    fn image(
-        &self,
-        image: &Image,
-        link: Option<SharedString>,
-        flow: ImageFlow,
-        key: &str,
-    ) -> AnyElement {
+    /// Image `image`, in a link to `link` (its URL and title) if it is in
+    /// one (a press on it is the link's, and so is its hint), sized as
+    /// `flow` says.
+    fn image(&self, image: &Image, link: Option<LinkTo>, flow: ImageFlow, key: &str) -> AnyElement {
         let scope = self.scope;
         let pressed = image.clone();
         let is_link = link.is_some();
-        let link = link.map(|url| self.link_press(url));
+        // Where the link goes, on the image that takes its press (below
+        // it: the image's own title, a tooltip, shows above), as on a link
+        // of text; a terminal links the text it reads as instead.
+        let hint = link.clone().filter(|_| !is_terminal()).map(|(url, title)| {
+            LinkImageHint(link_hint(
+                move || Some(url.clone()),
+                move || title.clone(),
+                HintAt::Link,
+            ))
+        });
+        let link = link.map(|(url, _)| self.link_press(url));
         // In a link it is the link's; else a press reports the image.
-        let press = Some(move || match &link {
-            Some(press) => press(),
+        let press = Some(move |e: &PressEvent| match &link {
+            Some(press) => press(e),
             None => scope.emit(TextViewEvent::ImagePress(pressed.clone())),
         });
         let role = if is_link {
@@ -1723,7 +1929,15 @@ impl Cx {
                     .role(role)
                     .label(SharedString::from(image.alt.clone()))
                     .on_press(press)
+                    // On its own, as wide as the text: the app's image
+                    // sizes against this view, so a `w_full()` of its own
+                    // fills the column and a `max_w(relative(1.0))` holds
+                    // it to the column, as the document's own images are
+                    // held (one of a fixed width keeps it, at the start).
+                    .when(matches!(flow, ImageFlow::Block), |v| v.w_full())
                     .child(el)
+                    // The view taking the press is the image's anchor.
+                    .when_some(hint, |v, hint| v.child(hint.0))
                     .into_element(),
                 None => el.into_element(),
             };
@@ -1803,6 +2017,7 @@ impl Cx {
                     Some(press) => el.role(role).on_press(press),
                     None => el.role(AccessibilityRole::Image),
                 };
+                let el = el.when_some(hint, |el, hint| el.tooltip(hint));
                 return view()
                     .w(box_width)
                     .max_w(relative(1.0))
@@ -1827,7 +2042,25 @@ impl Cx {
             Some(press) => el.role(role).on_press(press),
             None => el.role(AccessibilityRole::Image),
         };
+        let el = el.when_some(hint, |el, hint| el.tooltip(hint));
         self.part(el, Part::Image).into_element()
+    }
+}
+
+/// A link's URL and title.
+type LinkTo = (SharedString, Option<SharedString>);
+
+/// A link's URL and title, borrowed from its document.
+type LinkRef<'a> = (&'a str, Option<&'a str>);
+
+/// A link's hint on an image in the link: a child of the image, which
+/// takes the link's press and is the hint's anchor (an image takes no
+/// children but its tooltip, which this is, as `Tooltip` is an element's).
+struct LinkImageHint(nsh_core::element::Overlay);
+
+impl IntoTooltip for LinkImageHint {
+    fn apply_tooltip(self, node: &mut nsh_core::element::ElNode) {
+        nsh_core::element::__hint_tooltip(node, self.0.into_element());
     }
 }
 
@@ -1841,20 +2074,24 @@ enum ImageFlow {
 }
 
 /// The images of content that is only images (each in a link or not), with
-/// their links: shown as blocks, as gpui-kit shows a paragraph of images
-/// with no text.
-fn only_images(content: &[Inline]) -> Option<Vec<(&Image, Option<&str>)>> {
+/// their links (URL and title): shown as blocks, as gpui-kit shows a
+/// paragraph of images with no text.
+fn only_images(content: &[Inline]) -> Option<Vec<(&Image, Option<LinkRef<'_>>)>> {
     fn walk<'a>(
         content: &'a [Inline],
-        link: Option<&'a str>,
-        out: &mut Vec<(&'a Image, Option<&'a str>)>,
+        link: Option<LinkRef<'a>>,
+        out: &mut Vec<(&'a Image, Option<LinkRef<'a>>)>,
     ) -> bool {
         content.iter().all(|inline| match inline {
             Inline::Image(image) => {
                 out.push((image, link));
                 true
             }
-            Inline::Link { url, content, .. } => walk(content, Some(url), out),
+            Inline::Link {
+                url,
+                title,
+                content,
+            } => walk(content, Some((url.as_str(), title.as_deref())), out),
             _ => false,
         })
     }
@@ -2108,6 +2345,20 @@ const TASK_BOX: f32 = 15.0;
 /// The size of an alert's icon.
 const ALERT_ICON: f32 = 16.0;
 
+/// A block of the top level, as its row gets it.
+#[derive(Clone, PartialEq)]
+struct Row {
+    /// Where it is among the blocks.
+    index: usize,
+    /// The tasks before this row, including those in closed disclosures.
+    tasks_before: u32,
+    block: SharedBlock,
+    /// What comes before it: a heading's room above it.
+    before: Before,
+    /// Whether it is the last block, which the caret follows.
+    last: bool,
+}
+
 /// What comes before a block in its column, for the room above it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Before {
@@ -2309,6 +2560,23 @@ fn ink_on(bg: Hsla) -> Hsla {
     }
 }
 
+/// A code block's annotated `content`, when it has one whose plain text is
+/// its `code` (what copying takes): other content would show one text and
+/// copy another, so it is ignored with a warning.
+fn annotated(code: &CodeBlock) -> Option<&[Inline]> {
+    if code.content.is_empty() {
+        return None;
+    }
+    let mut plain = String::new();
+    super::document::inline_text(&code.content, &mut plain);
+    if plain == code.code {
+        Some(&code.content)
+    } else {
+        log::warn!("TextView: a code block's content does not spell its code; showing the code");
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nsh_core::geometry::{Percentage, Points};
@@ -2339,13 +2607,17 @@ mod tests {
     fn content_of_images_alone_is_shown_as_blocks() {
         let link = |content| Inline::Link {
             url: "https://x.y".into(),
-            title: None,
+            title: Some("X".into()),
             content,
         };
         let content = [image("a.png"), link(vec![image("b.png")])];
         let images = only_images(&content).unwrap();
         let found: Vec<_> = images.iter().map(|(i, l)| (i.src.as_str(), *l)).collect();
-        assert_eq!(found, [("a.png", None), ("b.png", Some("https://x.y"))]);
+        // The link's title too: the image's hint shows it.
+        assert_eq!(
+            found,
+            [("a.png", None), ("b.png", Some(("https://x.y", Some("X"))))]
+        );
         // Text, even a space, puts the images in its lines, as gpui-kit's
         // text flow does.
         assert!(only_images(&[image("a.png"), Inline::text(" "), image("b.png")]).is_none());

@@ -160,6 +160,11 @@ struct Node<H: Host> {
     /// The owner (for a root, the one it was made under: context and
     /// `runTop` look through it, but it does not own the root).
     owner: u32,
+    /// The owner's generation when the node was made under it. A root
+    /// outlives the owner it was made under (that owner does not own it):
+    /// once the owner is freed its slot may name another node, which the
+    /// root must not take for its owner in `runTop` ([`Graph::owner_of`]).
+    owner_generation: u32,
     owned: Vec<u32>,
     cleanups: Vec<H::Cleanup>,
     context: Option<Rc<Frame<H>>>,
@@ -168,6 +173,9 @@ struct Node<H: Host> {
     handle: bool,
     /// Disposed: runs no more (a memo keeps its value for its handle).
     disposed: bool,
+    /// Being disposed (what it owns goes, its cleanups run): until that
+    /// ends, the node is the graph's, not its handle's.
+    disposing: bool,
 }
 
 impl<H: Host> Node<H> {
@@ -183,11 +191,13 @@ impl<H: Host> Node<H> {
             sources: Vec::new(),
             observers: Vec::new(),
             owner: NONE,
+            owner_generation: 0,
             owned: Vec::new(),
             cleanups: Vec::new(),
             context: None,
             handle: false,
             disposed: false,
+            disposing: false,
         }
     }
 
@@ -240,6 +250,10 @@ pub struct Graph<H: Host> {
     effects: Option<Vec<u32>>,
     exec: u64,
     runs: u64,
+    /// The generation a slot added at the end starts at: above every
+    /// generation of the slots [`Graph::compact`] dropped, so a handle of a
+    /// dropped node never names the node made in its place.
+    floor: u32,
     /// The host's own state.
     pub data: H::Data,
 }
@@ -256,6 +270,7 @@ impl<H: Host> Graph<H> {
             effects: None,
             exec: 0,
             runs: 0,
+            floor: 1,
             data,
         }
     }
@@ -268,10 +283,34 @@ impl<H: Host> Graph<H> {
                 id
             }
             None => {
-                self.nodes.push(Node::new(kind, 1));
+                self.nodes.push(Node::new(kind, self.floor));
                 (self.nodes.len() - 1) as u32
             }
         }
+    }
+
+    /// Gives back the slots a large tree used once it is gone: drops the
+    /// free slots at the end of the arena, then lets the arena's spare
+    /// room go. Freed slots are reused lowest first from then on, so those
+    /// near the end empty out and go at the next compaction. Call when no
+    /// round runs (the engine does when it is idle); a no-op otherwise.
+    pub fn compact(&mut self) {
+        if self.updates.is_some() || self.effects.is_some() || self.free.is_empty() {
+            return;
+        }
+        while let Some(n) = self.nodes.last() {
+            if n.kind != Kind::Free {
+                break;
+            }
+            self.floor = self.floor.max(n.generation.wrapping_add(1).max(1));
+            self.nodes.pop();
+        }
+        let len = self.nodes.len() as u32;
+        self.free.retain(|&id| id < len);
+        // `alloc` pops from the end: the lowest ids go first.
+        self.free.sort_unstable_by(|a, b| b.cmp(a));
+        shrink_spare(&mut self.nodes);
+        shrink_spare(&mut self.free);
     }
 
     /// A new signal holding `value` (owned), compared by `equals`, named by
@@ -299,6 +338,7 @@ impl<H: Host> Graph<H> {
         n.owner = if is_node(owner) { owner } else { NONE };
         drop(old);
         if is_node(owner) {
+            self.nodes[id as usize].owner_generation = self.nodes[owner as usize].generation;
             self.nodes[owner as usize].owned.push(id);
         }
         id
@@ -318,6 +358,7 @@ impl<H: Host> Graph<H> {
         n.owner = if is_node(owner) { owner } else { NONE };
         n.context = context;
         if is_node(owner) {
+            self.nodes[id as usize].owner_generation = self.nodes[owner as usize].generation;
             self.nodes[owner as usize].owned.push(id);
         }
         id
@@ -332,6 +373,9 @@ impl<H: Host> Graph<H> {
         let n = &mut self.nodes[id as usize];
         n.owner = if current == DISPOSED { NONE } else { current };
         n.context = context;
+        if is_node(current) {
+            self.nodes[id as usize].owner_generation = self.nodes[current as usize].generation;
+        }
         id
     }
 
@@ -381,9 +425,29 @@ impl<H: Host> Graph<H> {
         self.nodes[id as usize].generation
     }
 
-    /// The owner of node `id` (for a root, the one it was made under).
+    /// The owner of node `id` (for a root, the slot it was made under: an
+    /// owner that re-makes its root in place, as a region does, is found
+    /// through it again).
     pub fn parent(&self, id: u32) -> u32 {
         self.nodes[id as usize].owner
+    }
+
+    /// Node `id`'s owner for `runTop`, or [`NONE`] once the slot it named
+    /// was freed (a root whose owner went: the slot may name another node
+    /// now, maybe one under the root itself, which would close the walk up
+    /// the owners into a loop).
+    fn owner_of(&self, id: u32) -> u32 {
+        let n = &self.nodes[id as usize];
+        let owner = n.owner;
+        if !is_node(owner) {
+            return owner;
+        }
+        let o = &self.nodes[owner as usize];
+        if o.kind == Kind::Free || o.generation != n.owner_generation {
+            NONE
+        } else {
+            owner
+        }
     }
 
     /// Node `id`'s kind.
@@ -425,13 +489,23 @@ impl<H: Host> Graph<H> {
         self.nodes[id as usize].handle = true;
     }
 
+    /// Whether node `id`'s handle owns what the node holds: it is freed with
+    /// the handle ([`Self::drop_handle`]), as a signal or a disposed
+    /// computation is. A live computation belongs to its owner and outlives
+    /// its handle, so what it holds is not the handle's (a garbage collector
+    /// must not count it among the handle's children); so does one being
+    /// disposed, until that ends ([`dispose`] frees it then).
+    pub fn held_by_handle(&self, id: u32) -> bool {
+        let n = &self.nodes[id as usize];
+        n.kind == Kind::Signal || (n.disposed && !n.disposing)
+    }
+
     /// The handle of node `id` went: a signal, or a disposed computation,
     /// is freed now (what it held comes back, to free once the graph is no
     /// longer borrowed).
     pub fn drop_handle(&mut self, id: u32) -> Option<Held<H>> {
-        let n = &mut self.nodes[id as usize];
-        n.handle = false;
-        if n.kind == Kind::Signal || n.disposed {
+        self.nodes[id as usize].handle = false;
+        if self.held_by_handle(id) {
             self.unlink_observers(id);
             Some(self.release(id))
         } else {
@@ -523,6 +597,12 @@ impl<H: Host> Graph<H> {
         Some(cleanups.remove(at))
     }
 
+    /// The number of cleanups node `id` holds.
+    #[cfg(test)]
+    pub(crate) fn cleanup_count(&self, id: u32) -> usize {
+        self.nodes.get(id as usize).map_or(0, |n| n.cleanups.len())
+    }
+
     /// Whether a round is running (its end reports errors).
     pub fn in_round(&self) -> bool {
         self.updates.is_some()
@@ -556,7 +636,15 @@ impl<H: Host> Graph<H> {
 
     fn track(&mut self, id: u32) {
         let l = self.listener;
-        if l == NONE || l == UNOWNED || self.nodes[l as usize].disposed {
+        if l == NONE || l == UNOWNED {
+            return;
+        }
+        // Only a live computation takes sources: it unlinks them before its
+        // slot is freed (when it runs again or is disposed). A computation
+        // disposed in a nested run is the listener again once that run
+        // returns, and its slot may hold a signal by then.
+        let n = &self.nodes[l as usize];
+        if n.disposed || !n.is_computation() {
             return;
         }
         // Repeated reads of the same source make one edge.
@@ -655,6 +743,15 @@ impl<H: Host> Graph<H> {
             n.context = None;
             n.kind = Kind::Free;
         }
+    }
+}
+
+/// Lets `v`'s room go when it is more than twice what it holds (and more
+/// than a small arena's), keeping a quarter more for growth.
+fn shrink_spare<T>(v: &mut Vec<T>) {
+    const SMALL: usize = 1024;
+    if v.capacity() > SMALL && v.capacity() > 2 * v.len() {
+        v.shrink_to((v.len() + v.len() / 4).max(SMALL));
     }
 }
 
@@ -788,7 +885,7 @@ fn run_top<H: Host>(h: H, id: u32) {
     }
     let exec = graph.exec;
     let mut ancestors = vec![id];
-    let mut at = node.owner;
+    let mut at = graph.owner_of(id);
     while is_node(at) {
         let n = &graph.nodes[at as usize];
         if n.updated_at.is_some_and(|t| t >= exec) {
@@ -797,7 +894,7 @@ fn run_top<H: Host>(h: H, id: u32) {
         if n.state != CLEAN && n.is_computation() {
             ancestors.push(at);
         }
-        at = n.owner;
+        at = graph.owner_of(at);
     }
     for &node in ancestors.iter().rev() {
         let n = &g(h).nodes[node as usize];
@@ -865,9 +962,13 @@ fn run_computation<H: Host>(h: H, id: u32, time: u64) {
     graph.listener = listener;
     graph.leave_owner(owner);
     let Some(next) = result else {
+        // A failed run keeps the last value and stays clean, as an effect's
+        // does: a write to what it read before failing queues it again and
+        // marks what reads it. Left stale, it was never queued again (`write`
+        // and `mark_downstream` take only clean observers), so what read it
+        // stopped hearing of changes.
         let n = &mut graph.nodes[id as usize];
         if n.kind == Kind::Memo {
-            n.state = STALE;
             let owned = std::mem::take(&mut n.owned);
             for c in owned {
                 dispose(h, c);
@@ -988,6 +1089,13 @@ pub fn dispose<H: Host>(h: H, id: u32) {
     if !is_node(id) || g(h).nodes[id as usize].disposed {
         return;
     }
+    // Disposed before it is cleaned: what runs meanwhile (what it owns
+    // going, its cleanups, a flush they start) neither tracks into it, runs
+    // it again nor disposes it again. Each would leave links to its slot
+    // once the slot is freed, or free the slot twice.
+    let n = &mut g(h).nodes[id as usize];
+    n.disposed = true;
+    n.disposing = true;
     // Code running under it goes on under no owner it could reuse the slot
     // of: what it makes from now on goes at once (its cleanups' too).
     if g(h).owner == id {
@@ -997,7 +1105,7 @@ pub fn dispose<H: Host>(h: H, id: u32) {
     let graph = g(h);
     graph.unlink_observers(id);
     let n = &mut graph.nodes[id as usize];
-    n.disposed = true;
+    n.disposing = false;
     n.state = CLEAN;
     if n.handle {
         let func = n.func.take();

@@ -1,7 +1,7 @@
 import { type JSX, platform, signal, Text, View } from "nsh";
 import { HoverCard, type OpenChangeReason } from "nsh/base";
 import { LucideIcon, type LucideIconName } from "../icons";
-import { alpha, Badge, Button, Caption, colors, Card, DemoPage, focusRing, hint, mono, PopIn, type PopupSide, popupSurface, Segmented, Stat, terminal, Toggle, toneColor } from "../ui";
+import { alpha, Badge, Button, Caption, colors, Card, DemoPage, finish, focusRing, hint, mono, PopIn, popoverLook, type PopupSide, Segmented, Stat, terminal, Toggle, toneColor } from "../ui";
 import { Avatar, createEvents } from "./OverlayUi";
 
 // A trigger is a view with the link role and its own `onPress`: the card's
@@ -18,7 +18,6 @@ const exit = {
   popupClass: "transition-opacity duration-150 ease-in motion-reduce:transition-none",
   popupEndingClass: "opacity-0",
 };
-const card = (width: number) => ({ ...popupSurface(), width, padding: pointer ? 14 : 16, gap: 12 });
 const small = pointer ? 12 : 13;
 const body = pointer ? 13 : 15;
 
@@ -41,12 +40,12 @@ const people: Record<string, Person> = {
   lena: { handle: "lena", name: "Lena Okafor", role: "Product manager · Trading", bio: "Owns the order ticket and everything that can go wrong in it.", city: "Lagos", time: "09:42", projects: "7", reviews: "96", followers: 512, away: true },
 };
 
-type Site = { href: string; domain: string; title: string; summary: string; icon: LucideIconName; read: string; hue: [string, string] };
+type Site = { href: string; domain: string; title: string; summary: string; icon: LucideIconName; read: string };
 
 const sites: Record<string, Site> = {
-  taffy: { href: "https://github.com/DioxusLabs/taffy", domain: "github.com", title: "taffy: a flexbox, grid and block layout library", summary: "A high-performance UI layout library written in Rust, with CSS Block, Flexbox and Grid.", icon: "code", read: "2.3k stars", hue: ["#3b82f6", "#8b5cf6"] },
-  quickjs: { href: "https://bellard.org/quickjs/", domain: "bellard.org", title: "QuickJS JavaScript Engine", summary: "A small and embeddable JavaScript engine supporting the ES2023 specification.", icon: "globe", read: "Fabrice Bellard", hue: ["#f59e0b", "#ef4444"] },
-  wgsl: { href: "https://www.w3.org/TR/WGSL/", domain: "w3.org", title: "WebGPU Shading Language", summary: "The shader language of WebGPU: types, expressions, statements and the built-in functions.", icon: "scroll-text", read: "W3C Draft", hue: ["#10b981", "#0ea5e9"] },
+  taffy: { href: "https://github.com/DioxusLabs/taffy", domain: "github.com", title: "taffy: a flexbox, grid and block layout library", summary: "A high-performance UI layout library written in Rust, with CSS Block, Flexbox and Grid.", icon: "code", read: "2.3k stars" },
+  quickjs: { href: "https://bellard.org/quickjs/", domain: "bellard.org", title: "QuickJS JavaScript Engine", summary: "A small and embeddable JavaScript engine supporting the ES2023 specification.", icon: "globe", read: "Fabrice Bellard" },
+  wgsl: { href: "https://www.w3.org/TR/WGSL/", domain: "w3.org", title: "WebGPU Shading Language", summary: "The shader language of WebGPU: types, expressions, statements and the built-in functions.", icon: "scroll-text", read: "W3C Draft" },
 };
 
 type Quote = { symbol: string; name: string; price: number; open: number; volume: string; cap: string; pe: string };
@@ -96,13 +95,13 @@ export function HoverCardDemo() {
           role="link"
           onPress={() => log(`onPress /people/${p.handle}`)}
           hoverStyle={{ backgroundColor: alpha(colors.accent, 0.12) }}
-          focusStyle={focusRing(1)}
+          focusVisibleStyle={focusRing(1)}
           style={{ borderRadius: 4, paddingHorizontal: 2, marginHorizontal: -3, borderWidth: 1, borderColor: "transparent", transitionProperty: "background-color", transitionDuration: 120 }}
         >
           <Text style={{ fontSize: body, fontWeight: "500", color: colors.accent }}>@{p.name}</Text>
         </View>
       }>
-        <PopIn side={side()} style={card(pointer ? 280 : 300)}>
+        <PopIn side={side()} style={popoverLook({ width: pointer ? 280 : 300 })}>
           <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
             <View>
               <Avatar name={p.name} size={44} />
@@ -196,7 +195,7 @@ export function HoverCardDemo() {
             {words("the order ticket uses the same card.")}
           </Comment>
         </View>
-        <Caption label={hint("A tap outside closes it", "The pointer away from both for 300 ms closes it; Escape at once")} />
+        <Caption label={hint("A tap outside closes it", "Leave for 300 ms, or press Escape, to close")} />
       </Card>
     );
   }
@@ -210,24 +209,26 @@ export function HoverCardDemo() {
           role="link"
           onPress={() => log(`onPress ${s.href}`)}
           hoverStyle={{ borderBottomColor: colors.accent }}
-          focusStyle={focusRing(1)}
+          focusVisibleStyle={focusRing(1)}
           style={{ borderBottomWidth: 1, borderBottomColor: alpha(colors.accent, 0.35), transitionProperty: "border-color", transitionDuration: 150 }}
         >
           <Text style={{ fontSize: body, color: colors.accent }}>{props.label}</Text>
         </View>
       }>
-        <PopIn side="top" style={{ ...card(pointer ? 300 : 310), padding: 0, gap: 0, overflow: "hidden" }}>
-          <View style={{ height: 88, backgroundImage: `linear-gradient(135deg, ${s.hue[0]}, ${s.hue[1]})`, alignItems: "flex-start", justifyContent: "flex-end", padding: 12 }}>
-            <View style={{ width: 34, height: 34, borderRadius: 9, backgroundColor: "rgba(255,255,255,0.92)", alignItems: "center", justifyContent: "center" }}>
-              <LucideIcon name={s.icon} size={18} tint={s.hue[0]} />
+        <PopIn side="top" style={popoverLook({ width: pointer ? 300 : 310 })}>
+          {/* The site: its mark on a raised tile, its domain and what it is, the
+              link's way out at the end; then the page's title and summary. */}
+          <View style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+            <View style={{ width: 32, height: 32, borderRadius: 8, borderCurve: "continuous", borderWidth: 1, alignItems: "center", justifyContent: "center", backgroundColor: colors.raised, ...finish.raised }}>
+              <LucideIcon name={s.icon} size={16} tint={colors.text} />
             </View>
+            <View style={{ flex: 1, gap: 1 }}>
+              <Text style={{ fontSize: small, fontWeight: "500", color: colors.text }}>{s.domain}</Text>
+              <Text style={{ fontSize: 11.5, color: colors.faint }}>{s.read}</Text>
+            </View>
+            <LucideIcon name="external-link" size={13} tint={colors.faint} />
           </View>
-          <View style={{ padding: pointer ? 12 : 14, gap: 6 }}>
-            <View style={{ flexDirection: "row", alignItems: "center", gap: 5 }}>
-              <LucideIcon name="external-link" size={12} tint={colors.faint} />
-              <Text style={{ fontSize: 11.5, color: colors.faint }}>{s.domain}</Text>
-              <Text style={{ fontSize: 11.5, color: colors.faint }}>· {s.read}</Text>
-            </View>
+          <View style={{ gap: 4 }}>
             <Text style={{ fontSize: body, fontWeight: "600", color: colors.text }}>{s.title}</Text>
             <Text style={{ fontSize: small, lineHeight: pointer ? 17 : 19, color: colors.muted }}>{s.summary}</Text>
           </View>
@@ -238,7 +239,7 @@ export function HoverCardDemo() {
 
   function Links() {
     return (
-      <Card icon="link" title="A link preview" subtitle="The page behind a link, before going there: the link still opens on a press">
+      <Card icon="link" title="A link preview" subtitle="The page behind a link; a press still opens it">
         <View style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 4, rowGap: 4 }}>
           {words("Layout runs on")}
           {attached(<Preview site={sites.taffy} label="Taffy" />, ",")}
@@ -288,7 +289,7 @@ export function HoverCardDemo() {
             focusable
             accessibilityLabel={`${q.symbol} ${price().toFixed(2)}`}
             hoverStyle={{ backgroundColor: alpha(toneColor(tone()), 0.16) }}
-            focusStyle={focusRing(1)}
+            focusVisibleStyle={focusRing(1)}
             style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 8, height: pointer ? 26 : 32, borderRadius: 13, borderWidth: 1, borderColor: alpha(toneColor(tone()), 0.25), backgroundColor: alpha(toneColor(tone()), 0.08), transitionProperty: "background-color", transitionDuration: 120 }}
           >
             <Text style={{ fontSize: small, fontWeight: "600", fontFamily: mono, color: colors.text }}>${q.symbol}</Text>
@@ -298,7 +299,7 @@ export function HoverCardDemo() {
           </View>
         }
       >
-        <PopIn style={card(pointer ? 260 : 290)}>
+        <PopIn style={popoverLook({ width: pointer ? 260 : 290 })}>
           <View style={{ flexDirection: "row", alignItems: "flex-start" }}>
             <View style={{ flex: 1, gap: 2 }}>
               <Text style={{ fontSize: pointer ? 15 : 17, fontWeight: "600", color: colors.text }}>{q.symbol}</Text>
@@ -333,8 +334,6 @@ export function HoverCardDemo() {
                     height: 6 + ((c() - lo()) / Math.max(0.01, hi() - lo())) * 38,
                     borderRadius: 1.5,
                     backgroundColor: i() === closes().length - 1 ? toneColor(tone()) : alpha(toneColor(tone()), 0.35),
-                    transitionProperty: "height",
-                    transitionDuration: 300,
                   }}
                 />
               )}
@@ -352,7 +351,7 @@ export function HoverCardDemo() {
 
   function Tickers() {
     return (
-      <Card icon="chart" title="A stock ticker" subtitle="A live quote behind each symbol: it ticks only while its card is open (onOpen to onClose)">
+      <Card icon="chart" title="A stock ticker" subtitle="A live quote behind each symbol, ticking only while open">
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 8 }}>
           <Ticker quote={quotes.AAPL} />
           <Ticker quote={quotes.NVDA} />
@@ -368,13 +367,21 @@ export function HoverCardDemo() {
     const close = signal("300");
     const side = signal<PopupSide>("bottom");
     return (
-      <Card icon="sliders" title="Delays and placement" subtitle="openDelay keeps it from flashing open; closeDelay leaves time to reach it">
-        <View style={{ gap: 8 }}>
-          <Text style={{ fontSize: 12, color: colors.muted }}>openDelay</Text>
-          <Segmented size="small" options={[{ value: "0", label: "0" }, { value: "300", label: "300" }, { value: "600", label: "600" }, { value: "1200", label: "1200" }]} value={open()} onChange={(v) => open.set(v)} />
-          <Text style={{ fontSize: 12, color: colors.muted }}>closeDelay</Text>
-          <Segmented size="small" options={[{ value: "0", label: "0" }, { value: "300", label: "300" }, { value: "1000", label: "1000" }]} value={close()} onChange={(v) => close.set(v)} />
-          <Segmented size="small" options={[{ value: "top", label: "Top" }, { value: "bottom", label: "Bottom" }, { value: "left", label: "Left" }, { value: "right", label: "Right" }]} value={side()} onChange={(v) => side.set(v)} />
+      <Card icon="sliders" title="Delays and placement" subtitle="A wait before opening, and time to reach the card">
+        {/* Each label close over its control, the groups further apart, so a label reads with the control under it. */}
+        <View style={{ gap: 12 }}>
+          <View style={{ gap: 4 }}>
+            <Text style={{ fontSize: 12, color: colors.text }}>Open delay (ms)</Text>
+            <Segmented size="small" options={[{ value: "0", label: "0" }, { value: "300", label: "300" }, { value: "600", label: "600" }, { value: "1200", label: "1200" }]} value={open()} onChange={(v) => open.set(v)} />
+          </View>
+          <View style={{ gap: 4 }}>
+            <Text style={{ fontSize: 12, color: colors.text }}>Close delay (ms)</Text>
+            <Segmented size="small" options={[{ value: "0", label: "0" }, { value: "300", label: "300" }, { value: "1000", label: "1000" }]} value={close()} onChange={(v) => close.set(v)} />
+          </View>
+          <View style={{ gap: 4 }}>
+            <Text style={{ fontSize: 12, color: colors.text }}>Side</Text>
+            <Segmented size="small" options={[{ value: "top", label: "Top" }, { value: "bottom", label: "Bottom" }, { value: "left", label: "Left" }, { value: "right", label: "Right" }]} value={side()} onChange={(v) => side.set(v)} />
+          </View>
         </View>
         <View style={{ alignItems: "center", paddingVertical: pointer ? 36 : 24 }}>
           <HoverCard
@@ -386,13 +393,13 @@ export function HoverCardDemo() {
             margin={8}
             onOpenChange={changed("delays")}
             trigger={
-              <View focusable hoverStyle={{ backgroundColor: alpha(colors.text, 0.06) }} focusStyle={focusRing(1)} style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, height: pointer ? 28 : 40, borderRadius: 8, borderWidth: 1, borderStyle: "dashed", borderColor: colors.border }}>
+              <View focusable hoverStyle={{ backgroundColor: alpha(colors.text, 0.06) }} focusVisibleStyle={focusRing(1)} style={{ flexDirection: "row", alignItems: "center", gap: 6, paddingHorizontal: 12, height: pointer ? 28 : 40, borderRadius: 8, borderWidth: 1, borderStyle: "dashed", borderColor: colors.border }}>
                 <LucideIcon name="hand" size={14} tint={colors.muted} />
                 <Text style={{ fontSize: body, color: colors.text }}>{pointer ? "Rest here" : "Tap here"}</Text>
               </View>
             }
           >
-            <PopIn side={side()} style={{ ...popupSurface(), padding: 12, gap: 4, maxWidth: 220 }}>
+            <PopIn side={side()} style={{ ...popoverLook({ compact: true }), maxWidth: 220 }}>
               <Text style={{ fontSize: 13, fontWeight: "600", color: colors.text }}>
                 {open()} ms in · {close()} ms out
               </Text>
@@ -408,7 +415,7 @@ export function HoverCardDemo() {
     const open = signal(false);
     const pinned = signal(false);
     return (
-      <Card icon="components" title="Controlled" subtitle="The app owns open: pinned, it stays whatever the pointer does">
+      <Card icon="components" title="Controlled" subtitle="The app owns open: pinned, it stays">
         <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
           <HoverCard
             {...exit}
@@ -423,13 +430,13 @@ export function HoverCardDemo() {
             trigger={
               // A terminal shows the focus itself: no edge kept for a ring,
               // which would take a row above and below.
-              <View focusable focusStyle={terminal ? undefined : focusRing(1)} style={{ flexDirection: "row", alignItems: "center", gap: 8, borderRadius: 8, borderWidth: terminal ? 0 : 1, borderColor: "transparent" }}>
+              <View focusable focusVisibleStyle={terminal ? undefined : focusRing(1)} style={{ flexDirection: "row", alignItems: "center", gap: 8, borderRadius: 8, borderWidth: terminal ? 0 : 1, borderColor: "transparent" }}>
                 <Avatar name="Ravi Patel" size={pointer ? 28 : 34} />
                 <Text style={{ fontSize: body, color: colors.text }}>Build #4182</Text>
               </View>
             }
           >
-            <PopIn side="right" style={card(pointer ? 220 : 240)}>
+            <PopIn side="right" style={popoverLook({ width: pointer ? 220 : 240 })}>
               <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
                 <LucideIcon name="circle-check" size={16} tint={colors.up} />
                 <Text style={{ fontSize: body, fontWeight: "600", color: colors.text }}>Passed in 4m 12s</Text>
@@ -443,7 +450,7 @@ export function HoverCardDemo() {
           <View style={{ flex: 1 }} />
           {/* The switch's name in sight, as the gallery's other switches have
               theirs: alone, a terminal's `[ ]` would say nothing. */}
-          <Text style={{ fontSize: small, color: colors.muted }}>Pin open</Text>
+          <Text style={{ fontSize: small, color: colors.text }}>Pin open</Text>
           <Toggle label="Pin open" value={pinned()} onChange={(v) => pinned.set(v)} />
         </View>
         <Caption label={pinned() ? "Pinned: onOpenChange still reports, the app keeps it open" : "Pin it, then move away"} />

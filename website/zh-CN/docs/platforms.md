@@ -16,18 +16,20 @@ NSH 运行在手机、桌面、终端和网页上：iOS、Android、macOS、Wind
 | 平台 | 后端；文本 | 运行环境 | 开发 | 打包 |
 |---|---|---|---|---|
 | [iOS](./ios.md) | UIKit；CoreText | iOS 15.0+，真机和模拟器 | `nsh run --target ios` | `.app`（模拟器）、签名的 `.ipa` |
-| [Android](./android.md) | Android 视图；`StaticLayout` | Android 9（API 28）+，`arm64-v8a`、`armeabi-v7a` 和 `x86_64` | `nsh run --target android` | 签名的 `.apk` |
+| [Android](./android.md) | Android 视图；`StaticLayout` | Android 8（API 26）+，`arm64-v8a`、`armeabi-v7a` 和 `x86_64` | `nsh run --target android` | 签名的 `.apk` |
 | [macOS](./macos.md) | AppKit 与 Core Animation；CoreText | macOS 14+ | `nsh run --target macos` | ad hoc 签名的 `.app` |
-| [Windows](./windows.md) | 用 Direct2D 绘制的 Win32 窗口；DirectWrite | Windows 10 1809+、Windows 11 | `nsh run`（Windows 上的默认目标） | 一个目录和一个 `.zip` |
+| [Windows](./windows.md) | 用 Direct2D 绘制的 Win32 窗口；DirectWrite | Windows 10 1809+、Windows 11 | `nsh run`（Windows 上的默认目标） | 一个目录、一个 `.zip` 和一个安装程序 |
 | [Linux](./linux.md) | GTK 4 控件；Pango | GTK 4.14+ | `nsh run`（Linux 上的默认目标） | 一个目录和一个 `.tar.gz` |
 | [GPUI](./gpui.md) | GPUI；GPUI 的文字系统 | macOS、Windows、Linux（Vulkan） | 在你的 GPUI 应用里；TSX 也可用 `nsh run --target gpui` | 随嵌入它的 GPUI 应用发布 |
-| [终端](./tui.md) | 在终端 Cell 网格上用 ratatui 绘制；终端的字体 | macOS、Windows 和 Linux 上的终端 | `nsh run --target tui` | 随嵌入它的终端应用发布 |
 | [Web](./web.md) | HTML 与 CSS；浏览器的字体 | 现代浏览器，桌面和手机 | `nsh run --target web` | 一个静态网站 |
+| [TUI](./tui.md) | 在终端 Cell 网格上用 ratatui 绘制；终端的字体 | macOS、Windows 和 Linux 上的终端 | `nsh run --target tui` | 随嵌入它的终端应用发布 |
 
 - **[GPUI](./gpui.md)** 用姊妹项目 GPUI Kit 所基于的 [GPUI](https://gpui-kit.com) 绘制应用，在 macOS、Windows 和 Linux 上表现一致：它是嵌入 GPUI 和 GPUI Kit 应用的后端，这些应用把 `AppView` 放进自己的元素树。独立的桌面应用用各操作系统自己的后端（AppKit、Win32、GTK 4）运行和打包。
-- **[终端](./tui.md)** 把应用绘制在终端的字符 Cell 网格上，使用终端自己的颜色，以键盘为主，也支持鼠标：`nsh run --target tui` 在当前终端中运行应用，ratatui 应用用 `AppView` 嵌入应用。
+- **[TUI](./tui.md)** 把应用绘制在终端的字符 Cell 网格上，使用终端自己的颜色，以键盘为主，也支持鼠标：`nsh run --target tui` 在当前终端中运行应用，ratatui 应用用 `AppView` 嵌入应用。
 - **[Web](./web.md)** 把应用渲染成浏览器页面里的 HTML：`nsh package --target web` 发布一个静态网站，可部署到任意 Web 服务器或 CDN，Rust 应用的引擎和 crate 编译为 WebAssembly；你自己的网页可以用 `createPlayer` 或 iframe 嵌入应用。本站的在线示例和 [Playground](/playground) 也由它运行。
 - **Mac Catalyst** 在 Mac 上用 iPhone 尺寸的窗口（390×844）运行 iOS 后端，用于开发。用 `--target catalyst` 选择它，快速查看应用在手机上的样子。
+
+社区还在同一个引擎上构建了更多平台，每个平台有自己的仓库，`nsh` 命令行按名字运行它们：[`nsh-platform-miniprogram`](https://github.com/huacnlee/nsh-platform-miniprogram) 在微信小程序中运行应用（`--target miniprogram`）。[构建平台](./platform-extensions.md)介绍了如何构建一个平台。
 
 ## 开发与打包
 
@@ -58,13 +60,45 @@ nsh package App.tsx --target macos
 | iOS | `AppView`（一个 `UIView`） | Rust 根组件、TSX bundle | `nsh-platform-ios` crate | Rust |
 | iOS | `NshAppView`（一个 `UIView`） | TSX bundle、签名包 | `NativeShell.xcframework` | Swift |
 | Android | `NshView`（一个 `FrameLayout`） | TSX bundle、签名包 | `nsh.aar` | Java 或 Kotlin |
-| 终端 | `AppView`（ratatui frame 中的一块区域） | Rust 根组件、TSX bundle | `nsh-platform-tui` crate | Rust |
 | Web | `createPlayer`（一个页面元素）或 iframe | TSX bundle；Rust 应用以发布的网站嵌入 | `nsh package --target web` 生成的运行时文件 | JavaScript 或 HTML |
+| TUI | `AppView`（ratatui frame 中的一块区域） | Rust 根组件、TSX bundle | `nsh-platform-tui` crate | Rust |
 
 Rust 宿主以 `AppSource::Rust` 或 `App::Rust` 挂载 Rust 根组件（`Root::of::<App>()`），并用 `set_ui_sets` 把应用的 UI 集合交给它的引擎，这样它加载的 TSX 就能导入应用自己的组件和模块。每个视图都是一个引擎，一个应用可以同时显示多个。在每个平台上，宿主都可以注册自己的原生视图给应用使用（[原生组件](./native-components.md)）。
 
 > [!NOTE]
 > Rust 宿主通过 NSH 仓库里的平台 crate 嵌入 NSH；macOS、Windows 和 Linux 的 `AppView` 从应用自己的文件（或源代码）加载 bundle，使用默认限制。GPUI crate 以及 iOS 和 Android SDK 还能加载[签名包](./signed-packages.md)，并为每个视图设置限制和能力（[沙箱与能力](./sandbox-and-capabilities.md)）。
+
+### 共享移动宿主的 Tokio 运行时
+
+链接 Rust 的移动宿主可以让 NSH 的异步任务运行在应用已有的 Tokio 运行时上。每个视图保存运行时 `Handle` 的一份克隆；运行时归应用所有，应用保持它（启用 IO 和时间驱动）运转到视图停止。`None` 使用 NSH 共享的运行时。
+
+iOS 在 `AppView`（或 `Surface`）的选项里设置运行时，视图的每次加载都使用它：
+
+```rust
+let mut options = SurfaceOptions::default();
+options.runtime = Some(runtime.handle().clone());
+let view = AppView::new(mtm, frame, options);
+view.load(bundle);
+```
+
+Android 在 UI 线程上用 `NshView` 的原生句柄（它的 `handle` 字段）调用 `nsh::set_runtime`，时机在视图加载应用或连接开发服务器之前。设置属于这个视图，从它的下一次加载起生效；运行中的引擎继续使用启动时的运行时。应用自己库里的 JNI 函数读取句柄：
+
+```rust
+#[unsafe(no_mangle)]
+extern "system" fn Java_com_example_app_RuntimeBridge_configure(
+    mut env: JNIEnv<'_>,
+    _: JClass<'_>,
+    view: JObject<'_>,
+) {
+    let Ok(handle) = env.get_field(&view, "handle", "J").and_then(|v| v.j()) else {
+        return;
+    };
+    // SAFETY: called on the UI thread with a live NshView of this library.
+    unsafe { nsh::set_runtime(handle, Some(app_runtime().clone())) };
+}
+```
+
+开启混淆时，保留桥接类的名称（`-keep class com.example.app.RuntimeBridge { *; }`）；分发的 AAR 已保留 `com.longbridge.nsh` 包，包括 `NshView.handle`。
 
 ## 为每个平台编写
 
@@ -114,7 +148,7 @@ function TabLayout() {
 }
 ```
 
-每个后端都列出了它以自己的方式处理的内容：[macOS](./macos.md#macos-上的差异)、[Windows](./windows.md#windows-上的差异)、[Linux](./linux.md#linux-上的差异)、[GPUI](./gpui.md#差异)、[终端](./tui.md)。
+每个后端都列出了它以自己的方式处理的内容：[macOS](./macos.md#macos-上的差异)、[Windows](./windows.md#windows-上的差异)、[Linux](./linux.md#linux-上的差异)、[GPUI](./gpui.md#差异)、[TUI](./tui.md)。
 
 ## 另请参阅
 
@@ -122,3 +156,4 @@ function TabLayout() {
 - [用 Rust 开发](./rust.md)：完全用 Rust 编写的应用，以及 Rust 加 TSX。
 - [安装](./installation.md)：每个平台需要的工具。
 - [架构](./architecture.md)：哪些部分共享，每个后端做什么。
+- [构建平台](./platform-extensions.md)：在 NSH 的引擎上构建你自己的平台。

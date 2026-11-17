@@ -1,10 +1,12 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
+
+use rustc_hash::FxHashMap;
 
 use super::{
     driver::{Running, ease},
     ops::{
         AnimationId, AnimationOp, Composite, Driver, Easing, Extrapolate, MathOp, NodeId, Operand,
-        Output,
+        Output, highest_frame_rate,
     },
 };
 
@@ -14,6 +16,8 @@ const LEAF_IDS: AnimationId = 0x8000_0000;
 /// How long a snapping `diffClamp` takes to reach its bound (seconds), as
 /// Flutter's floating app bar.
 const SNAP_SECONDS: f64 = 0.2;
+/// How far past an animation's end [`Graph::deadline`] is.
+const PAST_SECONDS: f64 = 0.001;
 
 /// The evaluated value of a node.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -57,7 +61,7 @@ impl Finished {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Node {
     Value {
         value: f32,
@@ -67,7 +71,7 @@ enum Node {
         running: Option<Running>,
     },
     Interpolate {
-        input: NodeId,
+        input: Input,
         input_range: Vec<f32>,
         output: Output,
         extrapolate: (Extrapolate, Extrapolate),
@@ -77,9 +81,11 @@ enum Node {
         ascending: bool,
     },
     DiffClamp {
-        input: NodeId,
-        min: f32,
-        max: f32,
+        input: Input,
+        /// Bounds, read at each evaluation (an upper bound below the lower
+        /// one is the lower one).
+        min: Arg,
+        max: Arg,
         /// The input and output at the last evaluation.
         state: Cell<Option<(f32, f32)>>,
         /// Settles at the nearer bound when its scroll view rests.
@@ -89,9 +95,43 @@ enum Node {
     },
     Math {
         op: MathOp,
-        a: Operand,
-        b: Operand,
+        a: Arg,
+        b: Arg,
     },
+}
+
+/// A node another node reads: its id, and the slot it was last found in,
+/// so that evaluating reads it there without looking the id up (checked
+/// against the id: a slot is taken again once its node is released).
+#[derive(Debug, Clone)]
+struct Input {
+    id: NodeId,
+    slot: Cell<u32>,
+}
+
+impl Input {
+    fn new(id: NodeId) -> Input {
+        Input {
+            id,
+            slot: Cell::new(u32::MAX),
+        }
+    }
+}
+
+/// An operand of a math node: [`Operand`], its node an [`Input`].
+#[derive(Debug, Clone)]
+enum Arg {
+    Node(Input),
+    Const(f32),
+}
+
+impl From<Operand> for Arg {
+    fn from(operand: Operand) -> Arg {
+        match operand {
+            Operand::Node(id) => Arg::Node(Input::new(id)),
+            Operand::Const(c) => Arg::Const(c),
+        }
+    }
 }
 
 /// A `diffClamp` moving to a bound after its scroll view came to rest.
@@ -116,10 +156,16 @@ struct Snap {
 const MAX_DEPTH: u32 = 64;
 
 /// All animation nodes of one surface.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Graph {
-    /// Indexed by node id (dense, assigned by JS).
-    nodes: Vec<Option<Node>>,
+    /// The live nodes, each in a slot of its own: as many slots as nodes
+    /// lived at once, not as ids were ever made (JS and the core each
+    /// count theirs up and never reuse one).
+    slots: Vec<Option<Slot>>,
+    /// The slots of the nodes, by id.
+    index: FxHashMap<NodeId, u32>,
+    /// Slots of released nodes, for the next nodes made.
+    free: Vec<u32>,
     /// Value nodes with a running animation.
     animating: Vec<NodeId>,
     /// Running composite animations.
@@ -133,30 +179,40 @@ pub struct Graph {
     baselines: Vec<(u32, Vec<(NodeId, f32)>)>,
     /// `diffClamp` nodes settling at a bound.
     snaps: Vec<NodeId>,
-    /// Which state of the graph the values in `values` are of: a change to
+    /// Which state of the graph the nodes' evaluated values are of: a change to
     /// the graph (an op, a value set, a frame) moves on to the next.
     generation: u64,
-    /// Nodes' values as evaluated, by node id, each with the generation it
-    /// is of: a node read by many (the time, a shared track) is evaluated
-    /// once a frame, not once for each reader.
-    values: RefCell<Vec<(u64, AnimationValue)>>,
     /// The evaluation under way reached a node deeper than `MAX_DEPTH`:
     /// what it gave stands for a cycle, not for a value to keep.
     cut: Cell<bool>,
 }
 
+/// A node and its value as last evaluated.
+#[derive(Debug, Clone)]
+struct Slot {
+    id: NodeId,
+    node: Node,
+    /// The value evaluated, with the generation of the graph it is of: a
+    /// node read by many (the time, a shared track) is evaluated once a
+    /// frame, not once for each reader.
+    value: Cell<(u64, AnimationValue)>,
+}
+
 /// A running composite animation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Program {
     id: AnimationId,
     key: u32,
     root: Step,
     /// When it started (its first frame).
     at: Option<f64>,
+    /// The highest frame rate its steps need ([`Composite::frame_rate`]),
+    /// asked for while it runs, delays included.
+    frame_rate: Option<f32>,
 }
 
 /// The state of one part of a composite animation.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum Step {
     Run {
         node: NodeId,
@@ -196,6 +252,23 @@ enum Step {
 /// How a step ended: completed (or stopped) and when.
 type End = (bool, f64);
 
+/// [`warn_out_of_range`](super::driver::warn_out_of_range) for every
+/// driver of a composite, and a delay that is not a number: once when it
+/// starts, not on each pass of a loop.
+fn warn_composite_out_of_range(spec: &Composite) {
+    match spec {
+        Composite::Run { driver, .. } => super::driver::warn_out_of_range(driver),
+        Composite::Sequence(children) | Composite::Parallel { children, .. } => {
+            children.iter().for_each(warn_composite_out_of_range);
+        }
+        Composite::Delay(ms) if ms.is_nan() => {
+            log::warn!("animation delay out of range (NaN): no delay");
+        }
+        Composite::Delay(_) => {}
+        Composite::Loop { child, .. } => warn_composite_out_of_range(child),
+    }
+}
+
 impl Step {
     fn new(spec: &Composite) -> Step {
         match spec {
@@ -218,8 +291,10 @@ impl Step {
                 stop_together: *stop_together,
                 at: None,
             },
+            // A NaN delay never ended (`at + NaN`): it is none. An infinite
+            // one is the app's to wait out.
             Composite::Delay(ms) => Step::Delay {
-                ms: *ms,
+                ms: if ms.is_nan() { 0.0 } else { *ms },
                 until: None,
             },
             Composite::Loop {
@@ -366,6 +441,31 @@ impl Step {
         }
     }
 
+    /// When something in what runs now happens next (seconds; see
+    /// [`Graph::deadline`]): the end of the step that runs, `now` for one
+    /// that has to start or has ended.
+    fn deadline(&self, g: &Graph, now: f64) -> Option<f64> {
+        match self {
+            Step::Run { node, leaf, .. } => match *leaf {
+                Some(id) if g.running_id(*node) == Some(id) => {
+                    g.running(*node).map(|r| r.deadline(now))
+                }
+                _ => Some(now),
+            },
+            Step::Sequence { steps, index, .. } => {
+                steps.get(*index).map_or(Some(now), |s| s.deadline(g, now))
+            }
+            Step::Parallel { steps, ends, .. } => steps
+                .iter()
+                .zip(ends)
+                .filter(|(_, end)| end.is_none())
+                .filter_map(|(step, _)| step.deadline(g, now))
+                .reduce(f64::min),
+            Step::Delay { until, .. } => Some(until.unwrap_or(now)),
+            Step::Loop { current, .. } => current.deadline(g, now),
+        }
+    }
+
     /// Whether what runs now never ends by itself: it runs in a loop
     /// without a number of iterations (every unfinished part of a parallel
     /// does).
@@ -469,7 +569,7 @@ impl Graph {
             } => self.insert(
                 node,
                 Node::Interpolate {
-                    input,
+                    input: Input::new(input),
                     ascending: input_range.windows(2).all(|w| w[0] <= w[1]),
                     input_range,
                     output,
@@ -486,24 +586,29 @@ impl Graph {
             } => self.insert(
                 node,
                 Node::DiffClamp {
-                    input,
-                    min,
-                    max: max.max(min),
+                    input: Input::new(input),
+                    min: min.into(),
+                    max: max.into(),
                     state: Cell::new(None),
                     snap,
                     snapping: Cell::new(None),
                 },
             ),
-            AnimationOp::CreateMath { node, op, a, b } => {
-                self.insert(node, Node::Math { op, a, b })
-            }
+            AnimationOp::CreateMath { node, op, a, b } => self.insert(
+                node,
+                Node::Math {
+                    op,
+                    a: a.into(),
+                    b: b.into(),
+                },
+            ),
             AnimationOp::Set { node, value } => self.set(node, value, finished),
             AnimationOp::SetOutput { node, output } => {
-                if let Some(Some(Node::Interpolate {
+                if let Some(Node::Interpolate {
                     input_range,
                     output: current,
                     ..
-                })) = self.nodes.get_mut(node as usize)
+                }) = self.node_mut(node)
                     && output_len(&output) == input_range.len()
                 {
                     *current = output;
@@ -514,6 +619,7 @@ impl Graph {
                 animation,
                 driver,
             } => {
+                super::driver::warn_out_of_range(&driver);
                 self.start(node, animation, driver, None, finished);
             }
             AnimationOp::StartComposite {
@@ -521,6 +627,7 @@ impl Graph {
                 key,
                 spec,
             } => {
+                warn_composite_out_of_range(&spec);
                 let mut nodes = Vec::new();
                 spec.nodes(&mut nodes);
                 let values = nodes
@@ -536,6 +643,7 @@ impl Graph {
                     key,
                     root: Step::new(&spec),
                     at: None,
+                    frame_rate: spec.frame_rate(),
                 });
             }
             AnimationOp::ResetComposite { key } => {
@@ -567,26 +675,20 @@ impl Graph {
             }
             AnimationOp::Release { node } => {
                 self.stop(node, finished);
-                if let Some(slot) = self.nodes.get_mut(node as usize) {
-                    *slot = None;
-                }
+                self.remove(node);
             }
             AnimationOp::SetOffset { node, offset: new } => {
-                if let Some(Some(Node::Value { offset, .. })) = self.nodes.get_mut(node as usize) {
+                if let Some(Node::Value { offset, .. }) = self.node_mut(node) {
                     *offset = new;
                 }
             }
             AnimationOp::FlattenOffset { node } => {
-                if let Some(Some(Node::Value { value, offset, .. })) =
-                    self.nodes.get_mut(node as usize)
-                {
+                if let Some(Node::Value { value, offset, .. }) = self.node_mut(node) {
                     *value += std::mem::take(offset);
                 }
             }
             AnimationOp::ExtractOffset { node } => {
-                if let Some(Some(Node::Value { value, offset, .. })) =
-                    self.nodes.get_mut(node as usize)
-                {
+                if let Some(Node::Value { value, offset, .. }) = self.node_mut(node) {
                     *offset += std::mem::take(value);
                 }
             }
@@ -608,17 +710,21 @@ impl Graph {
         start: Option<f64>,
         finished: &mut Vec<Finished>,
     ) -> bool {
-        let Some(Some(Node::Value {
+        let Some(Node::Value {
             value,
             velocity,
             running,
             ..
-        })) = self.nodes.get_mut(node as usize)
+        }) = self.node_mut(node)
         else {
             return false;
         };
         let mut new = Running::new(animation, driver, *value, *velocity);
-        if let Some(start) = start {
+        // Replacing one in motion, it goes on from that one's last frame,
+        // where `value` and `velocity` were taken: started on the next
+        // frame instead, a value retargeted on every frame (one following
+        // the pointer) would never move.
+        if let Some(start) = start.or_else(|| running.as_ref().and_then(Running::last_step)) {
             new = new.starting_at(start);
         }
         if let Some(old) = running.replace(new) {
@@ -636,7 +742,7 @@ impl Graph {
 
     /// The animation running on value `node`.
     fn running_id(&self, node: NodeId) -> Option<AnimationId> {
-        match self.nodes.get(node as usize)? {
+        match self.node(node) {
             Some(Node::Value {
                 running: Some(r), ..
             }) => Some(r.id),
@@ -645,12 +751,88 @@ impl Graph {
     }
 
     fn insert(&mut self, id: NodeId, node: Node) {
-        let idx = id as usize;
-        if idx >= self.nodes.len() {
-            self.nodes
-                .resize_with((idx + 1).next_power_of_two(), || None);
+        let slot = Slot {
+            id,
+            node,
+            value: Cell::new((u64::MAX, AnimationValue::Number(0.0))),
+        };
+        if let Some(&i) = self.index.get(&id) {
+            self.slots[i as usize] = Some(slot);
+            return;
         }
-        self.nodes[idx] = Some(node);
+        let i = match self.free.pop() {
+            Some(i) => {
+                self.slots[i as usize] = Some(slot);
+                i
+            }
+            None => {
+                self.slots.push(Some(slot));
+                (self.slots.len() - 1) as u32
+            }
+        };
+        self.index.insert(id, i);
+    }
+
+    /// Releases node `id`; once most slots are free, the nodes move
+    /// together and give back what a crowd of nodes, since released, took.
+    fn remove(&mut self, id: NodeId) {
+        let Some(i) = self.index.remove(&id) else {
+            return;
+        };
+        self.slots[i as usize] = None;
+        self.free.push(i);
+        let live = self.index.len();
+        if self.slots.len() > 4 * live.max(16) {
+            // Readers find a moved input by its id, once, on their next
+            // evaluation.
+            self.slots.retain(Option::is_some);
+            self.slots.shrink_to(2 * live);
+            self.free.clear();
+            self.free.shrink_to(live);
+            for (i, slot) in self.slots.iter().enumerate() {
+                if let Some(slot) = slot {
+                    self.index.insert(slot.id, i as u32);
+                }
+            }
+            self.index.shrink_to(2 * live);
+        }
+    }
+
+    /// The slot of node `id`.
+    fn slot(&self, id: NodeId) -> Option<&Slot> {
+        let &i = self.index.get(&id)?;
+        self.slots[i as usize].as_ref()
+    }
+
+    /// The slot of the node `input` reads: where it was last, or found by
+    /// its id.
+    fn find(&self, input: &Input) -> Option<&Slot> {
+        if let Some(Some(slot)) = self.slots.get(input.slot.get() as usize)
+            && slot.id == input.id
+        {
+            return Some(slot);
+        }
+        let &i = self.index.get(&input.id)?;
+        input.slot.set(i);
+        self.slots[i as usize].as_ref()
+    }
+
+    fn node(&self, id: NodeId) -> Option<&Node> {
+        self.slot(id).map(|slot| &slot.node)
+    }
+
+    fn node_mut(&mut self, id: NodeId) -> Option<&mut Node> {
+        let &i = self.index.get(&id)?;
+        self.slots[i as usize].as_mut().map(|slot| &mut slot.node)
+    }
+
+    /// How many nodes the graph has room for, live or not.
+    #[cfg(test)]
+    fn storage(&self) -> usize {
+        self.slots
+            .capacity()
+            .max(self.index.capacity())
+            .max(self.free.capacity())
     }
 
     /// Sets a value directly (gestures, scroll offsets, JS `set`), stopping
@@ -659,9 +841,9 @@ impl Graph {
         self.changed();
         self.stop(node, finished);
         self.route_leaf_ends(finished);
-        if let Some(Some(Node::Value {
+        if let Some(Node::Value {
             value, velocity, ..
-        })) = self.nodes.get_mut(node as usize)
+        }) = self.node_mut(node)
         {
             *value = new;
             *velocity = 0.0;
@@ -669,9 +851,9 @@ impl Graph {
     }
 
     fn stop(&mut self, node: NodeId, finished: &mut Vec<Finished>) {
-        if let Some(Some(Node::Value {
+        if let Some(Node::Value {
             running, velocity, ..
-        })) = self.nodes.get_mut(node as usize)
+        }) = self.node_mut(node)
             && let Some(old) = running.take()
         {
             *velocity = 0.0;
@@ -686,7 +868,7 @@ impl Graph {
 
     /// The current value of a value node.
     pub fn value(&self, node: NodeId) -> Option<f32> {
-        match self.nodes.get(node as usize)? {
+        match self.node(node) {
             Some(Node::Value { value, .. }) => Some(*value),
             _ => None,
         }
@@ -695,6 +877,26 @@ impl Graph {
     /// True while any animation runs (the platform keeps its frame clock on).
     pub fn is_animating(&self) -> bool {
         !self.animating.is_empty() || !self.programs.is_empty() || !self.snaps.is_empty()
+    }
+
+    /// The highest frame rate the running animations need, in Hz
+    /// ([`Driver::frame_rate`]): `None` as soon as one asks for the
+    /// screen's highest (or none runs). A composite asks for the highest
+    /// rate of its steps for as long as it runs; a snapping `diffClamp`
+    /// settling asks for the screen's highest. Platforms that can lower
+    /// their frame rate fold it with what else wants frames.
+    pub fn frame_rate(&self) -> Option<f32> {
+        if !self.snaps.is_empty() {
+            return None;
+        }
+        let drivers = self.animating.iter().map(|&node| match self.node(node) {
+            Some(Node::Value {
+                running: Some(r), ..
+            }) => r.frame_rate(),
+            _ => None,
+        });
+        let programs = self.programs.iter().map(|p| p.frame_rate);
+        drivers.chain(programs).reduce(highest_frame_rate).flatten()
     }
 
     /// True while an animation that ends by itself runs: as
@@ -712,6 +914,51 @@ impl Graph {
                 .any(|&node| self.running_id(node).is_some_and(|id| id < LEAF_IDS))
     }
 
+    /// When the next animation that ends by itself ends (seconds, on the
+    /// clock [`Graph::tick`] is given), or `now` when one has to be
+    /// stepped to start: what a surface that draws no frames (a hidden
+    /// window) ticks the graph at, so animations end on time and report
+    /// it without frames. `None` while none runs, or only ones that loop
+    /// forever ([`Graph::is_finishing`]), which only frames move.
+    pub fn deadline(&self, now: f64) -> Option<f64> {
+        let leaves = self
+            .animating
+            .iter()
+            // The steps of composite animations are their programs'.
+            .filter(|&&node| self.running_id(node).is_some_and(|id| id < LEAF_IDS))
+            .filter_map(|&node| self.running(node).map(|r| r.deadline(now)));
+        let programs = self
+            .programs
+            .iter()
+            .filter(|p| !p.root.endless())
+            .filter_map(|p| match p.at {
+                None => Some(now),
+                Some(_) => p.root.deadline(self, now),
+            });
+        let snaps = self.snaps.iter().filter_map(|&node| match self.node(node) {
+            Some(Node::DiffClamp { snapping, .. }) => {
+                let snap = snapping.get()?;
+                Some(snap.start.map_or(now, |start| start + SNAP_SECONDS))
+            }
+            _ => None,
+        });
+        // A millisecond past it: a step there finds it ended whatever the
+        // rounding of the time elapsed.
+        leaves
+            .chain(programs)
+            .chain(snaps)
+            .reduce(f64::min)
+            .map(|t| t + PAST_SECONDS)
+    }
+
+    /// The animation running on value `node`.
+    fn running(&self, node: NodeId) -> Option<&Running> {
+        match self.node(node) {
+            Some(Node::Value { running, .. }) => running.as_ref(),
+            _ => None,
+        }
+    }
+
     /// The scroll view whose scroll value is `source` came to rest (its
     /// drag and momentum ended): every snapping `diffClamp` that follows it
     /// and rests between its bounds settles at the nearer one, at `max`
@@ -721,29 +968,35 @@ impl Graph {
         self.changed();
         let mut started = false;
         let at = self.eval(source).number();
+        // In the order of their ids, as they were made.
+        let mut clamps: Vec<NodeId> = self
+            .slots
+            .iter()
+            .flatten()
+            .filter(|slot| matches!(slot.node, Node::DiffClamp { snap: true, .. }))
+            .map(|slot| slot.id)
+            .collect();
+        clamps.sort_unstable();
         // Register moving nodes first, independent of their ids. Bound
         // dependents then hold their output while those inputs settle.
         for hold_bounds in [false, true] {
             if hold_bounds && !started {
                 break;
             }
-            for i in 0..self.nodes.len() {
+            for &i in &clamps {
                 let Some(Node::DiffClamp {
-                    input,
-                    min,
-                    max,
-                    snap: true,
-                    ..
-                }) = &self.nodes[i]
+                    input, min, max, ..
+                }) = self.node(i)
                 else {
                     continue;
                 };
-                let (input, min, max) = (*input, *min, *max);
+                let input = input.id;
                 if !self.depends(input, source, 0) {
                     continue;
                 }
+                let (min, max) = self.bounds(min, max, 0);
                 // Brings its output up to the input.
-                let out = self.eval(i as NodeId).number();
+                let out = self.eval(i).number();
                 let x = self.eval(input).number();
                 let bounded = out <= min || out >= max;
                 if bounded != hold_bounds {
@@ -759,7 +1012,7 @@ impl Graph {
                 } else {
                     min
                 };
-                if let Some(Node::DiffClamp { snapping, .. }) = &self.nodes[i] {
+                if let Some(Node::DiffClamp { snapping, .. }) = self.node(i) {
                     snapping.set(Some(Snap {
                         from: out,
                         to,
@@ -772,13 +1025,23 @@ impl Graph {
                 }
                 // Read from now on as settling.
                 self.changed();
-                if !self.snaps.contains(&(i as NodeId)) {
-                    self.snaps.push(i as NodeId);
+                if !self.snaps.contains(&i) {
+                    self.snaps.push(i);
                 }
                 started = true;
             }
         }
         started
+    }
+
+    /// The current `min..=max` of a `diffClamp` (`max` no lower than `min`).
+    fn bounds(&self, min: &Arg, max: &Arg, depth: u32) -> (f32, f32) {
+        let value = |o: &Arg| match o {
+            Arg::Node(n) => self.eval_input(n, depth + 1).number(),
+            Arg::Const(c) => *c,
+        };
+        let min = value(min);
+        (min, value(max).max(min))
     }
 
     /// Whether `node` reads `source`, directly or through other nodes.
@@ -789,13 +1052,13 @@ impl Graph {
         if depth > MAX_DEPTH {
             return false;
         }
-        match self.nodes.get(node as usize) {
-            Some(Some(Node::Interpolate { input, .. } | Node::DiffClamp { input, .. })) => {
-                self.depends(*input, source, depth + 1)
+        match self.node(node) {
+            Some(Node::Interpolate { input, .. } | Node::DiffClamp { input, .. }) => {
+                self.depends(input.id, source, depth + 1)
             }
-            Some(Some(Node::Math { a, b, .. })) => [a, b].into_iter().any(|o| match *o {
-                Operand::Node(n) => self.depends(n, source, depth + 1),
-                Operand::Const(_) => false,
+            Some(Node::Math { a, b, .. }) => [a, b].into_iter().any(|o| match o {
+                Arg::Node(n) => self.depends(n.id, source, depth + 1),
+                Arg::Const(_) => false,
             }),
             _ => false,
         }
@@ -804,11 +1067,14 @@ impl Graph {
     /// Moves the settling `diffClamp` nodes to `now`. True if one moved.
     fn run_snaps(&mut self, now: f64) -> bool {
         let mut changed = false;
-        let nodes = &self.nodes;
+        let (index, slots) = (&self.index, &self.slots);
         self.snaps.retain(|&node| {
-            let Some(Some(Node::DiffClamp {
-                state, snapping, ..
-            })) = nodes.get(node as usize)
+            let Some(Some(Slot {
+                node: Node::DiffClamp {
+                    state, snapping, ..
+                },
+                ..
+            })) = index.get(&node).map(|&i| &slots[i as usize])
             else {
                 return false;
             };
@@ -857,12 +1123,16 @@ impl Graph {
     /// Steps the animation of `node` to `now`: `(value changed, ended)`.
     /// Ends of composite steps go to `leaf_ends`, with their exact time.
     fn step_node(&mut self, node: NodeId, now: f64, finished: &mut Vec<Finished>) -> (bool, bool) {
-        let Some(Some(Node::Value {
+        let Some(Node::Value {
             value,
             velocity,
             running: running @ Some(_),
             ..
-        })) = self.nodes.get_mut(node as usize)
+        }) = self
+            .index
+            .get(&node)
+            .and_then(|&i| self.slots[i as usize].as_mut())
+            .map(|slot| &mut slot.node)
         else {
             return (false, true);
         };
@@ -935,65 +1205,74 @@ impl Graph {
         self.eval_depth(node, 0)
     }
 
-    /// The value of `node`, evaluated once for this generation of the
-    /// graph and kept (unless a cycle cut it short).
+    /// The value of `node` ([`Graph::eval_slot`]'s).
     fn eval_depth(&self, node: NodeId, depth: u32) -> AnimationValue {
         if depth > MAX_DEPTH {
             self.cut.set(true);
             return AnimationValue::Number(0.0);
         }
-        let i = node as usize;
-        if let Some(&(generation, value)) = self.values.borrow().get(i)
-            && generation == self.generation
-        {
+        match self.slot(node) {
+            Some(slot) => self.eval_slot(slot, depth),
+            None => AnimationValue::Number(0.0),
+        }
+    }
+
+    /// The value of the node `input` reads ([`Graph::eval_slot`]'s).
+    fn eval_input(&self, input: &Input, depth: u32) -> AnimationValue {
+        if depth > MAX_DEPTH {
+            self.cut.set(true);
+            return AnimationValue::Number(0.0);
+        }
+        match self.find(input) {
+            Some(slot) => self.eval_slot(slot, depth),
+            None => AnimationValue::Number(0.0),
+        }
+    }
+
+    /// The value of the node in `slot`, evaluated once for this generation
+    /// of the graph and kept (unless a cycle cut it short).
+    fn eval_slot(&self, slot: &Slot, depth: u32) -> AnimationValue {
+        let (generation, value) = slot.value.get();
+        if generation == self.generation {
             return value;
         }
         let outer = self.cut.replace(false);
-        let value = self.compute(node, depth);
+        let value = self.compute(&slot.node, depth);
         if !self.cut.get() {
-            let mut values = self.values.borrow_mut();
-            if i >= values.len() {
-                values.resize(
-                    self.nodes.len().max(i + 1),
-                    (u64::MAX, AnimationValue::Number(0.0)),
-                );
-            }
-            values[i] = (self.generation, value);
+            slot.value.set((self.generation, value));
         }
         self.cut.set(outer || self.cut.get());
         value
     }
 
-    /// `node`'s value from its inputs' (`eval_depth`'s).
-    fn compute(&self, node: NodeId, depth: u32) -> AnimationValue {
-        match self.nodes.get(node as usize) {
-            Some(Some(Node::Value { value, offset, .. })) => {
-                AnimationValue::Number(*value + *offset)
-            }
-            Some(Some(Node::Interpolate {
+    /// `node`'s value from its inputs' (`eval_input`'s).
+    fn compute(&self, node: &Node, depth: u32) -> AnimationValue {
+        match node {
+            Node::Value { value, offset, .. } => AnimationValue::Number(*value + *offset),
+            Node::Interpolate {
                 input,
                 input_range,
                 output,
                 extrapolate,
                 easing,
                 ascending,
-            })) => interpolate(
-                self.eval_depth(*input, depth + 1).number(),
+            } => interpolate(
+                self.eval_input(input, depth + 1).number(),
                 input_range,
                 output,
                 *extrapolate,
                 *easing,
                 *ascending,
             ),
-            Some(Some(Node::DiffClamp {
+            Node::DiffClamp {
                 input,
                 min,
                 max,
                 state,
                 snapping,
                 ..
-            })) => {
-                let x = self.eval_depth(*input, depth + 1).number();
+            } => {
+                let x = self.eval_input(input, depth + 1).number();
                 if let Some(mut snap) = snapping.get() {
                     if self.eval_depth(snap.source, depth + 1).number() != snap.at {
                         // Scrolled again: it follows the input from where
@@ -1009,17 +1288,18 @@ impl Graph {
                         snapping.set((!snap.done).then_some(snap));
                     }
                 }
+                let (min, max) = self.bounds(min, max, depth);
                 let out = match state.get() {
-                    None => x.clamp(*min, *max),
-                    Some((last, out)) => (out + x - last).clamp(*min, *max),
+                    None => x.clamp(min, max),
+                    Some((last, out)) => (out + x - last).clamp(min, max),
                 };
                 state.set(Some((x, out)));
                 AnimationValue::Number(out)
             }
-            Some(Some(Node::Math { op, a, b })) => {
-                let operand = |o: &Operand| match *o {
-                    Operand::Node(n) => self.eval_depth(n, depth + 1).number(),
-                    Operand::Const(c) => c,
+            Node::Math { op, a, b } => {
+                let operand = |o: &Arg| match o {
+                    Arg::Node(n) => self.eval_input(n, depth + 1).number(),
+                    Arg::Const(c) => *c,
                 };
                 let (a, b) = (operand(a), operand(b));
                 AnimationValue::Number(match op {
@@ -1032,7 +1312,6 @@ impl Graph {
                     MathOp::Div => 0.0,
                 })
             }
-            _ => AnimationValue::Number(0.0),
         }
     }
 }
@@ -1111,7 +1390,10 @@ fn lerp_color(a: u32, b: u32, t: f32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::animation::ops::{Driver, Easing};
+    use crate::animation::{
+        driver::CHECK_SECONDS,
+        ops::{Driver, Easing},
+    };
 
     /// [`super::interpolate`], its breakpoints' order found.
     fn interpolate(
@@ -1190,6 +1472,85 @@ mod tests {
         }
     }
 
+    /// A linear timing to `to` over a second, needing at most `hz`.
+    fn capped(to: f32, hz: Option<f32>) -> Driver {
+        Driver::Timing {
+            to,
+            duration_ms: 1000.0,
+            easing: Easing::Linear,
+            delay_ms: 0.0,
+            frame_rate: hz,
+        }
+    }
+
+    #[test]
+    fn frame_rates_fold_to_the_highest() {
+        let mut finished = Vec::new();
+        let values = (1..=5).map(|node| AnimationOp::CreateValue { node, value: 0.0 });
+        let mut g = graph_of(0.0, values);
+        // Nothing runs: no rate asked for.
+        assert_eq!(g.frame_rate(), None);
+        let start = |g: &mut Graph, node, hz, finished: &mut Vec<Finished>| {
+            g.apply(
+                AnimationOp::Start {
+                    node,
+                    animation: node,
+                    driver: capped(1.0, hz),
+                },
+                finished,
+            )
+        };
+        start(&mut g, 1, Some(30.0), &mut finished);
+        assert_eq!(g.frame_rate(), Some(30.0));
+        start(&mut g, 2, Some(60.0), &mut finished);
+        assert_eq!(g.frame_rate(), Some(60.0));
+        // One without a rate: the screen's highest.
+        start(&mut g, 3, None, &mut finished);
+        assert_eq!(g.frame_rate(), None);
+        g.apply(AnimationOp::Stop { node: 3 }, &mut finished);
+        g.apply(AnimationOp::Stop { node: 2 }, &mut finished);
+        assert_eq!(g.frame_rate(), Some(30.0));
+        // Not a rate: the screen's highest.
+        start(&mut g, 2, Some(0.0), &mut finished);
+        assert_eq!(g.frame_rate(), None);
+        g.apply(AnimationOp::Stop { node: 2 }, &mut finished);
+
+        // A composite asks for its steps' highest, through its delays too.
+        let run = |node, hz| Composite::Run {
+            node,
+            driver: capped(1.0, hz),
+        };
+        let spec = Composite::Loop {
+            child: Box::new(Composite::Sequence(vec![
+                run(4, Some(24.0)),
+                Composite::Delay(500.0),
+                run(5, Some(12.0)),
+            ])),
+            iterations: None,
+            reset: true,
+        };
+        assert_eq!(spec.frame_rate(), Some(24.0));
+        g.apply(AnimationOp::Stop { node: 1 }, &mut finished);
+        g.apply(
+            AnimationOp::StartComposite {
+                animation: 9,
+                key: 1,
+                spec,
+            },
+            &mut finished,
+        );
+        assert_eq!(g.frame_rate(), Some(24.0));
+        start(&mut g, 1, Some(30.0), &mut finished);
+        assert_eq!(g.frame_rate(), Some(30.0));
+        // A step without a rate makes the whole composite uncapped.
+        let uncapped = Composite::Parallel {
+            children: vec![run(4, Some(24.0)), run(5, None)],
+            stop_together: true,
+        };
+        assert_eq!(uncapped.frame_rate(), None);
+        assert_eq!(Composite::Delay(100.0).frame_rate(), None);
+    }
+
     #[test]
     fn shared_inputs_follow_every_change() {
         // Three readers of one sum of the value: evaluated once for each
@@ -1216,6 +1577,7 @@ mod tests {
                     duration_ms: 1000.0,
                     easing: Easing::Linear,
                     delay_ms: 0.0,
+                    frame_rate: None,
                 },
                 animation: 1,
             },
@@ -1243,6 +1605,65 @@ mod tests {
         assert_eq!(g.eval(3 + 2 * 79), AnimationValue::Number(0.0));
         assert_eq!(g.eval(3 + 2 * 10), AnimationValue::Number(5.0));
         assert_eq!(g.eval(3 + 2 * 79), AnimationValue::Number(0.0));
+    }
+
+    #[test]
+    fn storage_follows_the_live_nodes_not_every_id_ever_made() {
+        // Ids are never reused: a long session makes and releases nodes
+        // under ever larger ids while few live at once, one of them (the
+        // value at 1) for the whole session.
+        let mut g = graph_of(7.0, []);
+        let mut f = Vec::new();
+        let mut live = std::collections::VecDeque::new();
+        let mut next: NodeId = 3;
+        let mut peak = 0;
+        for i in 0..50_000 {
+            g.apply(
+                AnimationOp::CreateValue {
+                    node: next,
+                    value: i as f32,
+                },
+                &mut f,
+            );
+            g.apply(add(next + 2, next, Operand::Node(1)), &mut f);
+            assert_eq!(g.eval(next + 2), AnimationValue::Number(i as f32 + 7.0));
+            live.push_back(next);
+            next += 4;
+            while live.len() > 8 {
+                let old = live.pop_front().unwrap();
+                g.apply(AnimationOp::Release { node: old + 2 }, &mut f);
+                g.apply(AnimationOp::Release { node: old }, &mut f);
+            }
+            peak = peak.max(1 + 2 * live.len());
+        }
+        assert!(
+            g.storage() <= 8 * peak,
+            "{} slots for at most {peak} live nodes",
+            g.storage()
+        );
+        assert_eq!(g.eval(1), AnimationValue::Number(7.0));
+        // Released nodes are gone, a live one still reads its inputs.
+        assert_eq!(g.value(3), None);
+        let last = *live.back().unwrap();
+        assert_eq!(g.eval(last + 2), AnimationValue::Number(49_999.0 + 7.0));
+    }
+
+    #[test]
+    fn a_reader_of_a_released_node_does_not_read_the_node_made_after_it() {
+        let mut g = graph_of(5.0, [add(3, 1, Operand::Const(1.0))]);
+        let mut f = Vec::new();
+        assert_eq!(g.eval(3), AnimationValue::Number(6.0));
+        g.apply(AnimationOp::Release { node: 1 }, &mut f);
+        // Made where the released one was.
+        g.apply(
+            AnimationOp::CreateValue {
+                node: 5,
+                value: 100.0,
+            },
+            &mut f,
+        );
+        assert_eq!(g.eval(3), AnimationValue::Number(1.0));
+        assert_eq!(g.eval(5), AnimationValue::Number(100.0));
     }
 
     /// A frame of many readers of shared inputs, as a vector animation's
@@ -1517,6 +1938,7 @@ mod tests {
                     duration_ms: 100.0,
                     easing: Easing::Linear,
                     delay_ms: 0.0,
+                    frame_rate: None,
                 },
             },
             &mut finished,
@@ -1556,6 +1978,7 @@ mod tests {
             damping: 10.0,
             mass: 1.0,
             velocity: None,
+            frame_rate: None,
         };
         g.apply(
             AnimationOp::Start {
@@ -1597,12 +2020,63 @@ mod tests {
         assert!(!g.is_animating());
     }
 
+    /// A spring given a new target on every frame (a value that follows
+    /// the pointer, #632) still moves on each frame, as far as one that
+    /// keeps its target.
+    #[test]
+    fn a_spring_retargeted_every_frame_keeps_moving() {
+        let spring = |to| Driver::Spring {
+            to,
+            stiffness: 170.0,
+            damping: 26.0,
+            mass: 1.0,
+            velocity: None,
+            frame_rate: None,
+        };
+        let run = |retarget: bool| {
+            let mut g = Graph::default();
+            let mut finished = Vec::new();
+            g.apply(
+                AnimationOp::CreateValue {
+                    node: 1,
+                    value: 0.0,
+                },
+                &mut finished,
+            );
+            let mut trace = Vec::new();
+            for frame in 0..10u32 {
+                if frame == 0 || retarget {
+                    g.apply(
+                        AnimationOp::Start {
+                            node: 1,
+                            animation: frame + 1,
+                            driver: spring(100.0),
+                        },
+                        &mut finished,
+                    );
+                }
+                g.tick(f64::from(frame) / 60.0, &mut finished);
+                trace.push(g.value(1).unwrap());
+            }
+            trace
+        };
+        let steady = run(false);
+        let retargeted = run(true);
+        for (frame, (a, b)) in steady.iter().zip(&retargeted).enumerate() {
+            assert!(
+                (a - b).abs() < 0.5,
+                "frame {frame}: {steady:?} vs {retargeted:?}"
+            );
+        }
+    }
+
     fn timing(to: f32, ms: f32) -> Driver {
         Driver::Timing {
             to,
             duration_ms: ms,
             easing: Easing::Linear,
             delay_ms: 0.0,
+            frame_rate: None,
         }
     }
 
@@ -1619,6 +2093,139 @@ mod tests {
             g.tick(t, f);
             t += 1.0 / 60.0;
         }
+    }
+
+    /// Ticks only at the graph's deadlines from `from` (a surface that
+    /// draws no frames): the times it ticked at, and the animations that
+    /// finished at each.
+    fn run_to_deadlines(
+        g: &mut Graph,
+        f: &mut Vec<Finished>,
+        from: f64,
+    ) -> Vec<(f64, Vec<AnimationId>)> {
+        let mut t = from;
+        let mut ticks = Vec::new();
+        for _ in 0..100 {
+            let before = f.len();
+            g.tick(t, f);
+            ticks.push((
+                t,
+                f[before..]
+                    .iter()
+                    .filter(|e| e.finished)
+                    .map(|e| e.animation)
+                    .collect(),
+            ));
+            match g.deadline(t) {
+                Some(next) => t = next.max(t),
+                None => return ticks,
+            }
+        }
+        panic!("deadlines did not come to an end: {ticks:?}");
+    }
+
+    #[test]
+    fn deadlines_end_animations_on_time_without_frames() {
+        let mut g = Graph::default();
+        let mut f = Vec::new();
+        values(&mut g, &mut f, &[1, 2, 3]);
+        g.apply(
+            AnimationOp::Start {
+                node: 1,
+                animation: 1,
+                driver: timing(100.0, 250.0),
+            },
+            &mut f,
+        );
+        g.apply(
+            AnimationOp::StartComposite {
+                animation: 5,
+                key: 1,
+                spec: Composite::Sequence(vec![
+                    Composite::Run {
+                        node: 2,
+                        driver: timing(100.0, 100.0),
+                    },
+                    Composite::Delay(50.0),
+                    Composite::Run {
+                        node: 2,
+                        driver: timing(0.0, 100.0),
+                    },
+                ]),
+            },
+            &mut f,
+        );
+        // A spinner: only frames move it, and it gives no deadline.
+        g.apply(
+            AnimationOp::StartComposite {
+                animation: 7,
+                key: 2,
+                spec: Composite::Loop {
+                    child: Box::new(Composite::Run {
+                        node: 3,
+                        driver: timing(360.0, 1000.0),
+                    }),
+                    iterations: None,
+                    reset: true,
+                },
+            },
+            &mut f,
+        );
+        // Not started: tick now, which starts them.
+        assert_eq!(g.deadline(1000.0), Some(1000.0 + PAST_SECONDS));
+        let ticks = run_to_deadlines(&mut g, &mut f, 1000.0);
+        let ended = |id| {
+            ticks
+                .iter()
+                .find(|(_, ids)| ids.contains(&id))
+                .map(|(t, _)| t - 1000.0)
+        };
+        let near = |t: Option<f64>, want: f64| t.is_some_and(|t| (t - want).abs() < 0.01);
+        assert!(near(ended(1), 0.25), "{ticks:?}");
+        assert!(near(ended(5), 0.25), "{ticks:?}");
+        // The start, the first step's end, the delay's, the last.
+        assert!(ticks.len() <= 5, "{ticks:?}");
+        assert_eq!(g.value(1), Some(100.0));
+        assert_eq!(g.value(2), Some(0.0));
+        assert!(ended(7).is_none());
+        assert!(g.is_animating());
+    }
+
+    #[test]
+    fn a_spring_is_checked_until_it_settles() {
+        let mut g = Graph::default();
+        let mut f = Vec::new();
+        values(&mut g, &mut f, &[1]);
+        g.apply(
+            AnimationOp::Start {
+                node: 1,
+                animation: 1,
+                driver: Driver::Spring {
+                    to: 100.0,
+                    stiffness: 100.0,
+                    damping: 10.0,
+                    mass: 1.0,
+                    velocity: None,
+                    frame_rate: None,
+                },
+            },
+            &mut f,
+        );
+        let ticks = run_to_deadlines(&mut g, &mut f, 50.0);
+        let (end, _) = ticks
+            .iter()
+            .find(|(_, ids)| ids.contains(&1))
+            .expect("it settled");
+        // Every check a tenth of a second apart.
+        assert!(
+            ticks
+                .windows(2)
+                .skip(1)
+                .all(|w| (w[1].0 - w[0].0 - (CHECK_SECONDS + PAST_SECONDS)).abs() < 1e-9)
+        );
+        assert!(end - 50.0 < 3.0, "{ticks:?}");
+        assert_eq!(g.value(1), Some(100.0));
+        assert_eq!(g.deadline(*end), None);
     }
 
     #[test]
@@ -1707,6 +2314,68 @@ mod tests {
         g.tick(0.5, &mut f);
         assert_eq!(g.value(2), Some(stopped));
         assert!(!g.is_animating());
+    }
+
+    /// A loop of parameters out of range warns once, when it starts, not on
+    /// each of its passes (up to 16 a frame for passes of no duration:
+    /// `run_programs` routes each pass's end in a round of its own).
+    #[test]
+    fn a_loop_out_of_range_warns_once() {
+        let mut g = Graph::default();
+        let mut f = Vec::new();
+        values(&mut g, &mut f, &[1]);
+        let warnings = || crate::animation::driver::WARNINGS.with(|n| n.get());
+        let before = warnings();
+        g.apply(
+            AnimationOp::StartComposite {
+                animation: 3,
+                key: 1,
+                spec: Composite::Loop {
+                    child: Box::new(Composite::Run {
+                        node: 1,
+                        driver: timing(1.0, f32::NAN),
+                    }),
+                    iterations: None,
+                    reset: false,
+                },
+            },
+            &mut f,
+        );
+        run(&mut g, &mut f, 0.0, 0.5);
+        assert_eq!(warnings() - before, 1);
+        assert_eq!(g.value(1), Some(1.0));
+    }
+
+    /// A NaN delay (`at + NaN` never came) is none.
+    #[test]
+    fn a_nan_delay_is_none() {
+        let mut g = Graph::default();
+        let mut f = Vec::new();
+        values(&mut g, &mut f, &[1]);
+        g.apply(
+            AnimationOp::StartComposite {
+                animation: 3,
+                key: 1,
+                spec: Composite::Sequence(vec![
+                    Composite::Delay(f32::NAN),
+                    Composite::Run {
+                        node: 1,
+                        driver: timing(10.0, 100.0),
+                    },
+                ]),
+            },
+            &mut f,
+        );
+        run(&mut g, &mut f, 0.0, 0.3);
+        assert_eq!(g.value(1), Some(10.0));
+        assert_eq!(
+            f,
+            vec![Finished {
+                animation: 3,
+                finished: true,
+                value: None,
+            }]
+        );
     }
 
     #[test]
@@ -1868,8 +2537,8 @@ mod tests {
             AnimationOp::CreateDiffClamp {
                 node: 2,
                 input: 1,
-                min: 0.0,
-                max: 50.0,
+                min: Operand::Const(0.0),
+                max: Operand::Const(50.0),
                 snap: false,
             },
             &mut f,
@@ -1897,6 +2566,45 @@ mod tests {
         assert_eq!(g.eval(3).number(), 330.0);
     }
 
+    /// A `diffClamp` whose bounds are nodes clamps at their current values
+    /// and moves back right away when its input reverses at a bound
+    /// (#2033: a drag range that shrinks while dragging).
+    #[test]
+    fn diff_clamp_follows_dynamic_bounds() {
+        let mut g = Graph::default();
+        let mut f = Vec::new();
+        // 1: the drag, 2: min, 3: max.
+        values(&mut g, &mut f, &[1, 2, 3]);
+        g.set(3, 100.0, &mut f);
+        g.apply(
+            AnimationOp::CreateDiffClamp {
+                node: 4,
+                input: 1,
+                min: Operand::Node(2),
+                max: Operand::Node(3),
+                snap: false,
+            },
+            &mut f,
+        );
+        let drag = |g: &mut Graph, f: &mut Vec<Finished>, v: f32| {
+            g.set(1, v, f);
+            g.eval(4).number()
+        };
+        assert_eq!(drag(&mut g, &mut f, 80.0), 80.0);
+        // The range shrinks to 0..=60 while dragging: it clamps at once.
+        g.set(3, 60.0, &mut f);
+        assert_eq!(g.eval(4).number(), 60.0);
+        assert_eq!(drag(&mut g, &mut f, 120.0), 60.0);
+        // Dragging back moves back right away, by the drag's change.
+        assert_eq!(drag(&mut g, &mut f, 110.0), 50.0);
+        // A lower bound that rises clamps too.
+        g.set(2, 55.0, &mut f);
+        assert_eq!(g.eval(4).number(), 55.0);
+        // An upper bound below the lower one is the lower one.
+        g.set(3, 10.0, &mut f);
+        assert_eq!(drag(&mut g, &mut f, 200.0), 55.0);
+    }
+
     /// A snapping `diffClamp` of value 1 in `0..=50` (node 2).
     fn snapping(g: &mut Graph, f: &mut Vec<Finished>) {
         values(g, f, &[1]);
@@ -1904,8 +2612,8 @@ mod tests {
             AnimationOp::CreateDiffClamp {
                 node: 2,
                 input: 1,
-                min: 0.0,
-                max: 50.0,
+                min: Operand::Const(0.0),
+                max: Operand::Const(50.0),
                 snap: true,
             },
             f,
@@ -1989,8 +2697,8 @@ mod tests {
             AnimationOp::CreateDiffClamp {
                 node: 3,
                 input: 2,
-                min: 0.0,
-                max: 100.0,
+                min: Operand::Const(0.0),
+                max: Operand::Const(100.0),
                 snap: true,
             },
             &mut f,
@@ -2045,8 +2753,8 @@ mod tests {
                     AnimationOp::CreateDiffClamp {
                         node,
                         input,
-                        min: 0.0,
-                        max,
+                        min: Operand::Const(0.0),
+                        max: Operand::Const(max),
                         snap: true,
                     },
                     &mut f,
@@ -2085,8 +2793,8 @@ mod tests {
             AnimationOp::CreateDiffClamp {
                 node: 4,
                 input: 1,
-                min: 0.0,
-                max: 50.0,
+                min: Operand::Const(0.0),
+                max: Operand::Const(50.0),
                 snap: false,
             },
             &mut f,
@@ -2104,8 +2812,8 @@ mod tests {
             AnimationOp::CreateDiffClamp {
                 node: 6,
                 input: 5,
-                min: 0.0,
-                max: 50.0,
+                min: Operand::Const(0.0),
+                max: Operand::Const(50.0),
                 snap: true,
             },
             &mut f,

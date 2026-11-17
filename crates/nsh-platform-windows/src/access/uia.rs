@@ -169,7 +169,40 @@ fn element(key: u64, view: &NshView) -> IRawElementProviderFragment {
 fn simple(key: u64, view: Option<&NshView>) -> IRawElementProviderSimple {
     match view {
         Some(v) => Element { key, id: v.id() }.into(),
-        None => Root { key }.into(),
+        None => Root {
+            key,
+            window: ROOT_ID,
+        }
+        .into(),
+    }
+}
+
+// --- Windows ---------------------------------------------------------------
+
+/// The root view and native window of window `window` (`ROOT_ID`: the main
+/// one; else a window of the app's own, by its dialog root).
+fn window(surface: &Surface, window: NodeId) -> Option<(NshView, HWND)> {
+    if window == ROOT_ID {
+        return Some((surface.root.clone(), surface.hwnd()));
+    }
+    Some((
+        crate::app_window::root_view(surface, window)?,
+        crate::app_window::hwnd_of(surface, window)?,
+    ))
+}
+
+/// The window `view` shows in: each window exposes its own tree.
+fn window_of(surface: &Surface, view: &NshView) -> NodeId {
+    crate::app_window::window_of(surface, view)
+}
+
+/// Pixels per point in window `window`: a window of the app's own has the
+/// scale of the monitor it is on.
+fn scale_in(surface: &Surface, window: NodeId, hwnd: HWND) -> f32 {
+    if window == ROOT_ID {
+        surface.scale()
+    } else {
+        crate::window::dpi(hwnd) as f32 / 96.0
     }
 }
 
@@ -269,17 +302,25 @@ fn hit(view: &NshView, m: &Mat4, x: f32, y: f32) -> Option<NshView> {
 
 /// Views came or went: the tree under the root is read again.
 pub(super) fn structure_changed(surface: &Rc<Surface>) {
-    let root = simple(surface.key(), None);
-    let mut id = runtime_id(ROOT_ID);
-    // SAFETY: the runtime id outlives the call.
-    let _ = unsafe {
-        UiaRaiseStructureChangedEvent(
-            &root,
-            StructureChangeType_ChildrenInvalidated,
-            id.as_mut_ptr(),
-            id.len() as i32,
-        )
-    };
+    let mut windows = vec![ROOT_ID];
+    windows.extend(crate::app_window::ids(surface));
+    for window in windows {
+        let root: IRawElementProviderSimple = Root {
+            key: surface.key(),
+            window,
+        }
+        .into();
+        let mut id = runtime_id(window);
+        // SAFETY: the runtime id outlives the call.
+        let _ = unsafe {
+            UiaRaiseStructureChangedEvent(
+                &root,
+                StructureChangeType_ChildrenInvalidated,
+                id.as_mut_ptr(),
+                id.len() as i32,
+            )
+        };
+    }
 }
 
 fn property_changed(provider: &IRawElementProviderSimple, id: UIA_PROPERTY_ID, old: Var, new: Var) {
@@ -322,6 +363,14 @@ pub(super) fn changed(surface: &Rc<Surface>, view: &NshView, old: &Exposed, new:
             UIA_HelpTextPropertyId,
             Var::opt_str(old.help.as_deref()),
             Var::opt_str(new.help.as_deref()),
+        );
+    }
+    if old.description != new.description {
+        property_changed(
+            &p,
+            UIA_FullDescriptionPropertyId,
+            Var::opt_str(old.description.as_deref()),
+            Var::opt_str(new.description.as_deref()),
         );
     }
     if old.enabled != new.enabled {
@@ -369,6 +418,14 @@ pub(super) fn changed(surface: &Rc<Surface>, view: &NshView, old: &Exposed, new:
             Var::str(if new.busy { "busy" } else { "" }),
         );
     }
+    if old.invalid != new.invalid {
+        property_changed(
+            &p,
+            UIA_IsDataValidForFormPropertyId,
+            Var::bool(!old.invalid),
+            Var::bool(!new.invalid),
+        );
+    }
     if old.now != new.now
         && let Some(now) = new.now
     {
@@ -379,6 +436,25 @@ pub(super) fn changed(surface: &Rc<Surface>, view: &NshView, old: &Exposed, new:
             Var::f64(now as f64),
         );
     }
+}
+
+/// ARIA's `aria-current` and `aria-invalid` as browsers expose them
+/// (`AriaProperties`: `name=value` pairs split by `;`); `None` without
+/// either.
+fn aria_properties(s: &nsh_core::AccessibilityState) -> Option<String> {
+    let current = s.current.map(|current| match current {
+        AccessibilityCurrent::True => "current=true",
+        AccessibilityCurrent::Page => "current=page",
+        AccessibilityCurrent::Step => "current=step",
+        AccessibilityCurrent::Location => "current=location",
+        AccessibilityCurrent::Date => "current=date",
+        AccessibilityCurrent::Time => "current=time",
+    });
+    let parts: Vec<&str> = current
+        .into_iter()
+        .chain(s.invalid.then_some("invalid=true"))
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(";"))
 }
 
 /// The name of `view` (an element that groups its content) changed with
@@ -426,9 +502,11 @@ pub(super) fn focus_changed(surface: &Rc<Surface>, view: &NshView) {
     let _ = unsafe { UiaRaiseAutomationEvent(&p, UIA_AutomationFocusChangedEventId) };
 }
 
-/// `WM_GETOBJECT`: answers UI Automation's request with the root provider.
+/// `WM_GETOBJECT`: answers UI Automation's request with the root provider
+/// of window `window`.
 pub(super) fn get_object(
     surface: &Rc<Surface>,
+    window: NodeId,
     hwnd: HWND,
     wparam: WPARAM,
     lparam: LPARAM,
@@ -436,14 +514,18 @@ pub(super) fn get_object(
     if lparam.0 as i32 != UiaRootObjectId {
         return None;
     }
-    let root = simple(surface.key(), None);
+    let root: IRawElementProviderSimple = Root {
+        key: surface.key(),
+        window,
+    }
+    .into();
     // SAFETY: the window's own message, answered with a live provider.
     Some(unsafe { UiaReturnRawElementProvider(hwnd, wparam, lparam, &root) })
 }
 
 // --- The root --------------------------------------------------------------
 
-/// The window's content: the fragment root.
+/// A window's content: the fragment root.
 #[implement(
     IRawElementProviderSimple,
     IRawElementProviderFragment,
@@ -451,6 +533,25 @@ pub(super) fn get_object(
 )]
 struct Root {
     key: u64,
+    /// The window (`ROOT_ID`: the main one).
+    window: NodeId,
+}
+
+impl Root_Impl {
+    /// The surface, and the window's root view and native window.
+    fn window(&self) -> Result<(Rc<Surface>, NshView, HWND)> {
+        let surface = surface_of(self.key)?;
+        let (root, hwnd) = window(&surface, self.window).ok_or_else(not_available)?;
+        Ok((surface, root, hwnd))
+    }
+
+    fn this(&self) -> IRawElementProviderFragment {
+        Root {
+            key: self.key,
+            window: self.window,
+        }
+        .into()
+    }
 }
 
 impl IRawElementProviderSimple_Impl for Root_Impl {
@@ -463,7 +564,7 @@ impl IRawElementProviderSimple_Impl for Root_Impl {
     }
 
     fn GetPropertyValue(&self, property: UIA_PROPERTY_ID) -> Result<VARIANT> {
-        surface_of(self.key)?;
+        self.window()?;
         Ok(match property {
             UIA_FrameworkIdPropertyId | UIA_ProviderDescriptionPropertyId => Var::str("nsh"),
             _ => Var::empty(),
@@ -472,21 +573,21 @@ impl IRawElementProviderSimple_Impl for Root_Impl {
     }
 
     fn HostRawElementProvider(&self) -> Result<IRawElementProviderSimple> {
-        let surface = surface_of(self.key)?;
-        // SAFETY: the surface's window.
-        unsafe { UiaHostProviderFromHwnd(surface.hwnd()) }
+        let (_, _, hwnd) = self.window()?;
+        // SAFETY: the window's live handle.
+        unsafe { UiaHostProviderFromHwnd(hwnd) }
     }
 }
 
 impl IRawElementProviderFragment_Impl for Root_Impl {
     fn Navigate(&self, direction: NavigateDirection) -> Result<IRawElementProviderFragment> {
-        let surface = surface_of(self.key)?;
+        let (_, root, _) = self.window()?;
         let pick = match direction {
             NavigateDirection_FirstChild => <[NshView]>::first,
             NavigateDirection_LastChild => <[NshView]>::last,
             _ => return none(),
         };
-        let kids = super::element_children(&surface.root, true);
+        let kids = super::element_children(&root, true);
         match pick(&kids) {
             Some(v) => Ok(element(self.key, v)),
             None => none(),
@@ -512,32 +613,39 @@ impl IRawElementProviderFragment_Impl for Root_Impl {
     }
 
     fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
-        Ok(Root { key: self.key }.into())
+        Ok(Root {
+            key: self.key,
+            window: self.window,
+        }
+        .into())
     }
 }
 
 impl IRawElementProviderFragmentRoot_Impl for Root_Impl {
     fn ElementProviderFromPoint(&self, x: f64, y: f64) -> Result<IRawElementProviderFragment> {
-        let surface = surface_of(self.key)?;
+        let (surface, root, hwnd) = self.window()?;
         let mut p = POINT {
             x: x as i32,
             y: y as i32,
         };
         // SAFETY: a point to convert.
-        let _ = unsafe { ScreenToClient(surface.hwnd(), &mut p) };
-        let scale = surface.scale().max(0.01);
+        let _ = unsafe { ScreenToClient(hwnd, &mut p) };
+        let scale = scale_in(&surface, self.window, hwnd).max(0.01);
         let (px, py) = (p.x as f32 / scale, p.y as f32 / scale);
-        let found = hit(&surface.root, &Mat4::new(), px, py)
-            .and_then(|v| super::exposed(&v).ok().flatten());
+        let found =
+            hit(&root, &Mat4::new(), px, py).and_then(|v| super::exposed(&v).ok().flatten());
         Ok(match found {
             Some(v) => element(self.key, &v),
-            None => Root { key: self.key }.into(),
+            None => self.this(),
         })
     }
 
     fn GetFocus(&self) -> Result<IRawElementProviderFragment> {
-        let surface = surface_of(self.key)?;
-        match super::focused(&surface) {
+        let (surface, _, _) = self.window()?;
+        // Each window keeps its own keyboard focus; a field's is shared.
+        let focused =
+            crate::keyboard::focused_in(&surface, self.window).or_else(|| super::focused(&surface));
+        match focused.filter(|v| window_of(&surface, v) == self.window) {
             Some(v) => Ok(element(self.key, &v)),
             None => none(),
         }
@@ -549,6 +657,7 @@ impl IRawElementProviderFragmentRoot_Impl for Root_Impl {
 /// One exposed view.
 #[implement(
     IRawElementProviderSimple,
+    IRawElementProviderSimple2,
     IRawElementProviderFragment,
     IInvokeProvider,
     IValueProvider,
@@ -717,12 +826,17 @@ impl IRawElementProviderSimple_Impl for Element_Impl {
                 let s = view.state();
                 Var::opt_str(super::help_of(&s.props.accessibility, Some(control)).as_deref())
             }
+            UIA_FullDescriptionPropertyId => {
+                Var::opt_str(view.state().props.accessibility.description.as_deref())
+            }
             UIA_IsEnabledPropertyId => Var::bool(!view.state().props.accessibility.state.disabled),
             UIA_IsKeyboardFocusablePropertyId => Var::bool(
                 control.focusable() || view.state().events.contains(nsh_core::EventKind::Press),
             ),
             UIA_HasKeyboardFocusPropertyId => {
-                Var::bool(super::focused(&t.surface).is_some_and(|f| f == *view))
+                let focused = crate::keyboard::focused_in(&t.surface, window_of(&t.surface, view))
+                    .or_else(|| crate::text_input::focused(&t.surface));
+                Var::bool(focused.is_some_and(|f| f == *view))
             }
             UIA_IsOffscreenPropertyId => {
                 Var::bool(!placement(view).is_some_and(|(_, shown)| shown))
@@ -755,18 +869,18 @@ impl IRawElementProviderSimple_Impl for Element_Impl {
                 _ => Var::empty(),
             },
             UIA_LocalizedLandmarkTypePropertyId if control == Control::Region => Var::str("region"),
-            // ARIA's `aria-current`, as browsers expose it.
-            UIA_AriaPropertiesPropertyId => match view.state().props.accessibility.state.current {
-                Some(current) => Var::str(match current {
-                    AccessibilityCurrent::True => "current=true",
-                    AccessibilityCurrent::Page => "current=page",
-                    AccessibilityCurrent::Step => "current=step",
-                    AccessibilityCurrent::Location => "current=location",
-                    AccessibilityCurrent::Date => "current=date",
-                    AccessibilityCurrent::Time => "current=time",
-                }),
-                None => Var::empty(),
-            },
+            // Narrator says "dialog" and the name as the focus enters one.
+            UIA_IsDialogPropertyId => {
+                Var::bool(matches!(control, Control::Dialog | Control::AlertDialog))
+            }
+            UIA_AriaPropertiesPropertyId => {
+                Var::opt_str(aria_properties(&view.state().props.accessibility.state).as_deref())
+            }
+            // ARIA's `aria-invalid`, as browsers expose it; valid is UIA's
+            // default.
+            UIA_IsDataValidForFormPropertyId if view.state().props.accessibility.state.invalid => {
+                Var::bool(false)
+            }
             UIA_FrameworkIdPropertyId | UIA_ProviderDescriptionPropertyId => Var::str("nsh"),
             UIA_IsControlElementPropertyId | UIA_IsContentElementPropertyId => Var::bool(true),
             _ => Var::empty(),
@@ -787,7 +901,11 @@ impl IRawElementProviderFragment_Impl for Element_Impl {
             NavigateDirection_Parent => {
                 return Ok(match super::parent_element(view) {
                     Some(p) => element(self.key, &p),
-                    None => Root { key: self.key }.into(),
+                    None => Root {
+                        key: self.key,
+                        window: window_of(&t.surface, view),
+                    }
+                    .into(),
                 });
             }
             NavigateDirection_FirstChild => super::element_children(view, false).first().cloned(),
@@ -795,7 +913,10 @@ impl IRawElementProviderFragment_Impl for Element_Impl {
             NavigateDirection_NextSibling | NavigateDirection_PreviousSibling => {
                 let siblings = match super::parent_element(view) {
                     Some(p) => super::element_children(&p, false),
-                    None => super::element_children(&t.surface.root, true),
+                    None => match window(&t.surface, window_of(&t.surface, view)) {
+                        Some((root, _)) => super::element_children(&root, true),
+                        None => Vec::new(),
+                    },
                 };
                 siblings.iter().position(|v| v == view).and_then(|i| {
                     if direction == NavigateDirection_NextSibling {
@@ -837,8 +958,12 @@ impl IRawElementProviderFragment_Impl for Element_Impl {
         let Some(((x, y, w, h), _)) = placement(&t.view) else {
             return Ok(UiaRect::default());
         };
-        let scale = t.surface.scale() as f64;
-        let (ox, oy) = client_origin(t.surface.hwnd());
+        let id = window_of(&t.surface, &t.view);
+        let Some((_, hwnd)) = window(&t.surface, id) else {
+            return Ok(UiaRect::default());
+        };
+        let scale = scale_in(&t.surface, id, hwnd) as f64;
+        let (ox, oy) = client_origin(hwnd);
         Ok(UiaRect {
             left: ox + x as f64 * scale,
             top: oy + y as f64 * scale,
@@ -856,15 +981,33 @@ impl IRawElementProviderFragment_Impl for Element_Impl {
         if t.view.kind() == ViewKind::Input {
             crate::text_input::focus(&t.view);
             super::focus_changed(&t.surface, &t.view);
-        } else {
+        } else if !crate::keyboard::focus_control(&t.surface, &t.view) {
+            // A stop of the keyboard takes the focus as Tab gives it; the
+            // others keep UI Automation's focus alone.
             super::focus(&t.surface, &t.view);
         }
         Ok(())
     }
 
     fn FragmentRoot(&self) -> Result<IRawElementProviderFragmentRoot> {
-        surface_of(self.key)?;
-        Ok(Root { key: self.key }.into())
+        let t = self.target()?;
+        Ok(Root {
+            key: self.key,
+            window: window_of(&t.surface, &t.view),
+        }
+        .into())
+    }
+}
+
+// `ShowContextMenu`: what screen readers and other clients open an
+// element's context menu with.
+impl IRawElementProviderSimple2_Impl for Element_Impl {
+    fn ShowContextMenu(&self) -> Result<()> {
+        let t = self.enabled()?;
+        if !crate::input::show_context_menu(&t.surface, &t.view) {
+            return Err(not_supported());
+        }
+        Ok(())
     }
 }
 
@@ -1148,7 +1291,7 @@ fn control_type(c: Control) -> UIA_CONTROLTYPE_ID {
         Control::ToolBar => UIA_ToolBarControlTypeId,
         Control::List => UIA_ListControlTypeId,
         Control::ListItem => UIA_ListItemControlTypeId,
-        Control::Pane => UIA_PaneControlTypeId,
+        Control::Pane | Control::Dialog | Control::AlertDialog => UIA_PaneControlTypeId,
     }
 }
 
@@ -1157,12 +1300,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn aria_properties_name_current_and_invalid() {
+        use nsh_core::AccessibilityState;
+        assert_eq!(aria_properties(&AccessibilityState::default()), None);
+        let page = AccessibilityState {
+            current: Some(AccessibilityCurrent::Page),
+            ..Default::default()
+        };
+        assert_eq!(aria_properties(&page).as_deref(), Some("current=page"));
+        let invalid = AccessibilityState {
+            invalid: true,
+            ..Default::default()
+        };
+        assert_eq!(aria_properties(&invalid).as_deref(), Some("invalid=true"));
+        let both = AccessibilityState {
+            invalid: true,
+            ..page
+        };
+        assert_eq!(
+            aria_properties(&both).as_deref(),
+            Some("current=page;invalid=true")
+        );
+    }
+
+    #[test]
     fn control_types() {
         assert_eq!(control_type(Control::Switch), UIA_ButtonControlTypeId);
         assert_eq!(control_type(Control::Heading), UIA_TextControlTypeId);
         assert_eq!(control_type(Control::TabList), UIA_TabControlTypeId);
         assert_eq!(control_type(Control::Pane), UIA_PaneControlTypeId);
         assert_eq!(control_type(Control::ListItem), UIA_ListItemControlTypeId);
+        assert_eq!(control_type(Control::Dialog), UIA_PaneControlTypeId);
+        assert_eq!(control_type(Control::AlertDialog), UIA_PaneControlTypeId);
     }
 
     #[test]

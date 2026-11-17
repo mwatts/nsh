@@ -158,6 +158,9 @@ stack's state, dialogs, the Android back button and tabs.
 - When the user leaves a page natively (the back button, swipe back, Android back, the desktops' back keys, the
   browser's back), the page goes. In TSX the stack removes its route from the state, so `nav.routes()` always matches
   what the user sees. In Rust the page reports `on_dismiss`, where you drop its route (and the routes above it).
+- Android back, the desktops' back keys and the browser's back act on the stack that shows: a stack laid out at no
+  size, or inside a view laid out so (a tab that is not selected, `display: none`), keeps its pages until it shows
+  again.
 - In TSX, a child function that returns something other than a `<NavPage>` gets a page with default options. Return
   a `<NavPage>` to set its header and other options.
 
@@ -205,6 +208,7 @@ const depth = () => nav.routes().length;
 | `children` | `.child(..)` | `(route: R, index: Accessor<number>) => JSX.Element` | Renders a route. Return a `<NavPage>` for its options. Required. |
 | `style`, `class` | style methods | | The stack's style; usually `flex: 1`. |
 | `testID` | `.test_id(..)` | `string` | Finds the stack in tests and `nsh test --trace`. |
+| `onChange` | an `effect` reading the routes' signal | `({ routes }: { routes: readonly R[] }) => void` | The routes changed: pushed, popped, replaced or set by the app, or a page the user went back from (a back button, a swipe, the browser's back). It runs after the change is rendered, and not for the routes the stack starts with. Use it to track screens, save the navigation state, or set the page's address with [`UrlScheme.setUrl`](../modules/nsh.md#urlscheme). |
 
 The TSX child function receives the route value itself and an accessor of its position in the stack.
 
@@ -234,6 +238,7 @@ the props' snake-case names.
 | `animation` | `.animation(..)` | `"default" \| "slide" \| "fade" \| "none"` | `"default"` | How the page enters and leaves. |
 | `transitionShader` | `.transition_shader(TransitionShader::new(program))` | `{ source: string; uniforms?: Record<string, ShaderUniform>; duration?: number }` | none | The page enters and leaves through a WGSL shader in place of its `animation`: `shade(uv)` reads the page below as `sample_from` and this page as `sample_to` while `nsh.progress` runs from 0 to 1 over `duration` milliseconds (350 by default), and from 1 back to 0 as the page leaves. When the system asks for less motion, the page takes its own `animation`. See [Shader](./shader.md). |
 | `statusBar` | `.status_bar(..)` | `{ foreground?, hidden?, animated? }` | none | iOS and Android: the status bar while the page is on top. See [Status bar](../modules/nsh-base.md#status-bar). |
+| `ios={{ supportedOrientations }}`, `android={{ supportedOrientations }}` | `.supported_orientations(..)` | `("portrait" \| "portrait-upside-down" \| "landscape" \| "landscape-left" \| "landscape-right")[]` | the app's | The orientations the screen may take while the page is shown: a viewer that rotates in an app kept upright, or the reverse. Of the pages displayed, the one shown most recently with a setting decides, and the one under it applies again when it goes; a page kept in a tab that is not shown (`display: none`) does not decide. iOS: the window's root controller in an app made by `nsh package` (an app embedded in a native one: the host's controller, which returns `NshAppView.supportedInterfaceOrientations` from its `supportedInterfaceOrientations`, [iOS](../docs/ios.md#nshappview)). Android: the activity's requested orientation, given back when no page sets one. `landscape-left` is the device turned clockwise, its home side on the left (UIKit's `landscapeLeft`), on both. |
 | `style`, `class` | style methods | | none | The page's style. |
 | `children` | `.child(..)` | `JSX.Element` | none | The content. |
 | `testID` | `.test_id(..)` | `string` | none | Finds the page in tests and `nsh test --trace`. |

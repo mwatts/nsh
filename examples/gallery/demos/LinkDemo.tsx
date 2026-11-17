@@ -1,26 +1,22 @@
-import { platform, signal, Text, token, View } from "nsh";
-import { Link } from "nsh/base";
-import { alpha, Button, Caption, Card, colors, DemoPage, density, focusRing, Icon, mono, Toggle } from "../ui";
+import { platform, signal, Text, View } from "nsh";
+import { Link, TextView } from "nsh/base";
+import { Button, Caption, Card, colors, DemoPage, density, linkColor, linkLook, LinkText, mono, textViewLinkClasses, LabeledToggle, ghostOutdent } from "../ui";
 
 // `nsh/base`'s `Link` owns presses, Return and Space, the keyboard focus,
 // the disabled state and the link role; the look is the gallery's: the
 // citrus accent with a quiet underline that a bar grows over under the
 // pointer, violet once visited (the app remembers what it opened), the
-// gallery's focus ring, dimmed while disabled. Colors move with
-// `transition-colors`, the bar and the arrows with `transition-transform`;
-// both stand still with reduced motion.
+// gallery's focus ring, dimmed while disabled (`linkLook`, `LinkText`,
+// `linkColor`). Colors move with `transition-colors`, the bar and the
+// arrows with `transition-transform`; both stand still with reduced motion.
 
 const pointer = platform.desktop;
-const violet = token("violet");
 
 /** The hrefs opened so far, for the visited look, and the event log. */
 const visited = signal(new Set<string>());
 const log = signal<string[]>([]);
 const note = (line: string) => log.set([line, ...log()].slice(0, 5));
 const remember = (href: string) => visited.set(new Set(visited()).add(href));
-
-const motion = "transition-colors duration-200 motion-reduce:transition-none";
-const slide = "transition-transform duration-300 ease-out motion-reduce:transition-none";
 
 /**
  * A link of the gallery's look: `tone` its color (the accent, the text for
@@ -32,6 +28,7 @@ const slide = "transition-transform duration-300 ease-out motion-reduce:transiti
 function TextLink(props: {
   href: string;
   label: string;
+  title?: string;
   openWith?: "system" | "app";
   onRoute?: (href: string) => void;
   disabled?: boolean;
@@ -42,14 +39,12 @@ function TextLink(props: {
   inline?: boolean;
   testID?: string;
 }) {
-  const seen = () => visited().has(props.href);
-  const color = () =>
-    props.disabled ? colors.faint : props.current ? colors.text : seen() ? violet : props.quiet ? colors.muted : colors.accent;
-  const size = () => props.size ?? density.body;
+  const color = () => linkColor({ disabled: props.disabled, current: props.current, visited: visited().has(props.href), quiet: props.quiet });
   return (
     <Link
       testID={props.testID}
       href={props.href}
+      title={props.title}
       openWith={props.openWith ?? "app"}
       disabled={props.disabled}
       current={props.current}
@@ -59,35 +54,9 @@ function TextLink(props: {
         props.onRoute?.(href);
       }}
       onPress={() => note(`onPress ${props.label}`)}
-      class={`group flex-row items-center gap-1 rounded-sm active:opacity-60 ${motion} ${props.inline ? "align-text-bottom" : "self-start"}`}
-      focusStyle={focusRing(2)}
+      {...linkLook({ inline: props.inline })}
     >
-      <View>
-        <Text
-          class={motion}
-          style={{
-            fontSize: size(),
-            fontWeight: props.current ? "600" : "500",
-            color: color(),
-          }}
-        >
-          {props.label}
-        </Text>
-        <If when={!props.quiet && !props.disabled}>
-          <View class={`absolute left-0 right-0 bottom-0 h-px ${motion}`} style={{ backgroundColor: alpha(color(), 0.35) }} />
-        </If>
-        <If when={!props.disabled}>
-          <View
-            class={`absolute left-0 right-0 bottom-0 h-[1.5px] origin-left rounded-full ${slide} ${props.current ? "scale-x-100" : "scale-x-0 group-hover:scale-x-100"}`}
-            style={{ backgroundColor: color() }}
-          />
-        </If>
-      </View>
-      <If when={props.icon}>
-        <View class={`${slide} group-hover:translate-x-0.5 group-hover:-translate-y-0.5`}>
-          <Icon name="external" size={Math.round(size() * 0.85)} tint={color()} />
-        </View>
-      </If>
+      <LinkText label={props.label} color={color()} size={props.size} current={props.current} quiet={props.quiet} disabled={props.disabled} icon={props.icon} />
     </Link>
   );
 }
@@ -110,7 +79,7 @@ export function LinkDemo() {
           <TextLink href="/legal/terms" label="terms" size={15} inline />
           {"."}
         </Text>
-        <Caption label="Opened links turn violet: the app keeps what it opened" note={`${visited().size} visited`} />
+        <Caption label="Opened links turn violet; the app remembers them" note={`${visited().size} visited`} />
       </Card>
     );
   }
@@ -171,17 +140,7 @@ export function LinkDemo() {
       <Card
         title="Footer"
         subtitle="Quiet links; a closed page stays disabled"
-        right={
-          // The terminal's switch is a glyph: its label beside it says what it turns on.
-          platform.idiom === "terminal" ? (
-            <View style={{ flexDirection: "row", gap: 8 }}>
-              <Text style={{ fontSize: 12, color: colors.muted }}>Hiring</Text>
-              <Toggle value={hiring()} onChange={(v) => hiring.set(v)} label="Hiring" />
-            </View>
-          ) : (
-            <Toggle value={hiring()} onChange={(v) => hiring.set(v)} label="Hiring" />
-          )
-        }
+        right={<LabeledToggle label="Hiring" value={hiring()} onChange={(v) => hiring.set(v)} />}
       >
         <View style={{ flexDirection: "row", flexWrap: "wrap", gap: 20 }}>
           <Each of={columns}>
@@ -213,10 +172,17 @@ export function LinkDemo() {
       <Card
         title="Events"
         subtitle="onOpen({ href }) before onPress()"
-        right={<Button label="Forget visited" variant="ghost" size="small" onPress={() => visited.set(new Set())} />}
+        right={
+          // A ghost button's label lines up with the card's edge, its
+          // padding hanging past it as its hover fill does.
+          <View style={ghostOutdent("right", "small")}>
+            <Button label="Forget visited" variant="ghost" size="small" onPress={() => visited.set(new Set())} />
+          </View>
+        }
       >
-        <View style={{ gap: 4, minHeight: 96 }}>
-          <If when={log().length > 0} else={<Text style={{ fontSize: 13, color: colors.faint }}>Press a link</Text>}>
+        {/* No room held for the log: the hint alone until there is one, as the pagination's. */}
+        <View style={{ gap: 4 }}>
+          <If when={log().length > 0} else={<Caption label="Press a link" />}>
             <Each of={log()}>
               {(line, i) => (
                 <Text style={{ fontSize: 12, color: i() === 0 ? colors.text : colors.muted, fontFamily: mono }}>{line()}</Text>
@@ -228,5 +194,43 @@ export function LinkDemo() {
     );
   }
 
-  return <DemoPage cards={[Paragraph, Navigation, External, Footer, Events]} />;
+  function Destinations() {
+    return (
+      <Card
+        title="Where it goes"
+        subtitle={pointer ? "Rest the pointer on a link to see its URL" : "On a desktop, a resting pointer shows the URL"}
+      >
+        <View style={{ gap: 10 }}>
+          <TextLink href="https://nsh.dev/" label="A short address" openWith="system" icon testID="where-short" />
+          <TextLink
+            href="https://nsh.dev/docs/elements/link"
+            title="Link reference"
+            label="A titled link"
+            openWith="system"
+            icon
+            testID="where-titled"
+          />
+          <TextLink href={LONG_URL} label="A long address" openWith="system" icon testID="where-long" />
+          <TextLink href={LOOK_ALIKE_URL} label={"exаmple.com, with a Cyrillic а"} openWith="system" icon testID="where-idn" />
+        </View>
+        <View style={{ paddingTop: 10, borderTopWidth: 1, borderTopColor: colors.line }}>
+          <TextView markdown={TITLED} classes={{ ...textViewLinkClasses, root: "text-[13px] leading-[19px]" }} onLinkPress={({ url }) => note(`onLinkPress ${url}`)} />
+        </View>
+        <Caption label="A title shows above the address; a long path loses its middle; a look-alike host shows as its ASCII form" />
+      </Card>
+    );
+  }
+
+  return <DemoPage cards={[Paragraph, Navigation, External, Destinations, Footer, Events]} />;
 }
+
+/** A path and query longer than a hint's line: the middle gives way. */
+const LONG_URL = "https://docs.example.com/guides/getting-started/installation/linux/packages?channel=stable&arch=arm64#verify";
+
+/** A host whose "а" is Cyrillic (U+0430): its hint shows the punycode it really is. */
+const LOOK_ALIKE_URL = "https://exаmple.com/account/sign-in";
+
+/** A Markdown link with a title: the title above the URL. */
+const TITLED =
+  // The link early in the sentence, so it stays whole on its first line rather than breaking at the line's end.
+  'Read [the changelog](https://nsh.dev/changelog "What changed in this release") before you update: a Markdown link shows its title over the address.';

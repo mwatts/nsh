@@ -33,6 +33,7 @@
 mod ambient;
 pub(crate) mod animated;
 mod asset;
+mod audio;
 mod back;
 pub(crate) mod builder;
 pub(crate) mod call;
@@ -46,6 +47,7 @@ mod engine_context;
 pub(crate) mod env;
 mod events;
 pub(crate) mod flow;
+pub mod header;
 pub(crate) mod host;
 mod js;
 pub(crate) mod json_host;
@@ -56,6 +58,7 @@ pub(crate) mod module;
 mod once;
 pub mod palette;
 mod prop;
+pub(crate) mod quit;
 pub mod reactive;
 pub(crate) mod renderer;
 mod resource;
@@ -71,6 +74,8 @@ pub mod tokens;
 mod value;
 pub(crate) mod virtual_list;
 pub(crate) mod watch;
+
+pub(crate) use events::download_target;
 
 /// Whether this build carries the text of declarations: the documentation
 /// and TypeScript of the specs, which only make `.nsh/types` (feature
@@ -110,6 +115,10 @@ pub use self::{
         sample_spring,
     },
     asset::{AssetFile, AssetKind, FileAsset, FontAsset, ImageAsset, ImageSrc},
+    audio::{
+        AudioFailure, AudioPlayer, PlayerState, Sound, SoundSource, audio_available, audio_player,
+        load_sound,
+    },
     builder::{
         __hint_tooltip, Accessible, AnyElement, Attrs, BoundListConfig, Child, Children,
         ComponentBuilder, ComponentElement, ElNode, Element, FluentBuilder, Image, InputPartStyle,
@@ -129,17 +138,19 @@ pub use self::{
         MemberCall, MemberKind, MemberSpec, Ret, Thrown,
     },
     component::{
-        Api, BuiltInScrollbar, Component, ComponentError, ComponentSpec, Event, EventSpec, Method,
-        MethodRun, MethodSpec, Methods, NoEvent, Param, PropDecode, PropKind, PropSpec, Props,
-        Registry, Root, ScrollbarSource, declarations,
+        Api, BuiltInScrollbar, Component, ComponentError, ComponentSpec, Event, EventSpec,
+        HOST_PROPS, Method, MethodRun, MethodSpec, Methods, NoEvent, Param, PropDecode, PropKind,
+        PropSpec, Props, Registry, Root, ScrollbarSource, declarations,
     },
-    element_ref::{ComponentRef, ElementRef, FollowTarget},
+    element_ref::{
+        ComponentRef, ElementRef, ElementTarget, EvaluateOptions, Evaluation, FollowTarget,
+    },
     engine_context::{EngineContext, EngineContextGuard, engine_context},
     env::Environment,
     events::{
-        CaretEvent, Composition, FileDropEvent, GestureEvent, HintReason, ImageProgress, KeyPress,
-        NativeEvent, OverlayPosition, PanEvent, ScrollEvent, Selection, VideoInfo, VideoProgress,
-        WebNavigation,
+        CaretEvent, Composition, FileDragEvent, FileDropEvent, GestureEvent, HintReason,
+        ImageProgress, KeyPress, NativeEvent, OverlayPosition, PanEvent, ScrollEvent, Selection,
+        TextSelectionEvent, VideoInfo, VideoProgress, WebNavigation,
     },
     flow::{Each, If, IntoElements, Reset, catch_error, dynamic, each, when},
     host::{
@@ -177,7 +188,7 @@ pub use self::{
         CallCx, Cleanup, ErrorClass, ErrorFields, Held, IntoThrown, JsError, Later, Local, Locals,
         Quotas, RefuseConnections, Stop, System, codes, io_code,
     },
-    task::{Answer, ClipboardImage, DialogAnswer, ImageSize, Task},
+    task::{Answer, ClipboardImage, ClipboardItem, DialogAnswer, ImageSize, Task},
     tokens::{FONT_MONO, FONT_SANS, ThemeTokens, Token, TokenSource, Tokens},
     value::{JsValue, NodeRef, PropEnum, PropError, SharedString, TsType, TsTypes, ts_of},
     virtual_list::{ListLayout, ViewableItems, VirtualList, virtual_list},
@@ -187,10 +198,10 @@ pub(crate) use self::{
     animated::LiveNode,
     back::BackListener,
     builder::{ElKind, PlaceFn},
-    component::{AnyInstance, caught},
+    component::{AnyInstance, caught, panic_message},
     task::{
-        Action, AfterAnswer, AnswerSlot, ClipboardRead, Executor, FileAnswer, NotificationAction,
-        SpeechAction,
+        Action, AfterAnswer, AnswerSlot, AudioAction, ClipboardRead, Executor, FileAnswer,
+        NotificationAction, SpeechAction,
     },
 };
 /// The geometry Rust components style with (`crate::geometry`).
@@ -201,14 +212,17 @@ pub use crate::geometry::{
 };
 pub use crate::{
     AccessibilityRole, AccessibilityState, AutoCapitalize, AutoFill, BackdropMaterial, BlendMode,
-    BoxShadow, ContextMenuEvent, Cursor, Dialog, DialogButton, DialogButtonStyle, EdgeInsets,
-    EllipsizeMode, EventKind, EventPayload, HeaderSystemItem, KeyboardAppearance,
+    BoxShadow, ColorStop, ContextMenuEvent, Cursor, Dialog, DialogButton, DialogButtonStyle,
+    EdgeInsets, EllipsizeMode, EventKind, EventPayload, FpsMode, Haptic, HapticImpact,
+    HapticNotification, HeaderSystemItem, KeyCapture, KeyEvent, KeyboardAppearance,
     KeyboardDismissMode, KeyboardTaps, KeyboardType, KeyframeAnimation, Keyframes, LayoutAnimation,
-    LayoutCurve, LayoutProperty, LayoutTransition, ListViewport, Measurement, ModalAnimation,
-    ModalPresentation, MouseButton, MouseEvent, PanActivation, PasteBehavior, PasteEvent,
-    PastedFile, PointerEvents, PressEvent, ResizeMode, ReturnKeyType, ScreenAnimation,
-    SelectionEvent, SnapAlignment, StatusBarConfig, StatusBarSetting, StatusBarStyle,
-    SubmitBehavior, TextShadow, TouchEvent, TransformKind, TransformOrigin, Viewability,
+    LayoutCurve, LayoutProperty, LayoutTransition, ListAlignment, ListScrollPosition, ListViewport,
+    MacOsBackdrop, MacOsBackdropBlending, MacOsBackdropMaterial, MacOsBackdropState, Measurement,
+    ModalAnimation, ModalPresentation, MouseButton, MouseEvent, PanActivation, PasteBehavior,
+    PasteEvent, PastedFile, PinchEvent, PinchPhase, PointerEvents, PointerType, PressEvent,
+    ResizeMode, ReturnKeyType, RevealOptions, ScreenAnimation, ScrollAlignment, SelectionEvent,
+    SheetDetent, SnapAlignment, StatusBarConfig, StatusBarSetting, StatusBarStyle, SubmitBehavior,
+    TextShadow, TouchEvent, TransformKind, TransformOrigin, Viewability, WheelDelta, WheelEvent,
     animation::{
         Curve, EaseMode, Easing, Extrapolate, Keyframe, KeyframeTiming, MotionChannel, MotionKind,
         MotionPreset, MotionSpec, Output as AnimationOutput, PlaybackDirection, StaggerFrom,
@@ -218,8 +232,13 @@ pub use crate::{
         ColorParseError, Hsla, Rgba, black, blue, green, hsl, hsla, opaque_grey, red, rgb, rgba,
         transparent_black, transparent_white, white, yellow,
     },
+    main_thread::{MainThreadError, OnMainThread},
     overlay::{Align, Placement},
-    platform::{Appearance, HttpBody, HttpHead, HttpRequest, Idiom, Lifecycle, Locale, Os},
+    platform::{
+        Appearance, HourCycle, HttpBody, HttpHead, HttpRequest, Idiom, Languages, Lifecycle,
+        Locale, LocaleSettings, MeasurementSystem, Os, PerfStats, SizeClass, TemperatureUnit,
+        TimeZone, Weekday,
+    },
     style::Color,
     text::TextLine,
 };

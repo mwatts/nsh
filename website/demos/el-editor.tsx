@@ -1,7 +1,7 @@
 import { mount, signal, Text, View } from "nsh";
 import { Input } from "nsh/base";
 import { Editor, type EditorDiagnostic, type EditorRef, type EditorSearchResult } from "nsh/base";
-import { button, buttonText, desktop, field, Log, Panel, Segmented, size, Split, ui, wide } from "./palette";
+import { button, buttonText, desktop, field, Log, Panel, Segmented, Split, ui, wide, sectionSurface } from "./palette";
 
 const SAMPLES = {
   rust: `/// The n-th Fibonacci number.
@@ -64,7 +64,7 @@ function App() {
 
   const action = (label: string, onPress: () => void) => (
     <View onPress={onPress} role="button" {...button("secondary", { size: "sm" })}>
-      <Text style={buttonText()}>{label}</Text>
+      <Text style={buttonText("secondary", { size: "sm" })}>{label}</Text>
     </View>
   );
 
@@ -92,7 +92,7 @@ function App() {
                 accessibilityLabel="Find"
                 autoCapitalize="none"
                 autoCorrect={false}
-                {...field({ style: { height: size.controlSm, paddingVertical: 0 } })}
+                {...field()}
               />
               <Text style={{ fontSize: 13, fontVariant: ["tabular-nums"], color: ui().text }}>
                 {query() ? (found().error ?? `${found().current == null ? "–" : found().current! + 1} of ${found().count}`) : "–"}
@@ -109,7 +109,7 @@ function App() {
           </>
         }
       >
-        <View style={{ height: wide() ? 380 : 300, ...ui().card, borderRadius: 14, overflow: "hidden" }}>
+        <View style={{ height: wide() ? 380 : 300, ...sectionSurface(), overflow: "hidden" }}>
           {() => {
             const lang = language();
             return (

@@ -4,9 +4,10 @@ import { Clipboard } from "nsh";
 import { platform } from "nsh";
 import { Picker } from "nsh";
 import { Input } from "nsh/base";
-import { keyboardFrame, safeAreaInsets } from "nsh";
+import { keyboardFrame, safeAreaInsets, windowSize } from "nsh";
 import { Icon, type IconName } from "../icons";
-import { alpha, Appear, Badge, colors, desktop, finish, IconTile, motion, Press, radius, RoundButton, Segmented, toneTint } from "../ui";
+import { alpha, Appear, backdrop, Badge, colors, desktop, finish, IconTile, motion, Press, radius, RoundButton, Segmented, toneTint } from "../ui";
+import { play as sound } from "../../nsh-gallery-ui/sound";
 import { localReply, type Provider } from "./chat/local";
 import { Glyph } from "./chat/glyphs";
 import { Markdown } from "./chat/markdown";
@@ -156,6 +157,8 @@ export function Chat() {
       error,
     };
     run = null;
+    // A finished reply is a result arriving, said quietly.
+    if (status === "done") sound("ready", { volume: 0.35 });
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
     batch(() => {
       messages.set(messages().map((m) => (m.id === r.id ? final : m)));
@@ -261,6 +264,7 @@ export function Chat() {
     const offline = !native && s.steps.find((step) => "offline" in step) as { offline: number } | undefined;
     const user: User = { kind: "user", id: nextId(), text, image, file, waiting: !!offline };
     LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
+    sound("tap");
     batch(() => {
       const start: Msg[] = messages().length ? [] : [{ kind: "date", id: nextId(), label: "Today" }];
       messages.set([...messages(), ...start, user]);
@@ -582,7 +586,7 @@ export function Chat() {
                 each={messages()}
                 keyExtractor={(m) => m.id}
                 estimatedItemSize={140}
-                initialScrollIndex={Math.max(0, messages().length - 1)}
+                alignment="bottom"
                 style={{ flex: 1 }}
                 contentStyle={{ paddingTop: 8, paddingBottom: 16 }}
                 keyboardDismissMode="interactive"
@@ -683,7 +687,7 @@ export function Chat() {
           {/* The "+" menu: attachments and the scenarios, to replay them. */}
           <View
             onPress={() => menu.set(false)}
-            style={{ pointerEvents: menu() ? "auto" : "none", position: "absolute", top: 0, left: 0, right: 0, bottom: 0, backgroundColor: "rgba(0,0,0,0.45)", opacity: menuValue }}
+            style={{ pointerEvents: menu() ? "auto" : "none", position: "absolute", top: 0, left: 0, right: 0, bottom: 0, ...backdrop(), opacity: menuValue }}
           />
           <View
             style={{
@@ -704,7 +708,8 @@ export function Chat() {
                 ...finish.menu,
                 borderWidth: 1,
                 paddingVertical: 6,
-                maxHeight: 460,
+                // 460 at most, and short of a low window's chat area (above the composer, under the header): its rows scroll.
+                maxHeight: Math.min(460, windowSize().height * 0.6),
                 overflow: "hidden",
               }}
             >
@@ -799,7 +804,7 @@ export function Chat() {
               placeholder={`Message ${native ? provider() : model()}`}
               onFocus={() => menu.set(false)}
               onContentSizeChange={({ size }) => inputHeight.set(Math.min(100, Math.max(20, size.height)))}
-              style={{ placeholderColor: colors.faint, caretColor: colors.accent, selectionColor: colors.accent, height: inputHeight() + 20, fontSize: 15, lineHeight: 20, color: colors.text, paddingHorizontal: 10, paddingVertical: 10 }}
+              style={{ placeholderColor: colors.muted, caretColor: colors.accent, selectionColor: colors.accent, height: inputHeight() + 20, fontSize: 15, lineHeight: 20, color: colors.text, paddingHorizontal: 10, paddingVertical: 10 }}
             />
             <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
               <View
@@ -872,7 +877,6 @@ export function Chat() {
               ...finish.raised,
               borderWidth: 1,
               borderColor: colors.border,
-              cursor: "pointer",
             }}
           >
             <Icon name="plus" size={15} tint={colors.text} />
@@ -890,7 +894,7 @@ export function Chat() {
               accessibilityLabel={chip().label}
               accessibilityState={{ selected: current() === chip().id }}
               class={current() === chip().id ? "bg-accent" : "hover:bg-card active:bg-accent"}
-              style={{ paddingHorizontal: 12, paddingVertical: 9, borderRadius: radius.control, gap: 2, cursor: "pointer" }}
+              style={{ paddingHorizontal: 12, paddingVertical: 9, borderRadius: radius.control, gap: 2 }}
             >
               <Text style={{ numberOfLines: 1, fontSize: 14, fontWeight: current() === chip().id ? "600" : "400", color: colors.text }}>
                 {chip().label}

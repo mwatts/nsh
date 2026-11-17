@@ -31,7 +31,7 @@ use crate::{
     geom::Mat4,
     input::KeyEvent,
     render::{DrawCx, rect_f},
-    surface::Surface,
+    surface::{Next, Surface},
     view::{NshView, ViewState},
 };
 
@@ -75,6 +75,11 @@ impl ScrollHost for Host<'_> {
     fn report(&self, offset: Point<Points>, applied: u32) {
         let id = self.view.id();
         self.surface.control(|c| c.scroll(id, offset, applied));
+    }
+
+    fn key_scrolled(&self, key_move: KeyMove) {
+        let id = self.view.id();
+        self.surface.control(|c| c.key_scrolled(id, key_move));
     }
 
     fn moved(&self, offset: Point<Points>) {
@@ -121,9 +126,15 @@ impl ScrollHost for Host<'_> {
             if !view.attached() {
                 // Removed: nothing draws it; a later move starts again.
                 shared::detached(&host);
-                return false;
+                return Next::Done;
             }
-            shared::frame(&host, now * 1000.0)
+            let now = now * 1000.0;
+            if !shared::frame(&host, now) {
+                return Next::Done;
+            }
+            // `None`: only drawing is left (the indicator's fade, the
+            // refresh spinner), or input it waits for (a touchpad's end).
+            shared::deadline(&host, now).map_or(Next::Frame, |ms| Next::At(ms / 1000.0))
         });
     }
 
@@ -690,6 +701,10 @@ mod tests {
             down: true,
             repeat: false,
             modifiers,
+            scan: 0,
+            extended: false,
+            sys: false,
+            translated: false,
         }
     }
 

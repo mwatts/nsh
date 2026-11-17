@@ -1,8 +1,8 @@
 //! The runtime's modules written in Rust: `nsh/android`'s `BackHandler`,
 //! `nsh/accessibility`'s commands, `nsh/device`'s `openUrl`, `nsh`'s
-//! `Image` and `WebView` functions, all of `nsh/clipboard`, `nsh/picker`, `nsh`'s
-//! `Speech` and `nsh/storage`,
-//! `nsh/desktop`'s `Window`, the surface-independent `os` metadata,
+//! `Image` and `WebView` functions, all of `nsh/clipboard`, `nsh/picker`, `nsh`'s `Share`,
+//! `Speech`, `UrlScheme`, `setFpsEnabled` and `nsh/storage`,
+//! `nsh/desktop`'s `Application`, the surface-independent `os` metadata,
 //! `net`'s sockets, `websocket`'s connections, `fs/promises`' files and
 //! `nsh/host`'s calls. Their JS face is made
 //! from their specs like a UI set's (`nsh-js` `components.rs`), and so are
@@ -15,10 +15,14 @@ use crate::element::Registry;
 
 mod accessibility;
 mod android;
+mod audio;
 mod clipboard;
 mod desktop;
 mod device;
-mod fs;
+mod fonts;
+mod fps;
+pub(crate) mod fs;
+mod haptics;
 mod host;
 mod image;
 mod net;
@@ -26,10 +30,15 @@ mod notifications;
 mod os;
 mod picker;
 mod process;
+mod share;
 mod speech;
 mod storage;
+mod updater;
+mod url_scheme;
 mod websocket;
 mod webview;
+
+pub use updater::{PackageVersion, UpdaterHost, UpdaterSink};
 
 /// The [`crate::element::Quotas`] kind WebSockets count under: the `websocket`
 /// module's connections and the global `WebSocket`'s (`nsh-js`) share
@@ -44,26 +53,36 @@ pub fn registries() -> &'static [Registry] {
     static REGISTRIES: OnceLock<Vec<Registry>> = OnceLock::new();
     REGISTRIES.get_or_init(|| {
         let mut desktop = Registry::runtime("nsh/desktop");
-        desktop.module::<desktop::Window>();
+        desktop.module::<desktop::Application>();
         // `nsh`'s modules written in Rust; the rest of `nsh` is `nsh-js`'s.
         let mut nsh = Registry::runtime("nsh");
         nsh.module::<crate::element::Keyboard>()
             .module::<image::Image>()
             .module::<device::Device>()
+            .module::<fonts::Fonts>()
             .module::<accessibility::Accessibility>()
             .module::<clipboard::Clipboard>()
             .module::<picker::Picker>()
+            .module::<share::Share>()
             .module::<speech::Speech>()
+            .class::<audio::Sound>()
+            .class::<audio::AudioPlayer>()
             .module::<notifications::Notifications>()
+            .module::<url_scheme::UrlScheme>()
             .module::<webview::WebView>()
             .module::<storage::Storage>()
             .module::<host::Host>()
+            .module::<fps::Fps>()
             // The environment's accessors and hooks, made by `nsh-js`.
             .reexport(&["safeArea", "safeAreaInsets", "keyboardFrame"], &[]);
         let mut mobile = Registry::runtime("nsh/mobile");
         mobile
             .register::<crate::mobile::TabBar>()
-            .module::<android::BackHandler>();
+            .register::<crate::mobile::SegmentedControl>()
+            .register::<crate::mobile::Switch>()
+            .register::<crate::mobile::DateTimePicker>()
+            .module::<android::BackHandler>()
+            .module::<haptics::Haptics>();
         let mut os = Registry::runtime("os");
         os.module::<os::Os>();
         let mut process = Registry::runtime("process");
@@ -79,7 +98,11 @@ pub fn registries() -> &'static [Registry] {
             websocket.module::<websocket::WebSocket>();
             websocket
         };
-        vec![nsh, desktop, mobile, os, net, process, fs, websocket]
+        let mut updater = Registry::runtime("nsh/updater");
+        updater.module::<updater::Updater>();
+        vec![
+            nsh, desktop, mobile, os, net, process, fs, websocket, updater,
+        ]
     })
 }
 

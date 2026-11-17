@@ -188,7 +188,7 @@ view()
 - **Widths and colors** per side: `borderTopWidth`, `borderRightWidth`, ..., `borderTopColor`, ..., which keep their side in either direction; and `borderStartWidth`, `borderEndWidth`, `borderStartColor`, `borderEndColor`, which follow the [layout direction](./layout.md#right-to-left) (`.border_t(..)`, `.border_t_color(..)`, `.border_s(..)`, `.border_e_color(..)`, ... in Rust).
 - **The color** of a side whose width is set and whose color is not is the text color, as CSS's `currentColor`: `{ borderWidth: 1, color: "#0969da" }` draws a blue border.
 - **Radii** per corner: `borderTopLeftRadius`, `borderTopRightRadius`, `borderBottomRightRadius`, `borderBottomLeftRadius`, and `borderTopStartRadius` / `borderTopEndRadius` / `borderBottomStartRadius` / `borderBottomEndRadius` (top start, top end, bottom start, bottom end), which follow the [layout direction](./layout.md#right-to-left) (`.rounded_tl(..)`, ..., `.rounded_ss(..)`, `.rounded_se(..)`, `.rounded_es(..)`, `.rounded_ee(..)` in Rust, and the presets `.rounded_lg()`, `.rounded_full()`, ...).
-- **`borderCurve: "continuous"`** (`.border_curve(BorderCurve::Continuous)`, the class `corner-squircle`) draws superellipse corners, whose curvature eases into the edges, like iOS app icons: on iOS, Android and macOS, and on the web where the browser has CSS `corner-shape` (Chromium); elsewhere circular corners of the same radius. A pill (`borderRadius` of half the height) stays a pill.
+- **`borderCurve: "continuous"`** (`.border_curve(BorderCurve::Continuous)`, the class `corner-squircle`) draws superellipse corners, whose curvature eases into the edges, like iOS app icons: on iOS, Android, macOS and Linux, and on the web where the browser has CSS `corner-shape` (Chromium); elsewhere circular corners of the same radius. A pill (`borderRadius` of half the height) stays a pill.
 - **`overflow: "hidden"`** (`.overflow_hidden()`) clips children to the rounded shape. What it clips away is clipped in layout too: it does not reach an enclosing scroll view's content size, so a box that lays a child out wider than itself and scales it down with a `transform` (transforms do not affect layout) leaves the scroll view alone.
 
 Radii larger than half the side are clamped, so `borderRadius: 9999` (`.rounded_full()`) makes a circle or a pill.
@@ -253,6 +253,15 @@ Color stops are placed by percentages or lengths (`px`, `pt`, `rem`; plain numbe
 
 Colors mix between stops as in CSS: in the space a gradient names (`linear-gradient(in oklab, …)`; also `srgb`, `srgb-linear`, `xyz`, `oklch` with a hue method such as `longer hue`, and `hsl`), and otherwise in sRGB when every color is a hex, `rgb()`, `hsl()` or named color, and in Oklab when one is `oklch()`, `oklab()`, `lab()`, `lch()` or `color()`.
 
+`repeating-linear-gradient`, `repeating-radial-gradient` and `repeating-conic-gradient` repeat their stops past the last one, as in CSS: the distance from the first stop to the last is one period. They draw hatching, ruled lines and grids:
+
+```tsx
+// Diagonal hatching: a 1px line every 8px.
+<View style={{ backgroundImage: "repeating-linear-gradient(45deg, #d0d7de 0 1px, transparent 1px 8px)" }} />
+// A page grid: two ruled layers, one across and one down.
+<View style={{ backgroundImage: "repeating-linear-gradient(0deg, #eaeef2 0 1px, transparent 1px 24px), repeating-linear-gradient(90deg, #eaeef2 0 1px, transparent 1px 24px)" }} />
+```
+
 Text elements do not draw gradients on iOS.
 
 ## Filters and blending
@@ -262,6 +271,7 @@ Text elements do not draw gradients on iOS.
 | `filter` | CSS filters of the view and its content: `brightness()`, `contrast()`, `grayscale()`, `hue-rotate()`, `invert()`, `saturate()`, `sepia()`, `opacity()`, `blur()`, `drop-shadow()` (without a color, in the text color, as in CSS); several separated by spaces | `.brightness(n)`, `.contrast(n)`, `.grayscale(n)`, `.hue_rotate(angle)`, `.invert(n)`, `.saturate(n)`, `.sepia(n)`, `.blur(px(..))` |
 | `backdropFilter` | Filters of what is behind the view: `"blur(10px)"` (frosted glass) | `.backdrop_blur(px(10.0))`, `.backdrop_saturate(n)`, ... |
 | `glassEffect` | `"regular"` or `"clear"` for Apple's Liquid Glass on iOS 26 and macOS 26 and later; `"none"` (the default) uses `backdropFilter` | `.glass_effect(GlassEffect::Regular)` |
+| `glassTintColor` | On iOS 26 and macOS 26, a color the glass takes on; `null` (the default) restores the system's own | `.glass_tint_color(color)` / `.glass_tint_color(None)` |
 | `mixBlendMode` | How the view blends with what is behind it: `"multiply"`, `"screen"`, `"overlay"`, ... | `.mix_blend_mode(BlendMode::Multiply)` |
 
 ```rust tabs
@@ -312,8 +322,38 @@ view().backdrop_blur(px(30.0)).backdrop_material(BackdropMaterial::Regular)
 `"clear"` takes less color from the background. Pair it with `backdropFilter` for the blur shown on earlier iOS
 versions and other platforms. The glass follows the view's size and rounded corners.
 
+`glassTintColor` tints that glass on iOS 26 and macOS 26: `null` (or removing the key) restores the system's default.
+An explicit transparent color is a tint, not a reset. It draws nothing without `glassEffect`, and the blur fallback
+on earlier systems is unchanged. Rust accepts static colors directly or a `Signal<Option<AdaptiveColor>>`:
+
+```rust
+let tint = signal(Some(AdaptiveColor::rgb(0xffd278, 0xffd278)));
+let panel = view().glass_effect(GlassEffect::Regular).glass_tint_color(tint);
+// In the corresponding UI actions:
+tint.set(None); // restore the native default
+tint.set(Some(AdaptiveColor::rgb(0x5080ff, 0x5080ff)));
+```
+
 ```tsx
-<View style={{ height: 80, borderRadius: 16, backdropFilter: "blur(12px)", glassEffect: "regular" }} />
+<View style={{ height: 80, borderRadius: 16, backdropFilter: "blur(12px)", glassEffect: "regular", glassTintColor: "rgba(255, 210, 120, 0.35)" }} />
+```
+
+On macOS, `macos={{ backdrop: { material, blending, state } }}` selects an `NSVisualEffectView` material of its
+own, with or without a blur. `material` is one of `"titlebar"`, `"selection"`, `"menu"`, `"popover"` (the
+default), `"sidebar"`, `"headerView"`, `"sheet"`, `"windowBackground"`, `"hudWindow"`,
+`"fullScreenUI"`, `"toolTip"`, `"contentBackground"`, `"underWindowBackground"` or
+`"underPageBackground"`; `blending` is `"withinWindow"` (the default) or `"behindWindow"`; `state` is
+`"followsWindowActiveState"`, `"active"` (the default) or `"inactive"`. An explicit backdrop wins over
+`glassEffect` and `backdropFilter`; without it, macOS keeps the glass on macOS 26 and later and the blur
+elsewhere. Rust uses `.macos_backdrop(backdrop)` with a `MacOsBackdrop` (the struct is `#[non_exhaustive]`: start from
+`MacOsBackdrop::default()` and set `material`, `blending` and `state`); `None` (the default) leaves the fallback.
+`"behindWindow"` shows what is behind the window only in a transparent one. Window attributes can request this;
+a custom Rust host can also use `AppOptions { transparent: true, .. }` as an initial default, overridden by explicit
+main-window attributes and later window updates. Standard hosts default to opaque windows, and a view's blending
+never enables transparency. An embedded `AppView` leaves its host window unchanged.
+
+```tsx
+<View macos={{ backdrop: { material: "hudWindow", blending: "behindWindow" } }} style={{ height: 64 }} />
 ```
 
 ### Progressive blur
@@ -346,13 +386,17 @@ function ProgressiveBlur(props: { radius: number; style: ViewStyle }) {
 }
 ```
 
+In Rust, use `.mask_linear(deg(90.0), [transparent_black(), black(), transparent_black()])` to fade both edges, `.mask_radial([black(), transparent_black()])` for a centered radial fade, and `.mask_none()` to clear it. Angles and stop vectors accept signals or closures; an empty stop vector clears the mask. Positions use `(color, percentage(0.2))` or `(color, px(12.0))`.
+
 A masked `backdropFilter` draws the blur alone, without the system material's tint, at its exact radius, on iOS and macOS too. Each layer blurs what the window shows on every frame, so keep the layers few and the area small. Linux and GPUI draw no `backdropFilter`, so give the region a fading `backgroundImage` where the text over it must stay readable.
+
+GPUI draws no `maskImage` yet: a masked view draws whole, so a fade made with a mask is a hard edge there.
 
 ## Outlines, opacity and visibility
 
 - `outlineWidth`, `outlineColor`, `outlineStyle`, `outlineOffset` (`.outline(..)`, `.outline_color(..)`, `.outline_dashed()`, `.outline_offset(..)`): a line outside the border that takes no space (negative offsets draw inside). `outlineStyle: "none"` (or `"hidden"`, `.outline_none()`) hides the outline whatever its width, as in CSS.
 - `opacity` (`.opacity(n)`): 0 to 1, applied to the view and its children.
-- `visibility: "hidden"` (`.invisible()` in Rust): the view is not drawn but keeps its space, and screen readers skip it and its subtree, as in a browser. `display: "none"` (`.hidden()`) removes it from layout.
+- `visibility: "hidden"` (`.invisible()` in Rust): the view is not drawn but keeps its space, and screen readers skip it and its subtree, as in a browser. On a span (a `Text` inside a `Text`) it hides the span's characters in place, and copies leave them out too ([Text element](../elements/text.md#hidden-spans)). `display: "none"` (`.hidden()`) removes it from layout.
 - `zIndex` (`.z_index(n)`): the order among siblings, also the native stacking order (stable for equal values).
 - `cursor` (`.cursor(..)`, `.cursor_pointer()`): the pointer shape over the view, for pointers and desktops.
 
@@ -383,7 +427,7 @@ Each is a property of its own, as with classes: a style's `scale` replaces a `sc
 
 Rust's `.perspective(..)` is CSS's `perspective` property, as Tailwind's `perspective-*`: it gives the view's children their depth, while the `perspective()` function of a `transform` applies to the view's own transform. `transformOrigin` takes keywords, percentages and lengths (`"top left"`, `"50% 0"`, `[10, 20]`; `.origin_top_left()`, `.transform_origin(..)` in Rust); the default is the center. Transforms do not affect layout: siblings are placed as if the view were untransformed.
 
-Android has no skew transforms.
+Android has no skew transforms. GPUI cannot turn an image's pixels: a rotated or skewed `Image` is drawn upright at its own size, centered where it would be.
 
 ## Transitions
 
@@ -425,7 +469,24 @@ view()
 | `transitionProperty` | What animates: `"all"`, or names separated by commas: colors (`"colors"`, `"backgroundColor"`, `"borderColor"`, ...), `"opacity"`, `"transform"` (every transform property), `"boxShadow"`, `"borderRadius"` / `"borderWidth"` | `.transition()`, `.transition_all()`, `.transition_colors()`, `.transition_opacity()`, `.transition_transform()`, `.transition_shadow()` |
 | `transitionDuration` | `300`, `"300ms"`, `"0.3s"` | `.duration(300.0)` |
 | `transitionDelay` | As the duration | `.delay(100.0)` |
-| `transitionTimingFunction` | `"linear"`, `"ease"`, `"ease-in"`, `"ease-out"`, `"ease-in-out"`, `"cubic-bezier(x1, y1, x2, y2)"` | `.ease_linear()`, `.ease_in()`, `.ease_out()`, `.ease_in_out()`, `.ease_bezier(x1, y1, x2, y2)` |
+| `transitionTimingFunction` | `"linear"`, `"ease"`, `"ease-in"`, `"ease-out"`, `"ease-in-out"`, `"cubic-bezier(x1, y1, x2, y2)"`, `"spring(stiffness, damping)"`, `"spring(stiffness, damping, mass)"` | `.ease_linear()`, `.ease_in()`, `.ease_out()`, `.ease_in_out()`, `.ease_bezier(x1, y1, x2, y2)`, `.ease_spring(Spring { .. })` |
+
+A `cubic-bezier()` whose `y` goes past 0..1 overshoots, as in CSS (`"cubic-bezier(0.3, 1.25, 0.6, 1)"`). `spring()` runs
+the transition on a spring's physics instead: its stiffness, its damping (the coefficient, not a ratio) and its mass
+(1 when left out), from rest. A spring times itself, lasting until it settles, so `transitionDuration` is not used;
+`"spring(620, 36)"` passes its target by about 4% and settles in about 380 ms. The class is `ease-spring-[620,36]`
+(`ease-spring-[620,36,1]` with the mass), and a popup's exit waits for its spring as for any transition.
+
+```rust tabs
+view()
+    .transition_transform()
+    .ease_spring(Spring { stiffness: 620.0, damping: 36.0, ..Spring::default() })
+    .scale(move || if open.get() { 1.0 } else { 0.95 })
+```
+
+```tsx tabs
+<View class="transition-transform ease-spring-[620,36]" style={{ scale: open() ? 1 : 0.95 }} />
+```
 
 Sizes and positions are layout, not style, and do not transition; animate layout changes with `LayoutAnimation` or drive values with native animations ([Animation](./animation.md)).
 
@@ -469,10 +530,12 @@ These keys and classes carry what native platforms do beyond CSS:
 | `tintColor` | `tint-*` | Recolors an `<Image>`'s opaque pixels (template images, icons) |
 | `borderCurve` | | `"continuous"`: corners that ease into the edges, as the system's own (Apple's continuous corners) |
 | `glassEffect` | | Apple's Liquid Glass behind the view on iOS 26 and macOS 26, the `backdropFilter` elsewhere |
+| `glassTintColor` | | The tint of that glass on iOS 26 and macOS 26; `null` restores the native default |
 | `writingDirection` | | A text's base direction, `"auto"` (the default: from its content, as the platforms' text views do), `"ltr"` or `"rtl"`; `direction` sets the layout's |
 | `textAlignVertical` | | Where text shorter than its `<Text>` box sits: `"top"` (the default), `"center"` or `"bottom"` |
 | `textAlign: "auto"` | | The text's natural side, by its direction (the default) |
 | `selectedStyle` | `selected:` | The style while `accessibilityState.selected` is `true` (a selected `Button`, a tab) |
+| `transitionTimingFunction: "spring(…)"` | `ease-spring-[…]` | Transitions on a spring's stiffness, damping and mass, lasting until it settles ([Transitions](#transitions)) |
 | | `ios:`, `android:`, `web:` | Classes for one platform (`ios:pt-2`) |
 
 Values that change also take numbers where CSS takes a string: `transform` as a list of steps, `translate` and `scale` as `[x, y]`, `boxShadow` and `textShadow` as layers.

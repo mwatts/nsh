@@ -14,13 +14,22 @@ public final class AppActivity extends Activity {
     protected void onCreate(Bundle state) {
         super.onCreate(state);
         DevActivity.edgeToEdge(this);
+        // `nsh run` passes the app's declared environment as extras. Only a
+        // development build (debuggable) takes them: the activity is
+        // exported, so any app could start a store build with extras.
+        if ((getApplicationInfo().flags & android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE) != 0) {
+            DevActivity.applyEnv(getIntent().getExtras());
+        }
         view = new NshView(this);
         // An app on its own, not a module embedded in another app: no limits.
         view.useStandaloneLimits();
         setContentView(view);
         view.handleNotificationIntent(getIntent());
+        // A recreated activity's intent was handed in already.
+        if (state == null) view.handleUrlSchemeIntent(getIntent());
         if (rustApp()) view.runRustApp("nsh");
-        else view.loadAssetBundle("nsh");
+        // A newer signed package of the app's code it downloaded runs instead.
+        else view.loadAssetBundle("nsh", true);
     }
 
     /** A Rust app (`nsh package --rust` sets the manifest's `com.longbridge.nsh.RUST`). */
@@ -40,11 +49,14 @@ public final class AppActivity extends Activity {
         DevActivity.systemBars(this);
     }
 
-    /** A notification pressed while this activity is in its task. */
+    /** A notification pressed, or a URL opened, while this activity is in its task. */
     @Override
     protected void onNewIntent(android.content.Intent intent) {
         super.onNewIntent(intent);
-        if (view != null) view.handleNotificationIntent(intent);
+        if (view != null) {
+            view.handleNotificationIntent(intent);
+            view.handleUrlSchemeIntent(intent);
+        }
     }
 
     /** Android 12 and older: the app gets the back button first. */

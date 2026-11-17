@@ -1,9 +1,12 @@
-//! Window composition: web views between the content nsh draws below them
-//! and the content it draws above them.
+//! Window composition: web views, and native components that bring a
+//! visual of their own (`crate::native`), between the content nsh draws
+//! below them and the content it draws above them. A component's visual
+//! takes a web view's place below: it is stacked and placed the same way.
 //!
-//! A window without web views draws its whole tree into its flip-model
-//! swap chain ([`crate::render::frame`]) and has no composition at all.
-//! The first web view of a surface makes its [`Composition`]: a
+//! A window without web views or composed components draws its whole tree
+//! into its flip-model swap chain ([`crate::render::frame`]) and has no
+//! composition at all. The first of them in a surface makes its
+//! [`Composition`]: a
 //! DirectComposition target on the window, above the window's own swap
 //! chain, whose root holds, bottom to top, each web view's visual
 //! ([`Portal`], the WebView2 controller's root visual target) and after
@@ -66,26 +69,29 @@ use windows_numerics::Matrix3x2;
 
 use crate::gfx::{self, Gfx};
 
-/// Where a frame put a web view: what its visuals are set to.
+/// Where a frame put a composed item (a web view, a component's visual,
+/// [`crate::NativeComponent::placed`]): what its visuals are set to.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) struct Placement {
-    /// The web view's pixels (its own coordinates times the window's
-    /// scale) to window pixels.
-    pub(crate) matrix: Matrix3x2,
+#[non_exhaustive]
+pub struct Placement {
+    /// The item's pixels (its own coordinates times the window's scale) to
+    /// window pixels.
+    pub matrix: Matrix3x2,
     /// Its size in pixels.
-    pub(crate) size: (i32, i32),
+    pub size: (i32, i32),
     /// What its clipping ancestors leave visible (window pixels).
-    pub(crate) clip: D2D_RECT_F,
+    pub clip: D2D_RECT_F,
     /// Its own corner radii in pixels (clockwise from the top left) when
     /// it clips its content, else zeros.
-    pub(crate) radii: [f32; 4],
+    pub radii: [f32; 4],
     /// The opacity it is drawn with (its own and its ancestors').
-    pub(crate) alpha: f32,
+    pub alpha: f32,
 }
 
 impl Placement {
     /// Its window rectangle (pixels) when it is only translated, as
     /// WebView2's bounds (pop-ups and the IME are placed from them).
+    #[cfg_attr(not(feature = "webview"), allow(dead_code))]
     pub(crate) fn bounds(&self) -> windows::Win32::Foundation::RECT {
         let left = self.matrix.M31.round() as i32;
         let top = self.matrix.M32.round() as i32;
@@ -99,7 +105,8 @@ impl Placement {
 }
 
 /// The DirectComposition tree of one surface's window. Made with its first
-/// web view, gone with its last (each [`Portal`] holds it).
+/// web view or composed component, gone with the last (each [`Portal`],
+/// and each composed component's item, holds it).
 pub(crate) struct Composition {
     device: IDCompositionDesktopDevice,
     _target: IDCompositionTarget,
@@ -109,6 +116,9 @@ pub(crate) struct Composition {
     layers: RefCell<Vec<Layer>>,
     /// The root's visuals as last arranged, bottom to top.
     order: RefCell<Vec<IDCompositionVisual2>>,
+    /// A transparent window's swap chain, below everything else
+    /// ([`Composition::set_base`]).
+    base: RefCell<Option<IDCompositionVisual2>>,
 }
 
 /// What nsh draws above a web view: a composition swap chain the size of
@@ -143,6 +153,7 @@ impl Composition {
                 root,
                 layers: RefCell::default(),
                 order: RefCell::default(),
+                base: RefCell::default(),
             }))
         }
     }
@@ -176,7 +187,7 @@ impl Composition {
             layer.swap = None;
         }
         if layer.swap.is_none() {
-            let swap = composition_swap_chain(gfx, size)?;
+            let swap = composition_swap_chain(gfx, size, DXGI_SWAP_CHAIN_FLAG(0))?;
             // SAFETY: plain calls on live objects of this thread.
             unsafe { layer.visual.SetContent(&swap)? };
             layer.swap = Some(swap);
@@ -219,12 +230,17 @@ impl Composition {
         Ok(bitmap)
     }
 
+    /// Its device, on which composed components make their visuals.
+    pub(crate) fn device(&self) -> &IDCompositionDesktopDevice {
+        &self.device
+    }
+
     /// Shows what was drawn into the first `used` layers.
     pub(crate) fn present(&self, used: usize) -> Result<()> {
         for layer in self.layers.borrow().iter().take(used) {
             if let Some(swap) = &layer.swap {
-                // Not synchronized: the window's own swap chain waits for
-                // the vertical blank once for all of them.
+                // Not synchronized: the window's own swap chain paces the
+                // frames of all of them (`gfx::SwapChain::ready`).
                 // SAFETY: a COM call on a live swap chain.
                 unsafe { swap.Present(0, DXGI_PRESENT(0)).ok()? };
             }
@@ -271,7 +287,12 @@ impl Composition {
         unsafe {
             if !same {
                 let _ = self.root.RemoveAllVisuals();
+                let base = self.base.borrow();
                 let mut below: Option<&IDCompositionVisual> = None;
+                if let Some(base) = &*base {
+                    let _ = self.root.AddVisual(base, true, None);
+                    below = Some(base);
+                }
                 for visual in &order {
                     // Above the one added before it: with no reference,
                     // `insertAbove` puts a visual below all its siblings.
@@ -286,6 +307,35 @@ impl Composition {
         }
     }
 
+    /// Shows `swap` (a transparent window's own swap chain, made again
+    /// after a device loss) at the bottom of the tree, below the web views
+    /// and their layers.
+    pub(crate) fn set_base(&self, swap: &IDXGISwapChain1) -> Result<()> {
+        let mut base = self.base.borrow_mut();
+        // SAFETY: plain calls on the live device and tree, on its thread.
+        unsafe {
+            let visual = match &*base {
+                Some(v) => v.clone(),
+                None => {
+                    let v = self.device.CreateVisual()?;
+                    // With no reference, `insertAbove` puts it below all
+                    // its siblings.
+                    self.root.AddVisual(&v, true, None)?;
+                    *base = Some(v.clone());
+                    v
+                }
+            };
+            visual.SetContent(swap)?;
+            self.device.Commit()
+        }
+    }
+
+    /// A swap chain is shown at the bottom ([`Composition::set_base`]).
+    #[cfg(test)]
+    pub(crate) fn has_base(&self) -> bool {
+        self.base.borrow().is_some()
+    }
+
     /// Drops what lives on the lost device (the layers' swap chains).
     pub(crate) fn device_lost(&self) {
         for layer in self.layers.borrow_mut().iter_mut() {
@@ -297,8 +347,14 @@ impl Composition {
     }
 }
 
-/// A swap chain for composition of `size` pixels, premultiplied.
-fn composition_swap_chain(gfx: &Gfx, size: (u32, u32)) -> Result<IDXGISwapChain1> {
+/// A swap chain for composition of `size` pixels, premultiplied, made with
+/// `flags` (a window's base: [`gfx::SWAP_CHAIN_FLAGS`], paced; a layer's:
+/// none, presented with the base).
+pub(crate) fn composition_swap_chain(
+    gfx: &Gfx,
+    size: (u32, u32),
+    flags: DXGI_SWAP_CHAIN_FLAG,
+) -> Result<IDXGISwapChain1> {
     // SAFETY: plain factory creation.
     let factory: IDXGIFactory2 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0))? };
     let desc = DXGI_SWAP_CHAIN_DESC1 {
@@ -315,7 +371,7 @@ fn composition_swap_chain(gfx: &Gfx, size: (u32, u32)) -> Result<IDXGISwapChain1
         Scaling: DXGI_SCALING_STRETCH,
         SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
         AlphaMode: DXGI_ALPHA_MODE_PREMULTIPLIED,
-        Flags: 0,
+        Flags: flags.0 as u32,
     };
     // SAFETY: a valid description on the live device.
     unsafe { factory.CreateSwapChainForComposition(&gfx.d3d, &desc, None) }
@@ -324,6 +380,7 @@ fn composition_swap_chain(gfx: &Gfx, size: (u32, u32)) -> Result<IDXGISwapChain1
 /// A web view's visuals: an outer one with its ancestors' clip (window
 /// pixels) and its opacity, holding an inner one with its transform and
 /// rounded corners, which WebView2 draws the page into.
+#[cfg_attr(not(feature = "webview"), allow(dead_code))]
 pub(crate) struct Portal {
     /// Kept while the web view lives: the window composes while it has one.
     _composition: Rc<Composition>,
@@ -334,6 +391,7 @@ pub(crate) struct Portal {
     applied: Cell<Option<Placement>>,
 }
 
+#[cfg_attr(not(feature = "webview"), allow(dead_code))]
 impl Portal {
     /// Visuals in `composition` for a web view.
     pub(crate) fn new(composition: Rc<Composition>) -> Result<Portal> {

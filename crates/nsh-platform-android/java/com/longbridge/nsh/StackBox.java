@@ -13,6 +13,7 @@ import android.graphics.drawable.Drawable;
 import android.util.TypedValue;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewParent;
 import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.Toolbar;
@@ -30,6 +31,16 @@ final class StackBox extends FrameLayout implements Node {
     final Mounter mounter;
     final int id;
     final Decor decor = new Decor();
+
+    /** An outer box shadow draws outside the bounds, and compositing the
+     * view at alpha < 1 into the bounds-clipped offscreen buffer would cut
+     * it; such a view reports no overlapping rendering, so the alpha
+     * applies per draw op and the shadow fades with the content. */
+    @Override
+    public boolean hasOverlappingRendering() {
+        return !decor.hasOuterShadows();
+    }
+
     /** The app's screens, bottom to top. */
     final List<Integer> screens = new ArrayList<>();
     /** Screens the user popped natively, until the app removes them. */
@@ -58,6 +69,24 @@ final class StackBox extends FrameLayout implements Node {
 
     int depth() {
         return shown.size();
+    }
+
+    /**
+     * The screen a pop reveals stays drawn, at alpha 0, while it is
+     * invisible under the top one. HWUI drops the display list of a
+     * RenderNode that is no longer drawn, and recording a whole page again
+     * takes the first frame of the pop tens of milliseconds. Alpha 0 draws
+     * nothing; `INVISIBLE` keeps the screen out of touches, accessibility
+     * and focus.
+     */
+    @Override
+    protected void dispatchDraw(Canvas canvas) {
+        super.dispatchDraw(canvas);
+        if (shown.size() < 2 || !canvas.isHardwareAccelerated()) return;
+        ScreenBox below = shown.get(shown.size() - 2);
+        if (below.getVisibility() == INVISIBLE && below.getAlpha() == 0 && below.getParent() == this) {
+            drawChild(canvas, below, getDrawingTime());
+        }
     }
 
     ScreenBox top() {
@@ -110,7 +139,7 @@ final class StackBox extends FrameLayout implements Node {
     /**
      * `upper` comes over `lower` (`push`) or goes from it through its
      * `transitionShader`, once the screens are laid out; false where none
-     * runs (no shader, Android 9, less motion).
+     * runs (no shader, before Android 10, less motion).
      */
     private boolean shaderAnimate(ScreenBox lower, ScreenBox upper, boolean push, List<ScreenBox> leaving) {
         if (!NavTransition.wanted(mounter, upper.id)) return false;
@@ -178,14 +207,22 @@ final class StackBox extends FrameLayout implements Node {
         if (t != null) t.finish();
     }
 
-    /** Only the top screen is visible; removed screens leave. */
+    /**
+     * Only the top screen is visible; removed screens leave. The screens
+     * below are at alpha 0 for {@link #dispatchDraw}.
+     */
     private void settle(List<ScreenBox> leaving) {
-        for (ScreenBox s : leaving) removeView(s);
+        for (ScreenBox s : leaving) {
+            s.setLayerType(LAYER_TYPE_NONE, null);
+            removeView(s);
+        }
         for (int i = 0; i < shown.size(); i++) {
             ScreenBox s = shown.get(i);
+            boolean top = i == shown.size() - 1;
             s.setTranslationX(0);
-            s.setAlpha(1);
-            s.setVisibility(i == shown.size() - 1 ? VISIBLE : INVISIBLE);
+            s.setAlpha(top ? 1 : 0);
+            s.setLayerType(LAYER_TYPE_NONE, null);
+            s.setVisibility(top ? VISIBLE : INVISIBLE);
         }
         transition = null;
         mounter.updateBack();
@@ -200,6 +237,13 @@ final class StackBox extends FrameLayout implements Node {
         float w = getWidth();
         lower.setVisibility(VISIBLE);
         upper.setVisibility(VISIBLE);
+        lower.setAlpha(1);
+        upper.setAlpha(1);
+        // Each screen is drawn into a layer once, then the slide only moves
+        // the layers: drawing both pages every frame (their paths, shadows
+        // and text) takes the RenderThread longer than a frame.
+        lower.setLayerType(LAYER_TYPE_HARDWARE, null);
+        upper.setLayerType(LAYER_TYPE_HARDWARE, null);
         android.animation.ValueAnimator a = android.animation.ValueAnimator.ofFloat(push ? 1 : progress, push ? 0 : 1);
         a.setDuration(push ? 300 : Math.round(300 * (1 - progress)));
         a.setInterpolator(new DecelerateInterpolator(1.5f));
@@ -244,13 +288,33 @@ final class StackBox extends FrameLayout implements Node {
     /** Whether the back button pops a screen of this stack. */
     boolean canPop() {
         ScreenBox top = top();
-        return shown.size() > 1 && top != null && !top.preventBack && isShown();
+        return shown.size() > 1 && top != null && !top.preventBack && showsForBack();
     }
 
     /** Whether the top screen keeps the user (`popOnBack` false): back only tells JS. */
     boolean preventsBack() {
         ScreenBox top = top();
-        return top != null && top.preventBack && isShown();
+        return top != null && top.preventBack && showsForBack();
+    }
+
+    /**
+     * Whether going back may act on this stack: shown, and it and every
+     * view of the app around it laid out with a size
+     * (`nsh_core::navigation::shown_in_layout`: `display: none`, a tab not
+     * selected, is laid out at no size, which `isShown` does not see). The
+     * frames are the core's (`Box.Frame`), set when a batch lands: a screen
+     * just added has not been measured yet, and the views the platform
+     * places between (screens, a scroll view's content) have none.
+     */
+    private boolean showsForBack() {
+        if (!isShown()) return false;
+        for (ViewParent p = this; p instanceof View && !(p instanceof NshView); p = p.getParent()) {
+            if (((View) p).getLayoutParams() instanceof Box.Frame) {
+                Box.Frame f = (Box.Frame) ((View) p).getLayoutParams();
+                if (f.right <= f.left || f.bottom <= f.top) return false;
+            }
+        }
+        return true;
     }
 
     /** Whether a back gesture may drag the top screen away (`popOnSwipe`). */
@@ -266,7 +330,7 @@ final class StackBox extends FrameLayout implements Node {
      */
     void back() {
         ScreenBox top = top();
-        if (top == null || !isShown()) return;
+        if (top == null || !showsForBack()) return;
         if (mounter.wants(top.id, Native.BACK_REQUEST)) mounter.event(top.id, Native.BACK_REQUEST);
         if (!top.preventBack) pop();
     }
@@ -279,6 +343,10 @@ final class StackBox extends FrameLayout implements Node {
         backProgress = 0;
         ScreenBox lower = shown.get(shown.size() - 2);
         lower.setVisibility(VISIBLE);
+        lower.setAlpha(1);
+        // As in `animate`: the screens follow the finger as layers.
+        lower.setLayerType(LAYER_TYPE_HARDWARE, null);
+        top().setLayerType(LAYER_TYPE_HARDWARE, null);
         place(lower, top(), 0, getWidth(), false);
     }
 
@@ -345,10 +413,15 @@ final class StackBox extends FrameLayout implements Node {
         /** `popOnBack` false: the back buttons only send `onBackPress`. */
         boolean preventBack;
         private final BackArrow arrow;
+        private final Mounter mounter;
+        /** The header's colors as configured (0: the theme's), kept for an appearance change. */
+        private int tint, background, titleColor;
+        private boolean transparent;
 
         ScreenBox(Context context, Mounter mounter, int id) {
             super(context);
             this.id = id;
+            this.mounter = mounter;
             root = new Box(context, mounter, id);
             addView(root);
             toolbar = new Toolbar(context);
@@ -357,7 +430,35 @@ final class StackBox extends FrameLayout implements Node {
                 if (getParent() instanceof StackBox) ((StackBox) getParent()).back();
             });
             addView(toolbar, new ViewGroup.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0));
-            setBackgroundColor(themeColor(context, android.R.attr.colorBackground, 0xffffffff));
+            colors();
+        }
+
+        /**
+         * The theme's colors in the appearance shown: the app's own
+         * (`setColorScheme`) in the system's default theme of that
+         * appearance, as `SystemUi`'s dialogs take, else the activity's theme.
+         */
+        private Context themed() {
+            if (mounter.appearance == 0) return getContext();
+            return new android.view.ContextThemeWrapper(getContext(), mounter.night()
+                    ? android.R.style.Theme_DeviceDefault
+                    : android.R.style.Theme_DeviceDefault_Light);
+        }
+
+        /** Colors the screen and its header: what the page set, else the theme's. */
+        private void colors() {
+            Context theme = themed();
+            setBackgroundColor(themeColor(theme, android.R.attr.colorBackground, 0xffffffff));
+            int primary = themeColor(theme, android.R.attr.textColorPrimary, 0xff1f2328);
+            toolbar.setTitleTextColor(titleColor != 0 ? titleColor : primary);
+            if (transparent) toolbar.setBackgroundColor(0);
+            else toolbar.setBackgroundColor(background != 0 ? background : themeColor(theme, android.R.attr.colorBackground, 0xffffffff));
+            arrow.setColor(tint != 0 ? tint : primary);
+        }
+
+        /** The app's appearance changed (`setColorScheme`): the theme's colors follow it. */
+        void appearanceChanged() {
+            colors();
         }
 
         @Override
@@ -401,11 +502,11 @@ final class StackBox extends FrameLayout implements Node {
             ViewGroup.LayoutParams p = toolbar.getLayoutParams();
             p.height = height;
             toolbar.setLayoutParams(p);
-            int foreground = tint != 0 ? tint : themeColor(getContext(), android.R.attr.textColorPrimary, 0xff1f2328);
-            toolbar.setTitleTextColor(titleColor != 0 ? titleColor : themeColor(getContext(), android.R.attr.textColorPrimary, 0xff1f2328));
-            if (transparent) toolbar.setBackgroundColor(0);
-            else toolbar.setBackgroundColor(background != 0 ? background : themeColor(getContext(), android.R.attr.colorBackground, 0xffffffff));
-            arrow.setColor(foreground);
+            this.tint = tint;
+            this.background = background;
+            this.titleColor = titleColor;
+            this.transparent = transparent;
+            colors();
             toolbar.setNavigationIcon(backVisible && canGoBack ? arrow : null);
             toolbar.setNavigationContentDescription(backVisible && canGoBack ? upDescription(backTitle) : null);
             // Header items: the core sized them; the toolbar places them. A `header`

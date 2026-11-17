@@ -27,6 +27,9 @@ mod access;
 mod agent;
 mod animation;
 mod app;
+mod app_window;
+#[cfg_attr(not(feature = "media"), path = "audio_off.rs")]
+mod audio;
 mod canvas;
 mod chrome;
 mod compose;
@@ -38,18 +41,26 @@ mod file_requests;
 mod fps;
 mod geom;
 mod gfx;
+mod global_shortcut;
 mod image;
 mod input;
+mod keyboard;
 mod keymap;
+mod linking;
+mod login_item;
 mod mount;
 mod native;
 mod navigation;
 mod notifications;
 mod picker;
+mod presence;
 mod render;
+mod richedit;
 mod scroll;
 mod selectable_view;
+mod session;
 mod shader;
+mod shell;
 mod surface;
 #[cfg(feature = "dev")]
 mod synth;
@@ -57,10 +68,16 @@ mod system;
 mod text;
 mod text_input;
 mod transition;
+mod tray;
 mod view;
 mod window;
+mod window_close;
+mod window_state;
 
-pub use nsh_core::platform::{Appearance, Locale};
+pub use nsh_core::{
+    file_type,
+    platform::{Appearance, Locale},
+};
 pub use nsh_engine::{
     App, Bundle, ByteSize, CacheLocation, CacheOptions, CachePolicy, Limits, Root,
 };
@@ -73,6 +90,8 @@ pub use crate::{
         AppOptions, AppSource, AppView, debug_output, fatal_error, run_app, set_components,
         set_ui_sets,
     },
+    compose::Placement,
     image::AssetBase,
     native::{ComponentContext, ComponentFactory, Components, NativeComponent, Wheel},
+    text::DWriteTextEngine,
 };

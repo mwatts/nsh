@@ -65,6 +65,9 @@ final class TextLayouts {
             Typeface typeface = Typeface.createFromFile(file);
             synchronized (FAMILIES) {
                 List<Face> faces = FAMILIES.computeIfAbsent(family, k -> new ArrayList<>());
+                for (Face face : faces) {
+                    if (file.equals(face.file)) return null;
+                }
                 faces.add(new Face(weight, italic, typeface, file));
             }
             // Resolutions made before this font existed are stale.
@@ -110,19 +113,56 @@ final class TextLayouts {
                 if (chained != null) return chained;
                 // Exact faces are used as is; others are synthesized.
                 if (face.weight == weight && face.italic == italic) return face.typeface;
-                return Typeface.create(face.typeface, clamp(weight), italic);
+                return weighted(face.typeface, face.weight, face.italic, weight, italic);
             }
             Typeface base = installed(names.get(i));
-            if (base != null) return Typeface.create(base, clamp(weight), italic);
+            if (base != null) return weighted(base, 400, false, weight, italic);
         }
-        return Typeface.create(Typeface.DEFAULT, clamp(weight), italic);
+        return weighted(Typeface.DEFAULT, 400, false, weight, italic);
+    }
+
+    /**
+     * `base`, a face of `baseWeight` and `baseItalic`, at a weight and style.
+     * Android 9+ takes any weight. Before it, the default family takes the
+     * nearest of Roboto's named weights (thin, light, regular, medium, bold,
+     * black), and other faces get bold and italic synthesized only where
+     * they are lighter or upright, so a bold file is not thickened again.
+     */
+    static Typeface weighted(Typeface base, int baseWeight, boolean baseItalic, int weight, boolean italic) {
+        if (android.os.Build.VERSION.SDK_INT >= 28) return Typeface.create(base, clamp(weight), italic);
+        if (base == Typeface.DEFAULT) {
+            String named = robotoFamily(weight);
+            if (named != null) {
+                Typeface typeface = Typeface.create(named, italic ? Typeface.ITALIC : Typeface.NORMAL);
+                // A ROM without the alias gives its default: synthesize instead.
+                if (typeface != null && !typeface.equals(Typeface.DEFAULT)) return typeface;
+            }
+        }
+        int style = (weight >= 600 && baseWeight < 600 ? Typeface.BOLD : 0)
+                | (italic && !baseItalic ? Typeface.ITALIC : 0);
+        return style == 0 ? base : Typeface.create(base, style);
+    }
+
+    /**
+     * Roboto's family alias nearest to a weight, as CSS matches a missing
+     * weight (lighter first below 400, heavier first from 500), or null
+     * where the regular face with or without bold is nearest (400, 600, 700).
+     */
+    private static String robotoFamily(int weight) {
+        if (weight < 250) return "sans-serif-thin";
+        if (weight < 350) return "sans-serif-light";
+        if (weight < 500) return null;
+        if (weight < 600) return "sans-serif-medium";
+        if (weight < 800) return null;
+        return "sans-serif-black";
     }
 
     /**
      * The families of a `fontFamily` list, trimmed and unquoted, in order: a
-     * quoted name runs to its closing quote, commas and all (`'ACME, Inc'`),
-     * as `nsh_core::font_families` reads it. A quoted name is always a
-     * family's name, never a generic family (`"serif"`), as in CSS.
+     * quoted name runs to its closing quote, commas and `\` escapes included
+     * (`'ACME, Inc'`, `"A\"B"`), as `nsh_core::font_families` reads it. A
+     * quoted name is always a family's name, never a generic family
+     * (`"serif"`), as in CSS.
      */
     private static List<Family> families(String list) {
         List<Family> out = new ArrayList<>();
@@ -136,12 +176,30 @@ final class TextLayouts {
             int comma;
             boolean quoted = c == '"' || c == '\'';
             if (quoted) {
-                // To the closing quote (or the end, unclosed); what follows it
-                // up to the next comma is not part of the name.
-                int end = list.indexOf(c, i + 1);
-                if (end < 0) end = n;
-                name = list.substring(i + 1, end).trim();
-                comma = list.indexOf(',', Math.min(end + 1, n));
+                // To the unescaped closing quote (or the end, unclosed); what
+                // follows it up to the next comma is not part of the name.
+                StringBuilder decoded = new StringBuilder();
+                int p = i + 1;
+                while (p < n) {
+                    char ch = list.charAt(p);
+                    if (ch == '\\') {
+                        p++;
+                        if (p < n) {
+                            decoded.append(list.charAt(p));
+                            p++;
+                        } else {
+                            decoded.append('\\');
+                        }
+                    } else if (ch == c) {
+                        p++;
+                        break;
+                    } else {
+                        decoded.append(ch);
+                        p++;
+                    }
+                }
+                name = decoded.toString().trim();
+                comma = list.indexOf(',', p);
             } else {
                 comma = list.indexOf(',', i);
                 name = list.substring(i, comma < 0 ? n : comma).trim();
@@ -260,11 +318,12 @@ final class TextLayouts {
     // node. Floats: size, line height, letter spacing, decoration thickness,
     // underline offset, background radius.
     private static final int SPAN_INTS = 11;
-    private static final int SPAN_FLOATS = 6;
+    private static final int SPAN_FLOATS = 8;
     private static final int ITALIC = 1;
     private static final int UNDERLINE = 2;
     private static final int STRIKE = 4;
     private static final int BACKGROUND = 16;
+    private static final int HIDDEN = 32;
 
     static final class Prepared {
         final CharSequence text;
@@ -344,6 +403,14 @@ final class TextLayouts {
                     .setLineSpacing(0f, 1f)
                     .setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE)
                     .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE);
+            if (android.os.Build.VERSION.SDK_INT >= 35) {
+                // `obtain` hands out pooled builders and does not reset these
+                // two: a TextView in an app targeting 35 or later leaves them
+                // on, and lines would then break by the glyphs' ink, wider
+                // than the advances the text was measured by ("Wor" / "k").
+                b.setUseBoundsForWidth(false);
+                b.setShiftDrawingOffsetForStartOverhang(false);
+            }
             if (justify) b.setJustificationMode(Layout.JUSTIFICATION_MODE_INTER_WORD);
             if (maxLines > 0) {
                 b.setMaxLines(maxLines);
@@ -400,30 +467,36 @@ final class TextLayouts {
                 s.setSpan(new Decoration((flags & UNDERLINE) != 0, (flags & STRIKE) != 0, ints[o + 5], size,
                         ints[o + 8], thickness, offset), start, end, f);
             }
+            if ((flags & HIDDEN) != 0) s.setSpan(new Hidden(), start, end, f);
             if ((flags & BACKGROUND) != 0) {
                 measure.setTypeface(typeface);
                 measure.setTextSize(size);
                 measure.getFontMetrics(metrics);
                 float radius = floats[i * SPAN_FLOATS + 5] * density;
-                if (background != null && background.same(ints[o + 9], ints[o + 10], radius) && backgroundEnd == start) {
+                float top = floats[i * SPAN_FLOATS + 6] * density;
+                float bottom = floats[i * SPAN_FLOATS + 7] * density;
+                if (background != null && background.same(ints[o + 9], ints[o + 10], radius, top, bottom) && backgroundEnd == start) {
                     background.ascentPx = Math.max(background.ascentPx, -metrics.ascent);
                     background.descentPx = Math.max(background.descentPx, metrics.descent);
                 } else {
                     if (background != null) s.setSpan(background, backgroundStart, backgroundEnd, f);
-                    background = new Background(ints[o + 9], ints[o + 10], radius, -metrics.ascent, metrics.descent);
+                    background = new Background(ints[o + 9], ints[o + 10], radius, top, bottom, -metrics.ascent, metrics.descent);
                     backgroundStart = start;
                 }
                 backgroundEnd = end;
             }
         }
         if (background != null) s.setSpan(background, backgroundStart, backgroundEnd, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
-        // Attachments (offset, width, height in dp, vertical alignment):
+        // Attachments (offset, width, height in dp, vertical alignment, how
+        // far below its top its own baseline is in dp or a negative number):
         // placeholders of their size, placed in their line.
-        for (int i = 0; i + 3 < attachments.length; i += 4) {
+        for (int i = 0; i + 4 < attachments.length; i += 5) {
             int at = (int) attachments[i];
             if (at < 0 || at >= text.length()) continue;
+            float baseline = attachments[i + 4];
             s.setSpan(new Attachment(Math.round(attachments[i + 1] * density), Math.round(attachments[i + 2] * density),
-                    (int) attachments[i + 3]), at, at + 1, Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+                    (int) attachments[i + 3], baseline < 0 ? -1 : Math.round(baseline * density)), at, at + 1,
+                    Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
         }
         // `encode` packs the writing direction and the layout direction in.
         int writing = (align >> 4) & 3;
@@ -462,12 +535,17 @@ final class TextLayouts {
             default: truncate = TextUtils.TruncateAt.END;
         }
         // Glyphs are measured once here; every layout width reuses them.
-        PrecomputedText.Params params = new PrecomputedText.Params.Builder(paint)
-                .setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE)
-                .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
-                .setTextDirection(direction)
-                .build();
-        CharSequence measured = PrecomputedText.create(s, params);
+        // Android 8 has no PrecomputedText: each layout measures the spans
+        // again, with the same breaks (the core caches layouts per width).
+        CharSequence measured = s;
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            PrecomputedText.Params params = new PrecomputedText.Params.Builder(paint)
+                    .setBreakStrategy(Layout.BREAK_STRATEGY_SIMPLE)
+                    .setHyphenationFrequency(Layout.HYPHENATION_FREQUENCY_NONE)
+                    .setTextDirection(direction)
+                    .build();
+            measured = PrecomputedText.create(s, params);
+        }
         return new Prepared(measured, paint, alignment, align == 4, endAligned, maxLines, truncate, density,
                 direction);
     }
@@ -849,8 +927,47 @@ final class TextLayouts {
     }
 
     /**
+     * A hidden run ({@code visibility: "hidden"}): laid out as shown, nothing
+     * of it drawn (its color emoji and shadow neither), left out of copies
+     * and screen readers ({@link #shown}).
+     */
+    static final class Hidden extends android.text.style.CharacterStyle
+            implements android.text.style.UpdateAppearance {
+        @Override
+        public void updateDrawState(TextPaint paint) {
+            paint.setColor(0);
+            paint.clearShadowLayer();
+            paint.bgColor = 0;
+        }
+    }
+
+    /**
+     * The characters {@code start..end} of a laid out text as a copy and a
+     * screen reader take them: without hidden runs and attachments'
+     * placeholders.
+     */
+    static String shown(CharSequence text, int start, int end) {
+        start = Math.max(0, Math.min(start, text.length()));
+        end = Math.max(start, Math.min(end, text.length()));
+        StringBuilder out = new StringBuilder(end - start);
+        Spanned spanned = text instanceof Spanned ? (Spanned) text : null;
+        int at = start;
+        while (at < end) {
+            int next = spanned == null ? end : spanned.nextSpanTransition(at, end, Hidden.class);
+            if (spanned == null || spanned.getSpans(at, next, Hidden.class).length == 0) {
+                for (int i = at; i < next; i++) {
+                    char c = text.charAt(i);
+                    if (c != '\uFFFC') out.append(c);
+                }
+            }
+            at = next;
+        }
+        return out.toString();
+    }
+
+    /**
      * An attachment's placeholder: its size, placed in its line by its
-     * `verticalAlign` (as `TextAttachment::ascent` in nsh-core places it, with
+     * `verticalAlign` (as `AttachmentAlignments::ascent` in nsh-core places it, with
      * the run's font metrics); the line grows to hold it. Draws nothing.
      */
     static final class Attachment extends android.text.style.ReplacementSpan {
@@ -862,11 +979,16 @@ final class TextLayouts {
         /** The ascent and descent of the font around it (px, as {@link Paint.FontMetricsInt}), set by {@link #getSize}. */
         int fontAscent, fontDescent;
 
-        Attachment(int width, int height, int align) {
+        /**
+         * `baseline`: how far below its top its own baseline is (px), which
+         * stands on the line's (the first baseline of the text in it); negative: it has none, and
+         * stands on its bottom edge.
+         */
+        Attachment(int width, int height, int align, int baseline) {
             this.width = width;
             this.height = height;
             this.align = align;
-            this.ascent = height;
+            this.ascent = baseline < 0 ? height : Math.min(baseline, height);
         }
 
         @Override
@@ -934,24 +1056,30 @@ final class TextLayouts {
 
     /** A span background (`backgroundColor` on a nested text), drawn by
      * {@code TextBox} behind each line's part of its characters, as tall as
-     * its fonts. One covers the neighboring runs of one span. */
+     * its fonts and the span's vertical padding. One covers the neighboring
+     * runs of one span. */
     static final class Background {
         final int color;
         /** The span that set it: neighbors that look the same stay apart. */
         final int node;
         final float radiusPx;
+        /** Room above the fonts' ascent and below their descent. */
+        final float topPx, bottomPx;
         float ascentPx, descentPx;
 
-        Background(int color, int node, float radiusPx, float ascentPx, float descentPx) {
+        Background(int color, int node, float radiusPx, float topPx, float bottomPx, float ascentPx, float descentPx) {
             this.color = color;
             this.node = node;
             this.radiusPx = radiusPx;
+            this.topPx = topPx;
+            this.bottomPx = bottomPx;
             this.ascentPx = ascentPx;
             this.descentPx = descentPx;
         }
 
-        boolean same(int color, int node, float radiusPx) {
-            return this.color == color && this.node == node && this.radiusPx == radiusPx;
+        boolean same(int color, int node, float radiusPx, float topPx, float bottomPx) {
+            return this.color == color && this.node == node && this.radiusPx == radiusPx
+                    && this.topPx == topPx && this.bottomPx == bottomPx;
         }
     }
 

@@ -22,7 +22,7 @@ use std::rc::Rc;
 use gpui::{
     App, Bounds, CursorStyle, DispatchPhase, FocusHandle, Hitbox, KeyDownEvent, KeyUpEvent,
     MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, PinchEvent, Pixels,
-    ScrollDelta, ScrollWheelEvent, TouchPhase, Window,
+    ScrollDelta, ScrollEvent, TouchPhase, Window,
 };
 
 use crate::{
@@ -46,6 +46,14 @@ fn gesture_phase(phase: TouchPhase) -> GesturePhase {
         TouchPhase::Ended => GesturePhase::Ended,
         TouchPhase::Cancelled => GesturePhase::Cancelled,
     }
+}
+
+/// Whether a press moves the window's focus to the surface. A press on
+/// content that cannot take the focus leaves it where the host put it (an
+/// editor next to an embedded surface keeps its caret, #1926); with nothing
+/// focused, or on a focusable view, the surface takes it.
+fn takes_focus(focused: bool, other: bool, focusable: impl FnOnce() -> bool) -> bool {
+    !focused && (!other || focusable())
 }
 
 /// Points the surface's hitbox: the cursor over `(x, y)` (root
@@ -111,16 +119,22 @@ fn cursor_style(c: Cursor) -> CursorStyle {
     }
 }
 
-/// Listens to the window's input for `surface` this frame.
-pub(crate) fn install(
+/// Listens to the window's input for `surface` this frame: the main
+/// window's (`root` `None`), or that of the window of the app's own whose
+/// root node is `root` ([`crate::window`]), whose listeners pick views in
+/// that root.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install<V: gpui::EntityInputHandler>(
     surface: &Rc<Surface>,
+    root: Option<nsh_core::NodeId>,
     focus: &FocusHandle,
-    view: &gpui::WeakEntity<crate::app::AppView>,
+    view: &gpui::WeakEntity<V>,
     hitbox: &Hitbox,
     bounds: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
 ) {
+    let _in = crate::window::enter(surface, root);
     if surface.window_focus_requested.take() && !focus.is_focused(window) {
         let focus = focus.clone();
         // After this paint. Text already queued for the next field stays
@@ -129,7 +143,7 @@ pub(crate) fn install(
     }
     // The focused field's caret shows while the surface has the window's
     // focus; text and input methods come through the input handler.
-    let has_focus = window.is_window_active() && focus.is_focused(window);
+    let has_focus = crate::window::is_active(window, cx) && focus.is_focused(window);
     if crate::text_input::window_focus(surface, has_focus) {
         window.refresh();
     }
@@ -168,6 +182,7 @@ pub(crate) fn install(
     let h = hitbox.clone();
     let f = focus.clone();
     window.on_mouse_event(move |e: &MouseDownEvent, phase, window, cx| {
+        let _in = crate::window::enter(&s, root);
         // Hit tested at the event's own position against the frame on
         // screen: a press is the surface's whatever the window last saw
         // (no move since it opened, keyboard input since).
@@ -177,16 +192,32 @@ pub(crate) fn install(
         let Some(button) = button(e.button) else {
             return;
         };
-        if !f.is_focused(window) {
-            window.focus(&f, cx);
+        // A modal window of the app's own over this one takes the press.
+        if crate::window::blocked(&s, root, cx) {
+            cx.stop_propagation();
+            return;
         }
         let (x, y) = root_point(&s, e.position);
+        if takes_focus(f.is_focused(window), window.focused(cx).is_some(), || {
+            crate::input::focusable_at(&s, x, y)
+        }) {
+            window.focus(&f, cx);
+        }
         if button == 0 && s.input_pressed.get() & 1 != 0 {
             cancel_press(&s, &e.modifiers);
         }
         if button == 0 && crate::input::window_drag(&s, x, y) {
-            window.start_window_move();
-            crate::text_input::disarm(&s);
+            if crate::window::movable(&s, root) {
+                window.start_window_move();
+                crate::text_input::disarm(&s);
+            }
+            return;
+        }
+        if button == 0
+            && let Some(part) = crate::input::window_part(&s, x, y)
+        {
+            crate::window::part_pressed(&s, root, part, window, cx);
+            cx.stop_propagation();
             return;
         }
         s.input_pressed.set(s.input_pressed.get() | 1 << button);
@@ -216,7 +247,8 @@ pub(crate) fn install(
     });
 
     let s = surface.clone();
-    window.on_mouse_event(move |e: &MouseUpEvent, phase, _window, cx| {
+    window.on_mouse_event(move |e: &MouseUpEvent, phase, window, cx| {
+        let _in = crate::window::enter(&s, root);
         if phase != DispatchPhase::Bubble {
             return;
         }
@@ -227,7 +259,23 @@ pub(crate) fn install(
         // (one pressed outside the surface, a Control-click released as
         // the left button): the next move says it again.
         s.input.button.set(None);
+        if button == 0 {
+            let (x, y) = root_point(&s, e.position);
+            if crate::window::part_released(&s, root, x, y, window, cx) {
+                crate::rt::flush(cx);
+                return;
+            }
+        }
         let pressed = s.input_pressed.get();
+        // GPUI's macOS window turns a Control-click into a secondary press
+        // but releases it as the left button: that release is the
+        // secondary button's.
+        #[cfg(target_os = "macos")]
+        let button = if button == 0 && pressed & 1 == 0 && pressed & 1 << 1 != 0 {
+            1
+        } else {
+            button
+        };
         if pressed & 1 << button == 0 {
             return;
         }
@@ -255,6 +303,7 @@ pub(crate) fn install(
     let s = surface.clone();
     let h = hitbox.clone();
     window.on_mouse_event(move |e: &MouseMoveEvent, phase, window, cx| {
+        let _in = crate::window::enter(&s, root);
         if phase != DispatchPhase::Bubble {
             return;
         }
@@ -298,6 +347,7 @@ pub(crate) fn install(
     // still come as moves).
     let s = surface.clone();
     window.on_mouse_event(move |e: &MouseExitEvent, phase, _window, cx| {
+        let _in = crate::window::enter(&s, root);
         if phase != DispatchPhase::Bubble
             || s.input_pressed.get() != 0
             || !s.input_hovered.replace(false)
@@ -326,7 +376,8 @@ pub(crate) fn install(
 
     let s = surface.clone();
     let h = hitbox.clone();
-    window.on_mouse_event(move |e: &ScrollWheelEvent, phase, window, cx| {
+    window.on_mouse_event(move |e: &ScrollEvent, phase, window, cx| {
+        let _in = crate::window::enter(&s, root);
         if phase != DispatchPhase::Bubble || !h.should_handle_scroll(window) {
             return;
         }
@@ -346,18 +397,45 @@ pub(crate) fn install(
             modifiers: crate::keys::modifiers(&e.modifiers),
             time: s.clock(),
         };
-        if precise {
-            crate::input::touchpad(&s, event, gesture_phase(e.touch_phase));
+        let phase = gesture_phase(e.touch_phase);
+        // `onWheel` keeps GPUI's unit; positive toward the end, as `dx`.
+        let delta = match e.delta {
+            ScrollDelta::Pixels(_) => nsh_core::WheelDelta::Points(nsh_core::geometry::point(
+                nsh_core::Points(dx),
+                nsh_core::Points(dy),
+            )),
+            ScrollDelta::Lines(l) => {
+                nsh_core::WheelDelta::Lines(nsh_core::geometry::point(-l.x, -l.y))
+            }
+        };
+        let handled = if crate::input::wheel_event(&s, &event, delta, precise.then_some(phase)) {
+            // The view took it; a gesture going on elsewhere still ends.
+            if precise && matches!(phase, GesturePhase::Ended | GesturePhase::Cancelled) {
+                let end = WheelEvent {
+                    dx: 0.0,
+                    dy: 0.0,
+                    ..event
+                };
+                crate::input::touchpad(&s, end, phase);
+            }
+            true
+        } else if precise {
+            crate::input::touchpad(&s, event, phase)
         } else {
-            crate::input::wheel(&s, event);
+            crate::input::wheel(&s, event)
+        };
+        // Unhandled, it goes on to what is under the surface: the host
+        // view embedding it scrolls (#1927).
+        if handled {
+            cx.stop_propagation();
         }
-        cx.stop_propagation();
         crate::rt::flush(cx);
     });
 
     let s = surface.clone();
     let h = hitbox.clone();
     window.on_mouse_event(move |e: &PinchEvent, phase, window, cx| {
+        let _in = crate::window::enter(&s, root);
         if phase != DispatchPhase::Bubble {
             return;
         }
@@ -374,27 +452,41 @@ pub(crate) fn install(
 
     let s = surface.clone();
     window.on_key_event(move |e: &KeyDownEvent, phase, window, cx| {
+        let _in = crate::window::enter(&s, root);
         if phase != DispatchPhase::Bubble {
             return;
         }
         crate::chrome::key_pressed(&s);
-        let Some(vk) = crate::keys::vk_of(&e.keystroke.key) else {
+        if crate::window::blocked(&s, root, cx) {
             return;
-        };
+        }
+        // The key as GPUI reported it. A printable key nsh has no virtual
+        // key code for (`?`, `é`) still runs the app's bindings, by its
+        // canonical stroke, and reaches the focused view; a key with a code
+        // keeps the code's meaning. Only the keymap or a listener needs it.
+        let vk = crate::keys::vk_of(&e.keystroke.key);
+        let wants_raw =
+            crate::input::hears_keys(&s) || (vk.is_none() && crate::keymap::mounted(&s));
+        let raw = wants_raw.then(|| crate::keys::RawKey::down(&e.keystroke, e.is_held));
         let event = KeyEvent {
-            vk,
+            vk: vk.unwrap_or(0),
             down: true,
             repeat: e.is_held,
             modifiers: crate::keys::modifiers(&e.keystroke.modifiers),
         };
-        if vk == crate::keys::VK_ESCAPE {
+        if vk == Some(crate::keys::VK_ESCAPE) {
             crate::text_input::disarm(&s);
         }
         let handled = if crate::native::focused(&s, window) {
-            crate::input::component_key(&s, event)
+            crate::input::component_key(&s, event, raw.as_ref())
         } else {
-            crate::input::key(&s, event)
+            crate::input::window_key(&s, event, raw)
         };
+        // Escape nothing took closes a window that says so.
+        let handled = handled
+            || (vk == Some(crate::keys::VK_ESCAPE)
+                && !e.is_held
+                && crate::window::escape(&s, root, window, cx));
         if handled {
             cx.stop_propagation();
             window.prevent_default();
@@ -417,22 +509,31 @@ pub(crate) fn install(
 
     let s = surface.clone();
     window.on_key_event(move |e: &KeyUpEvent, phase, window, cx| {
+        let _in = crate::window::enter(&s, root);
         if phase != DispatchPhase::Bubble {
             return;
         }
-        let Some(vk) = crate::keys::vk_of(&e.keystroke.key) else {
-            return;
-        };
+        let vk = crate::keys::vk_of(&e.keystroke.key);
+        let wants_raw =
+            crate::input::hears_keys(&s) || (vk.is_none() && crate::keymap::mounted(&s));
+        let raw = wants_raw.then(|| crate::keys::RawKey::up(&e.keystroke));
         let event = KeyEvent {
-            vk,
+            vk: vk.unwrap_or(0),
             down: false,
             repeat: false,
             modifiers: crate::keys::modifiers(&e.keystroke.modifiers),
         };
-        if crate::native::focused(&s, window) {
-            crate::input::component_key(&s, event);
+        // A release a capture rule took is kept from the window's own
+        // handlers, as a captured press is; so is the Alt release the
+        // window swallows once Alt + key was ours.
+        let handled = if crate::native::focused(&s, window) {
+            crate::input::component_key(&s, event, raw.as_ref())
         } else {
-            crate::input::key(&s, event);
+            crate::input::window_key(&s, event, raw)
+        };
+        if handled {
+            cx.stop_propagation();
+            window.prevent_default();
         }
         crate::rt::flush(cx);
     });
@@ -441,10 +542,27 @@ pub(crate) fn install(
     // mouse told of the new modifiers (`onMouseMove`).
     let s = surface.clone();
     window.on_modifiers_changed(move |e, _, cx| {
+        let _in = crate::window::enter(&s, root);
         crate::keymap::forget_held(&s);
         let modifiers = crate::keys::modifiers(&e.modifiers);
         crate::chrome::modifiers_changed(&s, &modifiers);
         crate::input::modifiers_changed(&s, modifiers);
         crate::rt::flush(cx);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::takes_focus;
+
+    #[test]
+    fn press_keeps_the_hosts_focus_on_unfocusable_content() {
+        // #1926: the host's editor keeps its focus.
+        assert!(!takes_focus(false, true, || false));
+        // A field, or nothing focused yet: the surface takes it.
+        assert!(takes_focus(false, true, || true));
+        assert!(takes_focus(false, false, || false));
+        // Already focused: nothing to do.
+        assert!(!takes_focus(true, false, || true));
+    }
 }

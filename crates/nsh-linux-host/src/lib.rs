@@ -14,6 +14,11 @@
 //!   passes the app's (`nsh.json` `"id"`). The app's data (`Storage` of `nsh`)
 //!   is kept under the id its bundle carries, in the system's data
 //!   directory.
+//! - `--background` runs the app in the background where a user may type
+//!   on the display: its windows show without taking the focus from the
+//!   app the user works in, and the test agent's keys go to the widgets
+//!   (`nsh test --target linux` passes it; on Xvfb, with no keyboard but
+//!   its own virtual ones, the app runs as in the foreground).
 //!
 //! Without arguments it connects to the dev server on this machine.
 //!
@@ -59,13 +64,14 @@ pub fn main() -> std::process::ExitCode {
             "--trace" => options.trace = true,
             // The performance monitor's readings, once a second.
             "--fps" => options.fps = true,
+            "--background" => options.background = true,
             "--app-id" => {
                 if let Some(id) = args.next().filter(|id| !id.is_empty()) {
                     options.app_id = id;
                 }
             }
-            // Where apps keep their data (`nsh test --target` gives each app
-            // a fresh one); the system's data directory otherwise.
+            // The app's data directory (`nsh test --target` gives each app a
+            // fresh one); the one under its id in the system's otherwise.
             "--data-dir" => {
                 options.data_dir = args.next().map(PathBuf::from);
                 // Its caches too (downloaded images): a test's app starts with none.
@@ -80,6 +86,20 @@ pub fn main() -> std::process::ExitCode {
                     options.size = (w.parse().unwrap_or(390), h.parse().unwrap_or(844));
                 }
             }
+            // URL schemes that open the app (nsh.json `schemes`): `nsh run`
+            // registers them for the development host.
+            "--schemes" => {
+                options.schemes = args
+                    .next()
+                    .unwrap_or_default()
+                    .split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+            }
+            // A URL the desktop opened the app with: GApplication's `open`
+            // hears it.
+            other if other.contains("://") => {}
             other => log::warn!("unknown argument {other}"),
         }
     }
@@ -88,6 +108,16 @@ pub fn main() -> std::process::ExitCode {
         AppSource::DevServer(format!("ws://127.0.0.1:{DEFAULT_PORT}{WS_PATH}"))
     });
     options.title = "nsh".to_owned();
+    // The desktop starts this host for the app's links: it names the app,
+    // so the running host of the app hears them.
+    if !options.schemes.is_empty() {
+        nsh_platform_linux::set_exec_args(vec![
+            "--app-id".to_owned(),
+            options.app_id.clone(),
+            "--schemes".to_owned(),
+            options.schemes.join(","),
+        ]);
+    }
     if run_app(source, options) == nsh_platform_linux::gtk4::glib::ExitCode::SUCCESS {
         std::process::ExitCode::SUCCESS
     } else {

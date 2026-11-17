@@ -1,12 +1,23 @@
-//! `nsh/desktop`'s window functions (macOS, Windows, Linux; nothing
-//! happens elsewhere). Menus, which call the app's functions, are
-//! `nsh-js`'s.
+//! `nsh/desktop`'s app functions (macOS, Windows, Linux; elsewhere `quit`
+//! and `restart` do nothing and the app does not launch at login). Windows and
+//! menus, which call the app's functions and live in its reactive graph,
+//! are `nsh-js`'s.
+
+use std::{
+    cell::{Cell, RefCell},
+    rc::{Rc, Weak},
+};
 
 use crate::{
     Command, ROOT_ID,
-    desktop::{DesktopCommand, MenuBarMode, TitleBarStyle, WindowFrame, WindowLevel},
-    element::{JsObject, ModuleCx, module, task::Action},
-    geometry::Points,
+    desktop::{DesktopCommand, LaunchAtLoginError, QuitRequestOptions},
+    element::{
+        CallCx, Callback, JsError, JsHost, JsIn, JsObject, JsOwned, JsValue, Local, ModuleCx,
+        PropEnum, PropError, Ret, Stop, System, TsTypes, codes, io_code, module,
+        quit::{QuitRequestListener, Subscription},
+        task::Action,
+    },
+    single_instance::SecondInstance,
 };
 
 fn desktop(cx: &mut ModuleCx, command: DesktopCommand) {
@@ -16,111 +27,500 @@ fn desktop(cx: &mut ModuleCx, command: DesktopCommand) {
     ));
 }
 
-/// The app's window (desktops; its functions do nothing elsewhere).
-#[module]
-pub(crate) struct Window;
-
-/// `Window.setTitleBar`'s options, in one object so more can join them.
-#[derive(Debug, Clone, Default, PartialEq, JsObject)]
-pub(crate) struct TitleBarOptions {
-    /// `"default"`: the system's title bar; `"hidden"`: the app's.
-    pub(crate) style: TitleBarStyle,
-    /// The app's bar's height in points; the platform's without it.
-    pub(crate) height: Option<f32>,
+/// What a `setLaunchAtLogin` call rejects with.
+fn launch_at_login_error(error: LaunchAtLoginError) -> JsError {
+    match error {
+        LaunchAtLoginError::Unavailable => {
+            JsError::Error(error.to_string()).with_code(codes::UNAVAILABLE)
+        }
+        LaunchAtLoginError::Denied => JsError::access_denied(error.to_string(), "application", ""),
+        // Every failure has a code to branch on: the error's own, else EIO.
+        LaunchAtLoginError::System(io) => {
+            let code = io_code(&io).unwrap_or("EIO");
+            JsError::Error(LaunchAtLoginError::System(io).to_string()).with_code(code)
+        }
+    }
 }
 
+/// The application as a whole (desktops; its functions do nothing elsewhere,
+/// and of its events only `openFiles` comes on iOS too).
 #[module]
-impl Window {
-    /// Sets the window's title (the title bar, the taskbar / Dock, the
-    /// window switcher).
-    pub(crate) fn set_title(title: String, cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::SetTitle(title));
+pub(crate) struct Application;
+
+#[module]
+impl Application {
+    /// Quits the app, as the application menu's `quit` role and the
+    /// platform's quit key do: its windows close and the app stops as when
+    /// its last window closes, then its run ends, also while closing the
+    /// window alone would leave it running (a window kept hidden, a tray
+    /// icon). It quits while the app listens to `quitRequest` too: that is
+    /// how an app that asks first quits once it is ready. A view embedded
+    /// in another app leaves the app's lifecycle to that app. On the web,
+    /// called while a `quitRequest` listener runs, it lets the page leave
+    /// without a question.
+    pub(crate) fn quit(cx: &mut ModuleCx) {
+        desktop(cx, DesktopCommand::Quit);
     }
 
-    /// Shows the system's title bar (`"default"`) or hides it
-    /// (`"hidden"`), from `{ style, height }`: the app then fills the window up to its top edge and
-    /// draws a title bar of its own, made draggable with
-    /// `desktop={{ windowDrag: true }}`; the system's window controls stay,
-    /// in the area `titleBar()` reports. `height` is the app's bar's height
-    /// in points: the controls are centered in it (Windows' caption buttons
-    /// fill it); the platform's own without it. On macOS, it selects compact
-    /// chrome up to 44 points and regular chrome above; use `titleBar().height`
-    /// to lay out the bar at AppKit's actual height. An embedding host's
-    /// existing toolbar keeps its own style and height.
-    pub(crate) fn set_title_bar(options: TitleBarOptions, cx: &mut ModuleCx) {
-        let height = crate::desktop::title_bar_height(options.height.map(Points));
-        desktop(
-            cx,
-            DesktopCommand::SetTitleBar {
-                style: options.style,
-                height,
-            },
-        );
+    /// Sets the additional sources of `quitRequest` on standalone macOS
+    /// apps. `system` includes logout, restart and shutdown;
+    /// `mainWindowClose` includes a user closing the main window when that
+    /// would end the app. Both default to false, and each call replaces
+    /// them. A window with `closeOnPress: false` keeps its own close
+    /// handler; a window kept alive on close still hides. Requires a
+    /// `quitRequest` listener. Changing the options cancels a pending
+    /// request. Replacing the app cancels its request and restores the
+    /// default options. Other platforms and embedded views ignore it.
+    pub(crate) fn set_quit_request_options(options: QuitRequestOptions, cx: &mut ModuleCx) {
+        desktop(cx, DesktopCommand::SetQuitRequestOptions(options));
     }
 
-    /// When the menu bar shows on Windows and Linux, where the window draws
-    /// the application menu as a bar above the app: `"shown"` (the
-    /// default) always; `"autoHide"` only after Alt is pressed and released
-    /// alone, until Alt alone hides it again, as in Windows and GNOME apps.
-    /// F10 and Alt with a menu's initial still open a menu, and the bar
-    /// shows while it is open. macOS's menu bar is the system's and always
-    /// shows.
-    pub(crate) fn set_menu_bar(mode: MenuBarMode, cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::SetMenuBar(mode));
+    /// Cancels the pending quit request on standalone macOS apps,
+    /// including an intercepted logout or shutdown. Call `quit()` to
+    /// approve instead. Repeated requests share the pending confirmation
+    /// until answered. An unanswered system request is cancelled after
+    /// 110 seconds, before AppKit's logout timeout. Removing the last
+    /// listener also cancels it. Does nothing without a pending request
+    /// or on other platforms.
+    pub(crate) fn cancel_quit_request(cx: &mut ModuleCx) {
+        desktop(cx, DesktopCommand::CancelQuitRequest);
     }
 
-    /// Minimizes the window.
-    pub(crate) fn minimize(cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::Minimize);
+    /// Restarts the app: it quits as `quit` does, and once the app has
+    /// exited it starts again with the arguments it was started with. For a
+    /// setting that takes effect at the next start (the app's language, say):
+    /// ask the user first, then call it. Standalone apps on macOS, Windows
+    /// and Linux; a view embedded in another app leaves the app's lifecycle
+    /// to that app.
+    pub(crate) fn restart(cx: &mut ModuleCx) {
+        desktop(cx, DesktopCommand::Restart);
     }
 
-    /// Maximizes the window, or restores it when it is maximized.
-    pub(crate) fn toggle_maximize(cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::ToggleMaximize);
+    /// Whether the system opens the app when the user logs in, as the
+    /// system has it now: ask again when the app shows it, as the user may
+    /// change it in the system's settings. `false` wherever the app cannot
+    /// launch at login (a view embedded in another app, `nsh run`, iOS,
+    /// Android, the web) and while macOS waits for the user to approve it
+    /// in Login Items.
+    pub(crate) async fn launch_at_login() -> bool {
+        crate::element::desktop::launch_at_login().await
     }
 
-    /// Enters or leaves full screen.
-    pub(crate) fn toggle_full_screen(cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::ToggleFullScreen);
+    /// Turns launching at login on or off: turning on what is on and off
+    /// what is off succeed. Call it when the user turns the app's own
+    /// setting on or off, never at every start: what the user chose in the
+    /// system's settings stands. Rejects with
+    /// `ERR_FEATURE_UNAVAILABLE_ON_PLATFORM` where the app cannot launch at
+    /// login, with `ERR_ACCESS_DENIED` (`permission` `"application"`) for an
+    /// app that declares capabilities without `application`, and with the
+    /// system's error (Node's code, `EIO` without one).
+    pub(crate) async fn set_launch_at_login(enabled: bool) -> Result<(), JsError> {
+        crate::element::desktop::set_launch_at_login(enabled)
+            .await
+            .map_err(launch_at_login_error)
     }
 
-    /// Moves and sizes the window in points; omitted fields keep their values.
-    /// macOS and Windows use the outer frame, including window decorations;
-    /// Linux uses GTK's default window size. `x` and `y` are the top left
-    /// corner, from the primary screen's top left with `y` growing down.
-    /// `animated` enables macOS's resize animation (false by default).
-    /// Sizing is supported on macOS, Windows and Linux; positioning and levels
-    /// on macOS and Windows. A view embedded in another app's window leaves
-    /// its bounds and level to that app.
-    pub(crate) fn set_frame(frame: WindowFrame, cx: &mut ModuleCx) {
-        let frame = WindowFrame {
-            x: frame.x.filter(|v| v.is_finite()),
-            y: frame.y.filter(|v| v.is_finite()),
-            width: frame.width.filter(|v| v.is_finite() && v.0 > 0.0),
-            height: frame.height.filter(|v| v.is_finite() && v.0 > 0.0),
-            animated: frame.animated,
+    /// Listens to `event`. `secondInstance`: with nsh.json
+    /// `"singleInstance": true`, the app was launched again on Windows or
+    /// Linux; that launch exited without opening a window and handed this
+    /// one its `args` (the program's path not included) and `cwd`, the
+    /// directory relative paths among them are relative to. The main window
+    /// is already brought forward (shown when hidden); what else the launch
+    /// means is the app's. Anyone can start the app with any arguments:
+    /// treat them as untrusted input. Launches while nothing listened go to
+    /// the next listener (at most 16, the oldest dropped). macOS runs one
+    /// instance of an app on its own and reports nothing; files and links
+    /// come as `openFiles`, links through `UrlScheme`. `openFiles`: the
+    /// system opened the app with files of the types it declares (nsh.json
+    /// `fileTypes`: Open With, a double click, a drop on its icon) on macOS,
+    /// iOS, Windows or Linux, at launch or while it runs; `paths` are
+    /// absolute. Files that came while nothing listened, those that launched
+    /// the app included, go to the next listener at once (at most 64, the
+    /// oldest dropped). The app reads them with `fs`, which their opening
+    /// does not grant. `quit`: the app is quitting (its Quit
+    /// item, `quit()`, its last window closing, the system ending it, a host
+    /// app removing its view, on the web the page going, once, however the
+    /// user left it; a page the browser keeps to come back to keeps the app
+    /// running), for its cleanup, as GPUI's `on_app_quit`: it
+    /// cannot keep the app running (an app that asks first listens to
+    /// `quitRequest`). A promise the listener returns is awaited, 200 ms at
+    /// most for all of them, while the platform waits too. `quitRequest`:
+    /// the user asked to quit the app with its Quit item or the platform's
+    /// quit key (Command-Q, Ctrl+Q), as AppKit's
+    /// `applicationShouldTerminate:`. While anything listens, these no
+    /// longer quit: the app decides (it asks the user, saves, waits for work
+    /// to finish), then calls `quit()`. The system ending the app (logging
+    /// out, shutting down) does not ask by default. On macOS,
+    /// `setQuitRequestOptions` includes system requests and main-window
+    /// closes; answer with `quit()` or `cancelQuitRequest()`.
+    /// Standalone apps on macOS, Windows and Linux; on the web, the user
+    /// leaving the page (closing its tab,
+    /// reloading) is the request: a `quit()` the listener calls at once lets
+    /// the page go without a question, otherwise the browser asks the user
+    /// whether to leave; `quit` listeners run once the page is gone.
+    /// Returns a function that stops listening.
+    #[overload(fn(event: ApplicationSecondInstanceEvent, #[args(launch)] listener: Callback<ApplicationSecondInstance>) -> Stop)]
+    #[overload(fn(event: ApplicationOpenFilesEvent, #[args(files)] listener: Callback<ApplicationOpenFiles>) -> Stop)]
+    #[overload(fn(event: ApplicationQuitEvent, listener: Callback<()>) -> Stop)]
+    #[overload(fn(event: ApplicationQuitRequestEvent, listener: Callback<()>) -> Stop)]
+    pub(crate) fn on(
+        event: ApplicationEvent,
+        #[args(payload)] listener: Callback<Payload>,
+        sys: System,
+        cx: CallCx<'_>,
+    ) -> Stop {
+        match event {
+            ApplicationEvent::SecondInstance => second_instance(listener, &sys, cx),
+            ApplicationEvent::OpenFiles => open_files(listener, &sys, cx),
+            ApplicationEvent::Quit => quit(listener, &sys, cx),
+            ApplicationEvent::QuitRequest => quit_request(listener, &sys, cx),
+        }
+    }
+}
+
+fn second_instance(listener: Callback<Payload>, sys: &System, cx: CallCx<'_>) -> Stop {
+    let launches = sys.locals.get::<Launches>();
+    let id = launches.next.get();
+    launches.next.set(id.wrapping_add(1));
+    for launch in launches.unheard.take() {
+        listener.post(Payload::SecondInstance(launch.into()));
+    }
+    launches.listeners.borrow_mut().push((id, listener));
+    if !launches.started.replace(true) {
+        cx.start(deliver(Rc::downgrade(&launches)));
+    }
+    let launches = Rc::downgrade(&launches);
+    Stop::new(move || {
+        if let Some(launches) = launches.upgrade() {
+            launches.listeners.borrow_mut().retain(|(i, _)| *i != id);
+        }
+    })
+}
+
+fn open_files(listener: Callback<Payload>, sys: &System, cx: CallCx<'_>) -> Stop {
+    let files = sys.locals.get::<Files>();
+    let id = files.next.get();
+    files.next.set(id.wrapping_add(1));
+    let unheard = files.unheard.take();
+    if !unheard.is_empty() {
+        listener.post(Payload::OpenFiles(ApplicationOpenFiles::new(unheard)));
+    }
+    files.listeners.borrow_mut().push((id, listener));
+    if !files.started.replace(true) {
+        cx.start(deliver_files(Rc::downgrade(&files)));
+    }
+    let files = Rc::downgrade(&files);
+    Stop::new(move || {
+        if let Some(files) = files.upgrade() {
+            files.listeners.borrow_mut().retain(|(i, _)| *i != id);
+        }
+    })
+}
+
+fn quit(listener: Callback<Payload>, sys: &System, cx: CallCx<'_>) -> Stop {
+    let quits = sys.locals.get::<Quits>();
+    let id = quits.next.get();
+    quits.next.set(id.wrapping_add(1));
+    quits.listeners.borrow_mut().push((id, listener));
+    if !quits.started.replace(true) {
+        cx.start(hold(Rc::downgrade(&quits)));
+    }
+    let quits = Rc::downgrade(&quits);
+    Stop::new(move || {
+        if let Some(quits) = quits.upgrade() {
+            quits.listeners.borrow_mut().retain(|(i, _)| *i != id);
+        }
+    })
+}
+
+/// Hears the user ask to quit while the listener lasts: as long as one
+/// is there, the platform leaves quitting to the app.
+fn quit_request(listener: Callback<Payload>, sys: &System, cx: CallCx<'_>) -> Stop {
+    let requests = sys.locals.get::<QuitRequests>();
+    let id = requests.next.get();
+    requests.next.set(id.wrapping_add(1));
+    requests.listeners.borrow_mut().push((id, listener));
+    // The core's listener is added by a task of the core, where its
+    // registry is; one at a time.
+    if requests.subscription.borrow().is_none() && !requests.adding.replace(true) {
+        cx.start(subscribe(Rc::downgrade(&requests)));
+    }
+    let requests = Rc::downgrade(&requests);
+    Stop::new(move || {
+        let Some(requests) = requests.upgrade() else {
+            return;
         };
-        desktop(cx, DesktopCommand::SetFrame(frame));
+        let removed = {
+            let mut listeners = requests.listeners.borrow_mut();
+            listeners.retain(|(i, _)| *i != id);
+            // The last one gone: quit requests quit again.
+            listeners
+                .is_empty()
+                .then(|| requests.subscription.borrow_mut().take())
+        };
+        drop(removed);
+    })
+}
+
+/// The VM's `quitRequest` listeners.
+#[derive(Default)]
+struct QuitRequests {
+    listeners: RefCell<Vec<(u32, Callback<Payload>)>>,
+    next: Cell<u32>,
+    /// The core's listener, while the VM's has any: the platform asks the
+    /// app while it is there.
+    subscription: RefCell<Option<Subscription<QuitRequestListener>>>,
+    /// A task adding it is on its way.
+    adding: Cell<bool>,
+}
+
+impl Local for QuitRequests {
+    fn close(&self) {
+        self.listeners.borrow_mut().clear();
+        let subscription = self.subscription.borrow_mut().take();
+        drop(subscription);
+    }
+}
+
+/// Adds the core's listener of quit requests for the VM's, unless they
+/// went meanwhile: it posts each request to all of them.
+async fn subscribe(requests: Weak<QuitRequests>) {
+    let Some(this) = requests.upgrade() else {
+        return;
+    };
+    this.adding.set(false);
+    if this.listeners.borrow().is_empty() || this.subscription.borrow().is_some() {
+        return;
+    }
+    let subscription = crate::element::desktop::add_quit_request_listener(Rc::new(move || {
+        let Some(requests) = requests.upgrade() else {
+            return;
+        };
+        for (_, listener) in &*requests.listeners.borrow() {
+            listener.post(Payload::QuitRequest);
+        }
+    }));
+    *this.subscription.borrow_mut() = Some(subscription);
+}
+
+/// `Application.on`'s events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PropEnum)]
+pub(crate) enum ApplicationEvent {
+    /// The app was launched again (nsh.json `singleInstance`).
+    #[default]
+    SecondInstance,
+    /// The system opened the app with files (nsh.json `fileTypes`).
+    OpenFiles,
+    /// The app is quitting.
+    Quit,
+    /// The user asked to quit the app.
+    QuitRequest,
+}
+
+/// The event of a later launch (`on`'s first overload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PropEnum)]
+pub(crate) enum ApplicationSecondInstanceEvent {
+    SecondInstance,
+}
+
+/// The event of quitting (`on`'s second overload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PropEnum)]
+pub(crate) enum ApplicationQuitEvent {
+    Quit,
+}
+
+/// The event of the user asking to quit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PropEnum)]
+pub(crate) enum ApplicationQuitRequestEvent {
+    QuitRequest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PropEnum)]
+pub(crate) enum ApplicationOpenFilesEvent {
+    #[default]
+    OpenFiles,
+}
+
+/// What a listener gets.
+#[derive(Debug, Clone)]
+pub(crate) enum Payload {
+    SecondInstance(ApplicationSecondInstance),
+    OpenFiles(ApplicationOpenFiles),
+    Quit,
+    QuitRequest,
+}
+
+impl JsValue for Payload {
+    fn ts_type(types: &mut TsTypes) -> String {
+        <ApplicationSecondInstance as JsValue>::ts_type(types)
     }
 
-    /// Sets the window's level on macOS and Windows: `"normal"` restores the
-    /// normal level; `"floating"` stays above normal windows. `"desktopIcon"`
-    /// selects macOS's desktop icon level or moves a Windows window to the
-    /// bottom of the current z-order, where later activation can raise it.
-    /// Elsewhere the level is left to the host and the window manager.
-    pub(crate) fn set_level(level: WindowLevel, cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::SetLevel(level));
+    fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
+        Err(value.expected("no value (a payload goes to JS only)"))
     }
 
-    /// Brings the window to the front of its level and focuses it (the app
-    /// activates). The window keeps its level. On macOS, desktop-level
-    /// surfaces stay behind other windows.
-    pub(crate) fn order_front(cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::OrderFront);
+    fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
+        match self {
+            Payload::SecondInstance(launch) => launch.to_js(host),
+            Payload::OpenFiles(files) => files.to_js(host),
+            Payload::Quit | Payload::QuitRequest => Ret::into_js((), host),
+        }
     }
+}
 
-    /// Closes the window; the app ends with it.
-    pub(crate) fn close(cx: &mut ModuleCx) {
-        desktop(cx, DesktopCommand::Close);
+/// A later launch of the app (the `secondInstance` event).
+#[derive(Debug, Clone, Default, PartialEq, JsObject)]
+pub(crate) struct ApplicationSecondInstance {
+    /// Its command line's arguments, the program's path not included.
+    args: Vec<String>,
+    /// The directory it was started in; empty when unknown.
+    cwd: String,
+}
+
+impl From<SecondInstance> for ApplicationSecondInstance {
+    fn from(launch: SecondInstance) -> Self {
+        Self {
+            args: launch.args,
+            cwd: launch.cwd,
+        }
     }
+}
+
+/// The VM's `secondInstance` listeners.
+#[derive(Default)]
+struct Launches {
+    listeners: RefCell<Vec<(u32, Callback<Payload>)>>,
+    next: Cell<u32>,
+    /// The task waiting for the core's launches started; it lasts as the
+    /// VM does.
+    started: Cell<bool>,
+    /// Launches that came with no listener, for the next one.
+    unheard: RefCell<Vec<SecondInstance>>,
+}
+
+impl Local for Launches {
+    fn close(&self) {
+        self.listeners.borrow_mut().clear();
+    }
+}
+
+/// Posts the core's launches to the listeners, while the VM lasts.
+async fn deliver(launches: Weak<Launches>) {
+    loop {
+        let launch = crate::prelude::next_second_instance().await;
+        let Some(launches) = launches.upgrade() else {
+            return;
+        };
+        let listeners = launches.listeners.borrow();
+        if listeners.is_empty() {
+            let mut unheard = launches.unheard.borrow_mut();
+            if unheard.len() == crate::single_instance::MAX_PENDING {
+                unheard.remove(0);
+            }
+            unheard.push(launch);
+            continue;
+        }
+        for (_, listener) in &*listeners {
+            listener.post(Payload::SecondInstance(launch.clone().into()));
+        }
+    }
+}
+
+/// Files the system opened the app with (the `openFiles` event).
+#[derive(Debug, Clone, Default, PartialEq, JsObject)]
+pub(crate) struct ApplicationOpenFiles {
+    /// Their absolute paths.
+    paths: Vec<String>,
+}
+
+impl ApplicationOpenFiles {
+    fn new(paths: Vec<std::path::PathBuf>) -> Self {
+        Self {
+            paths: paths
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+}
+
+/// The VM's `openFiles` listeners.
+#[derive(Default)]
+struct Files {
+    listeners: RefCell<Vec<(u32, Callback<Payload>)>>,
+    next: Cell<u32>,
+    /// The task waiting for the core's files started; it lasts as the VM
+    /// does.
+    started: Cell<bool>,
+    /// Files that came with no listener, for the next one.
+    unheard: RefCell<Vec<std::path::PathBuf>>,
+}
+
+impl Local for Files {
+    fn close(&self) {
+        self.listeners.borrow_mut().clear();
+    }
+}
+
+/// Posts the core's files to the listeners, while the VM lasts.
+async fn deliver_files(files: Weak<Files>) {
+    loop {
+        let paths = crate::prelude::next_open_files().await;
+        let Some(files) = files.upgrade() else {
+            return;
+        };
+        let listeners = files.listeners.borrow();
+        if listeners.is_empty() {
+            let mut unheard = files.unheard.borrow_mut();
+            unheard.extend(paths);
+            let excess = unheard.len().saturating_sub(crate::file_type::MAX_PENDING);
+            unheard.drain(..excess);
+            continue;
+        }
+        let payload = ApplicationOpenFiles::new(paths);
+        for (_, listener) in &*listeners {
+            listener.post(Payload::OpenFiles(payload.clone()));
+        }
+    }
+}
+
+/// The VM's `quit` listeners.
+#[derive(Default)]
+struct Quits {
+    listeners: RefCell<Vec<(u32, Callback<Payload>)>>,
+    next: Cell<u32>,
+    /// The task holding the core's quit listener started; it lasts as the
+    /// VM does.
+    started: Cell<bool>,
+}
+
+impl Local for Quits {
+    fn close(&self) {
+        self.listeners.borrow_mut().clear();
+    }
+}
+
+/// Holds the core's quit listener for the VM's: as the app quits, it calls
+/// each of them and waits for what they return.
+async fn hold(quits: Weak<Quits>) {
+    let _subscription = crate::element::desktop::add_quit_listener(Rc::new(move || {
+        let calls: Vec<_> = quits
+            .upgrade()
+            .map(|quits| {
+                let listeners = quits.listeners.borrow();
+                listeners
+                    .iter()
+                    .map(|(_, listener)| listener.call_async(Payload::Quit))
+                    .collect()
+            })
+            .unwrap_or_default();
+        Box::pin(async move {
+            for call in calls {
+                if let Err(message) = call.await {
+                    log::error!(target: "js", "a quit listener failed: {message}");
+                }
+            }
+        })
+    }));
+    std::future::pending::<()>().await;
 }

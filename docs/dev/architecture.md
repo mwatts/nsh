@@ -48,7 +48,8 @@ Input                        native gestures -> EngineControl::dispatch_event ->
   animations run on the frame clock.
 - **macOS** (AppKit, `macos.md`): one flipped, layer-backed `NSView` per node at the core's frames, decorated by Core
   Animation (the iOS backend's), text and canvases drawn into content layers, desktop input and scroll views as on Linux; each
-  commit is one main-queue hop; native animations run on the root's display link.
+  commit is one main-queue hop; native animations run on a display link made from the root of a window that shows
+  (the main one's, else one of the app's own: `macos.md` "Frames").
 - **Windows** (Win32, `windows.md`): one retained `NshView` per node, the whole tree drawn by the surface's window
   with Direct2D into a flip-model swap chain (no child windows but web views and components' own windows); each
   commit is one `WM_NSH_WAKE` posted to the window; native animations run on a ticker paced by the compositor
@@ -64,8 +65,10 @@ Input                        native gestures -> EngineControl::dispatch_event ->
   classes in `crates/nsh-js/src/web/` (module docs there), made on first use of any of those globals (zero startup cost
   otherwise), as in browsers so libraries such as axios work (`fetch.rs` lists where they differ). `Intl`
   (`NumberFormat`, `DateTimeFormat`) and the `toLocaleString`s of numbers, BigInts and dates, which QuickJS lacks, are
-  there too (`web/intl/`): formatted in Rust for the common languages (limits in its module doc), in `Environment::locale` by
-  default (the platform's region format: `NSLocale.currentLocale`, `Locale.getDefault()`).
+  there too (`web/format/`): formatted in Rust for the common languages (limits in its module doc), in `Environment::locale` by
+  default (the platform's region format: `NSLocale.currentLocale`, `Locale.getDefault()`), local time `Date`'s,
+  named as the zone the C library computes it in (`TZ`, `/etc/localtime`; on Windows and Android as the platform
+  reports it, `LocaleSettings::time_zone`, `localeSettings().timeZone`).
 - **Time**: an engine runs on a `nsh_core::time::Clock` (`EngineConfig::clock`), its thread's while it runs
   (`Clock::enter`): JS's timers, Rust tasks' timers, throttled scroll events, mouse moves and the frames' time read it
   through `nsh_core::time::now()`, `Intl` and `Date` through `unix_ms()`. The system's clock is the default. A manual

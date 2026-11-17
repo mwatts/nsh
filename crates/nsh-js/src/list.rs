@@ -10,11 +10,13 @@ use std::{
     cell::RefCell,
     ffi::{CStr, CString, c_int},
     ptr,
+    rc::Rc,
 };
 
 use nsh_core::{
-    Command, EventKind, NodeId, Op, Tag,
+    Command, EventKind, NodeId, Op, Prop, Tag,
     geometry::{Percentage, Points},
+    list_diff::ListDiff,
 };
 use rquickjs::qjs;
 use rustc_hash::FxHashMap;
@@ -48,6 +50,7 @@ const FORWARDED: &[&str] = &[
     "keyboardDismissMode",
     "numColumns",
     "inverted",
+    "alignment",
     "maintainVisibleContentPosition",
     "stickyHeaderIndices",
     "stickyHeaderOffset",
@@ -61,6 +64,7 @@ const FORWARDED: &[&str] = &[
     "decelerationRate",
     "scrollable",
     "bounces",
+    "scrollsToTop",
     "contentInset",
     "contentOffset",
     "keyboardShouldPersistTaps",
@@ -86,6 +90,7 @@ const OWN: &[&str] = &[
     "loadMoreThreshold",
     "loadMoreAtStartThreshold",
     "initialScrollIndex",
+    "initialScrollAtEnd",
     "onViewableItemsChange",
     "header",
     "footer",
@@ -101,6 +106,7 @@ pub(crate) const ITEMS_PROPS: &[&str] = &[
     "keyExtractor",
     "stickyHeaderIndices",
     "initialScrollIndex",
+    "initialScrollAtEnd",
     "onViewableItemsChange",
     "viewabilityConfig",
     "refreshing",
@@ -124,14 +130,17 @@ struct ListData {
     node: JsValue,
     /// The items memo (`props.each`), which the cells' items read.
     items: JsValue,
-    /// How the items changed (`[at, removed, inserted]`), for the core.
-    splices: Vec<[u32; 3]>,
+    /// How the items changed, for the core.
+    diffs: Vec<Rc<ListDiff>>,
     /// The owner the list was made under: cells are made as its roots.
     owner: u32,
     /// Cells by slot.
     cells: Vec<Option<Cell>>,
-    /// Owners of the header, footer and empty cells.
+    /// Owners of the header and footer cells.
     extras: Vec<u32>,
+    /// The owner of the empty cell while it shows: disposed with the list
+    /// (its root is not owned by the list's owner).
+    empty: Option<u32>,
     /// The viewable range reported last, and the latest.
     reported: (i64, i64),
     latest: (i64, i64),
@@ -257,10 +266,11 @@ pub(crate) fn render(cx: *mut JsContext, props: JsValue) -> Result<JsValue, JsVa
         props: unsafe { qjs::JS_DupValue(cx, props) },
         node: unsafe { qjs::JS_DupValue(cx, node) },
         items: UNDEFINED,
-        splices: Vec::new(),
+        diffs: Vec::new(),
         owner: reactive::current_owner(cx),
         cells: Vec::new(),
         extras: Vec::new(),
+        empty: None,
         reported: (-1, -1),
         latest: (-1, -1),
         timer: None,
@@ -324,26 +334,29 @@ pub(crate) fn render(cx: *mut JsContext, props: JsValue) -> Result<JsValue, JsVa
         r.map_err(fail)?;
     }
     let initial = get(cx, props, "initialScrollIndex");
-    // SAFETY: an inline check and a conversion of a live value.
-    unsafe {
-        if qjs::JS_IsNumber(initial) {
+    let at_end = get(cx, props, "initialScrollAtEnd");
+    // SAFETY: these live values are read and released before queuing the op.
+    let initial_command = unsafe {
+        let command = if qjs::JS_ToBool(cx, at_end) > 0 {
+            Some(Command::ScrollToEnd { animated: false })
+        } else if qjs::JS_IsNumber(initial) {
             let mut index = 0f64;
             qjs::JS_ToFloat64(cx, &mut index, initial);
-            dom::push_op(
-                cx,
-                Op::Command {
-                    id,
-                    command: Command::ScrollToIndex {
-                        index: index.max(0.0) as u32,
-                        animated: false,
-                        view_position: Percentage(0.0),
-                        view_offset: Points::ZERO,
-                    },
-                },
-            )
-            .map_err(fail)?;
-        }
+            Some(Command::ScrollToIndex {
+                index: index.max(0.0) as u32,
+                animated: false,
+                view_position: Percentage(0.0),
+                view_offset: Points::ZERO,
+            })
+        } else {
+            None
+        };
         qjs::JS_FreeValue(cx, initial);
+        qjs::JS_FreeValue(cx, at_end);
+        command
+    };
+    if let Some(command) = initial_command {
+        dom::push_op(cx, Op::Command { id, command }).map_err(fail)?;
     }
     let ref_ = get(cx, props, "ref");
     // SAFETY: a live value, called untracked with the node.
@@ -391,7 +404,7 @@ unsafe extern "C" fn dispose(
     for cell in data.cells.iter().flatten() {
         reactive::dispose_owner(cx, cell.owner);
     }
-    for &owner in &data.extras {
+    for &owner in data.extras.iter().chain(&data.empty) {
         reactive::dispose_owner(cx, owner);
     }
     free_data(cx, *data);
@@ -427,10 +440,34 @@ unsafe extern "C" fn items_run(
         let (old_len, next_len) = (length(cx, old), length(cx, next));
         if old_len > 0 && !qjs::JS_IsStrictEqual(cx, old, next) {
             let max = old_len.min(next_len);
+            // With a `keyExtractor`, rows are the same when their keys
+            // are: apps that rebuild their rows (new objects, same keys)
+            // keep the rows' measurements and the reader's place.
+            let key_of = get(cx, props, "keyExtractor");
+            let keyed = qjs::JS_IsFunction(cx, key_of);
+            let key = |item: JsValue, i: i64| {
+                let mut args = [qjs::JS_DupValue(cx, item), qjs::JS_NewFloat64(i as f64)];
+                let k = qjs::JS_Call(cx, key_of, UNDEFINED, 2, args.as_mut_ptr());
+                qjs::JS_FreeValue(cx, args[0]);
+                k
+            };
             let same = |i: i64, j: i64| {
                 let a = qjs::JS_GetPropertyInt64(cx, old, i);
                 let b = qjs::JS_GetPropertyInt64(cx, next, j);
-                let s = qjs::JS_IsStrictEqual(cx, a, b);
+                let mut s = qjs::JS_IsStrictEqual(cx, a, b);
+                if !s && keyed {
+                    let (ka, kb) = (key(a, i), key(b, j));
+                    s = !qjs::JS_IsException(ka)
+                        && !qjs::JS_IsException(kb)
+                        && qjs::JS_IsStrictEqual(cx, ka, kb);
+                    for k in [ka, kb] {
+                        if qjs::JS_IsException(k) {
+                            qjs::JS_FreeValue(cx, qjs::JS_GetException(cx));
+                        } else {
+                            qjs::JS_FreeValue(cx, k);
+                        }
+                    }
+                }
                 qjs::JS_FreeValue(cx, a);
                 qjs::JS_FreeValue(cx, b);
                 s
@@ -445,14 +482,68 @@ unsafe extern "C" fn items_run(
             }
             let removed = old_len - start - end;
             let inserted = next_len - start - end;
+            let splice = || {
+                ListDiff::splice(
+                    old_len as u32,
+                    start as u32,
+                    removed as u32,
+                    inserted as u32,
+                )
+            };
+            // Rows on both sides of the change are matched by key: the rows
+            // that stay keep their cells and measurements wherever they go
+            // (one moved to the top, the rows it passed, a window of rows
+            // that slides), and the viewport its rows.
+            let diff = if removed > 0 && inserted > 0 {
+                // The keys stay alive until they are compared: an object's
+                // is its address, which a freed key's memory could reuse.
+                let (mut atoms, mut held) = (Vec::new(), Vec::new());
+                let mut keys = |array: JsValue, from: i64, to: i64| {
+                    (from..to)
+                        .map(|i| {
+                            let item = qjs::JS_GetPropertyInt64(cx, array, i);
+                            let k = if keyed {
+                                key(item, i)
+                            } else {
+                                qjs::JS_DupValue(cx, item)
+                            };
+                            qjs::JS_FreeValue(cx, item);
+                            let token = item_key(cx, k);
+                            if qjs::JS_IsException(k) {
+                                qjs::JS_FreeValue(cx, qjs::JS_GetException(cx));
+                            } else {
+                                held.push(k);
+                            }
+                            if let Some(ItemKey::Atom(atom)) = token {
+                                atoms.push(atom);
+                            }
+                            token
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let old_keys = keys(old, start, old_len - end);
+                let next_keys = keys(next, start, next_len - end);
+                let diff = ListDiff::new_partial(&old_keys, &next_keys)
+                    .map(|d| d.widened(start as u32, end as u32));
+                for atom in atoms {
+                    qjs::JS_FreeAtom(cx, atom);
+                }
+                for k in held {
+                    qjs::JS_FreeValue(cx, k);
+                }
+                diff.unwrap_or_else(splice)
+            } else {
+                splice()
+            };
+            let diff = Rc::new(diff);
+            qjs::JS_FreeValue(cx, key_of);
             if removed > 0 || inserted > 0 {
                 let mut id = 0f64;
                 qjs::JS_ToFloat64(cx, &mut id, list);
                 let indices: Vec<JsValue> =
                     match lists(cx).map.borrow_mut().get_mut(&(id as NodeId)) {
                         Some(d) => {
-                            d.splices
-                                .push([start as u32, removed as u32, inserted as u32]);
+                            d.diffs.push(Rc::clone(&diff));
                             d.cells
                                 .iter()
                                 .flatten()
@@ -462,11 +553,14 @@ unsafe extern "C" fn items_run(
                         None => Vec::new(),
                     };
                 for index in indices {
+                    // Where the cell's row is now (a removed row's cell keeps
+                    // its index until it is bound).
                     if let Some(i) = reactive::peek_number(cx, index)
-                        && i as i64 >= start + removed
+                        && i >= 0.0
+                        && let Some((moved, _)) = diff.new_index(i as u32)
+                        && moved != i as u32
                     {
-                        let moved = i + (inserted - removed) as f64;
-                        reactive::set_signal(cx, index, qjs::JS_NewFloat64(moved));
+                        reactive::set_signal(cx, index, qjs::JS_NewFloat64(moved as f64));
                     }
                     qjs::JS_FreeValue(cx, index);
                 }
@@ -474,6 +568,44 @@ unsafe extern "C" fn items_run(
         }
         next
     }
+}
+
+/// What `===` compares a row's key by, where it can be looked up: a string
+/// by its atom (one per content), an object by identity (its address: the
+/// key must stay alive while it is compared), a number by its value. Other
+/// keys (a symbol, `NaN`) are never found again: such rows change as one
+/// splice, as before.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum ItemKey {
+    Atom(qjs::JSAtom),
+    Object(usize),
+    Number(u64),
+}
+
+/// `key`'s [`ItemKey`] (borrowed; an atom made is the caller's).
+fn item_key(cx: *mut JsContext, key: JsValue) -> Option<ItemKey> {
+    // SAFETY: inline tag and pointer reads of a live value, an atom made of
+    // a string (owned by the caller) or a pending exception cleared.
+    unsafe {
+        if qjs::JS_IsObject(key) {
+            return Some(ItemKey::Object(qjs::JS_VALUE_GET_PTR(key) as usize));
+        }
+        if qjs::JS_IsString(key) {
+            let atom = qjs::JS_ValueToAtom(cx, key);
+            if atom != qjs::JS_ATOM_NULL {
+                return Some(ItemKey::Atom(atom));
+            }
+            qjs::JS_FreeValue(cx, qjs::JS_GetException(cx));
+            return None;
+        }
+        if qjs::JS_IsNumber(key) {
+            let mut n = 0f64;
+            qjs::JS_ToFloat64(cx, &mut n, key);
+            // `===`: NaN is no row's key twice; 0 and -0 are one.
+            return (!n.is_nan()).then(|| ItemKey::Number(if n == 0.0 { 0 } else { n.to_bits() }));
+        }
+    }
+    None
 }
 
 /// A run of the items effect: tells the core how the items changed and
@@ -497,21 +629,18 @@ unsafe extern "C" fn splice_run(
         qjs::JS_FreeValue(cx, next);
         let mut id = 0f64;
         qjs::JS_ToFloat64(cx, &mut id, list);
-        let splices = lists(cx)
+        let diffs = lists(cx)
             .map
             .borrow_mut()
             .get_mut(&(id as NodeId))
-            .map(|d| std::mem::take(&mut d.splices))
+            .map(|d| std::mem::take(&mut d.diffs))
             .unwrap_or_default();
-        for [at, removed, inserted] in splices {
-            let mut values = [
-                qjs::JS_NewFloat64(at as f64),
-                qjs::JS_NewFloat64(removed as f64),
-                qjs::JS_NewFloat64(inserted as f64),
-            ];
-            let splice = qjs::JS_NewArrayFrom(cx, 3, values.as_mut_ptr());
-            if let Err(e) = set(cx, node, "splice", splice) {
-                return e;
+        if let Some(id) = dom::node_id(cx, node) {
+            for diff in diffs {
+                let prop = Prop::ListDiff(diff);
+                if let Err(e) = dom::push_op(cx, Op::SetProp { id, prop }) {
+                    return e;
+                }
             }
         }
         if let Err(e) = set(cx, node, "count", qjs::JS_NewFloat64(len as f64)) {
@@ -679,9 +808,12 @@ unsafe extern "C" fn slot_run(
 
 /// `value` (owned) as a list slot renders it.
 fn slot(cx: *mut JsContext, value: JsValue) -> JsValue {
+    // `<If>` and `<Each>` are memos: called here, untracked, the slot would
+    // keep their first value; the insert tracks them.
+    let (signal, memo) = reactive::signal_kind(cx, value);
     // SAFETY: an inline check; a component is called untracked.
     unsafe {
-        if qjs::JS_IsFunction(cx, value) && dom::node_id(cx, value).is_none() {
+        if qjs::JS_IsFunction(cx, value) && dom::node_id(cx, value).is_none() && !signal && !memo {
             let mut args = [qjs::JS_NewObject(cx)];
             let r = reactive::untracked_with(cx, || {
                 qjs::JS_Call(cx, value, UNDEFINED, 1, args.as_mut_ptr())
@@ -774,6 +906,9 @@ unsafe extern "C" fn empty_run(
                     r
                 })
             });
+            if let Some(d) = lists(cx).map.borrow_mut().get_mut(&id) {
+                d.empty = Some(root);
+            }
             qjs::JS_SetPropertyUint32(cx, state, 0, qjs::JS_NewFloat64(root as f64));
             qjs::JS_SetPropertyUint32(cx, state, 1, cell_node);
             if let Err(e) = r {
@@ -784,6 +919,11 @@ unsafe extern "C" fn empty_run(
             let cell = qjs::JS_GetPropertyUint32(cx, state, 1);
             let mut root = 0f64;
             qjs::JS_ToFloat64(cx, &mut root, owner);
+            if let Some(id) = dom::node_id(cx, list)
+                && let Some(d) = lists(cx).map.borrow_mut().get_mut(&id)
+            {
+                d.empty = None;
+            }
             reactive::dispose_owner(cx, root as u32);
             let r = dom::remove_node(cx, list, cell);
             qjs::JS_FreeValue(cx, cell);
@@ -990,9 +1130,11 @@ unsafe extern "C" fn separated_run(
         if qjs::JS_IsUndefined(separator) {
             let mut owner = 0f64;
             qjs::JS_ToFloat64(cx, &mut owner, *data.add(4));
-            // The cached separator lives with the cell, not this rerunning computation.
+            qjs::JS_FreeValue(cx, component);
+            // The cached separator lives with the cell, not this rerunning
+            // computation: so does what its getter makes (an `<If>`'s memo).
             separator = nsh_core::reactive::with_owner(reactive::Js(cx), owner as u32, || {
-                slot(cx, component)
+                slot(cx, get(cx, props, "separator"))
             });
             if qjs::JS_IsException(separator) {
                 return separator;
@@ -1276,7 +1418,11 @@ export interface ListProps<T> extends Omit<ViewProps, "children" | "ref">, Scrol
   separator?: ListSlot;
   /** Scrolls to this item before the first frame. */
   initialScrollIndex?: number;
-  /** Key of an item in `onViewableItemsChange` tokens (default: `item.key`, `item.id`, or the index). */
+  /** Opens at the end before the first frame, following it while rows measure.
+   * Short content stays at the top. Takes precedence over initialScrollIndex. */
+  initialScrollAtEnd?: boolean;
+  /** The item's key: changes are matched by it, so a row that moves keeps its cell (default: the item's
+   * identity), and `onViewableItemsChange` tokens name the item by it (default: `item.key`, `item.id`, or the index). */
   keyExtractor?: (item: T, index: number) => string;
   onViewableItemsChange?: (info: { viewableItems: ViewToken<T>[]; changed: ViewToken<T>[] }) => void;
   style?: StyleProp<ViewStyle>;
@@ -1302,12 +1448,48 @@ export interface ListProps<T> extends Omit<ViewProps, "children" | "ref">, Scrol
 /** What an app passes to a Rust component that lays out a list of rows
  * (an `Items` prop): the data and the rows; the component decides the
  * layout. */
-export type ListItemsProps<T> = Pick<ListProps<T>, "each" | "children" | "keyExtractor" | "stickyHeaderIndices" | "initialScrollIndex" | "onViewableItemsChange" | "viewabilityConfig" | "refreshing" | "onRefresh" | "onLoadMore" | "loadMoreThreshold" | "header" | "footer" | "empty">;
+export type ListItemsProps<T> = Pick<ListProps<T>, "each" | "children" | "keyExtractor" | "stickyHeaderIndices" | "initialScrollIndex" | "initialScrollAtEnd" | "onViewableItemsChange" | "viewabilityConfig" | "refreshing" | "onRefresh" | "onLoadMore" | "loadMoreThreshold" | "header" | "footer" | "empty">;
 "#;
 
 #[cfg(test)]
 mod tests {
+    use nsh_core::{
+        Op, Prop,
+        list_diff::{DiffRun, ListDiff},
+    };
+
     use crate::{Host, HostOptions};
+
+    #[test]
+    fn initial_end_takes_precedence_and_false_preserves_the_index() {
+        let host = Host::with_options(HostOptions::default()).unwrap();
+        host.eval_source(r#"
+            import { List } from "nsh";
+            List({ each: [0], children: () => null, initialScrollAtEnd: true, initialScrollIndex: 0 });
+            List({ each: [0], children: () => null, initialScrollAtEnd: false, initialScrollIndex: 7 });
+            List({ each: [], children: () => null, initialScrollAtEnd: false });
+        "#).unwrap();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        let commands: Vec<_> = ops
+            .into_iter()
+            .filter_map(|op| match op {
+                nsh_core::Op::Command { command, .. } => Some(command),
+                _ => None,
+            })
+            .collect();
+        assert!(matches!(
+            commands.as_slice(),
+            [
+                nsh_core::Command::ScrollToEnd { animated: false },
+                nsh_core::Command::ScrollToIndex {
+                    index: 7,
+                    animated: false,
+                    ..
+                },
+            ]
+        ));
+    }
 
     #[test]
     fn cached_separators_keep_their_cell_owner() {
@@ -1421,5 +1603,174 @@ mod tests {
                 .count()
         };
         assert_eq!((made("Head"), made("Foot")), (1, 1));
+    }
+
+    /// Rows rebuilt as new objects with the same keys are the same rows:
+    /// appending one splices only the new row in.
+    #[test]
+    fn keyed_rows_rebuilt_with_the_same_keys_splice_only_the_new_row() {
+        let host = Host::with_options(HostOptions::default()).unwrap();
+        host.eval_source(
+            r#"
+            import { List, mount, signal } from "nsh";
+            import { text } from "nsh:rt";
+            const items = signal(["a", "b", "c"].map(id => ({ id })));
+            globalThis.keyed = { items };
+            mount(() => List({
+                get each() { return items(); },
+                keyExtractor: item => item.id,
+                children: item => text(item().id),
+            }));
+            "#,
+        )
+        .unwrap();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        ops.clear();
+        assert!(
+            host.eval_script(
+                "keyed-append",
+                "keyed.items.set([...keyed.items().map(i => ({...i})), {id: 'd'}]); true",
+            )
+            .unwrap()
+        );
+        host.take_ops(&mut ops);
+        let diffs = diffs(&ops);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(diffs[0].as_splice(), Some((3, 0, 1)), "{diffs:?}");
+    }
+
+    /// A window of rows that slides (the first dropped, one appended, rows
+    /// rebuilt with the same keys) keeps every row it still shows, not one
+    /// change over every row.
+    #[test]
+    fn a_sliding_window_of_keyed_rows_keeps_the_rows_it_shows() {
+        let host = Host::with_options(HostOptions::default()).unwrap();
+        host.eval_source(
+            r#"
+            import { List, mount, signal } from "nsh";
+            import { text } from "nsh:rt";
+            const items = signal(Array.from({ length: 240 }, (_, i) => ({ id: `r${i}` })));
+            globalThis.window = { items, next: 240 };
+            mount(() => List({
+                get each() { return items(); },
+                keyExtractor: item => item.id,
+                children: item => text(item().id),
+            }));
+            "#,
+        )
+        .unwrap();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        ops.clear();
+        assert!(
+            host.eval_script(
+                "keyed-slide",
+                "window.items.set([...window.items().slice(1).map(i => ({...i})), {id: `r${window.next++}`}]); true",
+            )
+            .unwrap()
+        );
+        host.take_ops(&mut ops);
+        let diffs = diffs(&ops);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(
+            diffs[0].runs,
+            [
+                DiffRun::Kept { from: 1, len: 239 },
+                DiffRun::Inserted { len: 1 }
+            ],
+        );
+    }
+
+    /// Keys that are new objects each time are never `===`: such rows are
+    /// all new, however the engine reuses the memory of the keys it has
+    /// read.
+    #[test]
+    fn keys_made_anew_as_objects_never_match() {
+        let host = Host::with_options(HostOptions::default()).unwrap();
+        host.eval_source(
+            r#"
+            import { List, mount, signal } from "nsh";
+            import { text } from "nsh:rt";
+            const items = signal(Array.from({ length: 240 }, (_, i) => ({ id: `r${i}` })));
+            globalThis.window = { items, next: 240 };
+            mount(() => List({
+                get each() { return items(); },
+                keyExtractor: item => ({ id: item.id }),
+                children: item => text(item().id),
+            }));
+            "#,
+        )
+        .unwrap();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        ops.clear();
+        assert!(
+            host.eval_script(
+                "object-keys-slide",
+                "window.items.set([...window.items().slice(1), {id: `r${window.next++}`}]); true",
+            )
+            .unwrap()
+        );
+        host.take_ops(&mut ops);
+        let diffs = diffs(&ops);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(diffs[0].as_splice(), Some((0, 240, 240)), "{diffs:?}");
+    }
+
+    /// A keyed row moved up is one move: the rows it passed stay, and the
+    /// cells that show rows follow them to their new indices.
+    #[test]
+    fn a_keyed_row_moved_up_is_a_move() {
+        let host = Host::with_options(HostOptions::default()).unwrap();
+        host.eval_source(
+            r#"
+            import { List, mount, signal } from "nsh";
+            import { text } from "nsh:rt";
+            const items = signal(Array.from({ length: 12 }, (_, i) => ({ id: `r${i}` })));
+            globalThis.moving = { items };
+            mount(() => List({
+                get each() { return items(); },
+                keyExtractor: item => item.id,
+                children: item => text(item().id),
+            }));
+            "#,
+        )
+        .unwrap();
+        let mut ops = Vec::new();
+        host.take_ops(&mut ops);
+        ops.clear();
+        assert!(
+            host.eval_script(
+                "keyed-move",
+                "const rows = moving.items().map(i => ({...i})); \
+                 rows.splice(2, 0, ...rows.splice(10, 1)); moving.items.set(rows); true",
+            )
+            .unwrap()
+        );
+        host.take_ops(&mut ops);
+        let diffs = diffs(&ops);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(
+            diffs[0].runs,
+            [
+                DiffRun::Kept { from: 0, len: 2 },
+                DiffRun::Moved { from: 10, len: 1 },
+                DiffRun::Kept { from: 2, len: 8 },
+                DiffRun::Kept { from: 11, len: 1 },
+            ],
+        );
+    }
+
+    fn diffs(ops: &[Op]) -> Vec<ListDiff> {
+        ops.iter()
+            .filter_map(|op| match op {
+                Op::SetProp {
+                    prop: Prop::ListDiff(diff),
+                    ..
+                } => Some((**diff).clone()),
+                _ => None,
+            })
+            .collect()
     }
 }

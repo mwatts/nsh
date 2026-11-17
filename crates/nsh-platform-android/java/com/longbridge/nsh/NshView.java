@@ -17,9 +17,9 @@ import android.util.TypedValue;
 import android.view.Choreographer;
 import android.view.Gravity;
 import android.view.View;
+import android.view.ViewTreeObserver;
 import android.view.Window;
 import android.view.WindowInsets;
-import android.view.WindowInsetsAnimation;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
@@ -101,6 +101,11 @@ public class NshView extends FrameLayout {
     final android.util.SparseArray<ShaderFrames> navFrames = new android.util.SparseArray<>();
     private final Mounter mounter;
     private final TouchTracker touches;
+    /** This window's shortcuts, raw keys, capture rules and Tab traversal. */
+    private final KeyDispatch keys;
+    private final ViewTreeObserver.OnTouchModeChangeListener keyboardFocus = inTouchMode -> {
+        if (!inTouchMode) focusForKeyboard();
+    };
 
     @Override
     public void onWindowFocusChanged(boolean hasWindowFocus) {
@@ -128,27 +133,28 @@ public class NshView extends FrameLayout {
 
     @Override
     public boolean dispatchTouchEvent(android.view.MotionEvent e) {
-        boolean tracking = touches.onTouch(e);
+        android.view.MotionEvent t = mounter.keyboardTap(e);
+        boolean tracking = touches.onTouch(t);
         // A tracked finger went down: hear the rest of the gesture even if
         // no view takes it.
-        return super.dispatchTouchEvent(e) || tracking;
+        boolean handled = super.dispatchTouchEvent(t) || tracking;
+        if (t != e) t.recycle();
+        return handled;
     }
 
     /**
-     * A hardware keyboard's keys go to the app's shortcuts ({@code nsh/keymap}) before the focused view
-     * gets them: a key a binding takes is consumed, with its release (the input never sees it).
+     * A hardware keyboard's keys go to the app's shortcuts ({@code nsh/keymap}) and the focused
+     * view's {@code captureKeys} rules before it gets them: a key a binding or a capture takes is
+     * consumed, with its release (the input never sees it). A system key (Back, Home, volume,
+     * media, camera, call) is never captured, even by {@code all}, and its raw notification is
+     * unaffected. A
+     * view with no raw listener and no capture leaves the key to Android; Tab and Shift+Tab then
+     * move the focus between managed stops and inputs, yielding to Android at the first and last
+     * stop.
      */
     @Override
     public boolean dispatchKeyEvent(android.view.KeyEvent e) {
-        if (handle != 0) {
-            int action = e.getAction();
-            if (action == android.view.KeyEvent.ACTION_DOWN && keymapKey(e)) {
-                return true;
-            } else if (action == android.view.KeyEvent.ACTION_UP && Native.keyUp(handle, e.getKeyCode())) {
-                return true;
-            }
-        }
-        return super.dispatchKeyEvent(e);
+        return keys.dispatchKeyEvent(e) || super.dispatchKeyEvent(e);
     }
 
     /**
@@ -157,19 +163,26 @@ public class NshView extends FrameLayout {
      */
     @Override
     public boolean dispatchKeyShortcutEvent(android.view.KeyEvent e) {
-        if (handle != 0 && e.getAction() == android.view.KeyEvent.ACTION_DOWN && keymapKey(e)) {
-            return true;
-        }
-        return super.dispatchKeyShortcutEvent(e);
+        return keys.dispatchKeyShortcutEvent(e) || super.dispatchKeyShortcutEvent(e);
     }
 
-    /** Whether the app's shortcuts take key press {@code e}. */
-    private boolean keymapKey(android.view.KeyEvent e) {
-        // An input or hosted view (a web view, a native component) has the focus: in text.
-        View focus = findFocus();
-        boolean editing = focus != null && focus != this;
-        return Native.keyDown(handle, e.getKeyCode(), e.getUnicodeChar(0), e.getMetaState(),
-                e.getRepeatCount() > 0, editing);
+    @Override
+    public void onWindowFocusChanged(boolean hasWindowFocus) {
+        super.onWindowFocusChanged(hasWindowFocus);
+        if (!hasWindowFocus) {
+            // The releases of the keys held may never come.
+            keys.focusLost();
+            if (handle != 0) Native.keyReset(handle);
+        } else {
+            focusForKeyboard();
+        }
+    }
+
+    /** Fill an empty keyboard focus path, never scroll a touch-only embedding host into view. */
+    private void focusForKeyboard() {
+        if (hasWindowFocus() && !isInTouchMode() && getRootView().findFocus() == null) {
+            requestFocus();
+        }
     }
 
     private final Handler main = new Handler(Looper.getMainLooper());
@@ -213,6 +226,7 @@ public class NshView extends FrameLayout {
         addView(root, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
         touches = new TouchTracker(mounter, this);
         mounter.touchTrackers.add(touches);
+        keys = new KeyDispatch(mounter, root, 1);
         setClipChildren(false);
         // Holds focus when no input does (see InputBox.blur).
         setFocusable(true);
@@ -227,25 +241,13 @@ public class NshView extends FrameLayout {
         // The keyboard's curve and duration, as it starts to move: what makes
         // room for it moves with it (`LayoutCurve::Keyboard`).
         if (Build.VERSION.SDK_INT >= 30) {
-            setWindowInsetsAnimationCallback(new WindowInsetsAnimation.Callback(
-                    WindowInsetsAnimation.Callback.DISPATCH_MODE_CONTINUE_ON_SUBTREE) {
-                @Override
-                public void onPrepare(WindowInsetsAnimation animation) {
-                    // Before the end state's insets are applied.
-                    if ((animation.getTypeMask() & WindowInsets.Type.ime()) == 0) return;
-                    keyboardDuration = animation.getDurationMillis();
-                    mounter.keyboardMotion(animation.getInterpolator(), keyboardDuration);
-                }
-
-                @Override
-                public WindowInsets onProgress(WindowInsets insets, java.util.List<WindowInsetsAnimation> running) {
-                    return insets;
-                }
-            });
+            KeyboardAnimation.install(this, mounter);
         }
         // The back key where the window has no OnBackInvokedCallback in
         // effect (below Android 13, or `enableOnBackInvokedCallback` off).
-        addOnUnhandledKeyEventListener((v, e) -> onBackKey(e));
+        // Android 8 has no such listener: there the activity's
+        // `onBackPressed` hands the press to `handleBack`.
+        if (Build.VERSION.SDK_INT >= 28) addOnUnhandledKeyEventListener((v, e) -> onBackKey(e));
         // Apps keep their data in <dataDir>/<app id>: nsh in the files
         // directory unless the development host's test session says.
         // ... and the images they download in <cacheDir>/<app id>/images: nsh
@@ -344,6 +346,24 @@ public class NshView extends FrameLayout {
         }
     }
 
+    /**
+     * Registers a font file (TrueType, OpenType, WOFF or WOFF2) the host
+     * ships, so every app this view loads can name its family in
+     * {@code fontFamily} without bundling the file. Call it before or after
+     * loading: a font registered before a load is in that app's first frame,
+     * and one registered while an app runs is used from the next layout.
+     * Registering the same file again does nothing.
+     *
+     * @param data the font file
+     * @throws IllegalArgumentException when {@code data} is not a font
+     */
+    public void registerFont(byte[] data) {
+        String error = Native.registerFont(handle, data);
+        if (error != null) {
+            throw new IllegalArgumentException(error);
+        }
+    }
+
     /** The contents of {@code file}, or null when it does not exist. */
     private static String readText(File file) throws java.io.IOException {
         return file.exists() ? new String(Net.readAll(new FileInputStream(file)), StandardCharsets.UTF_8) : null;
@@ -384,6 +404,25 @@ public class NshView extends FrameLayout {
     }
 
     /**
+     * Insets the host app adds to the safe area, like UIKit's
+     * {@code additionalSafeAreaInsets}: for its own UI that floats over this
+     * view, such as a tab bar drawn over the content. They add to the parts
+     * of the system bars the view sits under, and {@code safeAreaInsets()}
+     * reads the sum, so content can scroll under that UI and still end
+     * clear of it. Pages already shown follow a change. Call it on the UI
+     * thread.
+     *
+     * @param left   pixels added on the left
+     * @param top    pixels added at the top
+     * @param right  pixels added on the right
+     * @param bottom pixels added at the bottom
+     */
+    public void setAdditionalSafeAreaInsets(int left, int top, int right, int bottom) {
+        additional = new int[] {Math.max(0, top), Math.max(0, right), Math.max(0, bottom), Math.max(0, left)};
+        publishEnvironment(getRootWindowInsets());
+    }
+
+    /**
      * Runs a JS bundle written by `nsh build` (`bundle.js`); assets come from
      * `assets/` next to it. Bytecode only loads from the APK's own assets
      * ({@link #loadAssetBundle}) or a signed package ({@link #runPackage}):
@@ -407,7 +446,7 @@ public class NshView extends FrameLayout {
             assetHttp = null;
             assetApk = null;
             assetDir = new File(file.getParentFile(), "assets");
-            Native.load(handle, code, false, map, capabilities, app);
+            Native.load(handle, code, false, map, capabilities, app, null);
             return true;
         } catch (Exception e) {
             reportError("cannot read bundle " + file + ": " + e);
@@ -423,15 +462,27 @@ public class NshView extends FrameLayout {
      * @return false (reported to the error listener) if it cannot be read
      */
     public boolean loadAssetBundle(String dir) {
+        return loadAssetBundle(dir, false);
+    }
+
+    /**
+     * {@link #loadAssetBundle(String)} for the activity of packaged apps
+     * ({@link AppActivity}): with {@code packages}, a newer signed package of
+     * the app's code it downloaded ({@code nsh/updater}'s
+     * {@code downloadPackage}) runs instead, when the app's
+     * {@code assets/nsh-updater.json} trusts package roots.
+     */
+    boolean loadAssetBundle(String dir, boolean packages) {
         try {
             byte[] code = Net.readAll(getContext().getAssets().open(dir + "/bundle.nshc"));
             // Null when the app declares no capabilities / has no id.
             String capabilities = readAssetText(dir + "/capabilities.json");
             String app = readAssetText(dir + "/app.json");
+            String updater = packages ? readAssetText(dir + "/assets/nsh-updater.json") : null;
             assetHttp = null;
             assetDir = null;
             assetApk = dir + "/assets/";
-            Native.load(handle, code, true, null, capabilities, app);
+            Native.load(handle, code, true, null, capabilities, app, updater);
             return true;
         } catch (Exception e) {
             reportError("cannot read the app bundle: " + e);
@@ -487,6 +538,35 @@ public class NshView extends FrameLayout {
             return;
         }
         mounter.components.put(name, factory);
+    }
+
+    /** Hears a scroll view the host watches ({@link #watchScroll}) come and go, on the UI thread. */
+    public interface ScrollWatcher {
+        /**
+         * The scroll view is there: at once when it already is, and again
+         * with a new handle when the app replaces the element or reloads.
+         *
+         * @param handle follows and drives it
+         */
+        void onAttached(NshScrollHandle handle);
+
+        /** The scroll view is gone (deleted, its {@code nativeID} changed or its app stopped): its handle is dead. */
+        void onDetached();
+    }
+
+    /**
+     * Watches the app's {@code <Scroll>} whose {@code nativeID} is
+     * {@code nativeId}, for native UI of the host that follows or drives the
+     * app's scrolling in the frame of the scroll, without JS (a sheet under
+     * the content, say): {@code watcher} gets a {@link NshScrollHandle} when
+     * the scroll view is there. With several of the same {@code nativeID},
+     * the newest one is watched. One watcher per {@code nativeID}.
+     *
+     * @param nativeId the scroll view's {@code nativeID}
+     * @param watcher the watcher (UI thread), or null to stop watching
+     */
+    public void watchScroll(String nativeId, ScrollWatcher watcher) {
+        mounter.watchScroll(nativeId, watcher);
     }
 
     /**
@@ -566,6 +646,31 @@ public class NshView extends FrameLayout {
         Notifications.handleIntent(intent);
     }
 
+    /**
+     * Hands the app a URL the system opened it with, as its {@code onLink} event (a scheme the app registered, nsh.json
+     * {@code schemes}). URLs given before the app listens are kept until it does; given before an app loads, they are
+     * the address of the next one loaded when its code first runs ({@code UrlScheme.url()}). UI thread.
+     *
+     * @param url the URL
+     */
+    public void openUrl(String url) {
+        if (url == null || handle == 0) return;
+        mounter.eventMap(1, Native.URL_SCHEME, new String[] {"url"}, new Object[] {url});
+    }
+
+    /**
+     * Hands the app the URL {@code intent} carries, if it is an {@code ACTION_VIEW} intent with one ({@link #openUrl}).
+     * The activity showing this view calls it from {@code onCreate} (with the launch intent, when it is not being
+     * recreated) and {@code onNewIntent}.
+     *
+     * @param intent the activity's intent
+     */
+    public void handleUrlSchemeIntent(android.content.Intent intent) {
+        if (intent == null || !android.content.Intent.ACTION_VIEW.equals(intent.getAction())) return;
+        android.net.Uri data = intent.getData();
+        if (data != null) openUrl(data.toString());
+    }
+
     /** A URL the app opens ({@code request}, answered once); called by libnsh on the engine thread. */
     void openUrlMessage(String url, long request) {
         main.post(() -> {
@@ -624,6 +729,7 @@ public class NshView extends FrameLayout {
         // Joining the engine needs no Java lock.
         if (taken != 0) Native.destroy(taken);
         mounter.destroyComponents();
+        mounter.cancelAnimations();
         endShaders();
     }
 
@@ -636,6 +742,7 @@ public class NshView extends FrameLayout {
     void appStopped() {
         main.post(() -> {
             mounter.destroyComponents();
+            mounter.cancelAnimations();
             endShaders();
         });
     }
@@ -685,7 +792,7 @@ public class NshView extends FrameLayout {
      */
     private int lifecycle;
     /** How long the keyboard's last move took (ms; `keyboardFrame().duration`). */
-    private long keyboardDuration = 250;
+    long keyboardDuration = 250;
     /** The host app's locale and text size ({@link #setLocale}, {@link #setFontScale}). */
     private java.util.Locale hostLocale;
     private float hostFontScale;
@@ -781,8 +888,15 @@ public class NshView extends FrameLayout {
             mounter.keyboard(ime > 0 && !systemPans()
                     ? at[1] + getHeight() - Math.round(ime) : Integer.MAX_VALUE);
         }
+        // The host's own floating UI (setAdditionalSafeAreaInsets), on top of
+        // the system bars'; the keyboard keeps measuring from the view's edge.
+        top += additional[0];
+        right += additional[1];
+        bottom += additional[2];
+        left += additional[3];
         Configuration c = getResources().getConfiguration();
         boolean dark = (c.uiMode & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+        float[] previous = safe;
         safe = new float[] {top / density, right / density, bottom / density, left / density};
         java.util.Locale locale = hostLocale != null ? hostLocale : java.util.Locale.getDefault();
         float fontScale = hostFontScale > 0 && !Float.isInfinite(hostFontScale) ? hostFontScale : c.fontScale;
@@ -798,8 +912,40 @@ public class NshView extends FrameLayout {
             (c.uiMode & Configuration.UI_MODE_TYPE_MASK) == Configuration.UI_MODE_TYPE_TELEVISION ? 3
                     : c.smallestScreenWidthDp >= 600 ? 1 : 0,
             lifecycle,
-        }, dark, locale.toLanguageTag());
+            // 24-hour time: the user's setting, else the locale's.
+            android.text.format.DateFormat.is24HourFormat(getContext()) ? 1 : 0,
+        }, dark, locale.toLanguageTag(), timeZone,
+                // The user's list (an app's own language first, Android 13's
+                // per-app language included), after the embedding app's own.
+                (hostLocale != null ? hostLocale.toLanguageTag() + "," : "") + c.getLocales().toLanguageTags(),
+                // The system's, whatever the embedding app's language: Android
+                // 14 keeps the first day of the week and the temperature unit
+                // in its extension.
+                java.util.Locale.getDefault(java.util.Locale.Category.FORMAT).toLanguageTag());
+        // Screens report their own insets only when their options change, so
+        // a page already shown would keep the old safe area.
+        if (!java.util.Arrays.equals(previous, safe)) mounter.reportAllScreenInsets();
     }
+
+    /** The system's time zone's ID (`localeSettings()`'s `timeZone`). */
+    private String timeZone = java.util.TimeZone.getDefault().getID();
+
+    /**
+     * The system's time zone changed (the user's setting, or a new zone with
+     * automatic time zones): the broadcast names it, before the process's
+     * default zone may have caught up. Or the time changed, as when the user
+     * switches 24-hour time (`localeSettings()`'s `hourCycle`).
+     */
+    private final android.content.BroadcastReceiver timeChanged = new android.content.BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, android.content.Intent intent) {
+            if (android.content.Intent.ACTION_TIMEZONE_CHANGED.equals(intent.getAction())) {
+                String zone = intent.getStringExtra(android.content.Intent.EXTRA_TIMEZONE);
+                timeZone = zone != null ? zone : java.util.TimeZone.getDefault().getID();
+            }
+            publishEnvironment(getRootWindowInsets());
+        }
+    };
 
     /** The view's activity reported `state` (`lifecycle()`'s values). */
     private void activityState(Activity activity, int state) {
@@ -852,6 +998,9 @@ public class NshView extends FrameLayout {
     /** TalkBack turning on or off: `screenReaderEnabled()`. */
     private final android.view.accessibility.AccessibilityManager.TouchExplorationStateChangeListener screenReader =
             enabled -> publishEnvironment(getRootWindowInsets());
+
+    /** The host's additional safe-area insets (px: top, right, bottom, left). */
+    private int[] additional = new int[4];
 
     /** The safe-area insets last published (dp: top, right, bottom, left). */
     private float[] safe = new float[4];
@@ -944,6 +1093,7 @@ public class NshView extends FrameLayout {
     @Override
     protected void onAttachedToWindow() {
         super.onAttachedToWindow();
+        getViewTreeObserver().addOnTouchModeChangeListener(keyboardFocus);
         accessibility().addTouchExplorationStateChangeListener(screenReader);
         Activity activity = activity(getContext());
         if (activity != null) {
@@ -953,15 +1103,28 @@ public class NshView extends FrameLayout {
             Integer state = lifecycles.state(activity);
             if (state != null) activityState(activity, state);
         }
+        // The zone may have changed while the view was detached. The
+        // broadcasts are the system's alone: no export flag is needed.
+        timeZone = java.util.TimeZone.getDefault().getID();
+        android.content.IntentFilter time = new android.content.IntentFilter(android.content.Intent.ACTION_TIMEZONE_CHANGED);
+        time.addAction(android.content.Intent.ACTION_TIME_CHANGED);
+        getContext().registerReceiver(timeChanged, time);
         // The dispatcher exists once attached.
         if (handle != 0) mounter.updateBack();
+        // The window may already be active when an embedder attaches us.
+        // A real key leaving touch mode also enters through keyboardFocus.
+        focusForKeyboard();
     }
 
     @Override
     protected void onDetachedFromWindow() {
+        getViewTreeObserver().removeOnTouchModeChangeListener(keyboardFocus);
         super.onDetachedFromWindow();
+        keys.focusLost();
+        if (handle != 0) Native.keyReset(handle);
         accessibility().removeTouchExplorationStateChangeListener(screenReader);
         if (Lifecycles.registered != null) Lifecycles.registered.views.remove(this);
+        getContext().unregisterReceiver(timeChanged);
     }
 
     /** `BackHandler.exitApp()`: what the back button does without the app. */
@@ -1051,6 +1214,13 @@ public class NshView extends FrameLayout {
         });
     }
 
+    /** The app's functions for the UI thread wait in Rust: run them after the batches before. */
+    void runMainThreadTasks() {
+        main.post(() -> {
+            if (handle != 0) Native.runMainThreadTasks(handle);
+        });
+    }
+
     void reportError(String message) {
         android.util.Log.e("nsh", message);
         main.post(() -> {
@@ -1121,6 +1291,36 @@ public class NshView extends FrameLayout {
                 player.setDataSource(copy.getPath());
             }
         }
+    }
+
+    /**
+     * How far the system bars and the display cutout reach into this view
+     * (px: top, right, bottom, left), as {@link #publishEnvironment} measures
+     * them, without the host's additional insets.
+     */
+    private int[] barsInView(WindowInsets insets) {
+        int top, right, bottom, left;
+        if (Build.VERSION.SDK_INT >= 30) {
+            android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
+            top = bars.top;
+            right = bars.right;
+            bottom = bars.bottom;
+            left = bars.left;
+        } else {
+            top = insets.getSystemWindowInsetTop();
+            right = insets.getSystemWindowInsetRight();
+            bottom = insets.getSystemWindowInsetBottom();
+            left = insets.getSystemWindowInsetLeft();
+        }
+        View window = getRootView();
+        int[] at = new int[2];
+        getLocationInWindow(at);
+        return new int[] {
+            Math.max(0, top - at[1]),
+            Math.max(0, right - (window.getWidth() - at[0] - getWidth())),
+            Math.max(0, bottom - (window.getHeight() - at[1] - getHeight())),
+            Math.max(0, left - at[0]),
+        };
     }
 
     /** How far the system bars reach into this view from the top (0 when embedded below them). */
@@ -1205,14 +1405,16 @@ public class NshView extends FrameLayout {
             view.setBackgroundColor(0xfa1e1f22);
             view.addView(scroll, new LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT));
             view.addView(copy, at);
-            // Clear of the status and navigation bars, also when the screen shows
-            // before the window has its insets.
+            // Clear of the system bars and the display cutout on every side (a
+            // landscape navigation bar or cutout is at a side), also when the
+            // screen shows before the window has its insets. The sides pad the
+            // scroll view, so lines scrolled sideways stay clear too.
             view.setOnApplyWindowInsetsListener((v, insets) -> {
-                int[] where = new int[2];
-                getLocationInWindow(where);
-                int top = Math.max(0, insets.getSystemWindowInsetTop() - where[1]);
-                text.setPadding(pad, top + pad, pad, insets.getSystemWindowInsetBottom() + pad);
-                at.topMargin = top + Math.round(12 * density);
+                int[] bars = barsInView(insets);
+                scroll.setPadding(bars[3], 0, bars[1], 0);
+                text.setPadding(pad, bars[0] + pad, pad, bars[2] + pad);
+                at.topMargin = bars[0] + Math.round(12 * density);
+                at.rightMargin = bars[1] + pad;
                 copy.setLayoutParams(at);
                 return insets;
             });

@@ -14,7 +14,9 @@ const MAX_REDIRECTS: usize = 20;
 /// A request (or a redirect's hop) the app's capabilities do not grant:
 /// JS's `fetch` rejects with a `TypeError` whose `code` is
 /// `ERR_ACCESS_DENIED`, `permission` `"network"` and `resource` the URL
-/// (`nsh_js::Host::fetch_refused`); a Rust task's fails with the message.
+/// (`nsh_js::Host::fetch_refused`); a Rust task's fails with the message,
+/// and a module function's call rejects with the same fields
+/// (`Core::fetch_refused`: `registerFont`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Refused {
     /// Why, for people.
@@ -25,11 +27,14 @@ pub(crate) struct Refused {
 
 /// The refusal of `method` `url`.
 pub(crate) fn refused(method: &str, url: &str) -> Refused {
-    let host = nsh_core::access::parse_url(url).map_or_else(|| url.to_owned(), |u| u.host);
+    // No host to grant: naming the whole URL would mislead. Worded as
+    // `nsh_core::access`'s advice for the core's refusals.
+    let advice = nsh_core::access::parse_url(url).map_or_else(
+        || "it names no host a grant could add: write it as an http(s) URL with a host, a backslash as `%5C` and no control characters".to_owned(),
+        |u| format!("add `{}` to capabilities.network in nsh.json", u.host),
+    );
     Refused {
-        message: format!(
-            "fetch {method} {url} is not granted: add `{host}` to capabilities.network in nsh.json"
-        ),
+        message: format!("fetch {method} {url} is not granted: {advice}"),
         url: url.to_owned(),
     }
 }

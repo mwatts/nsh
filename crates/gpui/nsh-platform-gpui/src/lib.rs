@@ -40,6 +40,7 @@ mod file_drop;
 mod geom;
 mod image;
 mod input;
+mod key_focus;
 mod keymap;
 mod keys;
 mod mount;
@@ -58,6 +59,7 @@ mod text;
 mod text_input;
 mod transition;
 mod view;
+mod window;
 
 // Windows of GPUI's test platform, which `shot` turns on.
 #[cfg(all(test, feature = "shot"))]
@@ -66,6 +68,7 @@ mod tests;
 pub use gpui;
 pub use nsh_base::{Theme, ThemeError};
 pub use nsh_core::{
+    desktop::WindowBackend,
     element::{AdaptiveColor, Color, Hsla, Rgba},
     platform::{Appearance, Locale},
 };
@@ -81,7 +84,10 @@ pub use nsh_engine::{LoadedPackage, accept_package, load_package, package, verif
 #[cfg(feature = "dev")]
 pub use crate::app::set_root;
 pub use crate::{
-    app::{AppOptions, AppSource, AppView, CloseRequest, open_app_window, run_app, set_ui_sets},
+    app::{
+        AppOptions, AppSource, AppView, CloseRequest, WindowDisplay, open_app_window, run_app,
+        set_ui_sets,
+    },
     chrome::titlebar_options,
     image::AssetBase,
     native::{ComponentContext, ComponentFactory, Components, NativeComponent},

@@ -80,9 +80,17 @@ fn strings(items: &[String]) -> Result<Value, PropError> {
             .collect::<Result<Vec<_>, _>>()?,
     )
 }
+/// The MIME type of each file `uris` names, as the native JS host reports.
+fn file_mime_types(uris: &[String]) -> Vec<String> {
+    uris.iter()
+        .map(|uri| nsh_core::platform::file_mime_type(uri).to_owned())
+        .collect()
+}
+
 pub(super) fn payload(host: &Bindings, payload: &EventPayload) -> Result<Value, PropError> {
     Ok(match payload {
-        EventPayload::None => Value(0),
+        // The web opens no windows of the app's own.
+        EventPayload::None | EventPayload::Window(_) => Value(0),
         EventPayload::Value(v) => scalar(v)?,
         EventPayload::Map(fields) => object(
             fields
@@ -109,18 +117,62 @@ pub(super) fn payload(host: &Bindings, payload: &EventPayload) -> Result<Value, 
                     None => Value(1),
                 },
             ),
+            (
+                "button",
+                match m.button {
+                    Some(button) => Value::string(button.name())?,
+                    // `null`, as `PayloadValue::Null`.
+                    None => Value(1),
+                },
+            ),
         ])?,
+        EventPayload::Pinch(p) => object([
+            ("position", point(p.position)?),
+            ("pagePosition", point(p.page_position)?),
+            ("delta", number(p.delta.0)),
+            ("phase", Value::string(p.phase.name())?),
+            ("modifiers", modifiers(&p.modifiers)?),
+        ])?,
+        EventPayload::Key(event) => object([
+            ("key", Value::string(event.key.as_str())?),
+            ("code", Value::string(event.code.as_str())?),
+            ("modifiers", modifiers(&event.modifiers)?),
+            ("repeat", boolean(event.repeat)),
+            ("defaultPrevented", boolean(event.default_prevented)),
+        ])?,
+        EventPayload::Wheel(w) => {
+            let (dx, dy) = w.delta.xy();
+            object([
+                ("position", point(w.position)?),
+                ("pagePosition", point(w.page_position)?),
+                ("delta", object([("x", number(dx)), ("y", number(dy))])?),
+                ("deltaMode", Value::string(w.delta.mode_name())?),
+                ("modifiers", modifiers(&w.modifiers)?),
+            ])?
+        }
         EventPayload::ContextMenu(p) => object([
             ("position", point(p.position)?),
             ("pagePosition", point(p.page_position)?),
             ("modifiers", modifiers(&p.modifiers)?),
+            (
+                "pointerType",
+                match p.pointer_type {
+                    Some(pointer) => Value::string(pointer.name())?,
+                    // `null`, as `PayloadValue::Null`.
+                    None => Value(1),
+                },
+            ),
         ])?,
-        EventPayload::FileDrop(uris) => object([("uris", strings(uris)?)])?,
+        EventPayload::FileDrop(uris) => object([
+            ("uris", strings(uris)?),
+            ("mimeTypes", strings(&file_mime_types(uris))?),
+        ])?,
         EventPayload::FileDropAt {
             uris,
             page_position,
         } => object([
             ("uris", strings(uris)?),
+            ("mimeTypes", strings(&file_mime_types(uris))?),
             ("pagePosition", point(*page_position)?),
         ])?,
         EventPayload::Paste(paste) => {
@@ -140,7 +192,9 @@ pub(super) fn payload(host: &Bindings, payload: &EventPayload) -> Result<Value, 
         }
         EventPayload::Picked { id, .. }
         | EventPayload::FileRequest { id, .. }
-        | EventPayload::Speech { id, .. } => object([("id", number(*id))])?,
+        | EventPayload::CanvasImage { id, .. }
+        | EventPayload::Speech { id, .. }
+        | EventPayload::Audio { id, .. } => object([("id", number(*id))])?,
         EventPayload::Native { name, data } => object([
             ("name", Value::string(name)?),
             ("data", Value(host.json(data)?.0[0] as u32)),

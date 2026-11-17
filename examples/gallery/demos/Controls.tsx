@@ -1,9 +1,12 @@
-import { type AnimatedValue, cleanup, computed, createAnimatedValue, createMotion, Easing, effect, type JSX, LayoutAnimation, Scroll, signal, Text, token, View } from "nsh";
-import { Button as BaseButton, type CalendarEntry, Checkbox, Collapsible, Combobox, type DateMatcher, DatePicker, type DateRangePreset, NumberInput, OtpInput, type OtpInputRef, Progress, Radio, RadioGroup, Select, type SelectEntry, type SelectGroup, Slider, Switch, Tab, Tabs } from "nsh/base";
+import { type AnimatedValue, cleanup, computed, createAnimatedValue, createMotion, effect, type JSX, LayoutAnimation, Scroll, signal, Text, token, View } from "nsh";
+import { Button as BaseButton, Checkbox, Collapsible, Combobox, type DateMatcher, DatePicker, type DateRangePreset, NumberInput, OtpInput, type OtpInputRef, Progress, Radio, RadioGroup, Select, Slider, Switch, Tab, Tabs } from "nsh/base";
 import { reduceMotion } from "nsh";
-import { platform, windowSize } from "nsh";
+import { isAvailable as mobile, Switch as SystemSwitch } from "nsh/mobile";
+import { keymap, platform, windowSize } from "nsh";
+import { DateTimePicker, isAvailable } from "nsh/mobile";
 import { Icon, type IconName } from "../icons";
-import { alpha, Badge, Button, Caption, Card, colors, DemoPage, finish, focusRing, follow, hovered, IconTile, mono, motion, radius, Segmented, sliderFill, sliderLook, switchLook, terminal, TERMINAL_COLUMN, TERMINAL_GAP, TERMINAL_ROW, tints, type Tone, toneColor, toneTint } from "../ui";
+import { alpha, backdrop, Badge, plural, Button, CalendarItem, Kbd, calendarLook, Chevron, Caption, Card, chart, checkboxLook, DateTrigger, CheckboxMark, density, type CheckboxMarkKind, ChoiceLight, choiceTileLook, choiceWell, clearButtonLook, colors, comboboxLook, ComboToggle, controlSize, DemoPage, finish, focusRing, follow, hovered, IconTile, insetSurface, labelColumn, ListboxEmpty, ListboxHeader, listboxPopup, listboxPopupStarting, listboxSearch, listRow, MARK_WEIGHT, mono, motion, numberInputClasses, numberInputSteps, numberInputText, optionClass, OptionRow, otpCellLook, otpCells, Picker, plainRow, RadioRing, radius, RowDivider, RowLabel, Segmented, sliderFill, solidTint, sliderLook, switchLook, TAB_ICON_ROOM, tabsLook, TabTitle, terminal, TERMINAL_COLUMN, TERMINAL_GAP, TERMINAL_ROW, timeFieldClass, TimeSegment, tints, type Tone, toneColor, toneTint, underlineTabsLook, DisclosureChevron, disclosureTriggerLook, progressLook, progressSweep, LastEvent } from "../ui";
+import { play as sound } from "../../nsh-gallery-ui/sound";
 
 // `nsh/base`'s controls own presses, keys, the disabled state and what
 // screen readers say; every value is the app's, and so is the look: the
@@ -14,170 +17,33 @@ import { alpha, Badge, Button, Caption, Card, colors, DemoPage, finish, focusRin
 // motion.
 
 /**
- * The sizes of the page. Touch screens take the standard tier (44 pt and
- * more to press); a pointer the compact one desktops' settings and filters
- * use: smaller controls, rows and type, whatever the window's width. The
- * terminal's rows are one Cell row each, an indicator's box three Cells wide
- * for its glyph (`[x]`).
+ * The sizes of the page (`controlSize`): touch screens take the standard
+ * tier (44 pt and more to press); a pointer the compact one desktops'
+ * settings and filters use: smaller controls, rows and type, whatever the
+ * window's width.
  */
-const size = terminal
-  ? { row: TERMINAL_ROW, padding: 0, gap: TERMINAL_COLUMN, label: 14, detail: 12, control: 3 * TERMINAL_COLUMN, corner: 0, check: 12, dot: 6, tabs: TERMINAL_ROW, line: TERMINAL_ROW, clear: 2 * TERMINAL_COLUMN, switch: "small" as const }
-  : platform.desktop
-    ? { row: 40, padding: 6, gap: 10, label: 14, detail: 12, control: 16, corner: 5, check: 12, dot: 6, tabs: 30, line: 32, clear: 16, switch: "small" as const }
-    : { row: 56, padding: 8, gap: 12, label: 15, detail: 13, control: 22, corner: 7, check: 16, dot: 8, tabs: 40, line: 44, clear: 20, switch: "regular" as const };
+const size = controlSize;
 const pointer = platform.desktop;
 
-/** A control's row: the control and its label, the whole row pressable. */
-const row = (first: boolean) => ({
-  minHeight: size.row,
-  flexDirection: "row" as const,
-  alignItems: "center" as const,
-  gap: size.gap,
-  paddingVertical: size.padding,
-  borderTopWidth: first || terminal ? 0 : 1,
-  borderTopColor: colors.line,
-});
-/** How far a row's hover fill reaches past its content on each side, and its corners. */
-const BLEED = 8;
-
-/**
- * A row that takes the pointer's hover: `row`'s, its fill reaching `BLEED`
- * past the content on both sides with rounded corners, and the content where
- * it was (`start`: more room before it). The hairline above it is a
- * `Divider`, the length `row`'s top border had; the point it took stays in
- * the padding, so nothing moves.
- */
-const hoverRow = (first: boolean, start = 0) => ({
-  ...row(true),
-  marginHorizontal: -BLEED,
-  paddingStart: BLEED + start,
-  paddingEnd: BLEED,
-  paddingTop: size.padding + (first || terminal ? 0 : 1),
-  borderRadius: BLEED,
-});
-
-/** The hairline above a `hoverRow` that is not the first (none in the
- * terminal, whose rows are one row each). */
-function Divider(props: { show: boolean }) {
-  return (
-    <If when={props.show && !terminal}>
-      <View style={{ position: "absolute", top: 0, left: BLEED, right: BLEED, height: 1, backgroundColor: colors.line }} />
-    </If>
-  );
-}
+/** A row of values or of a field (`plainRow`): no presses, a hairline above all but the first; a `wide` control (a combobox) goes under its label on a touch screen. */
+const row = (first: boolean, wide = false) => plainRow({ first, wide });
 
 const pressed = { opacity: 0.7 };
-const dimmed = { opacity: 0.4 };
-
-/** The fill of a box or ring that is off: the field's well. */
-const empty = () => ({ backgroundColor: colors.field, backgroundImage: "none", borderColor: colors.fieldBorder, boxShadow: finish.field.boxShadow });
-
-/** The fill of a box or ring that is on (the main button's citrus finish:
- * its darker olive edge and lit top), over the empty one and covering its
- * edge: it fades in and out as the value changes. Gradients do not
- * interpolate, so the finish fades whole rather than its colors. */
-function Lit(props: { on: AnimatedValue; radius: number }) {
-  return (
-    <View
-      style={{ pointerEvents: "none", position: "absolute", top: -1, left: -1, right: -1, bottom: -1, borderRadius: props.radius, borderWidth: 1, ...finish.light, opacity: props.on }}
-    />
-  );
-}
+const dimmed = { opacity: 0.5 };
 
 /** A layer over the whole of its parent, its content centered: layers that cross over in place. */
 const centered = { position: "absolute", top: 0, left: 0, right: 0, bottom: 0, alignItems: "center", justifyContent: "center" } as const;
 
-type Mark = "check" | "dash" | null;
-
-/** A box's or ring's size: `scale` times the page's (0.8 small, 1.25 large);
- * one row high in the terminal, where it is a glyph three Cells wide. */
-const dims = (scale = 1) => ({
-  control: Math.round(size.control * scale),
-  height: terminal ? TERMINAL_ROW : Math.round(size.control * scale),
-  check: Math.round(size.check * scale),
-  corner: Math.round(size.corner * scale),
-  dot: Math.round(size.dot * scale),
-});
-
-/** A checkbox's box: its frame, empty; `BoxMark` fills it. `round`: a circle (a task's, as reminders draw it). */
-const box = (scale = 1, round = false) => {
-  const d = dims(scale);
-  return {
-    width: d.control,
-    height: d.height,
-    borderRadius: round ? d.control / 2 : d.corner,
-    alignItems: "center" as const,
-    justifyContent: "center" as const,
-    borderWidth: 1,
-    ...empty(),
-  };
-};
-
 /**
- * The press feedback of a box or a ring: it sinks a little while its row is
- * pressed (the row is the `group`), and springs back.
+ * The top of a control `height` tall in a choice tile's corner, centered on the line `center` points below the tile's
+ * padding edge (the tile's own padding is 14 on top: `choiceTileLook`), so it sits level with the icon or title it
+ * goes with; the terminal keeps `cells`.
  */
-const sink = "transition-transform duration-150 ease-out group-active:scale-90 motion-reduce:transition-none";
+const cornerTop = (center: number, height: number, cells: number) => (terminal ? cells : Math.round(center - height / 2));
+/** A small box's or ring's size, as `checkboxLook({ scale: 0.8 })` and `RadioRing scale={0.8}` draw it. */
+const smallChoice = Math.round(size.control * 0.8);
 
-/** What a checkbox's box shows: citrus with a check or a dash, drawn with the same bold pen (about 2 pt at the desktop size). */
-const markWeight = 3.2;
-function BoxMark(props: { mark: Mark; scale?: number; round?: boolean }) {
-  const d = dims(props.scale);
-  // Each part follows the value on a spring of its own and stays mounted
-  // while it fades out (unmounting it on the value showed only the fade
-  // in): a check turning into a dash crosses over on a fill that stays.
-  const on = follow(() => (props.mark ? 1 : 0));
-  const check = follow(() => (props.mark === "check" ? 1 : 0));
-  const dash = follow(() => (props.mark === "dash" ? 1 : 0));
-  /** A mark: centered in the box, growing a little as it fades in. */
-  const glyph = (t: AnimatedValue, name: "check" | "minus") => (
-    <View
-      style={{
-        ...centered,
-        pointerEvents: "none",
-        opacity: t,
-        transform: [{ scale: t.interpolate({ inputRange: [0, 1], outputRange: [0.75, 1] }) }],
-      }}
-    >
-      <Icon name={name} size={d.check} tint={colors.onAccent} weight={markWeight} />
-    </View>
-  );
-  // One view as large as the box inside its border holds the layers: the
-  // slot's content sits in a holder view sized to it (docs/dev/components.md
-  // "Children, slots and rows"), so layers placed only absolutely made it
-  // 0 × 0 and the fill a speck at the box's middle.
-  return (
-    <View style={{ width: d.control - 2, height: d.height - 2 }}>
-      <Lit on={on} radius={props.round ? d.control / 2 : d.corner} />
-      {glyph(check, "check")}
-      {glyph(dash, "minus")}
-    </View>
-  );
-}
-
-/** A radio's ring: empty, or citrus with a dot that grows in as it is checked. Its row is the `group` it sinks with. */
-function Ring(props: { on: boolean; scale?: number }) {
-  const d = dims(props.scale);
-  const on = follow(() => (props.on ? 1 : 0));
-  return (
-    <View
-      class={sink}
-      style={{ width: d.control, height: d.height, borderRadius: d.control / 2, alignItems: "center", justifyContent: "center", borderWidth: 1, ...empty() }}
-    >
-      <Lit on={on} radius={d.control / 2} />
-      <View
-        style={{
-          width: d.dot,
-          height: d.dot,
-          borderRadius: d.dot / 2,
-          backgroundColor: colors.onAccent,
-          opacity: on,
-          transform: [{ scale: on.interpolate({ inputRange: [0, 1], outputRange: [0.5, 1] }) }],
-        }}
-      />
-    </View>
-  );
-}
+type Mark = CheckboxMarkKind;
 
 /**
  * An animated value that runs from 0 to 1 on `motion.control`'s spring each
@@ -269,8 +135,10 @@ function Dot(props: { color: string; size?: number }) {
   );
 }
 
-/** A person's initials on their tone's tint, edged in it. */
-function Avatar(props: { name: string; tone: Tone; size?: number; ring?: boolean }) {
+/** A person's initials on their tone's tint, edged in it; the tint is opaque
+ * on `on`, the color of what the face sits on (default the card), so faces
+ * that overlap hide each other, and a `ring` (in a stack) is that color too. */
+function Avatar(props: { name: string; tone: Tone; size?: number; ring?: boolean; on?: string }) {
   const d = props.size ?? 22;
   return (
     <View
@@ -280,10 +148,10 @@ function Avatar(props: { name: string; tone: Tone; size?: number; ring?: boolean
         borderRadius: d / 2,
         alignItems: "center",
         justifyContent: "center",
-        backgroundColor: props.tone === "neutral" ? colors.inset : toneTint(props.tone),
+        backgroundColor: solidTint(props.tone, props.on ?? colors.surface),
         borderWidth: props.ring ? 2 : 1,
-        // In a stack, a ring of the card's color parts the faces.
-        borderColor: props.ring ? colors.surface : alpha(props.tone === "neutral" ? colors.text : toneColor(props.tone), 0.25),
+        // In a stack, a ring of the color under the faces parts them.
+        borderColor: props.ring ? (props.on ?? colors.surface) : alpha(props.tone === "neutral" ? colors.text : toneColor(props.tone), 0.25),
       }}
     >
       <Text style={{ fontSize: Math.round(d * 0.42), fontWeight: "600", color: props.tone === "neutral" ? colors.muted : toneColor(props.tone) }}>{initials(props.name)}</Text>
@@ -323,10 +191,10 @@ function Chip(props: { label: string; lead: JSX.Element; remove: string; onRemov
       <BaseButton
         accessibilityLabel={props.remove}
         onPress={props.onRemove}
-        class="items-center justify-center rounded-full enabled:hover:bg-accent active:bg-track"
+        class="items-center justify-center rounded-full enabled:hover:bg-foreground/8 active:bg-track"
         // Nearly the chip's height under a finger; a terminal's is its mark, as text.
         style={terminal ? undefined : { width: pointer ? h - 8 : h - 4, height: pointer ? h - 8 : h - 4 }}
-        focusStyle={focusRing()}
+        focusVisibleStyle={focusRing()}
       >
         <If when={terminal} else={<Icon name="close" size={pointer ? 10 : 12} tint={colors.muted} />}>
           <Text style={{ color: colors.muted }}>×</Text>
@@ -336,86 +204,8 @@ function Chip(props: { label: string; lead: JSX.Element; remove: string; onRemov
   );
 }
 
-/**
- * A choice card (a checkbox's or a radio's): raised while off; edged in the
- * accent over its tint while on, the change faded. It sinks a little while
- * pressed (`activeStyle`), at once with reduced motion.
- */
-const tile = (on: boolean) => ({
-  flex: 1,
-  minWidth: 0,
-  padding: 12,
-  paddingTop: 14,
-  borderRadius: radius.inset,
-  borderWidth: 1,
-  borderColor: on ? colors.accent : colors.border,
-  backgroundColor: on ? tints.accent : colors.raised,
-  boxShadow: on ? "none" : finish.raised.boxShadow,
-  transitionProperty: "transform, border-color, background-color, box-shadow",
-  transitionDuration: reduceMotion() ? 0 : 150,
-});
-
-/** A determinate bar's fill: the whole track's width, slid back by what is
- * left to do (`remaining`) so a new value glides there, on gpui-kit's 180 ms
- * `easing_move` curve (and a new tone fades in); the track clips it. */
-const glide = "w-full transition duration-180 ease-[cubic-bezier(0.2,0,0,1)] motion-reduce:transition-none";
-/** The fill's `translate` for `value` percent. */
-const remaining = (value: number) => `${Math.max(0, Math.min(100, value)) - 100}% 0`;
-/** A bar's rail, `height` points tall: the slider's. */
-const rail = (height = 6) => ({ height, borderRadius: height / 2, overflow: "hidden" as const, backgroundColor: colors.track, boxShadow: `inset 0 0 0 1px ${finish.track.borderColor}, ${finish.track.boxShadow}` });
-/** A bar's fill: the slider's citrus run, or a tone's color. */
-const fillOf = (height = 6, tone?: Tone) => (tone ? { height, borderRadius: height / 2, backgroundColor: toneColor(tone) } : { height, borderRadius: height / 2, ...sliderFill(0, 1) });
-
-/** The room a tab title's icon takes: the icon and the gap after it. */
-const ICON_ROOM = 14 + 6;
-
-/**
- * A tab's label (and icon): the text color while selected, fading in as the
- * indicator arrives. It keeps its natural width (never truncated) and
- * reports it without the icon (`onWidth`): the same whether the icon shows
- * or not, so a row deciding on its icons by it never flips back.
- * `underline`: a terminal marks the selected tab of an underlined strip by
- * underlining its label, where the strip's indicator, thinner than a Cell,
- * does not show.
- */
-function TabTitle(props: { name: string; selected: boolean; count?: number; icon?: IconName; underline?: boolean; onWidth?: (bare: number) => void }) {
-  const on = follow(() => (props.selected ? 1 : 0), motion.move);
-  const away = on.interpolate({ inputRange: [0, 1], outputRange: [1, 0] });
-  return (
-    <View
-      onLayout={({ bounds }) => props.onWidth?.(bounds.size.width - (props.icon ? ICON_ROOM : 0))}
-      style={{ flexDirection: "row", alignItems: "center", gap: 6, flexShrink: 0 }}
-    >
-      <If when={props.icon}>
-        {/* The icon's two tints cross over, as the label's color fades. */}
-        <View style={{ width: 14, height: 14 }}>
-          <View style={{ position: "absolute", opacity: away }}>
-            <Icon name={props.icon!} size={14} tint={colors.muted} />
-          </View>
-          <View style={{ position: "absolute", opacity: on }}>
-            <Icon name={props.icon!} size={14} tint={colors.text} />
-          </View>
-        </View>
-      </If>
-      <Text
-        style={{
-          numberOfLines: 1,
-          fontSize: 13,
-          fontWeight: "500",
-          color: on.interpolate({ inputRange: [0, 1], outputRange: [colors.muted, colors.text] }),
-          textDecorationLine: terminal && props.underline && props.selected ? "underline" : "none",
-        }}
-      >
-        {props.name}
-      </Text>
-      <If when={props.count !== undefined}>
-        <View style={{ minWidth: 18, height: 16, paddingHorizontal: 5, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: colors.inset, borderWidth: 1, borderColor: colors.line }}>
-          <Text style={{ fontSize: 10, fontWeight: "600", color: colors.muted, fontVariant: ["tabular-nums"] }}>{props.count}</Text>
-        </View>
-      </If>
-    </View>
-  );
-}
+// A bar's rail and fill, the fill gliding to each value, and the
+// indeterminate sweep: `look/meter.ts`'s (`progressLook`).
 
 /**
  * The widths of a row of tab titles without their icons (`TabTitle`'s
@@ -442,33 +232,7 @@ function titles(count: number) {
   };
 }
 
-/** The terminal's labels' column, so the details after them line up. */
-const LABEL_WIDTH = 16 * TERMINAL_COLUMN;
-/** The least a terminal's detail keeps beside its label: narrower, it wraps under it. */
-const DETAIL_WIDTH = 24 * TERMINAL_COLUMN;
-
-/** A terminal's name column for `names`: the longest of them (at least {@link LABEL_WIDTH}), so the details after it line up. */
 /** The terminal's text for each step button's icon. */
-const STEP_GLYPHS = { plus: "+", minus: "−" } as const;
-
-const labelColumn = (names: readonly string[]) => Math.max(LABEL_WIDTH, ...names.map((n) => n.length * TERMINAL_COLUMN));
-
-/** A label, and a quieter line under it (after it in the terminal). */
-function Label(props: { label: string; detail?: string; width?: number }) {
-  return (
-    // A terminal's gap is in the label's column: a row's gaps give first
-    // when its detail wraps, which would move the details off their column.
-    <View style={terminal ? { flex: 1, flexDirection: "row", flexWrap: "wrap" } : { flex: 1, gap: 2 }}>
-      <Text style={{ minWidth: terminal ? (props.width ?? LABEL_WIDTH) + TERMINAL_GAP : undefined, flexShrink: 0, fontSize: size.label, color: colors.text }}>{props.label}</Text>
-      <If when={props.detail}>
-        {/* Beside the label in a terminal, it wraps rather than lose its end to `…`;
-            with less than DETAIL_WIDTH beside it, it goes under the label, as on a phone. */}
-        <Text style={{ numberOfLines: terminal ? undefined : 1, flexShrink: 1, ...(terminal ? { flexGrow: 1, flexBasis: DETAIL_WIDTH } : {}), fontSize: size.detail, color: colors.muted }}>{props.detail}</Text>
-      </If>
-    </View>
-  );
-}
-
 const KINDS: { name: string; count: number }[] = [
   { name: "Photos", count: 1204 },
   { name: "Videos", count: 86 },
@@ -776,10 +540,10 @@ const NEW_TONES: Tone[] = ["accent", "info", "up", "warn", "down"];
 const NEW_LABEL = "new:";
 
 const COMMANDS: { value: string; title: string; group: string; icon: IconName; keys?: string; disabled?: boolean }[] = [
-  { value: "new-file", title: "New file", group: "Suggestions", icon: "document", keys: "⌘N" },
-  { value: "search", title: "Search everywhere", group: "Suggestions", icon: "search", keys: "⇧⌘F" },
-  { value: "sidebar", title: "Toggle sidebar", group: "View", icon: "sidebar", keys: "⌘B" },
-  { value: "terminal", title: "Toggle terminal", group: "View", icon: "terminal", keys: "⌃`" },
+  { value: "new-file", title: "New file", group: "Suggestions", icon: "document", keys: keymap.label("mod+n") },
+  { value: "search", title: "Search everywhere", group: "Suggestions", icon: "search", keys: keymap.label("mod+shift+f") },
+  { value: "sidebar", title: "Toggle sidebar", group: "View", icon: "sidebar", keys: keymap.label("mod+b") },
+  { value: "terminal", title: "Toggle terminal", group: "View", icon: "terminal", keys: keymap.label("ctrl+`") },
   { value: "zoom", title: "Reset zoom", group: "View", icon: "search", disabled: true },
   { value: "dark", title: "Use the dark theme", group: "Appearance", icon: "moon" },
   { value: "light", title: "Use the light theme", group: "Appearance", icon: "sun" },
@@ -861,27 +625,24 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             last.set(`${props.label}: ${on ? "on" : "off"}`);
           }}
           // The track at the trailing edge, after the label; the icon leads.
-          style={{ ...hoverRow(!!props.first), flexDirection: "row-reverse" }}
-          activeStyle={pressed}
-          hoverStyle={props.disabled ? undefined : hovered()}
-          focusStyle={focusRing()}
-          disabledStyle={dimmed}
+          {...listRow({ first: props.first, disabled: () => props.disabled, style: { flexDirection: "row-reverse" } })}
+          trackClass={look.trackClass}
           trackStyle={look.trackStyle}
           thumbStyle={look.thumbStyle}
         >
-          <Divider show={!props.first} />
-          <Label label={props.label} detail={props.detail} />
+          <RowDivider show={!props.first} />
+          <RowLabel label={props.label} detail={props.detail} />
           <IconTile name={props.icon} size={pointer ? 26 : 32} tint={props.on ? colors.accent : colors.muted} />
         </Switch>
       );
     }
-    /** A group's heading in the settings list. */
+    /** A group's heading in the settings list, in sentence case. */
     function Group(props: { title: string; first?: boolean }) {
-      return <Text style={{ marginTop: props.first ? 0 : size.gap, marginBottom: 2, fontSize: 11, fontWeight: "600", letterSpacing: 0.6, color: colors.faint }}>{props.title.toUpperCase()}</Text>;
+      return <Text style={{ marginTop: props.first ? 0 : size.gap, marginBottom: 2, fontSize: 12, fontWeight: "600", color: colors.muted }}>{props.title}</Text>;
     }
     const off = "Turn on notifications first";
     return (
-      <Card icon="controls" title="Switch" subtitle="A settings page: two groups, two settings that need another on">
+      <Card icon="controls" title="Switch" subtitle="Two groups; two settings need another on">
         <View>
           <Group first title="Alerts" />
           <Setting
@@ -916,6 +677,57 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     );
   }
 
+  /**
+   * `nsh/mobile`'s `Switch`, the system's own: a `UISwitch` on iOS and
+   * Material 3's switch on Android, on in the theme's `primary`, beside the
+   * row's label. The desktops and the web have no such control: the
+   * gallery's drawn switch stands in there.
+   */
+  function SystemSettings() {
+    const wifi = signal(true);
+    const ask = signal(true);
+    const bluetooth = signal(false);
+    function Row(props: { label: string; detail: string; on: boolean; set: (on: boolean) => void; disabled?: boolean; first?: boolean }) {
+      const flip = (on: boolean) => {
+        props.set(on);
+        last.set(`${props.label}: ${on ? "on" : "off"}`);
+      };
+      if (!mobile) {
+        const look = switchLook(() => props.on, size.switch);
+        return (
+          <Switch
+            checked={props.on}
+            disabled={props.disabled}
+            onChange={({ checked }) => flip(checked)}
+            {...listRow({ first: props.first, disabled: () => props.disabled, style: { flexDirection: "row-reverse" } })}
+            trackClass={look.trackClass}
+            trackStyle={look.trackStyle}
+            thumbStyle={look.thumbStyle}
+          >
+            <RowDivider show={!props.first} />
+            <RowLabel label={props.label} detail={props.detail} />
+          </Switch>
+        );
+      }
+      return (
+        <View style={row(!!props.first)}>
+          <RowLabel label={props.label} detail={props.detail} />
+          <SystemSwitch testID={`system-switch-${props.label}`} accessibilityLabel={props.label} checked={props.on} disabled={props.disabled} onChange={({ checked }) => flip(checked)} />
+        </View>
+      );
+    }
+    return (
+      <Card icon="system" title="The system's switch" subtitle={mobile ? "UIKit's and Material's switch, in the theme's color" : "Desktops draw the switch: nsh/base's Switch"}>
+        <View>
+          <Row first label="Wi-Fi" detail={wifi() ? "Connected" : "Off"} on={wifi()} set={(on) => wifi.set(on)} />
+          <Row label="Ask to join networks" detail={wifi() ? "Known networks join on their own" : "Turn on Wi-Fi first"} on={ask()} disabled={!wifi()} set={(on) => ask.set(on)} />
+          <Row label="Bluetooth" detail={bluetooth() ? "On" : "Off"} on={bluetooth()} set={(on) => bluetooth.set(on)} />
+        </View>
+        <Caption label={`Wi-Fi ${wifi() ? "on" : "off"} · Bluetooth ${bluetooth() ? "on" : "off"}`} />
+      </Card>
+    );
+  }
+
   function Quick() {
     const on = signal<string[]>(["Sounds", "Night Shift"]);
     const has = (name: string) => on().includes(name);
@@ -937,16 +749,14 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             on.set(next);
             last.set(`${props.name}: ${checked ? "on" : "off"}`);
           }}
-          style={{ ...tile(has(props.name)), width: "48%", flex: undefined, gap: 2 }}
-          activeStyle={{ transform: [{ scale: 0.97 }] }}
-          hoverStyle={held(props.name) || has(props.name) ? undefined : { borderColor: colors.faint }}
-          focusStyle={focusRing()}
-          disabledStyle={dimmed}
-          trackStyle={{ ...look.trackStyle, position: "absolute", top: 12, right: 12 }}
+          {...choiceTileLook(() => has(props.name), { disabled: () => held(props.name), style: { width: "48%", flex: undefined, gap: 2 } })}
+          trackClass={look.trackClass}
+          // Level with the icon's circle (32 high under the tile's 14 of padding).
+          trackStyle={{ ...look.trackStyle, position: "absolute", top: cornerTop(14 + 16, look.trackStyle.height as number, 12), end: 12 }}
           thumbStyle={look.thumbStyle}
         >
-          <View style={{ width: 32, height: 32, marginBottom: 8, borderRadius: 16, alignItems: "center", justifyContent: "center", borderWidth: 1, ...empty(), transform: [{ scale: pop }] }}>
-            <Lit on={t} radius={16} />
+          <View style={{ width: 32, height: 32, marginBottom: 8, borderRadius: 16, alignItems: "center", justifyContent: "center", borderWidth: 1, ...choiceWell(), transform: [{ scale: pop }] }}>
+            <ChoiceLight on={t} radius={16} />
             <View style={{ ...centered, opacity: away }}>
               <Icon name={props.icon} size={16} tint={colors.muted} />
             </View>
@@ -960,7 +770,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       );
     }
     return (
-      <Card title="Quick settings" subtitle="Tiles: the icon lights up with the switch; Focus silences the sounds">
+      <Card title="Quick settings" subtitle="The icon lights up with the switch">
         <View style={{ flexDirection: "row", flexWrap: "wrap", justifyContent: "space-between", rowGap: 8 }}>
           <QuickTile name="Focus" icon="moon" detail="Until tomorrow" />
           <QuickTile name="Night Shift" icon="sun" detail="Until 7:00" />
@@ -978,23 +788,20 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const all = () => shown().length === KINDS.length;
     const mark = (): Mark => (all() ? "check" : shown().length > 0 ? "dash" : null);
     return (
-      <Card icon="controls" title="Checkbox" subtitle="A filter: “Select all” shows a partial selection" right={<Badge label={`${shown().length} of ${KINDS.length}`} />}>
+      <Card icon="controls" title="Checkbox" subtitle="“Select all” shows a partial selection" right={<Badge label={`${shown().length} of ${KINDS.length}`} />}>
         <View>
           <Checkbox
             checked={all()}
             indeterminate={mark() === "dash"}
             onChange={({ checked: on }) => {
+              sound("toggle", { rate: on ? 1 : 0.9 });
               shown.set(on ? KINDS.map((k) => k.name) : []);
               last.set(`Select all: ${on}`);
             }}
             class="group"
-            style={hoverRow(true)}
-            activeStyle={pressed}
-            hoverStyle={hovered()}
-            focusStyle={focusRing()}
-            indicatorClass={sink}
-            indicatorStyle={box()}
-            indicator={<BoxMark mark={mark()} />}
+            {...listRow({ first: true })}
+            {...checkboxLook()}
+            indicator={<CheckboxMark mark={mark()} />}
           >
             <Text style={{ flex: 1, fontSize: size.label, fontWeight: "600", color: colors.text }}>Select all</Text>
           </Checkbox>
@@ -1003,20 +810,17 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               <Checkbox
                 checked={has(kind().name)}
                 onChange={({ checked: on }) => {
+                  sound("toggle", { rate: on ? 1 : 0.9 });
                   shown.set(on ? KINDS.map((k) => k.name).filter((n) => n === kind().name || has(n)) : shown().filter((n) => n !== kind().name));
                   last.set(`${kind().name}: ${on}`);
                 }}
                 // One level under "Select all": the boxes line up with its label.
                 class="group"
-                style={hoverRow(false, size.control + size.gap)}
-                activeStyle={pressed}
-                hoverStyle={hovered()}
-                focusStyle={focusRing()}
-                indicatorClass={sink}
-                indicatorStyle={box()}
-                indicator={<BoxMark mark={has(kind().name) ? "check" : null} />}
+                {...listRow({ start: size.control + size.gap })}
+                {...checkboxLook()}
+                indicator={<CheckboxMark mark={has(kind().name) ? "check" : null} />}
               >
-                <Divider show />
+                <RowDivider show />
                 <Text style={{ flex: 1, fontSize: size.label, color: colors.text }}>{kind().name}</Text>
                 <Text style={{ fontSize: size.detail, color: colors.faint, fontVariant: ["tabular-nums"] }}>{count(kind().count)}</Text>
               </Checkbox>
@@ -1039,19 +843,16 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
         <Checkbox
           checked={has(props.task)}
           onChange={({ checked: on }) => {
+            sound("toggle", { rate: on ? 1 : 0.9 });
             done.set(on ? [...done(), props.task] : done().filter((t) => t !== props.task));
             last.set(`${props.task}: ${on ? "done" : "to do"}`);
           }}
           class="group"
-          style={hoverRow(props.first)}
-          activeStyle={pressed}
-          hoverStyle={hovered()}
-          focusStyle={focusRing()}
-          indicatorClass={sink}
-          indicatorStyle={box(1, true)}
-          indicator={<BoxMark mark={has(props.task) ? "check" : null} round />}
+          {...listRow({ first: props.first })}
+          {...checkboxLook({ round: true })}
+          indicator={<CheckboxMark mark={has(props.task) ? "check" : null} round />}
         >
-          <Divider show={!props.first} />
+          <RowDivider show={!props.first} />
           <Text
             style={{
               flex: 1,
@@ -1066,11 +867,11 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       );
     }
     return (
-      <Card title="Checklist" subtitle="Round boxes: a task done fades back, and the bar fills" right={<Badge label={`${done().length} of ${TASKS.length}`} tone={left() === 0 ? "up" : "neutral"} />}>
+      <Card title="Checklist" subtitle="A task done fades back; the bar fills" right={<Badge label={`${done().length} of ${TASKS.length}`} tone={left() === 0 ? "up" : "neutral"} />}>
         <View>
           <Each of={TASKS}>{(task, i) => <Task task={task()} first={i() === 0} />}</Each>
         </View>
-        <Progress value={(done().length / TASKS.length) * 100} accessibilityLabel="Release readiness" trackStyle={rail(4)} indicatorClass={glide} indicatorStyle={{ ...fillOf(4), translate: remaining((done().length / TASKS.length) * 100) }} />
+        <Progress value={(done().length / TASKS.length) * 100} accessibilityLabel="Release readiness" {...progressLook(() => (done().length / TASKS.length) * 100, { height: 4 })} />
         <Caption label={left() === 0 ? "Ready to ship" : `${left()} to go before the release`} />
       </Card>
     );
@@ -1085,7 +886,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       saved.set(false);
     };
     return (
-      <Card title="Consent" subtitle="Choices with a description each; the necessary one cannot be turned off">
+      <Card title="Consent" subtitle="A description each; the necessary one stays on">
         <View>
           <Each of={COOKIES}>
             {(c, i) => (
@@ -1093,23 +894,22 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                 checked={c().required || has(c().name)}
                 disabled={c().required}
                 onChange={({ checked }) => {
+                  sound("toggle", { rate: checked ? 1 : 0.9 });
                   set(checked ? [...allowed(), c().name] : allowed().filter((n) => n !== c().name));
                   last.set(`${c().name}: ${checked}`);
                 }}
                 class="group"
                 // The box at the first line of the label, not its middle.
-                style={{ ...hoverRow(i() === 0), alignItems: "flex-start" }}
-                activeStyle={pressed}
-                hoverStyle={c().required ? undefined : hovered()}
-                focusStyle={focusRing()}
-                disabledStyle={{ opacity: 0.6 }}
-                indicatorClass={sink}
-                indicatorStyle={{ ...box(), marginTop: 2 }}
-                indicator={<BoxMark mark={c().required || has(c().name) ? "check" : null} />}
+                {...listRow({ first: i() === 0, disabled: () => c().required, style: { alignItems: "flex-start" } })}
+                // The necessary one reads as on rather than unavailable.
+                disabledStyle={{ opacity: 0.5 }}
+                indicatorClass={checkboxLook().indicatorClass}
+                indicatorStyle={{ ...checkboxLook({ disabled: c().required }).indicatorStyle, marginTop: 2 }}
+                indicator={<CheckboxMark mark={c().required || has(c().name) ? "check" : null} />}
               >
-                <Divider show={i() !== 0} />
+                <RowDivider show={i() !== 0} />
                 {/* A terminal keeps the names in one column: "always on" goes with the description. */}
-                <Label
+                <RowLabel
                   label={c().required && !terminal ? `${c().name} (always on)` : c().name}
                   detail={c().required && terminal ? `Always on · ${c().detail}` : c().detail}
                   width={labelColumn(COOKIES.map((k) => k.name))}
@@ -1148,7 +948,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const on = signal<string[]>(["Push"]);
     const has = (name: string) => on().includes(name);
     return (
-      <Card title="Choice cards" subtitle="The whole card is the checkbox: its edge and fill follow the value">
+      <Card title="Choice cards" subtitle="The whole card is the checkbox">
         <View style={{ flexDirection: "row", gap: 8 }}>
           <Each of={CHANNELS}>
             {(c) => (
@@ -1156,19 +956,17 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                 checked={has(c().name)}
                 disabled={c().disabled}
                 onChange={({ checked }) => {
+                  sound("toggle", { rate: checked ? 1 : 0.9 });
                   on.set(checked ? [...on(), c().name] : on().filter((n) => n !== c().name));
                   last.set(`${c().name}: ${checked}`);
                 }}
                 class="group"
-                style={tile(has(c().name))}
-                activeStyle={{ transform: [{ scale: 0.97 }] }}
-                hoverStyle={c().disabled || has(c().name) ? undefined : { borderColor: colors.faint }}
-                focusStyle={focusRing()}
-                disabledStyle={dimmed}
+                {...choiceTileLook(() => has(c().name), { disabled: () => c().disabled })}
                 // The box in the card's corner.
-                indicatorClass={sink}
-                indicatorStyle={{ ...box(0.8), position: "absolute", top: 10, right: 10 }}
-                indicator={<BoxMark mark={has(c().name) ? "check" : null} scale={0.8} />}
+                indicatorClass={checkboxLook().indicatorClass}
+                // Level with the 18-point icon.
+                indicatorStyle={{ ...checkboxLook({ scale: 0.8, disabled: c().disabled }).indicatorStyle, position: "absolute", top: cornerTop(14 + 9, smallChoice, 10), right: 12 }}
+                indicator={<CheckboxMark mark={has(c().name) ? "check" : null} scale={0.8} />}
               >
                 <Icon name={c().icon} size={18} tint={has(c().name) ? colors.accent : colors.muted} />
                 <Text style={{ marginTop: 6, fontSize: size.label, fontWeight: "600", color: colors.text }}>{c().name}</Text>
@@ -1192,15 +990,17 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
           checked={props.mark === "check"}
           indeterminate={props.mark === "dash"}
           disabled={props.disabled}
-          onChange={({ checked }) => props.onChange?.(checked)}
+          onChange={({ checked }) => {
+            sound("toggle", { rate: checked ? 1 : 0.9 });
+            props.onChange?.(checked);
+          }}
           class="group"
           style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 }}
           activeStyle={pressed}
-          focusStyle={focusRing(2)}
+          focusVisibleStyle={focusRing(2)}
           disabledStyle={dimmed}
-          indicatorClass={sink}
-          indicatorStyle={box(props.scale)}
-          indicator={<BoxMark mark={props.mark} scale={props.scale} />}
+          {...checkboxLook({ scale: props.scale, disabled: () => !!props.disabled })}
+          indicator={<CheckboxMark mark={props.mark} scale={props.scale} />}
         >
           <Text style={{ fontSize: size.label, color: colors.text }}>{props.label}</Text>
         </Checkbox>
@@ -1208,7 +1008,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     }
     const line = { flexDirection: "row" as const, flexWrap: "wrap" as const, alignItems: "center" as const, columnGap: 20, rowGap: 6 };
     return (
-      <Card title="Sizes and states" subtitle="Three sizes; disabled while unchecked, checked and indeterminate">
+      <Card title="Sizes and states" subtitle="Three sizes; disabled in every state">
         <View style={line}>
           <Each of={SIZES}>
             {(z) => (
@@ -1240,26 +1040,26 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const chosen = () => PLANS.find((p) => p.name === plan())!;
     return (
       <Card icon="controls" title="Radio" subtitle="A plan picker: one of a small set, all in view">
-        <RadioGroup>
+        <RadioGroup accessibilityLabel="Plan">
           <Each of={PLANS}>
             {(p, i) => (
               <Radio
                 checked={plan() === p().name}
                 disabled={p().disabled}
                 onChange={() => {
+                  sound("select");
                   plan.set(p().name);
                   last.set(`Plan: ${p().name}`);
                 }}
                 class="group"
-                style={hoverRow(i() === 0)}
-                activeStyle={pressed}
-                hoverStyle={p().disabled ? undefined : hovered()}
-                focusStyle={focusRing()}
-                disabledStyle={dimmed}
+                // The ring at the first line of the label, as the consent rows' boxes are.
+                {...listRow({ first: i() === 0, disabled: () => p().disabled, style: { alignItems: "flex-start" } })}
               >
-                <Divider show={i() !== 0} />
-                <Ring on={plan() === p().name} />
-                <Label label={p().name} detail={p().detail} />
+                <RowDivider show={i() !== 0} />
+                <View style={{ marginTop: 2 }}>
+                  <RadioRing on={plan() === p().name} disabled={p().disabled} />
+                </View>
+                <RowLabel label={p().name} detail={p().detail} />
                 <Text style={{ fontSize: size.label, color: plan() === p().name ? colors.text : colors.muted, fontVariant: ["tabular-nums"] }}>{p().price}</Text>
               </Radio>
             )}
@@ -1280,30 +1080,29 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
   function Delivery() {
     const speed = signal("Standard");
     return (
-      <Card title="Choice cards" subtitle="Delivery: the whole card is the radio, the ring in its corner">
-        <RadioGroup style={{ flexDirection: "row", gap: 8 }}>
+      <Card title="Choice cards" subtitle="The whole card is the radio">
+        <RadioGroup accessibilityLabel="Delivery" style={{ flexDirection: "row", gap: 8 }}>
           <Each of={SPEEDS}>
             {(d) => (
               <Radio
                 checked={speed() === d().name}
                 disabled={d().disabled}
                 onChange={() => {
+                  sound("select");
                   speed.set(d().name);
                   last.set(`Delivery: ${d().name}`);
                 }}
                 class="group"
-                style={tile(speed() === d().name)}
-                activeStyle={{ transform: [{ scale: 0.97 }] }}
-                hoverStyle={d().disabled || speed() === d().name ? undefined : { borderColor: colors.faint }}
-                focusStyle={focusRing()}
-                disabledStyle={dimmed}
+                {...choiceTileLook(() => speed() === d().name, { disabled: () => d().disabled })}
               >
-                <View style={{ position: "absolute", top: 10, right: 10 }}>
-                  <Ring on={speed() === d().name} scale={0.8} />
+                {/* Level with the title's line. */}
+                <View style={{ position: "absolute", top: cornerTop(14 + Math.round(size.label * 0.65), smallChoice, 10), right: 12 }}>
+                  <RadioRing on={speed() === d().name} scale={0.8} disabled={d().disabled} />
                 </View>
                 <Text style={{ marginRight: 20, fontSize: size.label, fontWeight: "600", color: colors.text }}>{d().name}</Text>
                 <Text style={{ fontSize: size.detail, color: colors.muted }}>{d().detail}</Text>
-                <Text style={{ marginTop: 8, fontSize: size.label, color: speed() === d().name ? colors.accent : colors.text, fontVariant: ["tabular-nums"] }}>{d().price}</Text>
+                {/* At the tile's foot, so the prices line up across tiles whatever the details' lines. */}
+                <Text style={{ marginTop: "auto", paddingTop: 8, fontSize: size.label, color: speed() === d().name ? colors.accent : colors.text, fontVariant: ["tabular-nums"] }}>{d().price}</Text>
               </Radio>
             )}
           </Each>
@@ -1317,30 +1116,31 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const chosen = () => TEXT_SIZES.find((t) => t.name === choice())!;
     const preview = settleOn(choice);
     return (
-      <Card title="Sizes" subtitle="Rings in three sizes, one locked; the preview follows the choice">
-        <RadioGroup style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 20, rowGap: 6 }}>
+      <Card title="Sizes" subtitle="Three sizes, one locked; the preview follows">
+        <RadioGroup accessibilityLabel="Text size" style={{ flexDirection: "row", flexWrap: "wrap", alignItems: "center", columnGap: 20, rowGap: 6 }}>
           <Each of={TEXT_SIZES}>
             {(t) => (
               <Radio
                 checked={choice() === t().name}
                 disabled={t().disabled}
                 onChange={() => {
+                  sound("select");
                   choice.set(t().name);
                   last.set(`Text size: ${t().name}`);
                 }}
                 class="group"
                 style={{ flexDirection: "row", alignItems: "center", gap: 8, paddingVertical: 4 }}
                 activeStyle={pressed}
-                focusStyle={focusRing(2)}
+                focusVisibleStyle={focusRing(2)}
                 disabledStyle={dimmed}
               >
-                <Ring on={choice() === t().name} scale={t().scale} />
+                <RadioRing on={choice() === t().name} scale={t().scale} disabled={t().disabled} />
                 <Text style={{ fontSize: size.label, color: colors.text }}>{t().name}</Text>
               </Radio>
             )}
           </Each>
         </RadioGroup>
-        <View style={{ padding: 12, borderRadius: radius.inset, backgroundColor: colors.inset, borderWidth: 1, borderColor: colors.line, ...finish.inset }}>
+        <View style={{ ...insetSurface(), padding: 12 }}>
           <View style={settle(preview)}>
             <Text style={{ fontSize: chosen().text, lineHeight: Math.round(chosen().text * 1.45), color: colors.text }}>
               Native views, styled by the app: every state and every motion is the gallery's own.
@@ -1354,9 +1154,9 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
   function Sections() {
     const section = signal("Overview");
     const shown = () => SECTIONS.find((s) => s.name === section())!;
-    // The track's padding and border: a tab is a pill inside them.
+    const look = tabsLook();
+    // The track's padding and border (`tabsLook`'s): a tab is a pill inside them.
     const inset = 3;
-    const inner = size.tabs - 2 * (inset + 1);
     const rows = settleOn(section);
     // The tabs share the track equally: icons show while every title fits
     // its share with its icon (a tab's border and padding are 14).
@@ -1364,7 +1164,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const icons = () => {
       const widths = sized.widths();
       const share = (sized.room() - 2 * (inset + 1) - 2 * (SECTIONS.length - 1)) / SECTIONS.length;
-      return widths.length > 0 && widths.every((w) => w + ICON_ROOM + 14 <= share);
+      return widths.length > 0 && widths.every((w) => w + TAB_ICON_ROOM + 14 <= share);
     };
     return (
       <Card icon="controls" title="Tabs" subtitle="A section switcher: the app shows the selected one">
@@ -1372,18 +1172,8 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             on the selected tab and springs to the next one natively (gpui-kit's `spring_move`). */}
         <Tabs
           onLayout={({ bounds }) => sized.room.set(bounds.size.width)}
-          style={{
-            height: size.tabs,
-            flexDirection: "row",
-            gap: 2,
-            padding: inset,
-            borderRadius: size.tabs / 2,
-            borderWidth: 1,
-            borderColor: colors.border,
-            backgroundColor: colors.inset,
-            boxShadow: finish.track.boxShadow,
-          }}
-          indicatorStyle={{ top: inset, bottom: inset, borderRadius: inner / 2, borderWidth: 1, ...finish.pill }}
+          style={look.style}
+          indicatorStyle={look.indicatorStyle}
         >
           <Each of={SECTIONS}>
             {(s, i) => (
@@ -1394,10 +1184,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                   section.set(s().name);
                   last.set(`Tab: ${s().name}`);
                 }}
-                style={{ flex: 1, paddingHorizontal: 6, borderRadius: inner / 2, borderWidth: 1, borderColor: "transparent", alignItems: "center", justifyContent: "center" }}
-                hoverStyle={s().disabled || section() === s().name ? undefined : hovered()}
-                focusStyle={focusRing()}
-                disabledStyle={dimmed}
+                {...look.tab({ selected: () => section() === s().name, disabled: () => s().disabled })}
               >
                 <TabTitle name={s().name} icon={icons() ? s().icon : undefined} onWidth={sized.report(i())} selected={section() === s().name} />
               </Tab>
@@ -1407,9 +1194,19 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
         <View style={settle(rows)}>
           <Each of={shown().rows}>
             {(r, i) => (
-              <View style={{ ...row(i() === 0), minHeight: size.line, paddingVertical: 0 }}>
-                <Text style={{ flex: 1, fontSize: size.label, color: colors.text }}>{r()[0]}</Text>
-                <Text style={{ fontSize: size.label, color: colors.muted, fontVariant: ["tabular-nums"] }}>{r()[1]}</Text>
+              // The overview's figures lead, their names quieter; other sections lead with the name.
+              <View style={plainRow({ first: i() === 0, dense: true })}>
+                <Text style={{ flex: 1, fontSize: size.label, color: shown().name === "Overview" ? colors.muted : colors.text }}>{r()[0]}</Text>
+                <Text
+                  style={{
+                    fontSize: size.label,
+                    fontWeight: shown().name === "Overview" ? "500" : "400",
+                    color: shown().name === "Overview" ? colors.text : colors.muted,
+                    fontVariant: ["tabular-nums"],
+                  }}
+                >
+                  {r()[1]}
+                </Text>
               </View>
             )}
           </Each>
@@ -1422,27 +1219,26 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const tab = signal("Issues");
     const shown = () => PROJECT.find((t) => t.name === tab())!;
     const rows = settleOn(tab);
+    const look = underlineTabsLook();
     // Icons show while the whole strip fits the card with them (a tab's
     // border and padding are 18, 2 between tabs); without them it scrolls
     // when it still does not fit.
     const sized = titles(PROJECT.length);
     const icons = () => {
       const widths = sized.widths();
-      return widths.length > 0 && widths.reduce((sum, w) => sum + w + ICON_ROOM + 18, 2 * (PROJECT.length - 1)) <= sized.room();
+      return widths.length > 0 && widths.reduce((sum, w) => sum + w + TAB_ICON_ROOM + 18, 2 * (PROJECT.length - 1)) <= sized.room();
     };
     return (
-      <Card title="Underlined" subtitle="Tabs as wide as their labels: the line travels and stretches to the next">
+      <Card title="Underlined" subtitle="As wide as their labels; the line travels">
         {/* The strip scrolls when the labels do not fit; the hairline under it is outside the scroll view, so the
             strip's clipping never cuts it, and the underline (at the strip's bottom) covers it. */}
         <View onLayout={({ bounds }) => sized.room.set(bounds.size.width)} style={{ marginHorizontal: -8 }}>
-          <View style={{ position: "absolute", left: 0, right: 0, bottom: 0, height: 1, backgroundColor: colors.line }} />
+          {/* The hairline runs from one edge of the card to the other, so its ends never hang in the padding. */}
+          <View style={terminal ? look.rule : { ...look.rule, left: 8 - density.pad, right: 8 - density.pad }} />
           <Scroll horizontal scrollbar={false} style={{ flexGrow: 0 }}>
             {/* The underline: the list's indicator at its bottom, as wide as the selected tab, which travels and
                 stretches to the next one natively. */}
-            <Tabs
-              style={{ flexDirection: "row", gap: 2, paddingTop: 3 }}
-              indicatorStyle={{ bottom: 0, height: 2, borderRadius: 1, backgroundColor: colors.accent }}
-            >
+            <Tabs style={look.style} indicatorStyle={look.indicatorStyle}>
               <Each of={PROJECT}>
                 {(t, i) => (
                   <Tab
@@ -1452,11 +1248,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                       tab.set(t().name);
                       last.set(`Project: ${t().name}`);
                     }}
-                    style={{ height: size.tabs, paddingHorizontal: 8, marginBottom: 4, borderRadius: radius.control, borderWidth: 1, borderColor: "transparent", justifyContent: "center" }}
-                    hoverStyle={t().disabled || tab() === t().name ? undefined : hovered()}
-                    activeStyle={pressed}
-                    focusStyle={focusRing()}
-                    disabledStyle={dimmed}
+                    {...look.tab({ selected: () => tab() === t().name, disabled: () => t().disabled })}
                   >
                     <TabTitle name={t().name} icon={icons() ? t().icon : undefined} onWidth={sized.report(i())} count={t().count} selected={tab() === t().name} underline />
                   </Tab>
@@ -1468,7 +1260,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
         <View style={settle(rows)}>
           <Each of={shown().rows}>
             {(r, i) => (
-              <View style={{ ...row(i() === 0), minHeight: size.line, paddingVertical: 0 }}>
+              <View style={plainRow({ first: i() === 0, dense: true })}>
                 <Icon name={shown().icon} size={size.check} tint={colors.faint} />
                 <Text style={{ flex: 1, numberOfLines: 1, fontSize: size.label, color: colors.text }}>{r()[0]}</Text>
                 <Text style={{ fontSize: size.detail, color: colors.faint, fontVariant: ["tabular-nums"] }}>{r()[1]}</Text>
@@ -1480,178 +1272,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     );
   }
 
-  // The lists' look, shared by the select's and the combobox's cards.
-  /** The list: a popup at the trigger with a pointer, as the menus'; a sheet at the bottom on a touch screen. */
-  const surface = () =>
-    pointer
-      ? { backgroundColor: colors.raised, borderRadius: radius.inset, borderWidth: 1, borderColor: colors.border, padding: 6, ...finish.raised }
-      : { backgroundColor: colors.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, paddingHorizontal: 10, paddingTop: 10, paddingBottom: 34, maxHeight: "70%" as const };
-  const backdrop = { backgroundColor: "rgba(0,0,0,0.45)" };
-  /** The clear button's inset from the trigger's end: centered where the chevron's lane is. The button is in the
-      select's view, outside the trigger, so its inset counts the trigger's 1 pt border too. */
-  const clearInset = 1 + 10 + size.check / 4 - size.clear / 2;
-  /** The chevron of a trigger: its icon box takes only the room of its stroke (half the box) in the row, so it
-      turns about its own center; it points down, and up while the list is open. */
-  function Chevron(props: { open: boolean; hidden?: boolean }) {
-    return (
-      <View
-        class="transition-transform duration-150 motion-reduce:transition-none"
-        style={{ display: props.hidden ? "none" : "flex", marginHorizontal: -size.check / 4, transform: [{ rotate: props.open ? "-90deg" : "90deg" }] }}
-      >
-        <Icon name="chevron" size={size.check} tint={colors.muted} />
-      </View>
-    );
-  }
-  /**
-   * The trigger: the chosen title and a chevron that turns while the list is open, its border lit then (faded,
-   * as under the pointer). `lead` goes before the title (a flag, a status's dot, faces); `error` edges it in the
-   * danger tone.
-   */
-  /**
-   * A field's focus ring, as the Input demo's: a 2-point accent edge around the border, fading in while the field
-   * (`group-focus:`) or a view in it (`group-focus-within:`) has the focus. It lies over the field and takes no touches.
-   */
-  function FieldRing(props: { within?: boolean; error?: boolean }) {
-    return (
-      <View
-        class={`opacity-0 transition-opacity duration-150 motion-reduce:transition-none ${props.within ? "group-focus-within:opacity-100" : "group-focus:opacity-100"}`}
-        style={{
-          pointerEvents: "none",
-          position: "absolute",
-          top: -2,
-          left: -2,
-          right: -2,
-          bottom: -2,
-          borderRadius: radius.control + 1,
-          borderWidth: 2,
-          borderColor: props.error ? colors.danger : colors.accent,
-        }}
-      />
-    );
-  }
-  function Picker(props: { title: string; open: boolean; disabled?: boolean; placeholder?: boolean; clearable?: boolean; lead?: JSX.Element; error?: boolean }) {
-    return (
-      <View
-        style={{
-          flexDirection: "row",
-          alignItems: "center",
-          gap: 8,
-          height: size.line,
-          // Room for the list's rows, which are as wide as the trigger.
-          minWidth: pointer ? 180 : undefined,
-          paddingLeft: 10,
-          // Room for the clear button, which goes over the trigger's end in place of the chevron. In the terminal the
-          // select's own marks go over the end, each in a slot of three Cells: ` ▾ `, or ` ×  ▾ `.
-          paddingRight: terminal ? (props.clearable ? 6 : 3) * TERMINAL_COLUMN : props.clearable ? clearInset + size.clear + 8 : 10,
-          borderRadius: radius.control,
-          borderWidth: 1,
-          borderColor: props.error ? colors.danger : props.open ? colors.faint : colors.border,
-          backgroundColor: colors.raised,
-          ...finish.raised,
-          // Dimmed while the select is: the app knows, as it passes `disabled`.
-          opacity: props.disabled ? dimmed.opacity : 1,
-          transitionProperty: "border-color, opacity",
-          transitionDuration: reduceMotion() ? 0 : 120,
-        }}
-        hoverStyle={props.disabled || props.error ? undefined : { borderColor: colors.faint }}
-        activeStyle={pressed}
-        class="group"
-        disabledStyle={dimmed}
-      >
-        {props.lead}
-        <Text style={{ flex: 1, numberOfLines: 1, fontSize: size.label, color: props.placeholder ? colors.faint : colors.text }}>{props.title}</Text>
-        {/* The terminal's select draws its own `▾` there. */}
-        <Chevron open={props.open} hidden={props.clearable || terminal} />
-        <FieldRing error={props.error} />
-      </View>
-    );
-  }
-  /**
-   * A row of the list, its look on the row (`itemClass`): lit while highlighted (`focus:`, the keys or the pointer
-   * on it), the fill and edge fading between rows as the highlight moves (at once with reduced motion), dimmed while
-   * disabled. Every state is the row's class (`group`), so the list draws a row's content once per item and the
-   * highlight moves without drawing anything.
-   */
-  const optionClass =
-    "group rounded-[7px] border border-transparent transition-colors duration-100 motion-reduce:transition-none focus:border-brand/30 focus:bg-brand-tint active:opacity-70 disabled:opacity-35";
-  /**
-   * A row's content: bolder with a check while chosen (`group-selected:`); `lead` before the title (a flag, a dot, a
-   * face, an icon), `note` after it.
-   */
-  function Option(props: { item: SelectEntry; note?: string; lead?: JSX.Element; detail?: string }) {
-    return (
-      <View
-        style={{
-          flexDirection: "row",
-          alignItems: "center",
-          gap: 8,
-          // The row's 1-point border on each side.
-          height: props.detail ? (pointer ? 38 : 52) : pointer ? 30 : 44,
-          // With its border and the popup's padding, the trigger's inset: a select's chosen row lies over the trigger, title on title.
-          paddingHorizontal: pointer ? 3 : 7,
-        }}
-      >
-        {props.lead}
-        <View style={{ flex: 1, minWidth: 0 }}>
-          <Text class="font-normal group-selected:font-semibold" style={{ numberOfLines: 1, fontSize: 14, color: colors.text }}>
-            {props.item.title}
-          </Text>
-          <If when={props.detail}>
-            <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.muted }}>{props.detail}</Text>
-          </If>
-        </View>
-        <If when={props.note}>
-          <Text style={{ fontSize: 12, color: colors.faint, fontVariant: ["tabular-nums"] }}>{props.note}</Text>
-        </If>
-        <View class="opacity-0 group-selected:opacity-100" style={{ width: 16, alignItems: "center" }}>
-          <Icon name="check" size={14} tint={colors.accent} />
-        </View>
-      </View>
-    );
-  }
-  /** The search field at the top of a list: a recessed well. Read in JSX, so it follows the appearance. */
-  const searchClass = `${pointer ? "text-sm" : "text-base"} text-foreground placeholder:text-faint`;
-  const searchStyle = () => ({
-    height: pointer ? 32 : 40,
-    paddingHorizontal: 9,
-    marginBottom: 6,
-    borderRadius: radius.control,
-    borderWidth: 1,
-    borderColor: colors.fieldBorder,
-    backgroundColor: colors.field,
-    ...finish.field,
-  });
-  /**
-   * A combobox's field, shadcn's input group: the root draws the box, the input types inside it, and the chevron
-   * opens and closes the list.
-   */
-  const comboStyle = (open: boolean) => ({
-    flexDirection: "row" as const,
-    alignItems: "center" as const,
-    // A set width with a pointer, as a select's; the row's on a touch screen.
-    ...(pointer ? { width: 260 } : { alignSelf: "stretch" as const }),
-    minHeight: size.line,
-    paddingLeft: 10,
-    paddingRight: 4,
-    borderRadius: radius.control,
-    borderWidth: 1,
-    borderColor: open ? colors.faint : colors.fieldBorder,
-    backgroundColor: colors.field,
-    ...finish.field,
-  });
-  const comboInputStyle = () => ({ flex: 1, minWidth: 40, height: size.line - 2 });
-  /** A combobox's toggle: the chevron in a square that lights under the pointer. */
-  function ComboToggle(props: { id: string; open: boolean }) {
-    return (
-      <View testID={props.id} style={{ width: 24, height: 24, alignItems: "center", justifyContent: "center", borderRadius: 6 }} hoverStyle={{ backgroundColor: colors.track }}>
-        <Chevron open={props.open} />
-      </View>
-    );
-  }
-  /** What a list shows while its search matches nothing. */
-  function Empty(props: { label: string }) {
-    return <Text style={{ paddingVertical: 20, textAlign: "center", fontSize: 14, color: colors.muted }}>{props.label}</Text>;
-  }
+  // The lists' look is the shared one (`look/listbox.tsx`): `Picker`, `OptionRow`, `ListboxHeader`, `comboboxLook`.
   /** A field's message under it: an error in the danger tone, settling in as it shows. */
   function Message(props: { label: string; tone?: Tone }) {
     const t = settleOn(() => props.label);
@@ -1659,13 +1280,6 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       <View style={settle(t)}>
         <Text style={{ fontSize: size.detail, color: props.tone ? toneColor(props.tone) : colors.muted }}>{props.label}</Text>
       </View>
-    );
-  }
-  function Header(props: { group: SelectGroup }) {
-    return (
-      <Text style={{ fontSize: 11, fontWeight: "600", letterSpacing: 0.6, color: colors.faint, paddingHorizontal: 9, paddingTop: 8, paddingBottom: 4 }}>
-        {props.group.title.toUpperCase()}
-      </Text>
     );
   }
   const opened = (set: (open: boolean) => void) => ({ open }: { open: boolean }) => set(open);
@@ -1679,7 +1293,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       <Card icon="controls" title="Select" subtitle="A choice from a list: the app owns the value">
         <View>
           <View style={row(true)}>
-            <Label label="Sort by" detail={pointer ? "Press a letter to jump to an order" : "Five orders in a sheet"} />
+            <RowLabel label="Sort by" detail={pointer ? "A letter jumps to an order" : "Five orders in a sheet"} />
             <Select
               items={SORTS}
               value={sort()}
@@ -1693,15 +1307,16 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               margin={8}
               align="end"
               // Wider than the trigger with a pointer: the titles whole.
-              popupStyle={surface()}
-              backdropStyle={backdrop}
+              popupStyle={listboxPopup()}
+              popupStartingStyle={listboxPopupStarting()}
+              backdropStyle={backdrop()}
               itemClass={optionClass}
               trigger={<Picker title={titleOf(SORTS, sort())} open={sortOpen()} />}
-              renderItem={(item) => <Option item={item} />}
+              renderItem={(item) => <OptionRow item={item} />}
             />
           </View>
           <View style={row(false)}>
-            <Label label="Font" detail="Search, sections, one not installed" />
+            <RowLabel label="Font" detail="Searched, in sections" />
             <Select
               items={FONTS}
               value={font()}
@@ -1714,27 +1329,25 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               searchable
               searchPlaceholder="Search fonts"
               searchAccessibilityLabel="Search fonts"
-              searchClass={searchClass}
-              searchStyle={searchStyle()}
-              empty={<Empty label="No font matches" />}
+              {...listboxSearch()}
+              empty={<ListboxEmpty label="No font matches" />}
               offset={4}
               margin={8}
               align="end"
-              popupStyle={pointer ? { ...surface(), minWidth: 260 } : surface()}
-              backdropStyle={backdrop}
+              popupStyle={listboxPopup({ minWidth: 260 })}
+              popupStartingStyle={listboxPopupStarting()}
+              backdropStyle={backdrop()}
               itemClass={optionClass}
               cleanable
               clearButtonAccessibilityLabel="Clear the font"
-              clearButtonClass="items-center justify-center rounded-full enabled:hover:bg-accent active:bg-track"
-              clearButtonStyle={terminal ? undefined : { position: "absolute", top: (size.line - size.clear) / 2, right: clearInset, width: size.clear, height: size.clear }}
-              clearButton={clearGlyph()}
+              {...clearButtonLook({ over: true })}
               trigger={<Picker title={font() === null ? "Default" : titleOf(FONTS, font())} open={fontOpen()} placeholder={font() === null} clearable={font() !== null} />}
-              renderItem={(item) => <Option item={item} note={item.disabled ? "Not installed" : undefined} />}
-              renderGroup={(group) => <Header group={group} />}
+              renderItem={(item) => <OptionRow item={item} note={item.disabled ? "Not installed" : undefined} />}
+              renderGroup={(group) => <ListboxHeader group={group} />}
             />
           </View>
           <View style={row(false)}>
-            <Label label="Language" detail="Set by your organization" />
+            <RowLabel label="Language" detail="Set by your organization" />
             <Select items={LANGUAGES} value="en" disabled accessibilityLabel="Language" trigger={<Picker title="English" open={false} disabled />} />
           </View>
         </View>
@@ -1747,22 +1360,19 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     offset: 4,
     margin: 8,
     align: "end" as const,
-    popupStyle: pointer && minWidth ? { ...surface(), minWidth } : surface(),
-    backdropStyle: backdrop,
+    get popupStyle() {
+      return listboxPopup({ minWidth });
+    },
+    get popupStartingStyle() {
+      return listboxPopupStarting();
+    },
+    get backdropStyle() {
+      return backdrop();
+    },
     itemClass: optionClass,
   });
   /** A clear button over the trigger's end, in place of its chevron (`Picker`'s `clearable`). */
-  /** A clear button's mark: an × in a terminal, which draws no icons. */
-  const clearGlyph = () => (terminal ? <Text style={{ color: colors.muted }}>×</Text> : <Icon name="close" size={size.clear - 6} tint={colors.muted} />);
-  const clearProps = (label: string) => ({
-    cleanable: true,
-    clearButtonAccessibilityLabel: label,
-    clearButtonClass: "items-center justify-center rounded-full enabled:hover:bg-accent active:bg-track",
-    // A terminal sets the clear button after the value, in the row: placed
-    // over it, its label ("Clear the deadline") would cover the value.
-    clearButtonStyle: terminal ? undefined : { position: "absolute" as const, top: (size.line - size.clear) / 2, right: clearInset, width: size.clear, height: size.clear },
-    clearButton: clearGlyph(),
-  });
+  const clearProps = (label: string) => ({ cleanable: true, clearButtonAccessibilityLabel: label, ...clearButtonLook({ over: true }) });
 
   function Downloads() {
     const sort = signal<DownloadSort>("added");
@@ -1796,7 +1406,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const detail = (f: (typeof DOWNLOADS)[number]) =>
       sort() === "size" ? `${f.kind} · ${ago(f.days)}` : sort() === "kind" ? `${fileSize(f.mb)} · ${ago(f.days)}` : `${f.kind} · ${fileSize(f.mb)}`;
     return (
-      <Card title="In a list header" subtitle="A quiet sort menu over the rows it orders: they move to their new places">
+      <Card title="In a list header" subtitle="A sort menu over the rows it orders">
         <View style={{ flexDirection: "row", alignItems: "center", gap: 4, paddingBottom: size.padding, borderBottomWidth: 1, borderColor: colors.line }}>
           <Text style={{ flex: 1, fontSize: 11, fontWeight: "600", letterSpacing: 0.6, color: colors.faint }}>{`DOWNLOADS · ${DOWNLOADS.length}`}</Text>
           <Select
@@ -1825,7 +1435,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                 }}
                 hoverStyle={open() ? undefined : hovered()}
                 activeStyle={pressed}
-                focusStyle={focusRing()}
+                focusVisibleStyle={focusRing()}
               >
                 <Text style={{ fontSize: size.detail, color: colors.muted }}>Sort by</Text>
                 <Text style={{ fontSize: size.detail, fontWeight: "500", color: colors.text }}>{sortTitle()}</Text>
@@ -1835,7 +1445,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                 </If>
               </View>
             }
-            renderItem={(item) => <Option item={item} />}
+            renderItem={(item) => <OptionRow item={item} />}
           />
           {/* The way the order runs: the arrow turns over. */}
           <BaseButton
@@ -1843,7 +1453,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             onPress={() => set(sort(), !down())}
             class="items-center justify-center rounded-md enabled:hover:bg-accent active:bg-track"
             style={{ width: pointer ? 26 : 34, height: pointer ? 26 : 34 }}
-            focusStyle={focusRing()}
+            focusVisibleStyle={focusRing()}
           >
             <View class="transition-transform duration-200 motion-reduce:transition-none" style={{ transform: [{ rotate: down() ? "0deg" : "180deg" }] }}>
               <Icon name="arrow-down" size={pointer ? 14 : 16} tint={colors.muted} />
@@ -1855,7 +1465,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             {(f, i) => (
               <View style={{ ...row(i() === 0), paddingVertical: 4 }}>
                 <IconTile name={f().icon} size={pointer ? 26 : 32} tint={colors.muted} />
-                <Label label={f().name} detail={detail(f())} width={labelColumn(DOWNLOADS.map((d) => d.name))} />
+                <RowLabel label={f().name} detail={detail(f())} width={labelColumn(DOWNLOADS.map((d) => d.name))} />
                 <Text style={{ fontSize: size.detail, color: colors.text, fontVariant: ["tabular-nums"] }}>{trailing(f())}</Text>
               </View>
             )}
@@ -1885,9 +1495,9 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       );
     }
     return (
-      <Card title="Shipping" subtitle="Countries by region with their flags and codes; search narrows them">
+      <Card title="Shipping" subtitle="Countries by region with flags; search narrows">
         <View style={row(true)}>
-          <Label label="Country" detail="Where your order goes" />
+          <RowLabel label="Country" detail="Where your order goes" />
           <Select
             items={COUNTRY_ITEMS}
             value={country()}
@@ -1900,13 +1510,12 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             searchable
             searchPlaceholder="Search countries"
             searchAccessibilityLabel="Search countries"
-            searchClass={searchClass}
-            searchStyle={searchStyle()}
-            empty={<Empty label="We do not ship there" />}
+            {...listboxSearch()}
+            empty={<ListboxEmpty label="We do not ship there" />}
             {...listProps(260)}
             trigger={<Picker title={chosen()?.title ?? "Choose"} lead={chosen() ? <Flag value={chosen()!.value} /> : undefined} open={open()} />}
-            renderItem={(item) => <Option item={item} lead={<Flag value={item.value} />} note={item.disabled ? "Not yet" : of(item.value).dial} />}
-            renderGroup={(group) => <Header group={group} />}
+            renderItem={(item) => <OptionRow item={item} lead={<Flag value={item.value} />} note={item.disabled ? "Not yet" : of(item.value).dial} />}
+            renderGroup={(group) => <ListboxHeader group={group} />}
           />
         </View>
         <View style={{ flexDirection: "row", paddingTop: size.padding, borderTopWidth: 1, borderColor: colors.line, ...settle(t) }}>
@@ -1941,10 +1550,10 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       last.set(`Issue filed: ${titleOf(STATUS_ITEMS, status())}, ${titleOf(TEAMS, team())}`);
     };
     return (
-      <Card title="Status and validation" subtitle="Statuses with their colors, a required team, a locked priority">
+      <Card title="Status and validation" subtitle="Colored statuses, a required team, a locked one">
         <View>
           <View style={row(true)}>
-            <Label label="Status" detail="Its dot follows the choice" />
+            <RowLabel label="Status" detail="Its dot follows the choice" />
             <Select
               items={STATUS_ITEMS}
               value={status()}
@@ -1956,7 +1565,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               accessibilityLabel="Status"
               {...listProps(180)}
               trigger={<Picker title={titleOf(STATUS_ITEMS, status())} lead={<Dot color={statusColor(status())} />} open={statusOpen()} />}
-              renderItem={(item) => <Option item={item} lead={<Dot color={statusColor(item.value)} />} />}
+              renderItem={(item) => <OptionRow item={item} lead={<Dot color={statusColor(item.value)} />} />}
             />
           </View>
           <View style={row(false)}>
@@ -1975,21 +1584,21 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                 onOpenChange={opened((o) => teamOpen.set(o))}
                 accessibilityLabel="Team"
                 {...listProps(180)}
-                trigger={<Picker title={team() === null ? "Choose a team" : titleOf(TEAMS, team())} placeholder={team() === null} error={missing()} open={teamOpen()} />}
-                renderItem={(item) => <Option item={item} />}
+                trigger={<Picker title={team() === null ? "Choose a team" : titleOf(TEAMS, team())} placeholder={team() === null} invalid={missing()} open={teamOpen()} />}
+                renderItem={(item) => <OptionRow item={item} />}
               />
             </View>
           </View>
           <View style={row(false)}>
-            <Label label="Priority" detail="Set by the triage bot" />
+            <RowLabel label="Priority" detail="Set by the triage bot" />
             <Select items={PRIORITIES} value="high" disabled accessibilityLabel="Priority" trigger={<Picker title="High" open={false} disabled />} />
           </View>
         </View>
         <View style={{ flexDirection: "row", alignItems: "center", gap: size.gap, marginTop: size.padding }}>
-          <Button label="File issue" size={size.switch} flex={pointer ? undefined : 1} onPress={file} />
+          <Button label="File issue" size="regular" flex={pointer ? undefined : 1} onPress={file} />
           <If when={filed() > 0}>
             <View style={{ flexDirection: "row", alignItems: "center", gap: 6, transform: [{ scale: pop }] }}>
-              <Icon name="check" size={size.check} tint={toneColor("up")} weight={markWeight} />
+              <Icon name="check" size={size.check} tint={toneColor("up")} weight={MARK_WEIGHT} />
               <Text style={{ fontSize: size.detail, color: colors.muted, fontVariant: ["tabular-nums"] }}>{`Filed as NSH-${611 + filed()}`}</Text>
             </View>
           </If>
@@ -2011,8 +1620,8 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     return (
       <Card icon="controls" title="Combobox" subtitle="Several values from a list: the app owns them">
         <View>
-          <View style={row(true)}>
-            <Label label="Topics" detail="Several at once, with search; the list stays open" />
+          <View style={row(true, true)}>
+            <RowLabel label="Topics" detail="Several, with search" />
             <Combobox
               items={TOPICS}
               multiple
@@ -2024,33 +1633,28 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               onConfirm={({ value }) => last.set(`Topics confirmed: ${value.length}`)}
               onOpenChange={opened((open) => topicsOpen.set(open))}
               accessibilityLabel="Topics"
-              class="group"
-              prefix={<FieldRing within />}
-              style={comboStyle(topicsOpen())}
+              {...comboboxLook(() => topicsOpen(), { filled: () => topics().length > 0 })}
               placeholder={topics().length ? topicsTitle() : "Add topics"}
-              inputClass={searchClass}
-              inputStyle={comboInputStyle()}
               triggerButton={<ComboToggle id="topics-toggle" open={topicsOpen()} />}
-              empty={<Empty label="No topic matches" />}
+              empty={<ListboxEmpty label="No topic matches" />}
               offset={4}
               margin={8}
               align="end"
-              popupStyle={surface()}
-              backdropStyle={backdrop}
+              popupStyle={listboxPopup()}
+              popupStartingStyle={listboxPopupStarting()}
+              backdropStyle={backdrop()}
               itemClass={optionClass}
               cleanable
               clearButtonAccessibilityLabel="Clear the topics"
-              clearButtonClass="items-center justify-center rounded-full enabled:hover:bg-accent active:bg-track"
-              clearButtonStyle={{ width: size.clear, height: size.clear }}
-              clearButton={clearGlyph()}
+              {...clearButtonLook()}
               footerStyle={{ marginTop: 6, paddingTop: 6, paddingHorizontal: terminal ? 0 : 9, borderTopWidth: 1, borderColor: colors.border }}
               footer={<Text style={{ fontSize: 12, color: colors.muted }}>{`${topics().length} selected`}</Text>}
-              renderItem={(item) => <Option item={item} note={item.disabled ? "Archived" : undefined} />}
-              renderGroup={(group) => <Header group={group} />}
+              renderItem={(item) => <OptionRow item={item} note={item.disabled ? "Archived" : undefined} />}
+              renderGroup={(group) => <ListboxHeader group={group} />}
             />
           </View>
-          <View style={row(false)}>
-            <Label label="Reviewer" detail="One person: a choice replaces the last" />
+          <View style={row(false, true)}>
+            <RowLabel label="Reviewer" detail="One person at a time" />
             <Combobox
               items={REVIEWERS}
               value={reviewer()}
@@ -2063,17 +1667,14 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               offset={4}
               margin={8}
               align="end"
-              popupStyle={surface()}
-              backdropStyle={backdrop}
+              popupStyle={listboxPopup()}
+              popupStartingStyle={listboxPopupStarting()}
+              backdropStyle={backdrop()}
               itemClass={optionClass}
-              class="group"
-              prefix={<FieldRing within />}
-              style={comboStyle(reviewerOpen())}
+              {...comboboxLook(() => reviewerOpen())}
               placeholder={"Nobody"}
-              inputClass={searchClass}
-              inputStyle={comboInputStyle()}
               triggerButton={<ComboToggle id="reviewer-toggle" open={reviewerOpen()} />}
-              renderItem={(item) => <Option item={item} />}
+              renderItem={(item) => <OptionRow item={item} />}
             />
           </View>
         </View>
@@ -2098,9 +1699,9 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       last.set(`Assignees: ${next.map((v) => person(v).title).join(", ") || "nobody"}`);
     };
     return (
-      <Card title="Assignees" subtitle="People with their faces, up to four; each pops in as a chip" right={<Badge label={`${people().length} of ${MAX_PEOPLE}`} tone={full() ? "warn" : "neutral"} />}>
-        <View style={row(true)}>
-          <Label label="Assignees" detail={full() ? "A task takes four people at most" : "Who works on the task"} />
+      <Card title="Assignees" subtitle="Up to four people, each a chip" right={<Badge label={`${people().length} of ${MAX_PEOPLE}`} tone={full() ? "warn" : "neutral"} />}>
+        <View style={row(true, true)}>
+          <RowLabel label="Assignees" detail={full() ? "Four people at most" : "Who works on the task"} />
           <Combobox
             items={items()}
             multiple
@@ -2108,31 +1709,27 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             onChange={({ value }) => set(value)}
             onOpenChange={opened((o) => open.set(o))}
             accessibilityLabel="Assignees"
-            class="group"
-            style={comboStyle(open())}
+            {...comboboxLook(() => open(), { filled: () => people().length > 0 })}
             placeholder={people().length ? `${people().length} ${people().length === 1 ? "person" : "people"}` : "Assign"}
-            inputClass={searchClass}
-            inputStyle={comboInputStyle()}
             triggerButton={<ComboToggle id="assignees-toggle" open={open()} />}
             prefix={
               <>
-              <FieldRing within />
-              {/* The faces overlap, each ringed in the card's color; a terminal's initials stand a Cell apart, then a gap. */}
+              {/* The faces overlap, each ringed in the field's color; a terminal's initials stand a Cell apart, then a gap. */}
               <If when={people().length}>
                 <View style={{ flexDirection: "row", marginRight: terminal ? TERMINAL_GAP : 6 }}>
-                  <Each of={people().slice(0, 3)}>{(v, i) => <View style={{ marginLeft: i() ? (terminal ? TERMINAL_COLUMN : -6) : 0 }}><Avatar name={person(v()).title} tone={person(v()).tone} size={pointer ? 20 : 24} ring /></View>}</Each>
+                  <Each of={people().slice(0, 3)}>{(v, i) => <View style={{ marginLeft: i() ? (terminal ? TERMINAL_COLUMN : -6) : 0 }}><Avatar name={person(v()).title} tone={person(v()).tone} size={pointer ? 20 : 24} ring on={colors.field} /></View>}</Each>
                 </View>
               </If>
               </>
             }
-            empty={<Empty label="Nobody by that name" />}
+            empty={<ListboxEmpty label="Nobody by that name" />}
             {...listProps()}
             footerStyle={{ marginTop: 6, paddingTop: 6, paddingHorizontal: terminal ? 0 : 9, borderTopWidth: 1, borderColor: colors.border }}
             footer={<Text style={{ fontSize: 12, color: colors.muted }}>{full() ? "Four assigned: take one off to add another" : `${MAX_PEOPLE - people().length} more can be added`}</Text>}
             renderItem={(item) => (
-              <Option
+              <OptionRow
                 item={item}
-                lead={<Avatar name={item.title} tone={person(item.value).tone} size={pointer ? 24 : 30} />}
+                lead={<Avatar name={item.title} tone={person(item.value).tone} size={pointer ? 24 : 30} on={colors.raised} />}
                 detail={person(item.value).role}
               />
             )}
@@ -2143,7 +1740,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             {(v) => (
               <Chip
                 label={person(v()).title}
-                lead={<Avatar name={person(v()).title} tone={person(v()).tone} size={pointer ? 18 : 24} />}
+                lead={<Avatar name={person(v()).title} tone={person(v()).tone} size={pointer ? 18 : 24} on={colors.raised} />}
                 remove={`Remove ${person(v()).title}`}
                 onRemove={() => set(people().filter((p) => p !== v()))}
               />
@@ -2174,9 +1771,9 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       last.set(`Labels: ${next.map((v) => label(v)?.title ?? v).join(", ") || "none"}`);
     };
     return (
-      <Card title="Labels" subtitle="Type a label that does not exist yet and Return creates it">
-        <View style={row(true)}>
-          <Label label="Labels" detail="Search them, or create one" />
+      <Card title="Labels" subtitle="Type a new label and Return creates it">
+        <View style={row(true, true)}>
+          <RowLabel label="Labels" detail="Search them, or create one" />
           <Combobox
             items={items()}
             multiple
@@ -2199,19 +1796,15 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               if (!o) query.set("");
             }}
             accessibilityLabel="Labels"
-            class="group"
-            prefix={<FieldRing within />}
-            style={comboStyle(open())}
+            {...comboboxLook(() => open())}
             placeholder={"Search or create labels"}
-            inputClass={searchClass}
-            inputStyle={comboInputStyle()}
             triggerButton={<ComboToggle id="labels-toggle" open={open()} />}
             {...listProps()}
             renderItem={(item) =>
               item.value.startsWith(NEW_LABEL) && !label(item.value) ? (
-                <Option item={item} lead={<Icon name="plus" size={14} tint={colors.accent} />} note={pointer ? "Return" : undefined} />
+                <OptionRow item={item} lead={<Icon name="plus" size={14} tint={colors.accent} />} note={pointer ? "Return" : undefined} />
               ) : (
-                <Option item={item} lead={<Dot color={toneColor(label(item.value)?.tone ?? "neutral")} />} note={label(item.value) && made().includes(label(item.value)!) ? "New" : undefined} />
+                <OptionRow item={item} lead={<Dot color={toneColor(label(item.value)?.tone ?? "neutral")} />} note={label(item.value) && made().includes(label(item.value)!) ? "New" : undefined} />
               )
             }
           />
@@ -2242,7 +1835,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const command = (value: string) => COMMANDS.find((c) => c.value === value)!;
     const t = settleOn(ran);
     return (
-      <Card title="Command list" subtitle="Grouped actions with their icons and shortcuts; running one keeps no value">
+      <Card title="Command list" subtitle="Grouped actions with icons and shortcuts">
         <Combobox
           items={COMMAND_ITEMS}
           // A command runs; it is not a value the list keeps.
@@ -2254,15 +1847,21 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
           }}
           onOpenChange={opened((o) => open.set(o))}
           accessibilityLabel="Command"
-          class="group"
-          style={comboStyle(open())}
+          {...comboboxLook(() => open())}
           placeholder={"Search commands…"}
-          inputClass={searchClass}
-          inputStyle={comboInputStyle()}
-          triggerButton={<ComboToggle id="command-toggle" open={open()} />}
+          // A search field has no chevron: with a pointer the shortcut's key is what a press opens the list on, the
+          // field's last part; a touch screen keeps the toggle.
+          triggerButton={
+            pointer && !terminal ? (
+              <View testID="command-toggle">
+                <Kbd label={keymap.label("mod+k")} style={{ marginLeft: 6, marginRight: 2 }} />
+              </View>
+            ) : (
+              <ComboToggle id="command-toggle" open={open()} />
+            )
+          }
           prefix={
             <>
-              <FieldRing within />
               {/* A terminal shows no icons: the placeholder says what the field does. */}
               <If when={!terminal}>
                 <View style={{ marginRight: 8 }}><Icon name="search" size={size.check} tint={colors.faint} /></View>
@@ -2270,15 +1869,15 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             </>
           }
           suffix={
-            <If when={pointer}>
-              <Text style={{ ...(terminal ? { marginRight: TERMINAL_COLUMN } : { marginHorizontal: 4 }), paddingHorizontal: 5, borderRadius: 4, borderWidth: 1, borderColor: colors.line, fontSize: 11, color: colors.muted }}>⌘K</Text>
+            <If when={pointer && terminal}>
+              <Text style={{ marginRight: TERMINAL_COLUMN, color: colors.muted }}>{keymap.label("mod+k")}</Text>
             </If>
           }
-          empty={<Empty label="No command matches" />}
+          empty={<ListboxEmpty label="No command matches" />}
           {...listProps()}
           align="start"
           renderItem={(item) => (
-            <Option
+            <OptionRow
               item={item}
               lead={
                 // The icon takes the text's color while its row is highlighted.
@@ -2294,11 +1893,11 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               note={item.disabled ? "At 100%" : pointer ? command(item.value).keys : undefined}
             />
           )}
-          renderGroup={(group) => <Header group={group} />}
+          renderGroup={(group) => <ListboxHeader group={group} />}
         />
         <View style={{ flexDirection: "row", alignItems: "center", gap: 8, ...settle(t) }}>
           <If when={ran()} else={<Caption label="Nothing run yet" />}>
-            <Icon name="check" size={size.check} tint={toneColor("up")} weight={markWeight} />
+            <Icon name="check" size={size.check} tint={toneColor("up")} weight={MARK_WEIGHT} />
             <Text style={{ fontSize: size.detail, color: colors.muted }}>{`Ran “${command(ran()!).title}”`}</Text>
           </If>
         </View>
@@ -2306,151 +1905,8 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     );
   }
 
-  // The calendar's look, the date picker's card's.
-  /** A day's cell: seven across the popup with a pointer, across a phone's sheet otherwise. */
-  const cell = pointer ? 30 : 42;
-  /** The gap between the months of a calendar of two. */
-  const monthGap = 16;
-  /**
-   * On a touch screen the calendar spans the sheet (the window less the sheet's padding), its columns sharing it: the
-   * header's titles split what Previous and Next leave, so the month and the year meet in the middle, and each month's
-   * title of two is over its month.
-   */
-  const toggleWidth = () => Math.floor((windowSize().width - 2 * 10) / 2 - cell);
-  /**
-   * The calendar's items (`itemClass`): pressed at 70%; `group`, so the drawing inside follows the item's states.
-   */
-  const calendarItemClass = "group active:opacity-70";
-  /**
-   * An item of the calendar (`renderItem`), drawn once from what it is, its states the item's classes: Previous and
-   * Next as chevrons (faint while they take no press), the month and year toggles (or each month's title, with
-   * `months` over one) by name, the open view's toggle in the accent, the weekdays' initials, and the days: today on
-   * the theme's quiet `accent` fill (gpui-component's), the selected date and a range's ends on the accent's, the days
-   * of a complete range on a band from end to end (`data-range-*`), the other months' days and the disabled ones faint,
-   * the keyboard's day ringed.
-   */
-  function CalendarItem(props: { item: CalendarEntry; months?: number }) {
-    const kind = props.item.kind;
-    if (terminal) {
-      // The terminal's calendar draws its days, years and arrows itself, on its grid of two-Cell columns: the
-      // labels are plain text at their own size (the painter bands the open view's toggle, from its state).
-      if (kind === "weekday") return <Text style={{ color: colors.faint }}>{WEEKDAYS[props.item.value]}</Text>;
-      if (kind === "month") return <Text>{MONTHS[props.item.value - 1].slice(0, 3)}</Text>;
-      const title = kind === "monthToggle" && (props.months ?? 1) > 1;
-      return (
-        <Text style={{ fontWeight: "600" }}>
-          {title ? `${MONTHS[props.item.value - 1]} ${props.item.year}` : kind === "monthToggle" ? MONTHS[props.item.value - 1] : String(props.item.value)}
-        </Text>
-      );
-    }
-    if (kind === "previous" || kind === "next") {
-      return (
-        <View class="group-disabled:opacity-30" style={{ width: cell, height: cell, alignItems: "center", justifyContent: "center" }}>
-          <View style={{ transform: [{ rotate: kind === "previous" ? "180deg" : "0deg" }] }}>
-            <Icon name="chevron" size={size.check} tint={colors.muted} />
-          </View>
-        </View>
-      );
-    }
-    if (kind === "monthToggle" || kind === "yearToggle") {
-      // A month's title in a calendar of several takes no press: the month and its year, over the month.
-      const title = kind === "monthToggle" && (props.months ?? 1) > 1;
-      return (
-        <Text
-          class="text-foreground group-selected:text-brand"
-          style={{
-            width: !pointer ? toggleWidth() : title ? 6 * cell + monthGap / 2 : kind === "monthToggle" ? 3 * cell : 2 * cell,
-            paddingHorizontal: 3,
-            textAlign: title ? "center" : kind === "monthToggle" ? "right" : "left",
-            fontSize: size.label,
-            fontWeight: "600",
-          }}
-        >
-          {title ? `${MONTHS[props.item.value - 1]} ${props.item.year}` : kind === "monthToggle" ? MONTHS[props.item.value - 1] : String(props.item.value)}
-        </Text>
-      );
-    }
-    if (kind === "weekday") {
-      return <Text style={{ minWidth: cell, paddingVertical: 4, textAlign: "center", fontSize: 11, fontWeight: "600", color: colors.faint }}>{WEEKDAYS[props.item.value]}</Text>;
-    }
-    if (kind === "month" || kind === "year") {
-      // The month view's months (rows of 3) and the year view's years (rows of 5), as wide as a month; the shown one
-      // filled.
-      return (
-        <View
-          class="group-selected:bg-brand-fill"
-          style={{ minWidth: (7 * cell) / (kind === "month" ? 3 : 5), height: cell + 6, alignItems: "center", justifyContent: "center", borderRadius: radius.control }}
-        >
-          <Text class="text-foreground group-selected:text-on-brand" style={{ fontSize: size.label }}>
-            {kind === "month" ? MONTHS[props.item.value - 1].slice(0, 3) : String(props.item.value)}
-          </Text>
-        </View>
-      );
-    }
-    // A day, as wide as its column (the calendar's columns share its width). The band spans a range's middle days
-    // and reaches from its ends' middles; a range of one day has none. The circle fills for the selected date and a
-    // range's ends (not its middle days), else for today.
-    const own = props.item.outside ? "text-faint" : "text-foreground";
-    return (
-      <View style={{ minWidth: cell, height: cell, alignItems: "center", justifyContent: "center" }}>
-        <View
-          class={
-            "absolute inset-y-0.5 left-0 right-0 hidden group-data-range-middle:flex group-data-range-start:flex group-data-range-start:left-1/2 " +
-            "group-data-range-end:flex group-data-range-end:right-1/2 group-data-range-start:group-data-range-end:hidden"
-          }
-          style={{ backgroundColor: tints.accent }}
-        />
-        <View
-          class={
-            `${props.item.today ? "bg-accent" : ""} border-[1.5px] border-transparent group-focus:border-brand ` +
-            "group-selected:bg-brand-fill group-data-range-middle:bg-transparent"
-          }
-          style={{ width: cell - 4, height: cell - 4, borderRadius: (cell - 4) / 2, alignItems: "center", justifyContent: "center" }}
-        >
-          <Text
-            class={
-              `${own} ${props.item.today ? "font-semibold" : "font-normal"} group-selected:font-semibold group-selected:text-on-brand ` +
-              `group-data-range-middle:${own} group-disabled:text-faint group-disabled:opacity-50`
-            }
-            style={{ fontSize: pointer ? 13 : 15, fontVariant: ["tabular-nums"] }}
-          >
-            {String(props.item.value)}
-          </Text>
-        </View>
-      </View>
-    );
-  }
-  /**
-   * The time field's segments: filled while the field has the keys on one (`focus:` on the segment, `segmentClass`),
-   * its digits (`renderSegment`) in the color on the fill (`group-focus:`), so moving between them draws nothing.
-   */
-  const segmentClass = "group rounded-[4px] active:opacity-70 focus:bg-brand-fill";
-  function Segment(props: { label: string }) {
-    return (
-      <Text class="text-foreground group-focus:text-on-brand" style={{ paddingHorizontal: 3, fontSize: size.label, fontVariant: ["tabular-nums"] }}>
-        {props.label}
-      </Text>
-    );
-  }
-  /** The popup's layout: the presets beside the calendar with a pointer, above it on a phone. */
-  const content = pointer ? { flexDirection: "row" as const, gap: 10 } : { gap: 12 };
-  const presets = pointer
-    ? { gap: 2, minWidth: 110, paddingRight: 10, borderRightWidth: 1, borderColor: colors.border }
-    : { flexDirection: "row" as const, flexWrap: "wrap" as const, gap: 6 };
-  const preset = pointer
-    ? { height: 28, paddingHorizontal: 8, borderRadius: radius.control, justifyContent: "center" as const, fontSize: 13, color: colors.text }
-    : { height: 34, paddingHorizontal: 12, borderRadius: 17, borderWidth: 1, borderColor: colors.border, justifyContent: "center" as const, fontSize: 14, color: colors.text };
-  const header = { marginBottom: 4 };
-  /** The calendar: in the popup with a pointer; across the sheet on a touch screen, as the time's row under it. */
-  const calendar = pointer ? { padding: 4 } : {};
-  /** The time's row under a hairline, its label at the start and the field at the end, on the calendar's edges. */
-  const time = { gap: 10, marginTop: 8, paddingTop: 8, borderTopWidth: 1, borderColor: colors.border, ...(pointer ? { paddingHorizontal: 4 } : {}) };
-  /** The time's field: a recessed well as the number inputs', with their hover and the keyboard's ring while it edits. */
-  const timeField = [
-    pointer ? "h-8 rounded-md px-2" : "h-11 rounded-lg px-3",
-    "items-center border border-input bg-field",
-    "enabled:hover:border-faint focus-within:outline-2 focus-within:outline-info",
-  ].join(" ");
+  // The calendar's look is the shared one (`calendarLook`, `CalendarItem`, `TimeSegment`).
+  const { cell, monthGap, itemClass: calendarItemClass, segmentClass, content, header, calendar } = calendarLook;
 
   function Dates() {
     const due = signal<string | null>(null);
@@ -2474,10 +1930,10 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       return r && r[0] && r[1] ? `${monthDay(r[0])} – ${monthDay(r[1])}` : "Pick dates";
     };
     return (
-      <Card icon="controls" title="DatePicker" subtitle="A date, a range or a date and time: the app owns the value">
+      <Card icon="controls" title="DatePicker" subtitle="A date, a range, or a date and time">
         <View>
           <View style={row(true)}>
-            <Label label="Due date" detail="Weekdays only; clear it to have none" />
+            <RowLabel label="Due date" detail="Weekdays; clearable" />
             <DatePicker
               value={due()}
               onChange={({ value }) => {
@@ -2491,22 +1947,21 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               offset={4}
               margin={8}
               align="end"
-              popupStyle={surface()}
-              backdropStyle={backdrop}
+              popupStyle={listboxPopup()}
+              popupStartingStyle={listboxPopupStarting()}
+              backdropStyle={backdrop()}
               calendarStyle={calendar}
               headerStyle={header}
               itemClass={calendarItemClass}
               renderItem={(item) => <CalendarItem item={item} />}
               cleanable
               clearButtonAccessibilityLabel="Clear the due date"
-              clearButtonClass="items-center justify-center rounded-full enabled:hover:bg-accent active:bg-track"
-              clearButtonStyle={terminal ? undefined : { position: "absolute", top: (size.line - size.clear) / 2, right: clearInset, width: size.clear, height: size.clear }}
-              clearButton={clearGlyph()}
-              trigger={<Picker title={due() ? shortDate(due()!) : "No due date"} open={dueOpen()} placeholder={!due()} clearable={due() !== null} />}
+              {...clearButtonLook({ over: true })}
+              trigger={<DateTrigger title={due() ? shortDate(due()!) : "No due date"} open={dueOpen()} placeholder={!due()} clearable={due() !== null} />}
             />
           </View>
           <View style={row(false)}>
-            <Label label="Trip" detail={twoMonths() ? "Two months; a press starts the range, the next ends it" : "A press starts the range, the next ends it"} />
+            <RowLabel label="Trip" detail={twoMonths() ? "A range over two months" : "A range: press its two ends"} />
             <DatePicker
               range
               value={trip()}
@@ -2522,22 +1977,23 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               offset={4}
               margin={8}
               align="end"
-              popupStyle={surface()}
-              backdropStyle={backdrop}
+              popupStyle={listboxPopup()}
+              popupStartingStyle={listboxPopupStarting()}
+              backdropStyle={backdrop()}
               contentStyle={content}
-              presetsStyle={presets}
-              presetStyle={preset}
-              presetClass="enabled:hover:bg-accent active:opacity-70"
+              presetsStyle={calendarLook.presets}
+              presetStyle={calendarLook.preset}
+              presetClass={calendarLook.presetClass}
               calendarStyle={calendar}
               headerStyle={header}
               bodyStyle={terminal ? undefined : { gap: monthGap }}
               itemClass={calendarItemClass}
               renderItem={(item) => <CalendarItem item={item} months={twoMonths() ? 2 : 1} />}
-              trigger={<Picker title={tripTitle()} open={tripOpen()} placeholder={!trip()} />}
+              trigger={<DateTrigger title={tripTitle()} open={tripOpen()} placeholder={!trip()} />}
             />
           </View>
           <View style={row(false)}>
-            <Label label="Meeting" detail={pointer ? "A day, then its time; the day again closes" : "A tap picks the day; open it again for the time"} />
+            <RowLabel label="Meeting" detail="A day, then its time" />
             <DatePicker
               value={meeting()}
               onChange={({ value }) => {
@@ -2553,20 +2009,21 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               offset={4}
               margin={8}
               align="end"
-              popupStyle={surface()}
-              backdropStyle={backdrop}
+              popupStyle={listboxPopup()}
+              popupStartingStyle={listboxPopupStarting()}
+              backdropStyle={backdrop()}
               calendarStyle={calendar}
               headerStyle={header}
               itemClass={calendarItemClass}
               renderItem={(item) => <CalendarItem item={item} />}
-              timeStyle={time}
+              timeStyle={calendarLook.time}
               timeLabel={<Text style={{ fontSize: size.label, color: colors.muted }}>Time</Text>}
               timeAccessibilityLabel="Meeting time"
-              timeFieldClass={timeField}
+              timeFieldClass={timeFieldClass}
               segmentClass={segmentClass}
-              separatorStyle={{ color: colors.faint, fontSize: size.label }}
-              renderSegment={(segment) => <Segment label={segment.label} />}
-              trigger={<Picker title={meeting() ? shortDate(meeting()!) : "Not scheduled"} open={meetingOpen()} placeholder={!meeting()} />}
+              separatorStyle={calendarLook.separator}
+              renderSegment={(segment) => <TimeSegment label={segment.label} />}
+              trigger={<DateTrigger title={meeting() ? shortDate(meeting()!) : "Not scheduled"} open={meetingOpen()} placeholder={!meeting()} />}
             />
           </View>
         </View>
@@ -2579,8 +2036,15 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     offset: 4,
     margin: 8,
     align,
-    popupStyle: surface(),
-    backdropStyle: backdrop,
+    get popupStyle() {
+      return listboxPopup();
+    },
+    get popupStartingStyle() {
+      return listboxPopupStarting();
+    },
+    get backdropStyle() {
+      return backdrop();
+    },
     calendarStyle: calendar,
     headerStyle: header,
     itemClass: calendarItemClass,
@@ -2622,19 +2086,19 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       return sum;
     };
     const total = () => (nights() ? lodging() + CLEANING : 0);
-    /** One end of the stay in the trigger: a small heading over the day. */
+    /** One end of the stay in the trigger: a small muted heading over the day, the day in the text color or a muted prompt. */
     function End(props: { label: string; value: string | null }) {
       return (
         <View style={{ flex: 1, justifyContent: "center", gap: 1, paddingHorizontal: 12 }}>
-          <Text style={{ fontSize: 10, fontWeight: "600", letterSpacing: 0.6, color: colors.faint }}>{props.label.toUpperCase()}</Text>
-          <Text style={{ numberOfLines: 1, fontSize: size.label, color: props.value ? colors.text : colors.faint }}>{props.value ? dayTitle(props.value) : "Add a date"}</Text>
+          <Text style={{ fontSize: 10, fontWeight: "600", letterSpacing: 0.6, color: colors.muted }}>{props.label.toUpperCase()}</Text>
+          <Text style={{ numberOfLines: 1, fontSize: size.label, color: props.value ? colors.text : colors.muted }}>{props.value ? dayTitle(props.value) : "Add a date"}</Text>
         </View>
       );
     }
     return (
       <Card
         title="Booking"
-        subtitle="Check-in and check-out: the nights and the price follow; past and sold-out nights cannot be picked"
+        subtitle="Nights and price follow the dates"
         right={<Badge label={nights() ? `${nights()} ${nights() === 1 ? "night" : "nights"}` : "No dates"} tone={nights() ? "accent" : "neutral"} />}
       >
         <DatePicker
@@ -2671,8 +2135,14 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               }}
               hoverStyle={{ borderColor: colors.faint }}
               activeStyle={pressed}
-              focusStyle={focusRing()}
+              focusVisibleStyle={focusRing()}
             >
+              {/* A date picker's trigger leads with the calendar, as `DateTrigger` does. */}
+              <If when={!terminal}>
+                <View style={{ justifyContent: "center", paddingLeft: 12, marginRight: -4 }}>
+                  <Icon name="calendar" size={pointer ? 16 : 18} tint={colors.muted} />
+                </View>
+              </If>
               <End label="Check-in" value={stay()?.[0] ?? null} />
               <View style={{ width: 1, marginVertical: 8, backgroundColor: colors.line }} />
               <End label="Check-out" value={stay()?.[1] ?? null} />
@@ -2690,13 +2160,74 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
         <View style={{ alignItems: pointer ? "flex-end" : "stretch" }}>
           <Button
             label="Reserve"
-            size={size.switch}
+            size="regular"
             disabled={!nights()}
             onPress={() => {
               const c = complete()!;
               last.set(`Reserved: ${c[0]} → ${c[1]}, ${money(total())}`);
             }}
           />
+        </View>
+      </Card>
+    );
+  }
+
+  /**
+   * A reminder set with the system's own picker (`nsh/mobile`'s
+   * `DateTimePicker`, on phones): its first day and time, the time it
+   * repeats at and the day it ends, each in the system's look; the summary
+   * follows them.
+   */
+  function Reminder() {
+    const today = new Date();
+    const starts = signal(`${iso(addDays(today, 1))}T08:00`);
+    const at = signal("09:30");
+    const until = signal(iso(addDays(today, 30)));
+    const t = settleOn(() => `${starts()} ${at()} ${until()}`);
+    const days = () => daysBetween(starts().slice(0, 10), until()) + 1;
+    return (
+      <Card title="Reminder" subtitle="The system's picker: a day, a time, or both" right={<View style={settle(t)}><Badge label={days() > 0 ? `${days()} days` : "Ends before it starts"} tone={days() > 0 ? "neutral" : "warn"} /></View>}>
+        <View>
+          <View style={row(true)}>
+            <RowLabel label="Starts" detail="The first reminder" />
+            <DateTimePicker
+              testID="reminder-starts"
+              mode="dateTime"
+              value={starts()}
+              min={`${iso(today)}T00:00`}
+              minuteInterval={15}
+              onChange={({ value }) => {
+                starts.set(value);
+                last.set(`Starts: ${value}`);
+              }}
+            />
+          </View>
+          <View style={row(false)}>
+            <RowLabel label="Every day at" detail="Five-minute steps" />
+            <DateTimePicker
+              testID="reminder-at"
+              mode="time"
+              value={at()}
+              minuteInterval={5}
+              onChange={({ value }) => {
+                at.set(value);
+                last.set(`Every day at: ${value}`);
+              }}
+            />
+          </View>
+          <View style={row(false)}>
+            <RowLabel label="Until" detail="No later than a year" />
+            <DateTimePicker
+              testID="reminder-until"
+              value={until()}
+              min={starts().slice(0, 10)}
+              max={iso(addDays(today, 365))}
+              onChange={({ value }) => {
+                until.set(value);
+                last.set(`Until: ${value}`);
+              }}
+            />
+          </View>
         </View>
       </Card>
     );
@@ -2724,7 +2255,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     };
     const t = settleOn(due);
     return (
-      <Card title="Deadline" subtitle="Quick presets beside the calendar; past days cannot be picked">
+      <Card title="Deadline" subtitle="Presets beside the calendar; no past days">
         <View>
           <View style={row(true)}>
             <View style={{ flex: 1, gap: 4, alignItems: "flex-start" }}>
@@ -2746,17 +2277,17 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               disabledMatcher={{ before: iso(today) }}
               {...calendarProps()}
               contentStyle={content}
-              presetsStyle={presets}
-              presetStyle={preset}
-              presetClass="enabled:hover:bg-accent active:opacity-70"
+              presetsStyle={calendarLook.presets}
+              presetStyle={calendarLook.preset}
+              presetClass={calendarLook.presetClass}
               renderItem={(item) => <CalendarItem item={item} />}
               {...clearProps("Clear the deadline")}
-              trigger={<Picker title={due() ? dayTitle(due()!) : "None"} open={open()} placeholder={!due()} clearable={due() !== null} />}
+              trigger={<DateTrigger title={due() ? dayTitle(due()!) : "None"} open={open()} placeholder={!due()} clearable={due() !== null} />}
             />
           </View>
           <View style={row(false)}>
-            <Label label="Sprint start" detail="Locked once the sprint began" />
-            <DatePicker value={iso(addDays(today, -9))} disabled accessibilityLabel="Sprint start" trigger={<Picker title={dayTitle(iso(addDays(today, -9)))} open={false} disabled />} />
+            <RowLabel label="Sprint start" detail="Locked once the sprint began" />
+            <DatePicker value={iso(addDays(today, -9))} disabled accessibilityLabel="Sprint start" trigger={<DateTrigger title={dayTitle(iso(addDays(today, -9)))} open={false} disabled />} />
           </View>
         </View>
       </Card>
@@ -2792,9 +2323,9 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       transitionDuration: reduceMotion() ? 0 : 150,
     });
     return (
-      <Card title="Time slots" subtitle="A weekday, then one of its open times; booked ones are struck through" right={<Badge label={`${free()} open`} />}>
+      <Card title="Time slots" subtitle="A weekday, then an open time" right={<Badge label={`${free()} open`} />}>
         <View style={row(true)}>
-          <Label label="Day" detail="From tomorrow, on weekdays" />
+          <RowLabel label="Day" detail="From tomorrow, on weekdays" />
           <DatePicker
             value={day()}
             onChange={({ value }) => {
@@ -2808,25 +2339,26 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             disabledMatcher={closed}
             {...calendarProps()}
             renderItem={(item) => <CalendarItem item={item} />}
-            trigger={<Picker title={day() ? dayTitle(day()!) : "Pick a day"} open={open()} placeholder={!day()} />}
+            trigger={<DateTrigger title={day() ? dayTitle(day()!) : "Pick a day"} open={open()} placeholder={!day()} />}
           />
         </View>
         <View style={settle(t)}>
-          <RadioGroup style={{ flexDirection: "row", flexWrap: "wrap", gap: terminal ? TERMINAL_GAP : 6, justifyContent: pointer ? "flex-start" : "space-between" }}>
+          <RadioGroup accessibilityLabel="Appointment time" style={{ flexDirection: "row", flexWrap: "wrap", gap: terminal ? TERMINAL_GAP : 6, justifyContent: pointer ? "flex-start" : "space-between" }}>
             <Each of={SLOTS}>
               {(s, i) => (
                 <Radio
                   checked={slot() === s()}
                   disabled={!day() || slotTaken(day()!, i())}
                   onChange={() => {
+                    sound("select");
                     slot.set(s());
                     last.set(`Slot: ${day()} ${s()}`);
                   }}
                   style={chip(slot() === s())}
                   activeStyle={{ transform: [{ scale: 0.95 }] }}
                   hoverStyle={slot() === s() ? undefined : { borderColor: colors.faint }}
-                  focusStyle={focusRing()}
-                  disabledStyle={{ opacity: 0.4 }}
+                  focusVisibleStyle={focusRing()}
+                  disabledStyle={{ opacity: 0.5 }}
                 >
                   <Text
                     style={{
@@ -2847,7 +2379,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
         <View style={{ alignItems: pointer ? "flex-end" : "stretch" }}>
           <Button
             label={slot() && day() ? `Book ${dayTitle(day()!)} at ${slot()}` : "Pick a time"}
-            size={size.switch}
+            size="regular"
             disabled={!slot() || !day()}
             onPress={() => last.set(`Booked: ${dayTitle(day()!)} at ${slot()}`)}
           />
@@ -2857,7 +2389,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
   }
 
   /** The always-visible row that flips a section: the app's trigger, which tells screen readers whether it is expanded. */
-  function Summary(props: { label: string; detail?: string; open: boolean; set: (open: boolean) => void; first?: boolean }) {
+  function Summary(props: { label: string; detail?: string; open: boolean; set: (open: boolean) => void; first?: boolean; accordion?: boolean }) {
     return (
       <View
         role="button"
@@ -2867,20 +2399,13 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
           props.set(next);
           last.set(`${props.label}: ${next ? "expanded" : "collapsed"}`);
         }}
-        style={hoverRow(!!props.first)}
-        activeStyle={pressed}
-        hoverStyle={hovered()}
-        focusStyle={focusRing()}
+        {...disclosureTriggerLook({ first: props.first })}
       >
-        <Divider show={!props.first} />
-        <Label label={props.label} detail={props.detail} />
-        {/* A lane as wide as the chevron's stroke (half its icon box), so the chevron ends where the values below it end. */}
-        <View
-          class="transition-transform duration-150 motion-reduce:transition-none"
-          style={{ width: size.check / 2, alignItems: "center", rotate: props.open ? "90deg" : "0deg" }}
-        >
-          <Icon name="chevron" size={size.check} tint={colors.muted} />
-        </View>
+        <RowDivider show={!props.first} />
+        <RowLabel label={props.label} detail={props.detail} />
+        {/* A lane as wide as the chevron's stroke, so the chevron ends where the values below it end;
+            an accordion's turns over as the Accordion demo's does. */}
+        <DisclosureChevron open={props.open} accordion={props.accordion} />
       </View>
     );
   }
@@ -2923,15 +2448,13 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                     originals.set(on);
                     last.set(`Keep originals: ${on ? "on" : "off"}`);
                   }}
-                  style={{ ...hoverRow(false, size.gap), flexDirection: "row-reverse" }}
-                  activeStyle={pressed}
-                  hoverStyle={hovered()}
-                  focusStyle={focusRing()}
-                  trackStyle={look.trackStyle}
+                  {...listRow({ start: size.gap, style: { flexDirection: "row-reverse" } })}
+                  trackClass={look.trackClass}
+          trackStyle={look.trackStyle}
                   thumbStyle={look.thumbStyle}
                 >
-                  <Divider show />
-                  <Label label="Keep originals" detail={originals() ? "Edits are saved as copies" : "Edits replace the photo"} />
+                  <RowDivider show />
+                  <RowLabel label="Keep originals" detail={originals() ? "Edits are saved as copies" : "Edits replace the photo"} />
                 </Switch>
               </View>
             }
@@ -2962,7 +2485,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             </View>
           }
         >
-          <Summary first={props.first} label={props.q} detail="" open={open() === props.q} set={(next) => open.set(next ? props.q : null)} />
+          <Summary first={props.first} accordion label={props.q} detail="" open={open() === props.q} set={(next) => open.set(next ? props.q : null)} />
         </Collapsible>
       );
     }
@@ -2986,16 +2509,8 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     };
     cleanup(stop);
     // The indeterminate bar's sweep: a third of the track crossing it and
-    // back (`sweep` from 0 to 1, times `travel`: the two thirds it crosses,
-    // from the bar's layout), looped natively, so no JS runs per crossing;
-    // it rests in the middle with reduced motion.
-    const sweep = createAnimatedValue(0);
-    const travel = createAnimatedValue(0);
-    effect(() => {
-      if (reduceMotion()) sweep.set(0.5);
-      else sweep.keyframes([0, 1], { duration: 800, easing: Easing.bezier(0.42, 0, 0.58, 1), iterations: "infinite", direction: "alternate" });
-    });
-    cleanup(() => void sweep.stop());
+    // back, looped natively; it rests in the middle with reduced motion.
+    const sweep = progressSweep();
     const start = () => {
       if (sent() >= 100) sent.set(0);
       running.set(true);
@@ -3015,20 +2530,15 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
           value={props.value}
           indeterminate={props.indeterminate}
           // The track spans the bar: the sweep crosses two thirds of it.
-          onLayout={props.indeterminate ? ({ bounds }) => travel.set((bounds.size.width * 2) / 3) : undefined}
+          onLayout={props.indeterminate ? sweep.onLayout : undefined}
           // The label row first: the children follow the track.
           style={{ ...row(!!props.first), flexDirection: "column-reverse", alignItems: "stretch", gap: size.padding }}
-          // The slider's rail and fill, so a level and a transfer read alike.
-          trackStyle={rail()}
-          // Determinate, the fill glides to each new value (`glide`).
-          indicatorClass={props.indeterminate ? "w-1/3" : glide}
-          indicatorStyle={{
-            ...fillOf(),
-            ...(props.indeterminate ? { transform: [{ translateX: sweep.mul(travel) }] } : { translate: remaining(props.value) }),
-          }}
+          // The slider's rail and fill, so a level and a transfer read alike;
+          // determinate, the fill glides to each new value.
+          {...progressLook(() => props.value, { indeterminate: () => props.indeterminate, sweep })}
         >
           <View style={{ flexDirection: "row", alignItems: "center", gap: size.gap }}>
-            <Label label={props.label} detail={props.detail} />
+            <RowLabel label={props.label} detail={props.detail} />
             <Text style={{ fontSize: size.label, color: colors.muted, fontVariant: ["tabular-nums"], textAlign: "right" }}>
               {props.indeterminate ? "—" : `${props.value}%`}
             </Text>
@@ -3110,19 +2620,17 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
         <Progress
           value={props.value}
           style={{ ...row(props.first), flexDirection: "column-reverse", alignItems: "stretch", gap: size.padding }}
-          trackStyle={rail(4)}
-          indicatorClass={glide}
-          indicatorStyle={{ ...fillOf(4, props.value >= 100 ? "up" : undefined), translate: remaining(props.value) }}
+          {...progressLook(() => props.value, { height: 4, tone: () => (props.value >= 100 ? "up" : undefined) })}
         >
           <View style={{ flexDirection: "row", alignItems: "center", gap: size.gap }}>
             <Icon name={props.icon} size={size.control} tint={colors.muted} />
-            <Label label={props.name} detail={props.size} width={labelColumn(FILES.map((f) => f.name))} />
+            <RowLabel label={props.name} detail={props.size} width={labelColumn(FILES.map((f) => f.name))} />
             <View style={{ width: 40, height: 20, alignItems: "flex-end", justifyContent: "center" }}>
               <View style={{ ...centered, alignItems: "flex-end", opacity: away }}>
                 <Text style={{ fontSize: size.detail, color: colors.muted, fontVariant: ["tabular-nums"] }}>{`${props.value}%`}</Text>
               </View>
               <View style={{ ...centered, left: undefined, width: 20, opacity: done, transform: [{ scale: done.interpolate({ inputRange: [0, 1], outputRange: [0.5, 1] }) }, { scale: pop }] }}>
-                <Icon name="check" size={size.check + 2} tint={toneColor("up")} weight={markWeight} />
+                <Icon name="check" size={size.check + 2} tint={toneColor("up")} weight={MARK_WEIGHT} />
               </View>
             </View>
           </View>
@@ -3130,7 +2638,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       );
     }
     return (
-      <Card title="Several files" subtitle="Each at its own pace; a check pops in as each is sent" right={<Badge label={`${sent().filter((v) => v >= 100).length} of ${FILES.length}`} tone={all() ? "up" : "neutral"} />}>
+      <Card title="Several files" subtitle="Each at its own pace, checked when sent" right={<Badge label={`${sent().filter((v) => v >= 100).length} of ${FILES.length}`} tone={all() ? "up" : "neutral"} />}>
         <View>
           <Each of={FILES}>{(f, i) => <File name={f().name} size={f().size} icon={f().icon} value={sent()[i()]} first={i() === 0} />}</Each>
         </View>
@@ -3167,26 +2675,26 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
             alignItems: "center",
             justifyContent: "center",
             borderWidth: 1,
-            ...empty(),
+            ...choiceWell(),
             borderColor: props.current ? colors.accent : colors.fieldBorder,
             transform: [{ scale: pop }],
           }}
         >
-          <Lit on={done} radius={DOT / 2} />
+          <ChoiceLight on={done} radius={DOT / 2} />
           <View style={{ width: 6, height: 6, borderRadius: 3, backgroundColor: colors.accent, opacity: current }} />
           <View style={{ ...centered, opacity: done }}>
-            <Icon name="check" size={10} tint={colors.onAccent} weight={markWeight} />
+            <Icon name="check" size={10} tint={colors.onAccent} weight={MARK_WEIGHT} />
           </View>
         </View>
       );
     }
     return (
-      <Card title="Steps" subtitle="A setup in four steps: the bar fills to the step you are on" right={<Badge label={step() >= STEPS.length ? "Done" : `Step ${step() + 1} of ${STEPS.length}`} tone={step() >= STEPS.length ? "up" : "neutral"} />}>
+      <Card title="Steps" subtitle="The bar fills to the step you are on" right={<Badge label={step() >= STEPS.length ? "Done" : `Step ${step() + 1} of ${STEPS.length}`} tone={step() >= STEPS.length ? "up" : "neutral"} />}>
         {/* The bar runs from the first dot's middle to the last's; each label is centered under its dot
             (a terminal's first and last start and end at theirs, off the card's border). */}
         <View style={{ height: DOT + 24, marginHorizontal: 24 }}>
           <View style={{ position: "absolute", left: DOT / 2, right: DOT / 2, top: (DOT - 4) / 2 }}>
-            <Progress value={value()} accessibilityLabel="Setup" trackStyle={rail(4)} indicatorClass={glide} indicatorStyle={{ ...fillOf(4), translate: remaining(value()) }} />
+            <Progress value={value()} accessibilityLabel="Setup" {...progressLook(() => value(), { height: 4 })} />
           </View>
           <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
             <Each of={STEPS}>
@@ -3243,7 +2751,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     /** A meter's tone by its value: low battery red, a full disk amber. */
     const tone = (i: number, v: number): Tone | undefined => (i === 0 && v < 20 ? "danger" : i === 1 && v > 85 ? "warn" : undefined);
     return (
-      <Card title="Sizes and tones" subtitle="Thin, regular and thick bars; a tone where the value calls for one">
+      <Card title="Sizes and tones" subtitle="Thin, regular and thick; a tone when it matters">
         <View style={{ gap: size.gap + 4 }}>
           <Each of={METERS}>
             {(m, i) => (
@@ -3251,9 +2759,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                 value={values()[i()]}
                 accessibilityLabel={m().name}
                 style={{ flexDirection: "column-reverse", alignItems: "stretch", gap: 6 }}
-                trackStyle={rail(m().height)}
-                indicatorClass={glide}
-                indicatorStyle={{ ...fillOf(m().height, tone(i(), values()[i()])), translate: remaining(values()[i()]) }}
+                {...progressLook(() => values()[i()], { height: m().height, tone: () => tone(i(), values()[i()]) })}
               >
                 <View style={{ flexDirection: "row", alignItems: "baseline", gap: 8 }}>
                   <Text style={{ flex: 1, fontSize: size.label, color: colors.text }}>{m().name}</Text>
@@ -3297,7 +2803,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       return (
         <View style={{ ...row(!!props.first), flexDirection: "column", alignItems: "stretch", gap: size.padding }}>
           <View style={{ flexDirection: "row", alignItems: "center", gap: size.gap }}>
-            <Label label={props.label} detail={props.detail} />
+            <RowLabel label={props.label} detail={props.detail} />
             <If when={props.value}>
               <Text style={{ fontSize: size.label, color: colors.muted, fontVariant: ["tabular-nums"], textAlign: "right" }}>{props.value}</Text>
             </If>
@@ -3342,7 +2848,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                         minHeight: 2,
                         borderTopLeftRadius: 2,
                         borderTopRightRadius: 2,
-                        backgroundColor: inRange(i(), price()) ? colors.accentFill : colors.track,
+                        backgroundColor: inRange(i(), price()) ? chart.s1 : alpha(colors.text, 0.1),
                       }}
                     />
                   )}
@@ -3379,6 +2885,21 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     );
   }
 
+  /**
+   * A band's well lit from 0 dB, its middle, to its value, so a flat band shows no gain and a cut runs down: the
+   * slider's own run, which starts at −12, stays clear.
+   */
+  const bandWell = (db: number) => {
+    const at = ((db + 12) / 24) * 100;
+    const [lo, hi] = [Math.min(50, at), Math.max(50, at)];
+    const [well, lit] = [colors.track, colors.accentFill];
+    return {
+      ...sliderLook({ vertical: true }).indicatorStyle,
+      backgroundImage: db === 0 ? "none" : `linear-gradient(0deg, ${well} ${lo}%, ${lit} ${lo}%, ${lit} ${hi}%, ${well} ${hi}%)`,
+    };
+  };
+  const clearRun = { backgroundColor: "transparent", backgroundImage: "none", borderWidth: 0 } as const;
+
   function Equalizer() {
     const bands = BANDS.map(() => signal(0));
     const preset = signal<"Flat" | "Bass" | "Vocal">("Flat");
@@ -3388,7 +2909,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       last.set(`Equalizer: ${name}`);
     };
     return (
-      <Card title="Vertical" subtitle="An equalizer: five bands from −12 to +12 dB, and presets" right={<Segmented options={EQ_PRESETS} value={preset()} onChange={apply} size="small" />}>
+      <Card title="Vertical" subtitle="Five bands from −12 to +12 dB" right={<Segmented options={EQ_PRESETS} value={preset()} onChange={apply} size="small" />}>
         {/* A terminal's controls are one row each: a band a row, its name, its slider across, its value. */}
         <If when={terminal}>
           <View style={{ gap: 4 }}>
@@ -3428,8 +2949,9 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                 accessibilityLabel={`${name} band`}
                 onChange={({ value }) => bands[i].set(value as number)}
                 onChangeEnd={({ value }) => last.set(`${name}: ${value} dB`)}
-                rangeStyle={sliderFill(0, (bands[i]() + 12) / 24, true)}
+                rangeStyle={clearRun}
                 {...sliderLook({ vertical: true })}
+                indicatorStyle={bandWell(bands[i]())}
               />
               <Text style={{ fontSize: size.detail, color: colors.muted }}>{name}</Text>
             </View>
@@ -3440,88 +2962,16 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     );
   }
 
-  // The number inputs' look, shared by their cards.
-  // One recessed well per input: a stronger border under the pointer and
-  // the keyboard's focus ring while its field edits (`focus-within:`);
-  // the buttons light up under the pointer and while pressed (still with
-  // reduced motion) and fade where a step does nothing (at the minimum
-  // or maximum) or while the input is locked, without their hover.
-  //
-  // In a terminal an input is one band a row high, as a select's trigger:
-  // a column inside its start, the prefix, the value at the end of the
-  // field, then a column (the caret's), the suffix, and − and + at the
-  // band's end, each a mark in a slot of three Cells that all take the
-  // press (` − ` ` + `, touching; the last slot's blank Cell is the
-  // band's end column). Every input has its steppers there, and a suffix
-  // takes the width of the widest, so the values and the suffixes of
-  // inputs stacked one above another line up. A band is its own edge, so
-  // no border, and nothing inside it is filled again; a disabled input
-  // dims all of it.
-  const frame = terminal
-    ? "h-4 flex-row items-stretch bg-field pl-2 disabled:opacity-50"
-    : [
-        pointer ? "h-8 rounded-md" : "h-11 rounded-lg",
-        "flex-row items-stretch overflow-hidden border border-input bg-field",
-        "enabled:hover:border-faint focus-within:outline-2 focus-within:outline-info",
-      ].join(" ");
-  const press = terminal
-    ? "justify-center disabled:opacity-35"
-    : "items-center justify-center transition-colors duration-100 motion-reduce:transition-none enabled:hover:bg-accent active:bg-track disabled:opacity-35";
-  /** − before the field and + after it. */
-  const stepBefore = (w: string) => `${w} ${press} border-r border-line`;
-  const stepAfter = (w: string) => `${w} ${press} border-l border-line`;
-  /** A pair at the well's end: the increment over the decrement. */
-  const pairClass = (w: string) => `${w} border-l border-line`;
-  const pairButton = (top: boolean) => `flex-1 ${press}${top ? " border-b border-line" : ""}`;
-  /**
-   * The step buttons: − before the field and + after it (`split`), or a pair of chevrons at the well's end (`pair`);
-   * in a terminal always − and + at the band's end, each in a slot of three Cells (as `nsh-base`'s `mark_slot`).
-   */
-  const steps = (kind: "split" | "pair", w: string, icon: number) =>
-    terminal
-      ? {
-          controlsRight: true,
-          controlsClass: "flex-row",
-          decrementButtonClass: `w-6 shrink-0 flex-row items-center ${press}`,
-          incrementButtonClass: `w-6 shrink-0 flex-row items-center ${press}`,
-          decrementButton: <Step name="minus" size={icon} />,
-          incrementButton: <Step name="plus" size={icon} />,
-        }
-      : kind === "split"
-        ? {
-            decrementButtonClass: stepBefore(w),
-            incrementButtonClass: stepAfter(w),
-            decrementButton: <Step name="minus" size={icon} />,
-            incrementButton: <Step name="plus" size={icon} />,
-          }
-        : {
-            controlsRight: true,
-            controlsClass: pairClass(w),
-            incrementButtonClass: pairButton(true),
-            decrementButtonClass: pairButton(false),
-            incrementButton: <Step name="chevron-up" size={icon - 2} />,
-            decrementButton: <Step name="chevron-down" size={icon - 2} />,
-          };
+  // The number inputs' look is the shared one (`numberInputClasses`, `numberInputSteps`, `numberInputText`): one
+  // recessed well per input, the fields' focus edge while its field edits, buttons lit under the pointer and faded
+  // where a step does nothing; in a terminal one band a row high, the steppers at its end.
+  const frame = numberInputClasses.frame;
+  const steps = numberInputSteps;
+  const field = numberInputText;
   /** The field's own spacing besides {@link field}'s. A terminal's field keeps {@link field}'s column before its value and none after it: the caret's column is the column after the value. */
   const spaced = (style: { paddingLeft?: number; paddingRight?: number; paddingHorizontal?: number }) => (terminal ? { paddingRight: 0 } : style);
-  const field = () => ({
-    flex: 1,
-    minWidth: 0,
-    paddingHorizontal: 8,
-    fontSize: size.label,
-    color: colors.text,
-    placeholderColor: colors.faint,
-    fontVariant: ["tabular-nums" as const],
-    // A terminal sets every number at the end, as a column of numbers reads.
-    ...(terminal ? { textAlign: "right" as const } : {}),
-  });
   /** Centered between its steppers, but at the end in a terminal (as {@link field}). */
   const stepAlign = terminal ? ("right" as const) : ("center" as const);
-  /** A step button's glyph: the gallery's icon, in the muted text color; a terminal's text glyph. */
-  function Step(props: { name: "plus" | "minus" | "chevron-up" | "chevron-down"; size: number }) {
-    if (terminal && (props.name === "plus" || props.name === "minus")) return <Text style={{ color: colors.muted }}>{STEP_GLYPHS[props.name]}</Text>;
-    return <Icon name={props.name} size={props.size} tint={colors.muted} />;
-  }
   /** A quantity: its label and the input at the trailing edge. */
   function Amount(props: { label: string; detail: JSX.Element; first?: boolean; children: JSX.Element }) {
     return (
@@ -3603,7 +3053,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
           <Button
             label={locked() ? "Unlock seats" : "Lock seats"}
             variant="secondary"
-            size={size.switch}
+            size="regular"
             flex={pointer ? undefined : 1}
             onPress={() => {
               locked.set(!locked());
@@ -3660,7 +3110,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       );
     }
     return (
-      <Card title="Cart" subtitle="Quantities held to the stock; each subtotal and the total roll to their new values" right={<Badge label={`${qty().reduce<number>((a, b) => a + (b ?? 0), 0)} items`} />}>
+      <Card title="Cart" subtitle="Held to the stock; totals roll to new values" right={<Badge label={plural(qty().reduce<number>((a, b) => a + (b ?? 0), 0), "item")} />}>
         <View>
           <Each of={CART}>{(_, i) => <Line i={i()} first={i() === 0} />}</Each>
         </View>
@@ -3668,14 +3118,12 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
           <Progress
             value={reached()}
             accessibilityLabel="Toward free shipping"
-            trackStyle={rail(4)}
-            indicatorClass={glide}
-            indicatorStyle={{ ...fillOf(4, toFree() === 0 ? "up" : undefined), translate: remaining(reached()) }}
+            {...progressLook(() => reached(), { height: 4, tone: () => (toFree() === 0 ? "up" : undefined) })}
           />
           <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
             <If when={toFree() === 0}>
               <View style={{ transform: [{ scale: pop }] }}>
-                <Icon name="check" size={size.check} tint={toneColor("up")} weight={markWeight} />
+                <Icon name="check" size={size.check} tint={toneColor("up")} weight={MARK_WEIGHT} />
               </View>
             </If>
             <Message label={toFree() === 0 ? "Free shipping unlocked" : `Add ${money(toFree())} more for free shipping`} tone={toFree() === 0 ? "up" : undefined} />
@@ -3705,7 +3153,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     /** The buttons at the well's end, the increment over the decrement (new glyphs for each input). */
     const right = () => steps("pair", pointer ? "w-6" : "w-9", pointer ? 14 : 16);
     return (
-      <Card title="Units and limits" subtitle="A percentage, a currency with its code, a temperature in half degrees, a read-only rate">
+      <Card title="Units and limits" subtitle="A percentage, a currency, half degrees, a rate">
         <View>
           <Amount
             first
@@ -3785,7 +3233,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               readonly
               accessibilityLabel="Interest rate"
               class={frame}
-              inputStyle={{ ...field(), textAlign: "right", ...spaced({ paddingRight: 2 }), color: colors.muted }}
+              inputStyle={{ ...field(), textAlign: "right", ...spaced({ paddingRight: 2 }) }}
               suffix={<Affix label="%" end />}
               {...right()}
             />
@@ -3805,12 +3253,6 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
   // In a terminal a cell is a framed box, three rows high and three Cells inside, its digit in the middle: its line
   // only, no fill. The cell that takes the next digit has its line in the accent, a verdict's tone edges them all, a
   // disabled code dims.
-  const cellClass = (cells: string) =>
-    terminal
-      ? "w-10 h-12 items-center justify-center border border-line font-semibold text-foreground focus:border-info disabled:opacity-50"
-      : `${cells} items-center justify-center rounded-lg border border-line bg-inset font-semibold text-foreground transition-colors motion-reduce:transition-none data-filled:border-input data-filled:bg-card focus:outline-2 focus:outline-info focus:-outline-offset-2 disabled:opacity-50`;
-  const cellStyle = (tone?: Tone) =>
-    terminal ? (tone ? { borderColor: toneColor(tone) } : {}) : tone ? { ...finish.inset, backgroundColor: toneTint(tone), borderColor: toneColor(tone) } : finish.inset;
   /** The codes' groups: three Cells apart in a terminal (a Cell's gap and a Cell of margin each side), their cells one. */
   const codeClass = terminal ? "flex-row items-center gap-2" : "flex-row items-center gap-3";
   const groupClass = terminal ? "flex-row gap-2 mx-2" : "flex-row gap-1.5";
@@ -3823,7 +3265,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       <View style={{ height: TERMINAL_ROW }} />
     </If>
   );
-  const sixCells = pointer ? "w-9 h-11 text-lg" : "w-11 h-13 text-xl";
+  const sixCells = otpCells;
 
   function Verify() {
     const CODE = "246810";
@@ -3834,7 +3276,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     cleanup(() => shake.stop());
     const tone = (): Tone | undefined => (verdict() === "Verified" ? "up" : verdict() ? "danger" : undefined);
     return (
-      <Card icon="controls" title="One-time code" subtitle={terminal ? "Six digits: type or paste them; a wrong code marks the cells" : "Six digits: type or paste them; a wrong code shakes"}>
+      <Card icon="controls" title="One-time code" subtitle={terminal ? "Six digits, typed or pasted; a wrong one marks" : "Six digits, typed or pasted; a wrong one shakes"}>
         <View style={{ alignItems: "center", gap: size.gap, paddingVertical: size.padding }}>
           <View style={shake.style}>
             <OtpInput
@@ -3854,10 +3296,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               accessibilityLabel="Verification code, 6 digits"
               class={codeClass}
               groupClass={groupClass}
-              cellClass={cellClass(sixCells)}
-              cellStyle={cellStyle(tone())}
-              caretClass="w-0.5 h-6 rounded-full"
-              caretStyle={{ backgroundColor: colors.text }}
+              {...otpCellLook({ cells: sixCells, tone: () => tone() })}
             />
           </View>
           <CodeSpace />
@@ -3964,12 +3403,12 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
       cleanup(() => m.stop());
       return (
         <View style={{ width: 20, height: 20, borderRadius: 10, alignItems: "center", justifyContent: "center", backgroundColor: tints.up, ...m.style }}>
-          <Icon name="check" size={12} tint={toneColor("up")} weight={markWeight} />
+          <Icon name="check" size={12} tint={toneColor("up")} weight={MARK_WEIGHT} />
         </View>
       );
     }
     return (
-      <Card title="Sign in" subtitle={terminal ? "Send a code, then wait to resend it; a wrong one empties the cells, three lock them" : "Send a code, then wait to resend it; a wrong one shakes, three lock the cells"}>
+      <Card title="Sign in" subtitle={terminal ? "Send, wait to resend; three wrong codes lock it" : "Send, wait to resend; three wrong codes lock it"}>
         <View style={{ alignItems: "center", gap: size.gap, paddingVertical: size.padding }}>
           <View style={shake.style}>
             <OtpInput
@@ -3989,10 +3428,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               accessibilityLabel="Sign-in code, 6 digits"
               class={codeClass}
               groupClass={groupClass}
-              cellClass={cellClass(sixCells)}
-              cellStyle={cellStyle(tone())}
-              caretClass="w-0.5 h-6 rounded-full"
-              caretStyle={{ backgroundColor: colors.text }}
+              {...otpCellLook({ cells: sixCells, tone: () => tone() })}
             />
           </View>
           <CodeSpace />
@@ -4051,7 +3487,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
     const done = () => (step() === "confirm" ? 1 : step() === "set" ? 2 : 0);
     const pinCells = pointer ? "w-11 h-11 text-xl" : "w-13 h-13 text-2xl";
     return (
-      <Card title="PIN" subtitle={terminal ? "Four masked digits, entered twice: a mismatch starts over" : "Four masked digits, entered twice: a mismatch shakes and starts over"} right={<Badge label={step() === "set" ? "Set" : `Step ${done() + 1} of 2`} tone={step() === "set" ? "up" : "neutral"} />}>
+      <Card title="PIN" subtitle={terminal ? "Entered twice; a mismatch starts over" : "Entered twice; a mismatch shakes"} right={<Badge label={step() === "set" ? "Set" : `Step ${done() + 1} of 2`} tone={step() === "set" ? "up" : "neutral"} />}>
         <View style={{ alignItems: "center", gap: size.gap, paddingVertical: size.padding }}>
           {/* The steps' bars; a terminal shows the step in the badge alone. */}
           <View style={{ flexDirection: "row", gap: 6, display: terminal ? "none" : "flex" }}>
@@ -4062,7 +3498,8 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
                     width: 28,
                     height: 4,
                     borderRadius: 2,
-                    backgroundColor: done() > i() ? colors.accent : colors.track,
+                    // Done steps filled; the one being entered half lit.
+                    backgroundColor: done() > i() ? colors.accent : done() === i() && step() !== "set" ? alpha(colors.accent, 0.4) : alpha(colors.text, 0.1),
                     transitionProperty: "background-color",
                     transitionDuration: reduceMotion() ? 0 : 200,
                   }}
@@ -4097,10 +3534,7 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
               accessibilityLabel="PIN, 4 digits"
               class="flex-row items-center gap-2"
               groupClass="flex-row gap-2"
-              cellClass={cellClass(pinCells)}
-              cellStyle={cellStyle(step() === "mismatch" ? "danger" : step() === "set" ? "up" : undefined)}
-              caretClass="w-0.5 h-6 rounded-full"
-              caretStyle={{ backgroundColor: colors.text }}
+              {...otpCellLook({ cells: pinCells, tone: () => step() === "mismatch" ? "danger" : step() === "set" ? "up" : undefined })}
             />
           </View>
           <CodeSpace />
@@ -4135,19 +3569,20 @@ export function Controls(props: { show: Control; firsts?: Control[] }) {
   function Last() {
     return (
       <Card icon="system" title="Last event">
-        <Text style={{ fontSize: 13, color: colors.text, fontFamily: mono }}>{last()}</Text>
+        <LastEvent value={last()} hint="Change a control" />
       </Card>
     );
   }
 
   const cards: Record<Control, (() => JSX.Element)[]> = {
-    Switch: [Settings, Quick],
+    Switch: [Settings, SystemSettings, Quick],
     Checkbox: [Filter, Checklist, Consent, Channels, BoxStates],
     Radio: [Plans, Delivery, Reading],
     Tabs: [Sections, Project],
     Select: [Choices, Downloads, Shipping, Issue],
     Combobox: [Tags, People, Labels, Commands],
-    DatePicker: [Dates, Booking, Deadline, Slots],
+    // The system's picker is on phones only: elsewhere the drawn ones stand alone.
+    DatePicker: [Dates, ...(isAvailable ? [Reminder] : []), Booking, Deadline, Slots],
     Collapsible: [Disclosure, Faq],
     Progress: [Transfers, Uploads, Steps, Meters],
     Slider: [Levels, Equalizer],

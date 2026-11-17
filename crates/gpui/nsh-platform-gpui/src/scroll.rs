@@ -1,14 +1,19 @@
 //! Scroll views: the GPUI side of [`nsh_core::scroll`], which holds
 //! their offsets, wheel / touchpad / touch / keyboard scrolling with
-//! momentum, snapping, the core's scroll requests and scroll events.
+//! momentum, snapping, zooming, the core's scroll requests and scroll
+//! events.
 //!
 //! [`crate::render`] draws the children at [`ViewState::child_origin`],
-//! which follows the offset. Every change of the offset reaches
+//! which follows the offset, scaled by a zoomable view's zoom
+//! ([`ViewState::child_matrix`], which hit tests and conversions follow
+//! too). Every change of the offset or the zoom reaches
 //! [`Host::moved`], which redraws, pins the sticky cells and feeds the
 //! native scroll value in the same frame. Reports are coalesced to one per
 //! frame by the view's frame client ([`Surface::on_frame`]), which also
 //! runs glides, animated scrolls, the indicator's fade and the refresh
-//! spinner, and stops when none of them is left.
+//! spinner, and stops when none of them is left; it tells the surface when
+//! the motion next ends ([`nsh_core::scroll::deadline`]), so a scroll ends
+//! and reports it on time while no frames are drawn.
 //!
 //! Here are what GPUI and the view tree do: drawing the indicator and
 //! the refresh spinner, the sticky cells' views, and finding the scroll
@@ -30,7 +35,7 @@ use crate::{
     geom::Mat4,
     input::KeyEvent,
     render::DrawCx,
-    surface::Surface,
+    surface::{Next, Surface},
     view::{NshView, ViewState},
 };
 
@@ -74,6 +79,16 @@ impl ScrollHost for Host<'_> {
     fn report(&self, offset: Point<Points>, applied: u32) {
         let id = self.view.id();
         self.surface.control(|c| c.scroll(id, offset, applied));
+    }
+
+    fn key_scrolled(&self, key_move: KeyMove) {
+        let id = self.view.id();
+        self.surface.control(|c| c.key_scrolled(id, key_move));
+    }
+
+    fn report_zoom(&self, scale: f32) {
+        let id = self.view.id();
+        self.surface.control(|c| c.zoom(id, scale));
     }
 
     fn moved(&self, offset: Point<Points>) {
@@ -120,9 +135,15 @@ impl ScrollHost for Host<'_> {
             if !view.attached() {
                 // Removed: nothing draws it; a later move starts again.
                 shared::detached(&host);
-                return false;
+                return Next::Done;
             }
-            shared::frame(&host, now * 1000.0)
+            let now = now * 1000.0;
+            if !shared::frame(&host, now) {
+                return Next::Done;
+            }
+            // A glide's, an eased move's or a wheel's end; the indicator's
+            // fade and the refresh spinner only draw.
+            shared::deadline(&host, now).map_or(Next::Frame, |ms| Next::At(ms / 1000.0))
         });
     }
 
@@ -311,9 +332,34 @@ pub(crate) fn refreshing(surface: &Rc<Surface>, view: &NshView, refreshing: bool
     shared::refreshing(&Host::new(surface, view), refreshing);
 }
 
-/// `scrollTo` and `scrollToEnd`.
+/// `scrollTo`, `scrollToEnd` and `zoomTo`.
 pub(crate) fn command(surface: &Rc<Surface>, view: &NshView, command: &Command) {
     shared::command(&Host::new(surface, view), command);
+}
+
+// Zooming.
+
+/// Whether a pinch at `view` zooms it: a zoomable scroll view.
+pub(crate) fn pinches(surface: &Rc<Surface>, view: &NshView) -> bool {
+    view.kind() == ViewKind::Scroll && shared::pinches(&Host::new(surface, view))
+}
+
+/// A pinch (a touchpad's or two fingers') over `view`
+/// ([`pinches`]) began.
+pub(crate) fn pinch_begin(surface: &Rc<Surface>, view: &NshView) {
+    shared::pinch_begin(&Host::new(surface, view));
+}
+
+/// The pinch is at `scale` times the zoom it began at, around `(x, y)`
+/// (`view`'s coordinates); past the limits it rubber-bands.
+pub(crate) fn pinch(surface: &Rc<Surface>, view: &NshView, scale: f32, x: f32, y: f32) {
+    let at = point(Points(x), Points(y));
+    shared::pinch(&Host::new(surface, view), scale, at);
+}
+
+/// The pinch around `(x, y)` ended: past the limits it springs back.
+pub(crate) fn pinch_end(surface: &Rc<Surface>, view: &NshView, x: f32, y: f32) {
+    shared::pinch_end(&Host::new(surface, view), point(Points(x), Points(y)));
 }
 
 // Input.
@@ -534,8 +580,11 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent, x: f32, y: f32) -> bo
     if crate::text_input::focused(surface).is_some() {
         return false;
     }
-    let root = &surface.root;
-    let (w, h) = surface.size();
+    let root = &surface.input_root();
+    let (w, h) = {
+        let s = root.state();
+        (s.frame.size.width.0, s.frame.size.height.0)
+    };
     let (x, y) = if x >= 0.0 && y >= 0.0 && x < w && y < h {
         (x, y)
     } else {
@@ -594,15 +643,7 @@ fn pick(view: &NshView, x: f32, y: f32) -> Option<NshView> {
     }
     let hit = view.with_children(|children| {
         children.iter().rev().find_map(|child| {
-            let local = {
-                let cs = child.state();
-                let (ox, oy) = state.child_origin(cs.frame, cs.shift);
-                let m = Mat4::new().translate(ox, oy);
-                match cs.transform() {
-                    Some(t) => Mat4::mul(&t, &m),
-                    None => m,
-                }
-            };
+            let local = state.child_matrix(&child.state());
             let (cx, cy) = local.unproject(x, y)?;
             pick(child, cx, cy)
         })

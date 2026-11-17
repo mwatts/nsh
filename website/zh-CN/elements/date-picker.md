@@ -84,7 +84,7 @@ function App() {
       presetClass="rounded-md px-2 py-1.5 text-sm hover:bg-accent"
       headerClass="flex-row items-center justify-between"
       rowClass="flex-row justify-between"
-      itemClass="h-8 min-w-8 items-center justify-center rounded-md text-sm focus:ring-2 focus:ring-ring selected:bg-primary selected:text-primary-foreground disabled:opacity-50"
+      itemClass="h-8 min-w-8 items-center justify-center rounded-md text-sm focus-visible:ring-2 focus-visible:ring-ring selected:bg-primary selected:text-primary-foreground disabled:opacity-50"
       timeClass="mt-2 gap-3"
       timeLabel={<Text class="text-sm">Time</Text>}
       timeAccessibilityLabel="Due time"
@@ -112,7 +112,7 @@ mount(App);
 
 - 单个日期：按下某一天会设置值并关闭弹出层。
 - 在 `range` 时，第一次按压开始范围，第二次结束范围，与[日历的](./calendar.md#value)相同；完整的范围设置值并关闭弹出层。
-- 在 `timePrecision` 时（仅限单个日期），日历下方显示一个时间输入框，时间的每次编辑都会报告。在桌面上，选中某一天时弹出层保持打开以便设置时间，并报告带时间的日期；再次按下已选中的日期会关闭弹出层。在手机和平板上，点一下某天就以它的时间选中这一天并关闭底部面板，与单个日期相同；再次打开面板即可设置时间。在设置任何时间之前选中的日期使用 `defaultTime`（默认 `00:00`）。`hourCycle` 是时间输入框的小时计法。
+- 在 `timePrecision` 时（仅限单个日期），日历下方显示一个时间输入框，时间的每次编辑都会报告。在桌面上，选中某一天时弹出层保持打开以便设置时间，并报告带时间的日期；再次按下已选中的日期会关闭弹出层。在手机和平板上，点一下某天就以它的时间选中这一天并关闭底部面板，与单个日期相同；再次打开面板即可设置时间。在设置任何时间之前选中的日期使用 `defaultTime`（默认 `00:00`）。`hourCycle` 是时间输入框的小时计法，与 [TimeField](./time-field.md) 的相同，包括用户的。
 
 `cleanable` 会在有值时加一个清除按钮：按下它会清除值（`onChange({ value: null })`）。这个按钮在触发元素之后，不在它里面，所以按它不会打开弹出层；由应用摆放并填充内容（`clearButton`），和[选择框的清除按钮](./select.md#value)一样。
 
@@ -129,6 +129,21 @@ mount(App);
 [Calendar](./calendar.md) 除值以外的每个属性都会传给选择器的日历：`numberOfMonths`、`firstDayOfWeek`、`disabledMatcher`、`yearRange`、`previousAccessibilityLabel`、`nextAccessibilityLabel`、各部件（从 `headerClass` 到 `itemStyle`）和 `renderItem`。`calendarClass` 和 `calendarStyle` 为日历本身设置样式。它的视图和按键与日历的相同。
 
 时间行（`timeClass`、`timeStyle`）是一行，其中各项垂直居中、两端分布（`flex-row items-center justify-between`，与 `gpui-component` 的相同）：开头是 `timeLabel`，即应用为它写的文字（"时间"），末尾是时间输入框（`timeFieldClass`、`timeFieldStyle`、`timeAccessibilityLabel`），其各段与 [TimeField](./time-field.md) 的相同（`segmentClass`、`separatorClass`、`renderSegment`）。
+
+<a id="entrance-and-exit"></a>
+
+## 出现与离开
+
+在桌面平台上，弹出层像 [Popover](./popover.md#entrance-and-exit) 一样随你的过渡出现和离开：`popupStartingClass` 是它第一帧的外观，`popupClass` 里的 `transition-*` 类把它过渡到自己的外观；`popupEndingClass` 是关闭后的外观，在这些过渡播放期间它会保留、不接受按压，随后触发 `onClose`。关闭时键盘焦点就回到触发元素，除非选择的 `onChange` 把焦点移到了别的视图（比如表单的下一个输入框），那样焦点就留在那里。在离开途中再次打开时，它从当前状态回到自己的外观。`popupStartingStyle` 和 `popupEndingStyle` 以内联样式做同样的事。用户要求减少动态效果时，它立即出现、立即离开；触摸屏上的 sheet 自带滑入和滑出的动作。
+
+```tsx
+<DatePicker
+  popupClass="rounded-lg bg-popover p-3 shadow-md transition-all duration-150 ease-out"
+  popupStartingClass="opacity-0 -translate-y-1"
+  popupEndingClass="opacity-0"
+  trigger={<DateTrigger />}
+/>
+```
 
 <a id="props"></a>
 
@@ -152,6 +167,8 @@ mount(App);
 | `previousAccessibilityLabel`、`nextAccessibilityLabel` | 同 `Calendar` | `string` | 无 | 屏幕阅读器对日历的"上一个"和"下一个"的称呼。 |
 | `placement`、`align`、`offset`、`margin` | `.placement(..)` 等 | 同 `Select` | `"bottom"`、`"start"`、0、0 | 桌面平台：弹出层相对触发元素的位置。 |
 | `popupClass`、`popupStyle` | `.popup_class(..)`、`.popup_style(..)` | `string`、`StyleProp<ViewStyle>` | 无 | 弹出层（桌面平台）或 sheet（触屏设备）。 |
+| `popupStartingClass`、`popupStartingStyle` | `.popup_starting_class(..)`、`.popup_starting_style(..)` | `string`、`StyleProp<ViewStyle>` | 无 | 桌面：弹出层第一帧的外观，叠加在它自己的外观之上：它的过渡从这里开始。 |
+| `popupEndingClass`、`popupEndingStyle` | `.popup_ending_class(..)`、`.popup_ending_style(..)` | `string`、`StyleProp<ViewStyle>` | 无 | 桌面：弹出层关闭后的外观，叠加在它自己的外观之上：过渡播放期间它会保留。 |
 | `backdropClass`、`backdropStyle` | `.backdrop_class(..)`、`.backdrop_style(..)` | `string`、`StyleProp<ViewStyle>` | 无 | sheet 后面的背景层。 |
 | `contentClass`、`contentStyle` | `.content_class(..)`、`.content_style(..)` | `string`、`StyleProp<ViewStyle>` | 无 | 弹出层的内容：预设在日历和时间旁边。 |
 | `presetsClass`、`presetsStyle` | `.presets_class(..)`、`.presets_style(..)` | `string`、`StyleProp<ViewStyle>` | 无 | 预设列。 |

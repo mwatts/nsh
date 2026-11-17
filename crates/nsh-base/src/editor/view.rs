@@ -64,6 +64,7 @@ pub(crate) fn parts<E: Element>(el: E, props: EditorProps, list: &'static [Edito
 
 /// The editor.
 pub(crate) fn render(ed: Ed) -> impl IntoElement {
+    let props = ed.props;
     let lh = {
         let ed = ed.clone();
         move || {
@@ -71,14 +72,6 @@ pub(crate) fn render(ed: Ed) -> impl IntoElement {
             ed.st.borrow().line_height()
         }
     };
-    let font = {
-        let ed = ed.clone();
-        move || {
-            ed.text_rev.get();
-            ed.st.borrow().font.clone()
-        }
-    };
-    let (font_a, font_b, font_c) = (font.clone(), font.clone(), font);
     let vscroll_ed = ed.clone();
     let layout_ed = ed.clone();
     let place_ed = ed.clone();
@@ -99,9 +92,13 @@ pub(crate) fn render(ed: Ed) -> impl IntoElement {
             None => Length::Auto,
         })
         .text_color(move || theme().foreground)
-        .font_family(move || font_a().family)
-        .text_size(move || Length::from(font_b().size))
-        .line_height(move || nsh_core::LineHeight::from(font_c().line_height))
+        // The app's own font: the core grows it by the user's text size, as
+        // the controller's `drawn_font` measures it.
+        .font_family(move || super::controller::font_family(props.font_family.get()))
+        .text_size(move || Length::from(props.font_size.get()))
+        .line_height(move || {
+            nsh_core::LineHeight::from(crate::terminal::row_height(props.line_height.get()))
+        })
         .child(
             scroll()
                 .element_ref(&ed.vscroll)
@@ -511,7 +508,6 @@ fn fold_hit(
                 .top(move || Length::from(lh() * slot.get().1 as f32))
                 .w(move || Length::from(fold_width()))
                 .h(move || Length::from(lh2()))
-                .cursor_pointer()
                 .on_mouse_enter(move |_: &MouseEvent| pointer.hover.set(Some(row())))
                 .on_mouse_leave(move |_: &MouseEvent| {
                     if pointer.hover.get_untracked() == Some(row()) {
@@ -1215,6 +1211,11 @@ fn row_view(
             .absolute()
             .top_0()
             .left(move || Length::from(indent()))
+            // A row is one line: a text the platform draws a little wider
+            // than measured is cut where the content ends, never wrapped
+            // over the next row.
+            .number_of_lines(1u32)
+            .text_overflow(nsh_core::EllipsizeMode::Clip)
             // Only a folded row's text takes presses (its placeholder
             // unfolds): over the scroll views, any other row's glyphs would
             // keep a finger or a wheel on them from the scroll views below.
@@ -1446,29 +1447,45 @@ fn carets(ed: Ed, lh: impl Fn() -> Points + Clone + 'static) -> impl IntoElement
 }
 
 /// What an input method is composing, drawn at the primary caret over the
-/// text.
+/// text, with what follows it on the row moved aside (the text changes only
+/// when the composition commits).
 fn composition(ed: Ed, lh: impl Fn() -> Points + Clone + 'static) -> impl IntoElement {
     let props = ed.props;
     dynamic(move || {
         ed.sel_rev.get();
         ed.text_rev.get();
-        let (text_, at) = {
+        let (text_, tail, at) = {
             let st = ed.st.borrow();
             let text_ = st.composition.clone()?;
-            (text_, st.caret_point(st.primary_head()))
+            let head = st.primary_head();
+            (text_, st.row_after(head), st.caret_point(head))
         };
-        Some(part(
-            text(text_)
+        // The row it covers is the active line's.
+        let active = props.active_line.get();
+        Some(
+            view()
                 .absolute()
                 .left(Length::from(at.x))
                 .top(Length::from(at.y))
                 .h(Length::from(lh()))
                 .pointer_events(PointerEvents::None)
                 .bg(move || theme().background)
-                .underline(),
-            props,
-            EditorPart::Composition,
-        ))
+                .child(
+                    view()
+                        .flex_row()
+                        .h_full()
+                        .bg(move || match active {
+                            true => theme().muted.opacity(0.6),
+                            false => AdaptiveColor::TRANSPARENT,
+                        })
+                        .child(part(
+                            text(text_).number_of_lines(1).underline(),
+                            props,
+                            EditorPart::Composition,
+                        ))
+                        .child(text(tail).number_of_lines(1)),
+                ),
+        )
     })
 }
 
@@ -1506,6 +1523,7 @@ fn sink(ed: Ed, lh: impl Fn() -> Points + Clone + 'static) -> impl IntoElement {
         ed.clone(),
     );
     let value = ed.sink_value;
+    let content = ed.clone();
     input()
         .element_ref(&ed.input)
         .absolute()
@@ -1519,12 +1537,32 @@ fn sink(ed: Ed, lh: impl Fn() -> Points + Clone + 'static) -> impl IntoElement {
         .border(px(0.0))
         .bg(AdaptiveColor::TRANSPARENT)
         .text_color(AdaptiveColor::TRANSPARENT)
+        // UIKit draws what an input method composes whatever the text's
+        // color (a highlight, the caret's knobs). Not 0: UIKit would take
+        // the input out of accessibility. A terminal has no translucency;
+        // keep its sink visible to keyboard focus traversal.
+        .opacity(if crate::terminal::is_terminal() {
+            1.0
+        } else {
+            0.02
+        })
         .caret(false)
         .multiline(true)
+        // The app's scroll bars belong to the text area, not the caret sink.
+        .scrollbar(false)
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
         .paste_behavior(PasteBehavior::Report)
         .value(move || value.get())
+        // The native field is only a keyboard sink; its semantic value is
+        // the document, including off-screen rows and external updates.
+        .accessibility_value(move || {
+            content.text_rev.get();
+            Some(nsh_core::AccessibilityValue {
+                text: Some(content.text().into()),
+                ..Default::default()
+            })
+        })
         .label(move || props.accessibility_label.get().unwrap_or_default())
         .on_change(move |text: &str| change.sink_changed(text))
         .on_composition_change(move |c: &Composition| composition.composition(c.composing, &c.text))

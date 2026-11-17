@@ -20,6 +20,7 @@ mod access;
 mod agent;
 mod animation;
 mod app;
+mod audio;
 mod canvas;
 mod chrome;
 mod decor;
@@ -28,11 +29,16 @@ pub mod dev;
 mod file_drop;
 mod file_requests;
 mod fps;
+mod global_shortcut;
 #[cfg(test)]
 mod gtk_test;
 mod image;
 mod input;
+mod key_focus;
+mod keyboard;
 mod keymap;
+mod links;
+mod login_item;
 mod menu_style;
 mod mount;
 mod native;
@@ -40,7 +46,12 @@ mod navigation;
 mod notifications;
 mod scroll;
 mod selectable_view;
+mod session;
 mod shader;
+// Without GStreamer (the feature `sound`), a stand-in whose loads fail
+// as not supported.
+#[cfg_attr(not(feature = "sound"), path = "sound_off.rs")]
+mod sound;
 mod surface;
 #[cfg(feature = "dev")]
 mod synth;
@@ -48,10 +59,17 @@ mod system;
 mod text;
 mod text_input;
 mod transition;
+mod tray;
 mod view;
+mod window;
+#[cfg(feature = "dev")]
+mod xtest;
 
 pub use gtk4;
-pub use nsh_core::platform::{Appearance, Locale};
+pub use nsh_core::{
+    file_type,
+    platform::{Appearance, Locale},
+};
 pub use nsh_engine::{
     App, Bundle, ByteSize, CacheLocation, CacheOptions, CachePolicy, Limits, Root,
 };
@@ -61,5 +79,6 @@ pub use crate::app::set_root;
 pub use crate::{
     app::{AppOptions, AppSource, AppView, run_app, set_components, set_ui_sets},
     image::AssetBase,
+    links::set_exec_args,
     native::{ComponentContext, ComponentFactory, Components, NativeComponent},
 };

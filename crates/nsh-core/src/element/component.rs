@@ -437,6 +437,32 @@ pub struct ComponentSpec {
     pub generic: bool,
 }
 
+/// The props JS sets on a component's host as on a view (TSX's
+/// `ComponentHostProps` but `ref`): the app's classes and styles, its test
+/// id, its tooltip, layout, file drop, mouse and context menu events.
+pub const HOST_PROPS: &[&str] = &[
+    "class",
+    "classList",
+    "style",
+    "activeStyle",
+    "hoverStyle",
+    "focusStyle",
+    "focusWithinStyle",
+    "focusVisibleStyle",
+    "disabledStyle",
+    "testID",
+    "tooltip",
+    "onLayout",
+    "onFileDragEnter",
+    "onFileDragLeave",
+    "onFileDrop",
+    "onMouseEnter",
+    "onMouseMove",
+    "onMouseLeave",
+    "onMouseUp",
+    "onContextMenu",
+];
+
 /// What makes a component's props', events' and methods' specs.
 type Specs = (
     fn(&mut TsTypes) -> Vec<PropSpec>,
@@ -445,6 +471,16 @@ type Specs = (
 );
 
 impl ComponentSpec {
+    /// The [`HOST_PROPS`] JS sets on its host: those it does not declare
+    /// itself. Its own prop or event of a host prop's name is the one apps
+    /// get (`DataTable`'s `onContextMenu` reports a row and column).
+    pub fn host_props(&self) -> impl Iterator<Item = &'static str> + '_ {
+        HOST_PROPS.iter().copied().filter(|&name| {
+            !self.props.iter().any(|p| p.name == name)
+                && !self.events.iter().any(|e| handler_name(e.name) == name)
+        })
+    }
+
     pub(crate) fn of<C: Component>() -> Self {
         Self::build(
             name_of::<C>(),
@@ -575,7 +611,11 @@ pub struct Root {
     fonts: Vec<Arc<[u8]>>,
     appearance: Option<crate::platform::Appearance>,
     app_id: Option<String>,
+    url_schemes: Vec<String>,
+    capabilities: Option<crate::access::Capabilities>,
     status_bar: Option<crate::StatusBarSetting>,
+    main_window: Option<crate::desktop::MainWindowOptions>,
+    translations: Option<crate::i18n::Translations>,
 }
 
 impl Root {
@@ -587,8 +627,37 @@ impl Root {
             fonts: Vec::new(),
             appearance: None,
             app_id: None,
+            url_schemes: Vec::new(),
+            capabilities: None,
             status_bar: None,
+            main_window: None,
+            translations: None,
         }
+    }
+
+    /// The app's translations (its `locales/` files, which nsh's generated
+    /// code compiles in): what [`t!`](crate::t) reads.
+    pub fn translations(mut self, translations: crate::i18n::Translations) -> Self {
+        self.translations = Some(translations);
+        self
+    }
+
+    /// [`Root::translations`] from the JSON the build writes of the app's
+    /// `locales/` files. A wrong one is logged and left out.
+    #[doc(hidden)]
+    pub fn translations_json(self, json: &str) -> Self {
+        match crate::i18n::Translations::from_json(json) {
+            Ok(translations) => self.translations(translations),
+            Err(e) => {
+                log::warn!("locales: {e}");
+                self
+            }
+        }
+    }
+
+    /// The app's translations ([`Root::translations`]).
+    pub fn translations_ref(&self) -> Option<&crate::i18n::Translations> {
+        self.translations.as_ref()
     }
 
     /// The app's id (`nsh.json` `"id"`, which nsh's generated code sets):
@@ -601,6 +670,60 @@ impl Root {
     /// The app's id ([`Root::app_id`]).
     pub fn app_id_ref(&self) -> Option<&str> {
         self.app_id.as_deref()
+    }
+
+    /// The URL schemes the app claims (`nsh.json` `schemes`,
+    /// which nsh's generated code sets): the links the core lets
+    /// through ([`crate::url_scheme`], [`crate::element::next_url_scheme_open`]).
+    pub fn url_schemes(mut self, schemes: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.url_schemes = schemes.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// The schemes the app claims ([`Root::url_schemes`]).
+    pub fn url_schemes_ref(&self) -> &[String] {
+        &self.url_schemes
+    }
+
+    /// What the app declares it may reach (`nsh.json` `capabilities`, which
+    /// nsh's generated code sets): the engine checks the app's requests,
+    /// URLs it opens, media, web views, clipboard, picker and the rest
+    /// against them, as it does a TSX app's. Without a declaration the app
+    /// reaches what an app without `capabilities` does.
+    pub fn capabilities(mut self, capabilities: crate::access::Capabilities) -> Self {
+        self.capabilities = Some(capabilities);
+        self
+    }
+
+    /// [`Root::capabilities`] from `nsh.json`'s `capabilities` as JSON
+    /// text, which nsh's generated code compiles in (checked when it was
+    /// generated). Read as a package's are: what this runtime does not know
+    /// is not granted (logged), and a declaration it cannot read grants
+    /// nothing.
+    #[doc(hidden)]
+    pub fn capabilities_json(self, json: &str) -> Self {
+        let read = serde_json::from_str::<serde_json::Value>(json)
+            .map_err(|e| e.to_string())
+            .and_then(|v| crate::access::Capabilities::from_json_lenient(&v));
+        let capabilities = match read {
+            Ok((capabilities, dropped)) => {
+                for what in dropped {
+                    log::warn!("nsh.json: {what}, not granted");
+                }
+                capabilities
+            }
+            Err(e) => {
+                log::warn!("nsh.json: capabilities: {e}; nothing granted");
+                crate::access::Capabilities::default()
+            }
+        };
+        self.capabilities(capabilities)
+    }
+
+    /// What the app declares it may reach ([`Root::capabilities`]); `None`:
+    /// no declaration.
+    pub fn capabilities_ref(&self) -> Option<&crate::access::Capabilities> {
+        self.capabilities.as_ref()
     }
 
     /// Renders with design tokens `tokens` (`nsh-base`'s theme's; by
@@ -630,6 +753,39 @@ impl Root {
     pub fn status_bar(mut self, setting: crate::StatusBarSetting) -> Self {
         self.status_bar = Some(setting);
         self
+    }
+
+    /// The main window's launch options (`nsh.json` `"window"`, which nsh's
+    /// generated code sets): the runners open the window by them, and the
+    /// engine applies their attributes with the first frame and keeps the
+    /// placement with `restore_bounds`, as for a TSX app's bundle.
+    pub fn main_window(mut self, options: crate::desktop::MainWindowOptions) -> Self {
+        self.main_window = Some(options);
+        self
+    }
+
+    /// [`Root::main_window`] from `nsh.json`'s `"window"` object as JSON
+    /// text, which nsh's generated code compiles in (checked when it was
+    /// generated). A wrong one is logged and left out.
+    #[doc(hidden)]
+    pub fn main_window_json(self, json: &str) -> Self {
+        let options = serde_json::from_str::<serde_json::Value>(json)
+            .map_err(|e| e.to_string())
+            .and_then(|v| {
+                crate::desktop::MainWindowOptions::from_json(&v).map_err(|e| e.to_string())
+            });
+        match options {
+            Ok(options) => self.main_window(options),
+            Err(e) => {
+                log::warn!("nsh.json: window: {e}");
+                self
+            }
+        }
+    }
+
+    /// The main window's launch options ([`Root::main_window`]).
+    pub fn main_window_ref(&self) -> Option<&crate::desktop::MainWindowOptions> {
+        self.main_window.as_ref()
     }
 
     /// The status bar's default ([`Root::status_bar`]).
@@ -1103,10 +1259,13 @@ impl Registry {
         }
     }
 
-    /// The tokens of theme file `json` (`None`: the defaults), by the
-    /// source a set brings ([`Registry::tokens_from`]; `None`: no set
-    /// does).
-    pub fn tokens(&self, json: Option<&str>) -> Option<Result<super::Tokens, String>> {
+    /// The tokens of theme file `json` (`None`: the defaults) and what of it
+    /// was left out, by the source a set brings ([`Registry::tokens_from`];
+    /// `None`: no set does).
+    pub fn tokens(
+        &self,
+        json: Option<&str>,
+    ) -> Option<Result<(super::Tokens, Vec<String>), String>> {
         self.tokens.map(|source| source(json))
     }
 
@@ -1380,10 +1539,23 @@ pub fn declarations(registry: &Registry, omit: &[&str]) -> String {
             None if spec.generic => ("<T>", "<T = any>", ""),
             None => ("", "", ""),
         };
-        // A component with methods: its ref is an object of them.
-        let host = if spec.methods.is_empty() {
-            "ComponentHostProps"
+        // A component with methods: its ref is an object of them. Host
+        // props it declares itself are its own.
+        let mut omit: Vec<&str> = HOST_PROPS
+            .iter()
+            .copied()
+            .filter(|&h| !spec.host_props().any(|p| p == h))
+            .collect();
+        if !spec.methods.is_empty() {
+            omit.insert(0, "ref");
+        }
+        let host = if omit.is_empty() {
+            "ComponentHostProps".to_owned()
         } else {
+            let names = omit.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>();
+            format!("Omit<ComponentHostProps, {}>", names.join(" | "))
+        };
+        if !spec.methods.is_empty() {
             let _ = write!(
                 out,
                 "/** The ref of `{0}`: its methods. */\nexport interface {0}Ref {{\n  /** The component's host node. */\n  readonly node: ViewRef;\n",
@@ -1406,8 +1578,7 @@ pub fn declarations(registry: &Registry, omit: &[&str]) -> String {
                 let _ = writeln!(out, "  {}({params}): {returns};", m.name);
             }
             out.push_str("}\n\n");
-            "Omit<ComponentHostProps, \"ref\">"
-        };
+        }
         let _ = writeln!(
             out,
             "export interface {}Props{params} extends {host}{extends} {{",
@@ -2048,5 +2219,31 @@ mod tests {
             message,
             "component `nsh_core::element::component::tests::Stepper` is registered twice, by two UI sets"
         );
+    }
+}
+
+#[cfg(test)]
+mod root_tests {
+    use super::Root;
+    use crate::{access::Capabilities, prelude::*};
+
+    #[component]
+    fn Empty() -> impl IntoElement {
+        view()
+    }
+
+    #[test]
+    fn a_root_reads_its_declared_capabilities_as_packages_are_read() {
+        assert_eq!(Root::of::<Empty>().capabilities_ref(), None);
+        // What this runtime does not know is not granted.
+        let root = Root::of::<Empty>().capabilities_json(r#"{"clipboard":true,"bluetooth":true}"#);
+        let expected = Capabilities {
+            clipboard: true,
+            ..Capabilities::default()
+        };
+        assert_eq!(root.capabilities_ref(), Some(&expected));
+        // A declaration it cannot read grants nothing.
+        let root = Root::of::<Empty>().capabilities_json("not json");
+        assert_eq!(root.capabilities_ref(), Some(&Capabilities::default()));
     }
 }

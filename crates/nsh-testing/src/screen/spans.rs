@@ -84,6 +84,8 @@ impl Screen {
                 .flat_map(|(view, text)| {
                     occurrences(&text.text, want)
                         .into_iter()
+                        // Hidden characters (`visibility: "hidden"`) are not seen.
+                        .filter(|&(start, _)| !text.hidden_at(start))
                         .map(|(start, end)| SpanHit {
                             view: *view,
                             start,
@@ -171,8 +173,7 @@ impl Screen {
 
 #[cfg(test)]
 mod tests {
-    use nsh_core::element::Root;
-    use nsh_core::prelude::*;
+    use nsh_core::{element::Root, prelude::*};
     use nsh_engine::EngineConfig;
 
     use crate::headless::Headless;

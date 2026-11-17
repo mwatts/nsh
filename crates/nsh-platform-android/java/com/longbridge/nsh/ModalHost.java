@@ -25,6 +25,8 @@ final class ModalHost {
     /** The modal's root view, placed by the core. */
     final Box root;
     private final Container container;
+    /** This dialog window's shortcuts, raw keys, capture rules and Tab traversal. */
+    private final KeyDispatch keys;
     private Dialog dialog;
     int animation; // 0 slide, 1 fade, 2 none
     /** `closeOnEscape`: the back button (Android's Escape) closes it here, then tells JS. */
@@ -44,6 +46,7 @@ final class ModalHost {
         this.id = id;
         root = new Box(context, mounter, id);
         container = new Container(context);
+        keys = new KeyDispatch(mounter, container, id);
         container.content.addView(root);
         mirror(mounter.rtl);
     }
@@ -78,8 +81,18 @@ final class ModalHost {
 
     /** The shown dialog's window (its decor view), or null. */
     View window() {
-        Window window = shown() && dialog.isShowing() ? dialog.getWindow() : null;
+        Window window = dialogWindow();
         return window == null ? null : window.getDecorView();
+    }
+
+    /** The shown dialog's window, or null. */
+    Window dialogWindow() {
+        return shown() && dialog.isShowing() ? dialog.getWindow() : null;
+    }
+
+    /** Holds focus after an input blurs, so this window still receives hardware keys. */
+    void focusRoot() {
+        container.requestFocus();
     }
 
     void show() {
@@ -101,6 +114,10 @@ final class ModalHost {
             window.addFlags(WindowManager.LayoutParams.FLAG_DRAWS_SYSTEM_BAR_BACKGROUNDS);
             window.setStatusBarColor(0);
             window.setNavigationBarColor(0);
+            // With three-button navigation the system lays a translucent scrim
+            // over a transparent navigation bar (API 29+): a grey band across
+            // the bottom of the app's popup, which reaches under the bar.
+            if (Build.VERSION.SDK_INT >= 29) window.setNavigationBarContrastEnforced(false);
             if (Build.VERSION.SDK_INT >= 30) window.setDecorFitsSystemWindows(false);
             else window.getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         }
@@ -119,6 +136,12 @@ final class ModalHost {
                     android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT, this::backPressed);
         }
         dialog.show();
+        // The dialog's own root takes the fallback focus (its id is the modal's).
+        if (!container.hasFocus()) container.requestFocus();
+        container.post(() -> {
+            if (closing || dialog == null) return;
+            if (container.findFocus() == null) container.requestFocus();
+        });
         matchSystemBars(window);
         Runnable animateIn = () -> {
             if (animation == 2) {
@@ -222,7 +245,7 @@ final class ModalHost {
                     | android.view.WindowInsetsController.APPEARANCE_LIGHT_NAVIGATION_BARS;
             to.setSystemBarsAppearance(from.getSystemBarsAppearance() & mask, mask);
         } else {
-            int mask = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR;
+            int mask = View.SYSTEM_UI_FLAG_LIGHT_STATUS_BAR | View.SYSTEM_UI_FLAG_LIGHT_NAVIGATION_BAR;
             View decor = window.getDecorView();
             int own = activity.getWindow().getDecorView().getSystemUiVisibility() & mask;
             decor.setSystemUiVisibility(decor.getSystemUiVisibility() & ~mask | own);
@@ -250,6 +273,8 @@ final class ModalHost {
         // dialog shows and `onShow` goes out before it goes.
         finishChange();
         closing = true;
+        keys.focusLost();
+        if (mounter.handle() != 0) Native.keyReset(mounter.handle());
         // Its keyboard hides with it, not once the dialog's window is gone.
         mounter.hideKeyboardIn(container);
         Dialog d = dialog;
@@ -306,6 +331,10 @@ final class ModalHost {
 
         Container(Context context) {
             super(context);
+            setFocusable(true);
+            setFocusableInTouchMode(true);
+            setDescendantFocusability(FOCUS_BEFORE_DESCENDANTS);
+            if (Build.VERSION.SDK_INT >= 26) setDefaultFocusHighlightEnabled(false);
             touches = new TouchTracker(mounter, this);
             mounter.touchTrackers.add(touches);
             // The core places the root (`Box.place`) inside it.
@@ -329,8 +358,32 @@ final class ModalHost {
 
         @Override
         public boolean dispatchTouchEvent(android.view.MotionEvent e) {
-            boolean tracking = touches.onTouch(e);
-            return super.dispatchTouchEvent(e) || tracking;
+            android.view.MotionEvent t = mounter.keyboardTap(e);
+            boolean tracking = touches.onTouch(t);
+            boolean handled = super.dispatchTouchEvent(t) || tracking;
+            if (t != e) t.recycle();
+            return handled;
+        }
+
+        @Override
+        public boolean dispatchKeyEvent(KeyEvent e) {
+            return keys.dispatchKeyEvent(e) || super.dispatchKeyEvent(e);
+        }
+
+        @Override
+        public boolean dispatchKeyShortcutEvent(KeyEvent e) {
+            return keys.dispatchKeyShortcutEvent(e) || super.dispatchKeyShortcutEvent(e);
+        }
+
+        @Override
+        public void onWindowFocusChanged(boolean hasWindowFocus) {
+            super.onWindowFocusChanged(hasWindowFocus);
+            if (!hasWindowFocus) {
+                keys.focusLost();
+                if (mounter.handle() != 0) Native.keyReset(mounter.handle());
+            } else if (findFocus() == null) {
+                requestFocus();
+            }
         }
 
         /** Holds the root where the content starts (below the status bar unless translucent). */
@@ -363,22 +416,43 @@ final class ModalHost {
 
         @Override
         public WindowInsets onApplyWindowInsets(WindowInsets insets) {
-            report();
-            if (Build.VERSION.SDK_INT >= 30) {
-                int ime = insets.getInsets(WindowInsets.Type.ime()).bottom;
-                if (ime != keyboard) {
-                    keyboard = ime;
-                    int[] at = new int[2];
-                    getLocationOnScreen(at);
-                    mounter.keyboard(ime > 0 ? at[1] + getHeight() - ime : Integer.MAX_VALUE);
-                }
+            int ime = keyboardHeight(insets);
+            if (ime != keyboard) {
+                keyboard = ime;
+                int[] at = new int[2];
+                getLocationOnScreen(at);
+                mounter.keyboard(ime > 0 ? at[1] + getHeight() - ime : Integer.MAX_VALUE);
+                // Shrink / grow the modal's layout area above the IME (see report).
+                requestLayout();
             }
+            report();
             return super.onApplyWindowInsets(insets);
+        }
+
+        /**
+         * How far the software keyboard reaches into this dialog. Below
+         * Android 11 it shares the bottom system inset with the navigation
+         * bar (same split as {@link NshView}).
+         */
+        private int keyboardHeight(WindowInsets insets) {
+            if (insets == null) return 0;
+            if (Build.VERSION.SDK_INT >= 30) {
+                return insets.getInsets(WindowInsets.Type.ime()).bottom;
+            }
+            int bottom = insets.getSystemWindowInsetBottom();
+            int navigation = navigationBarHeight();
+            return bottom > navigation ? bottom : 0;
+        }
+
+        private int navigationBarHeight() {
+            int res = getResources().getIdentifier("navigation_bar_height", "dimen", "android");
+            return res == 0 ? 0 : getResources().getDimensionPixelSize(res);
         }
 
         private void report() {
             WindowInsets insets = getRootWindowInsets();
             int top = 0, right = 0, bottom = 0, left = 0;
+            int ime = 0;
             if (insets != null) {
                 if (Build.VERSION.SDK_INT >= 30) {
                     android.graphics.Insets bars = insets.getInsets(WindowInsets.Type.systemBars() | WindowInsets.Type.displayCutout());
@@ -386,16 +460,27 @@ final class ModalHost {
                     right = bars.right;
                     bottom = bars.bottom;
                     left = bars.left;
+                    ime = insets.getInsets(WindowInsets.Type.ime()).bottom;
                 } else {
                     top = insets.getSystemWindowInsetTop();
                     right = insets.getSystemWindowInsetRight();
                     bottom = insets.getSystemWindowInsetBottom();
                     left = insets.getSystemWindowInsetLeft();
+                    // Bottom inset taller than the nav bar is the keyboard: keep
+                    // only the bar as a safe-area inset and shrink the height.
+                    int navigation = navigationBarHeight();
+                    if (bottom > navigation) {
+                        ime = bottom;
+                        bottom = navigation;
+                    }
                 }
             }
             int below = statusBar();
             top = Math.max(0, top - below);
-            int[] now = {getWidth(), getHeight() - below, top, right, bottom, left};
+            // Lay the dialog out above the IME so centered cards stay visible
+            // (the activity's keyboard-inset env often stays 0 while a dialog
+            // holds the soft keyboard).
+            int[] now = {getWidth(), Math.max(0, getHeight() - below - ime), top, right, bottom, left};
             if (now[0] == 0 || java.util.Arrays.equals(now, reported)) return;
             reported = now;
             float d = mounter.density;

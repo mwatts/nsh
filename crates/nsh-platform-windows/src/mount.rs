@@ -105,6 +105,8 @@ impl Mounter {
                 | MountItem::Remove { .. }
                 | MountItem::Delete { .. }
                 | MountItem::ViewProps { .. }
+                | MountItem::Frame { .. }
+                | MountItem::ViewStyle { .. }
         ) {
             crate::selectable_view::tree_changed();
         }
@@ -160,6 +162,7 @@ impl Mounter {
             }
             MountItem::Remove { id } => {
                 if let Some(view) = &self.get(*id) {
+                    crate::input::removed(surface, view);
                     crate::navigation::removing(surface, view);
                     // A removal animation detaches the view when it ends.
                     if !crate::transition::removing(surface, view, self.layout_animation.as_ref()) {
@@ -170,6 +173,7 @@ impl Mounter {
             MountItem::Delete { id } => {
                 crate::file_drop::deleted(surface, *id);
                 if let Some(view) = self.views.remove(*id) {
+                    crate::input::removed(surface, &view);
                     crate::navigation::removing(surface, &view);
                     crate::native::deleted(surface, &view);
                     crate::shader::deleted(surface, &view);
@@ -184,7 +188,9 @@ impl Mounter {
             }
             MountItem::Frame { id, frame } => {
                 let Some(view) = &self.get(*id) else { return };
-                if *id == ROOT_ID {
+                // A window's root takes its window's size, which the core
+                // lays it out at (`set_root_size`).
+                if *id == ROOT_ID || crate::app_window::is_window(surface, *id) {
                     return;
                 }
                 let mut frame = *frame;
@@ -426,6 +432,9 @@ impl Mounter {
             ViewKind::HeaderItem => return crate::navigation::header_item_removed(surface, view),
             _ => {}
         }
+        // A view that leaves has no keyboard focus to keep (its listeners
+        // hear no more keys).
+        crate::keyboard::forget(surface, view);
         let parent = view.parent_view();
         view.unparent();
         if let Some(parent) = parent
@@ -439,15 +448,29 @@ impl Mounter {
         let view = self.views.get(id);
         let view = view.as_ref();
         match command {
-            Command::Focus => view.map_or((), crate::text_input::focus),
+            // A field edits; a focusable custom view takes the keyboard
+            // focus as Tab gives it.
+            Command::Focus => match view {
+                Some(view) if view.kind() == ViewKind::Input => crate::text_input::focus(view),
+                Some(view) if view.id() != ROOT_ID => {
+                    crate::keyboard::focus_control(surface, view);
+                }
+                _ => {}
+            },
             Command::Blur => match view {
                 Some(view) if view.kind() == ViewKind::Input => crate::text_input::blur(view),
+                Some(view) if view.id() != ROOT_ID && crate::keyboard::blur(surface, view) => {}
                 _ => crate::text_input::blur_all(surface),
             },
             Command::SetSelection { start, end } => {
                 if let Some(view) = view {
                     crate::text_input::set_selection(view, *start, *end);
                 }
+            }
+            // Not carried out on this platform yet: the app's paste is lost,
+            // so say so.
+            Command::InsertText(_) => {
+                log::warn!("insertText is not supported on Windows yet; nothing inserted")
             }
             Command::ScrollTo { y, .. } if view.is_some_and(|v| v.kind() == ViewKind::Input) => {
                 crate::text_input::scroll_to(view.expect("an input"), *y);
@@ -477,11 +500,18 @@ impl Mounter {
             | Command::StopLoading
             | Command::InjectJavaScript(_)
             | Command::PostMessage(_)
+            | Command::Load(_)
+            | Command::WebViewRequest(_)
             | Command::Seek(_)
             | Command::Native { .. } => {
                 if let Some(view) = view {
                     crate::native::command(surface, view, command);
                 }
+            }
+            // A window of the app's own (`Window.open`) shows dialog root
+            // `id`.
+            Command::Desktop(desktop) if id != ROOT_ID => {
+                crate::app_window::command(surface, id, view, desktop);
             }
             other => crate::system::command(surface, id, other),
         }
@@ -499,7 +529,9 @@ enum Redraw {
 
 /// What `item` may change on screen once applied. Insertions and removals
 /// draw their parents again themselves ([`NshView::insert_before`],
-/// [`NshView::unparent`]); a new view is drawn when it is inserted.
+/// [`NshView::unparent`]), and so does a shader's layer, only when it
+/// changes what is drawn before its next frame ([`crate::shader::set`]); a
+/// new view is drawn when it is inserted.
 fn redrawn(item: &MountItem) -> Redraw {
     match item {
         MountItem::Create { .. }
@@ -517,6 +549,7 @@ fn redrawn(item: &MountItem) -> Redraw {
         | MountItem::ComponentPropSlots { .. }
         | MountItem::TreeOrder(_)
         | MountItem::ProjectStates { .. }
+        | MountItem::Shader { .. }
         | MountItem::NavShader { .. } => Redraw::Nothing,
         MountItem::Frame { id, .. }
         | MountItem::ViewStyle { id, .. }
@@ -530,7 +563,6 @@ fn redrawn(item: &MountItem) -> Redraw {
         | MountItem::ScrollBehavior { id, .. }
         | MountItem::Refreshing { id, .. }
         | MountItem::Canvas { id, .. }
-        | MountItem::Shader { id, .. }
         | MountItem::ShaderInput { id }
         | MountItem::ShaderTransition { id, .. }
         | MountItem::ViewProps { id, .. }

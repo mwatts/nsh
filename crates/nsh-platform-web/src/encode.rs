@@ -561,11 +561,21 @@ pub(crate) fn view_css(s: &ViewStyle) -> (String, Option<String>) {
         if p.has(TransitionProps::SHAPE) {
             props.extend(["border-radius", "outline-width"]);
         }
+        let easing = match t.spring {
+            // It times itself: its progress over the time it settles in.
+            Some(spring) => sampled_easing(|x| {
+                if x >= 1.0 {
+                    1.0
+                } else {
+                    spring.progress(x * spring.settle_ms())
+                }
+            }),
+            None => bezier(t.easing),
+        };
         let timing = format!(
-            "transition-duration:{}ms;transition-delay:{}ms;transition-timing-function:{};",
-            t.duration,
+            "transition-duration:{}ms;transition-delay:{}ms;transition-timing-function:{easing};",
+            t.run_ms(),
             t.delay,
-            bezier(t.easing)
         );
         let _ = write!(css, "transition-property:{};{timing}", props.join(","));
         // The overlay draws the border.
@@ -683,6 +693,11 @@ fn text_css(
     inherit_color: bool,
 ) -> String {
     let mut css = format!("font:{};", css_font(style));
+    // Hidden runs keep their place; the browser leaves them out of the
+    // selection's copy and of the accessibility tree.
+    if style.hidden {
+        css.push_str("visibility:hidden;");
+    }
     if !inherit_color {
         let _ = write!(css, "color:{};", css_color(style.color));
     }
@@ -763,8 +778,9 @@ fn props_json(p: &ViewProps) -> String {
     if let Some(l) = &a.label {
         let _ = write!(s, ",\"label\":{}", json_str(l));
     }
-    if let Some(h) = &a.hint {
-        let _ = write!(s, ",\"hint\":{}", json_str(h));
+    // `aria-description`: the description, then the hint.
+    if let Some(h) = a.help_text(None) {
+        let _ = write!(s, ",\"hint\":{}", json_str(&h));
     }
     // The role's JS name, which is ARIA's (`columnheader`, `treeitem`).
     let _ = write!(s, ",\"role\":{}", json_str(enum_name(&a.role)));
@@ -786,6 +802,9 @@ fn props_json(p: &ViewProps) -> String {
     if a.state.has_popup {
         s.push_str(",\"hasPopup\":true");
     }
+    if a.state.invalid {
+        s.push_str(",\"invalid\":true");
+    }
     if let Some(p) = a.state.pressed {
         let _ = write!(s, ",\"pressed\":{}", json_str(&kebab(&format!("{p:?}"))));
     }
@@ -794,6 +813,17 @@ fn props_json(p: &ViewProps) -> String {
     }
     if let Some(l) = a.level {
         let _ = write!(s, ",\"level\":{l}");
+    }
+    // The views it names (`aria-activedescendant`, `aria-controls`,
+    // `aria-describedby`).
+    if let Some(id) = a.active_descendant {
+        let _ = write!(s, ",\"activeDescendant\":{id}");
+    }
+    if let Some(id) = a.controls {
+        let _ = write!(s, ",\"controls\":{id}");
+    }
+    if let Some(id) = a.described_by {
+        let _ = write!(s, ",\"describedBy\":{id}");
     }
     if let Some(v) = &a.value {
         let n = |v: Option<f32>| v.map_or("null".to_owned(), |v| v.to_string());
@@ -819,6 +849,19 @@ fn props_json(p: &ViewProps) -> String {
     if let Some(t) = &p.test_id {
         let _ = write!(s, ",\"testID\":{}", json_str(t));
     }
+    // An overlay placed against its anchor: `overlays: "viewport"` draws
+    // it over the window (`syncFloats`).
+    if p.overlay_anchor.is_some() {
+        s.push_str(",\"anchored\":true");
+    }
+    // The HTML element the view is drawn as (`web={{ element }}`), and a
+    // link's target (`Link`'s `href`).
+    if let Some(tag) = p.web_element {
+        let _ = write!(s, ",\"element\":{}", json_str(enum_name(&tag)));
+    }
+    if let Some(h) = &p.href {
+        let _ = write!(s, ",\"href\":{}", json_str(h));
+    }
     // Unset leaves it to the presses (`ViewProps::focus_stop`).
     if let Some(focusable) = p.focusable {
         let _ = write!(s, ",\"focusable\":{focusable}");
@@ -829,6 +872,12 @@ fn props_json(p: &ViewProps) -> String {
     // A wrapped line's later part: a copy joins it to the part before.
     if p.continues_text {
         s.push_str(",\"continuesText\":true");
+    }
+    // A list in its parent's viewport: its cells are read in screen order.
+    match p.screen_order {
+        Some(nsh_core::geometry::Axis::Vertical) => s.push_str(",\"screenOrder\":\"vertical\""),
+        Some(nsh_core::geometry::Axis::Horizontal) => s.push_str(",\"screenOrder\":\"horizontal\""),
+        None => {}
     }
     s.push('}');
     s
@@ -926,11 +975,23 @@ fn transition_json(t: &Option<LayoutTransition>) -> String {
                 LayoutCurve::EaseIn => "ease-in".to_owned(),
                 LayoutCurve::EaseOut => "ease-out".to_owned(),
                 LayoutCurve::EaseInEaseOut | LayoutCurve::Keyboard => "ease-in-out".to_owned(),
-                LayoutCurve::Spring { damping } => spring_easing(damping),
+                LayoutCurve::FittedSpring { damping_ratio } => spring_easing(damping_ratio),
+                LayoutCurve::Bezier([x1, y1, x2, y2]) => {
+                    format!("cubic-bezier({x1}, {y1}, {x2}, {y2})")
+                }
+                // It times itself: its progress over the time it settles in,
+                // ending on its place.
+                LayoutCurve::Spring(spring) => sampled_easing(|x| {
+                    if x >= 1.0 {
+                        1.0
+                    } else {
+                        spring.progress(x * spring.settle_ms())
+                    }
+                }),
             };
             format!(
                 "{{\"duration\":{},\"delay\":{},\"easing\":{},\"property\":{}}}",
-                t.duration_ms,
+                t.run_ms(),
                 t.delay_ms,
                 json_str(&easing),
                 json_str(&kebab(&format!("{:?}", t.property)))
@@ -967,10 +1028,16 @@ fn spring(damping: f32, x: f32) -> f32 {
 /// Samples of the spring as a CSS `linear()` easing (piecewise linear,
 /// enough points that the overshoot keeps its shape).
 fn spring_easing(damping: f32) -> String {
+    sampled_easing(|x| spring(damping, x))
+}
+
+/// Samples of `curve` (progress at a fraction of the duration, from 0 to
+/// 1) as a CSS `linear()` easing.
+fn sampled_easing(curve: impl Fn(f32) -> f32) -> String {
     const SAMPLES: usize = 48;
     let mut out = String::from("linear(0");
     for i in 1..=SAMPLES {
-        let v = spring(damping, i as f32 / SAMPLES as f32);
+        let v = curve(i as f32 / SAMPLES as f32);
         let _ = write!(out, ",{}", (v * 1000.0).round() / 1000.0);
     }
     out.push(')');
@@ -1184,6 +1251,8 @@ pub(crate) fn encode(out: &mut Out, item: &MountItem) {
                 .num(options.fade_ms.unwrap_or(0.0))
                 // CSS's `object-position`; empty for the center.
                 .str(&object_position(options.position))
+                // `svg()`'s text color, for its `currentColor`.
+                .opt_str(options.current_color.map(css_color).as_deref())
                 .end();
         }
         MountItem::ScrollConfig {
@@ -1410,6 +1479,9 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
                 .num(*end)
                 .end();
         }
+        Command::InsertText(text) => {
+            out.item("cmd").num(id).str("insertText").str(text).end();
+        }
         Command::Dialog(d) => {
             out.item("cmd").num(id).str("dialog").num(d.id);
             out.opt_str(d.title.as_deref())
@@ -1448,6 +1520,8 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
         }
         Command::Back => out.item("cmd").num(id).str("back").end(),
         Command::ExitApp => out.item("cmd").num(id).str("exitApp").end(),
+        Command::SetAppUrl(url) => out.item("cmd").num(id).str("setAppUrl").str(url).end(),
+        Command::PushAppUrl(url) => out.item("cmd").num(id).str("pushAppUrl").str(url).end(),
         Command::Announce(text) => out.item("cmd").num(id).str("announce").str(text).end(),
         Command::AccessibilityFocus => out.item("cmd").num(id).str("a11yFocus").end(),
         Command::Seek(t) => out.item("cmd").num(id).str("seek").num(*t).end(),
@@ -1464,6 +1538,17 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
             out.bool(*animated).end();
         }
         Command::SetClipboard(text) => out.item("cmd").num(id).str("setClipboard").str(text).end(),
+        Command::SetClipboardItem(item) => {
+            out.item("cmd")
+                .num(id)
+                .str("setClipboardItem")
+                .str(&item.text);
+            match &item.html {
+                Some(html) => out.str(html),
+                None => out.raw("null"),
+            };
+            out.end();
+        }
         Command::Notification(command) => {
             use nsh_core::notifications::NotificationCommand as N;
             match command {
@@ -1485,6 +1570,7 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
                     .str(&notification.id)
                     .str(&notification.title)
                     .str(&notification.body)
+                    .bool(notification.silent)
                     .end(),
                 N::Close(name) => out
                     .item("cmd")
@@ -1492,12 +1578,16 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
                     .str("closeNotification")
                     .str(name)
                     .end(),
+                // The page's own: a browser gives a page none an earlier
+                // load showed.
+                N::CloseAll => out.item("cmd").num(id).str("closeAllNotifications").end(),
                 N::SetBadge(count) => out.item("cmd").num(id).str("setBadge").num(*count).end(),
                 // Presses are reported as they come: a browser starts no
                 // page from one.
                 _ => {}
             }
         }
+        Command::Audio(command) => encode_audio(out, id, command),
         Command::OpenUrl { id: request, url } => out
             .item("cmd")
             .num(id)
@@ -1510,6 +1600,18 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
             .num(id)
             .str("pickScreenColor")
             .num(*request)
+            .end(),
+        // `navigator.share`; a page shares no local files, so a share with
+        // files says only that it has some (`nsh.js` refuses it).
+        Command::Share { id: request, sheet } => out
+            .item("cmd")
+            .num(id)
+            .str("share")
+            .num(*request)
+            .opt_str(sheet.title.as_deref())
+            .opt_str(sheet.text.as_deref())
+            .opt_str(sheet.url.as_deref())
+            .bool(!sheet.files.is_empty())
             .end(),
         Command::ReadClipboard {
             id: request,
@@ -1563,6 +1665,27 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
                 .bool(asked.format == nsh_core::picker::PickFormat::Current)
                 .end();
         }
+        // `nsh.js` `pickFiles`: the request, the limit, the extensions
+        // offered as an input's `accept` (empty: any file), the largest file
+        // read (a larger one answers with its name and size only).
+        Command::PickFiles {
+            id: request,
+            request: asked,
+        } => {
+            let accept = nsh_core::file_dialog::extensions(&asked.filters)
+                .iter()
+                .map(|extension| format!(".{extension}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            out.item("cmd")
+                .num(id)
+                .str("pickFiles")
+                .num(*request)
+                .num(asked.limit)
+                .str(&accept)
+                .num(asked.size_limit() as f64)
+                .end();
+        }
         // The id is written whole (`num` rounds); the page answers with
         // `onHost` `{ type: "reply" }` (`nsh.js` `hostCall`).
         Command::HostCall {
@@ -1578,6 +1701,15 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
                 .raw(&args.to_string())
                 .end();
         }
+        // `nsh.js` `hostPost`: nothing comes back.
+        Command::HostPost { name, args } => {
+            out.item("cmd")
+                .num(id)
+                .str("hostPost")
+                .str(name)
+                .raw(&args.to_string())
+                .end();
+        }
         Command::ImageInfo { id: request, uri } => {
             out.item("cmd")
                 .num(id)
@@ -1586,8 +1718,246 @@ fn encode_command(out: &mut Out, id: u32, command: &Command) {
                 .str(uri)
                 .end();
         }
-        // A browser's bars are the browser's.
-        Command::StatusBar(_) => {}
+        // `nsh.js` `renderCanvas`: the request, the drawing as an on-screen
+        // canvas's (`cv`), the image's size in pixels, pixels per point and
+        // the MIME type; the page answers with `nsh_canvas_image`.
+        Command::RenderCanvas {
+            id: request,
+            drawing,
+            width,
+            height,
+            scale,
+            format,
+        } => {
+            out.item("cmd")
+                .num(id)
+                .str("renderCanvas")
+                .num(*request)
+                .raw(&crate::canvas::encode(drawing))
+                .num(*width)
+                .num(*height)
+                .raw(&serde_json::Value::from(*scale).to_string())
+                .str(format.mime())
+                .end();
+        }
+        // A browser's bars are the browser's; the browser's own developer
+        // tools measure the page.
+        Command::StatusBar(_) | Command::PerfMonitor(_) | Command::PerfMonitorMode(_) => {}
+        // The main window's title is the page's title (`nsh.js` writes it
+        // where the app is the page); the rest of a window is the browser's.
+        Command::Desktop(desktop) => match (id == nsh_core::ROOT_ID, &**desktop) {
+            (true, nsh_core::desktop::DesktopCommand::SetAttributes(attributes)) => {
+                if let Some(title) = &attributes.title {
+                    out.item("cmd").num(id).str("setTitle").str(title).end();
+                }
+            }
+            // While the app listens to quit requests, leaving the page asks
+            // the app first (`nsh.js` `deliverQuitRequest`).
+            (_, nsh_core::desktop::DesktopCommand::SetQuitOnRequest(quit)) => {
+                out.item("cmd")
+                    .num(id)
+                    .str("quitOnRequest")
+                    .bool(*quit)
+                    .end();
+            }
+            // The app's answer to the user leaving the page, while the page
+            // asks it.
+            (true, nsh_core::desktop::DesktopCommand::Quit) => {
+                out.item("cmd").num(id).str("quit").end();
+            }
+            _ => log::debug!("web: command {desktop:?} is not supported"),
+        },
         other => log::debug!("web: command {other:?} is not supported"),
+    }
+}
+
+/// An audio command as `audio*` / `player*` items for `nsh.js` (durations in
+/// seconds). `Load`'s bytes cross as base64: only `data:` sources have
+/// them, and every other source is fetched by the page (`LoadUrl`).
+fn encode_audio(out: &mut Out, id: u32, command: &nsh_core::audio::AudioCommand) {
+    use nsh_core::audio::AudioCommand as A;
+    let cmd = |out: &mut Out, name: &str| {
+        out.item("cmd").num(id).str(name);
+    };
+    match command {
+        A::Load {
+            id: sound,
+            bytes,
+            hint,
+            max_duration,
+        } => {
+            cmd(out, "audioLoad");
+            out.num(*sound)
+                .str(&base64(bytes.bytes()))
+                .str(hint)
+                .num(max_duration.as_secs_f64())
+                .end();
+        }
+        A::LoadUrl {
+            id: sound,
+            url,
+            max_bytes,
+            max_duration,
+        } => {
+            cmd(out, "audioLoadUrl");
+            out.num(*sound)
+                .str(url)
+                .num(*max_bytes as f64)
+                .num(max_duration.as_secs_f64())
+                .end();
+        }
+        A::Play {
+            id: sound,
+            volume,
+            rate,
+        } => {
+            cmd(out, "audioPlay");
+            out.num(*sound).num(*volume).num(*rate).end();
+        }
+        A::Stop { id: sound } => {
+            cmd(out, "audioStop");
+            out.num(*sound).end();
+        }
+        A::Unload { id: sound } => {
+            cmd(out, "audioUnload");
+            out.num(*sound).end();
+        }
+        A::Open {
+            id: player,
+            src,
+            settings,
+        } => {
+            cmd(out, "playerOpen");
+            out.num(*player)
+                .str(src)
+                .num(settings.volume)
+                .num(settings.rate)
+                .bool(settings.looped)
+                .end();
+        }
+        A::Preload { id: player } => {
+            cmd(out, "playerPreload");
+            out.num(*player).end();
+        }
+        A::Resume { id: player } => {
+            cmd(out, "playerResume");
+            out.num(*player).end();
+        }
+        A::Pause { id: player } => {
+            cmd(out, "playerPause");
+            out.num(*player).end();
+        }
+        A::Seek {
+            id: player,
+            position,
+        } => {
+            cmd(out, "playerSeek");
+            out.num(*player).num(position.as_secs_f64()).end();
+        }
+        A::Set {
+            id: player,
+            settings,
+        } => {
+            cmd(out, "playerSet");
+            out.num(*player)
+                .num(settings.volume)
+                .num(settings.rate)
+                .bool(settings.looped)
+                .end();
+        }
+        A::Close { id: player } => {
+            cmd(out, "playerClose");
+            out.num(*player).end();
+        }
+        // Commands added later: a page that does not know them plays nothing.
+        _ => {}
+    }
+}
+
+/// `bytes` as standard base64 (no dependency for a `data:` sound's bytes).
+fn base64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let n = (u32::from(chunk[0]) << 16)
+            | (u32::from(*chunk.get(1).unwrap_or(&0)) << 8)
+            | u32::from(*chunk.get(2).unwrap_or(&0));
+        s.push(ALPHABET[(n >> 18) as usize & 63] as char);
+        s.push(ALPHABET[(n >> 12) as usize & 63] as char);
+        s.push(if chunk.len() > 1 {
+            ALPHABET[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        s.push(if chunk.len() > 2 {
+            ALPHABET[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use nsh_core::desktop::{DesktopCommand, WindowAttributes, WindowRequest};
+
+    use super::*;
+
+    fn commands(id: u32, command: DesktopCommand) -> String {
+        let mut out = Out::new();
+        encode_command(&mut out, id, &Command::Desktop(Box::new(command)));
+        out.finish()
+    }
+
+    #[test]
+    // WindowAttributes is non-exhaustive outside nsh-core.
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_main_windows_title_is_the_pages() {
+        let mut attributes = WindowAttributes::default();
+        attributes.title = Some("Inbox".to_owned());
+        let set = || DesktopCommand::SetAttributes(Box::new(attributes.clone()));
+        assert_eq!(
+            commands(nsh_core::ROOT_ID, set()),
+            r#"[["cmd",1,"setTitle","Inbox"]]"#
+        );
+        // Another window's, other attributes and requests: the browser's.
+        assert_eq!(commands(nsh_core::ROOT_ID + 2, set()), "[]");
+        assert_eq!(
+            commands(
+                nsh_core::ROOT_ID,
+                DesktopCommand::SetAttributes(Box::default())
+            ),
+            "[]"
+        );
+        assert_eq!(
+            commands(
+                nsh_core::ROOT_ID,
+                DesktopCommand::Request(WindowRequest::Focus)
+            ),
+            "[]"
+        );
+    }
+
+    #[test]
+    fn listening_to_quit_requests_reaches_the_player() {
+        assert_eq!(
+            commands(nsh_core::ROOT_ID, DesktopCommand::SetQuitOnRequest(false)),
+            r#"[["cmd",1,"quitOnRequest",false]]"#
+        );
+        assert_eq!(
+            commands(nsh_core::ROOT_ID, DesktopCommand::SetQuitOnRequest(true)),
+            r#"[["cmd",1,"quitOnRequest",true]]"#
+        );
+    }
+
+    #[test]
+    fn the_apps_quit_reaches_the_player() {
+        assert_eq!(
+            commands(nsh_core::ROOT_ID, DesktopCommand::Quit),
+            r#"[["cmd",1,"quit"]]"#
+        );
+        // Restarting is the browser's (the user reloads).
+        assert_eq!(commands(nsh_core::ROOT_ID, DesktopCommand::Restart), "[]");
     }
 }

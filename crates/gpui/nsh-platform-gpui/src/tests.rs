@@ -12,7 +12,7 @@ use gpui::{
     VisualTestContext, Window, div,
 };
 
-use crate::{App, AppOptions, AppView, Bundle, NativeComponent};
+use crate::{App, AppOptions, AppView, Bundle, NativeComponent, Root};
 
 /// A native component that only draws a box.
 struct Square;
@@ -102,7 +102,8 @@ mount(App);
 /// into it: the range, then the caret's and the first line's left edge,
 /// vertical middle and width, rounded (`-` for none).
 const SELECTION_RECTS: &str = r#"
-import { Input, mount, signal, View } from "nsh";
+import { mount, signal, View } from "nsh";
+import { Input } from "nsh/base";
 
 type Rect = { x: number; y: number; width: number; height: number };
 const shown = (r?: Rect) =>
@@ -117,7 +118,7 @@ function App() {
       <Input
         autoFocus
         value={text()}
-        onChange={(t) => text.set(t)}
+        onChange={({ value }) => text.set(value)}
         onSelectionChange={(e) => {
           last = `${e.start} ${e.end} caret ${shown(e.caret)} first ${shown(e.firstRect)}`;
         }}
@@ -133,8 +134,8 @@ mount(App);
 /// moves, under keymap bindings that take Control+Up and Tab wherever the
 /// focus is; a press on the strip above writes the log into the field.
 const KEYS_AND_BINDINGS: &str = r#"
-import { Input, mount, signal, View } from "nsh";
-import { keymap } from "nsh/keymap";
+import { keymap, mount, signal, View } from "nsh";
+import { Input } from "nsh/base";
 
 function App() {
   const text = signal("abcd");
@@ -147,7 +148,7 @@ function App() {
       <Input
         autoFocus
         value={text()}
-        onChange={(t) => text.set(t)}
+        onChange={({ value }) => text.set(value)}
         onKeyPress={(e) => log.push(e.key + (e.shiftKey ? "+shift" : "") + (e.ctrlKey ? "+ctrl" : ""))}
         onSelectionChange={(e) => log.push(`sel ${e.start}`)}
         style={{ height: 40 }}
@@ -244,15 +245,21 @@ fn wait_for(view: &Entity<AppView>, cx: &mut VisualTestContext, text: &str) {
 fn windows(cx: &mut TestAppContext) {
     // The engine (and the settings portal) run on threads of their own.
     cx.executor().allow_parking();
+    // The tests' JS imports all of `nsh/base` (Popover etc.), not only the
+    // core part a host serves by default.
+    crate::set_ui_sets(vec![nsh_base::registry()]);
     keys_reach_the_fields_of_a_surface_showing_a_native_component(cx);
+    a_captured_key_release_is_kept_from_the_window(cx);
     compositions_are_reported_and_hold_values_until_they_end(cx);
     menu_shortcuts_leave_a_focused_field_the_keys_it_uses(cx);
     presses_carry_where_the_pointer_was(cx);
     files_dropped_from_outside_reach_the_view_under_them(cx);
     presses_carry_the_modifier_keys_and_click_count(cx);
     mouse_events_carry_the_position_button_and_modifiers(cx);
+    a_view_removed_under_the_mouse_hears_no_leave(cx);
     an_embedded_surface_takes_the_keyboard_when_its_app_focuses_a_field(cx);
     text_typed_ahead_of_enter_or_a_binding_lands_in_the_next_field(cx);
+    a_popovers_field_follows_its_trigger_in_the_tab_order(cx);
     the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx);
     js_and_rust_view_shortcuts_fire_together_in_either_order(cx);
     each_view_s_functions_read_the_context_its_options_gave_its_engine(cx);
@@ -264,6 +271,7 @@ fn windows(cx: &mut TestAppContext) {
     quit_and_close_requests_go_to_the_handler_instead_of_acting(cx);
     an_auto_hidden_menu_bar_shows_on_alt_alone_and_while_a_menu_is_open(cx);
     asset_uris_resolve_in_the_first_directory_that_has_the_file(cx);
+    the_host_s_theme_overrides_win_over_the_app_s_tokens_they_name(cx);
     releasing_shift_before_alt_keeps_the_auto_hidden_menu_bar_hidden(cx);
     text_typed_as_a_field_mounts_reaches_it(cx);
     text_typed_with_no_action_does_not_reach_a_later_field(cx);
@@ -271,8 +279,13 @@ fn windows(cx: &mut TestAppContext) {
     text_typed_after_a_shortcut_is_dropped_once_the_second_passes(cx);
     an_engine_batch_focuses_a_new_field_without_another_input(cx);
     the_app_s_state_follows_its_window_s_activation_and_visibility(cx);
-    set_frame_sizes_the_window_and_keeps_the_size_it_leaves_out(cx);
+    set_bounds_sizes_the_window_and_keeps_the_size_it_leaves_out(cx);
     a_secondary_click_on_a_drag_area_reaches_its_on_context_menu(cx);
+    props_and_commands_reach_a_native_component_whose_view_is_not_drawn(cx);
+    a_command_without_a_search_field_takes_the_keyboard_on_focus(cx);
+    // GPUI's test platform cannot minimize, which hides on Linux.
+    #[cfg(not(target_os = "linux"))]
+    a_background_app_s_hidden_main_window_is_not_focused(cx);
 }
 
 fn keys_reach_the_fields_of_a_surface_showing_a_native_component(cx: &mut TestAppContext) {
@@ -293,6 +306,102 @@ fn keys_reach_the_fields_of_a_surface_showing_a_native_component(cx: &mut TestAp
     wait_for(&view, cx, "bc");
     cx.simulate_keystrokes("right shift-right backspace");
     wait_for(&view, cx, "b");
+}
+
+mod captured_keys {
+    use nsh_core::prelude::*;
+
+    /// A focusable view that captures every key.
+    #[component]
+    pub(super) fn CapturedKeys() -> impl IntoElement {
+        view()
+            .w_full()
+            .h_full()
+            .focusable(true)
+            .capture_keys(nsh_core::KeyCapture::All)
+    }
+}
+
+/// The focusable stop a test app mounted, once it is drawn.
+fn wait_for_focus_stop(
+    surface: &Rc<crate::surface::Surface>,
+    cx: &mut VisualTestContext,
+) -> crate::view::NshView {
+    fn find(view: &crate::view::NshView) -> Option<crate::view::NshView> {
+        if view.state().props.focusable == Some(true) {
+            return Some(view.clone());
+        }
+        view.child_views()
+            .into_iter()
+            .find_map(|child| find(&child))
+    }
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        if let Some(stop) = find(&surface.root) {
+            return stop;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the focusable view is not drawn"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn a_captured_key_release_is_kept_from_the_window(cx: &mut TestAppContext) {
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| {
+        view.load(App::Rust(Root::of::<captured_keys::CapturedKeys>()))
+    });
+    // The window's focus on the surface, as its own keys reach it.
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    let surface = view.read_with(cx, |view, _| view.surface().clone());
+    let stop = wait_for_focus_stop(&surface, cx);
+    view.update(cx, |_, cx| {
+        crate::key_focus::focus(&surface, &stop);
+        crate::rt::flush(cx);
+    });
+    cx.run_until_parked();
+    let release = || gpui::KeyUpEvent {
+        keystroke: gpui::Keystroke::parse("a").unwrap(),
+    };
+    // The focus captures every key: the release is kept from the window's
+    // other handlers, as a captured press is.
+    let captured =
+        cx.update(|window, cx| window.dispatch_event(gpui::PlatformInput::KeyUp(release()), cx));
+    assert!(
+        !captured.propagate,
+        "a captured release reached the window's handlers"
+    );
+    assert!(
+        captured.default_prevented,
+        "a captured release ran the window's default"
+    );
+    // A captured press is kept the same way, through the path both share.
+    let pressed = cx.update(|window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("a").unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        )
+    });
+    assert!(
+        !pressed.propagate,
+        "a captured press reached the window's handlers"
+    );
+    assert!(pressed.default_prevented);
+    // Without the focus the same release is the window's.
+    crate::key_focus::clear(&surface);
+    cx.run_until_parked();
+    let plain =
+        cx.update(|window, cx| window.dispatch_event(gpui::PlatformInput::KeyUp(release()), cx));
+    assert!(plain.propagate);
+    assert!(!plain.default_prevented);
 }
 
 fn compositions_are_reported_and_hold_values_until_they_end(cx: &mut TestAppContext) {
@@ -507,6 +616,82 @@ fn text_typed_ahead_of_enter_or_a_binding_lands_in_the_next_field(cx: &mut TestA
     typed_ahead(cx, down(0x4E, modifiers));
 }
 
+/// A focused field, an open popover with a field in it, and a field
+/// after the popover.
+const POPOVER_FIELDS: &str = r#"
+import { mount, Text, View } from "nsh";
+import { Input, Popover } from "nsh/base";
+
+function App() {
+  return (
+    <View style={{ flex: 1, padding: 8, gap: 8 }}>
+      <Input autoFocus value="before" style={{ height: 30 }} />
+      <Popover defaultOpen trigger={<Text>Open</Text>}>
+        <Input value="inside" style={{ width: 100, height: 30 }} />
+      </Popover>
+      <Input value="after" style={{ height: 30 }} />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn a_popovers_field_follows_its_trigger_in_the_tab_order(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", POPOVER_FIELDS, &[]).unwrap();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    wait_for(&view, cx, "before");
+    let tab = |view: &Entity<AppView>, cx: &mut VisualTestContext, shift: bool| {
+        view.update(cx, |view, _| {
+            let modifiers = crate::input::Modifiers {
+                shift,
+                ..crate::input::Modifiers::default()
+            };
+            let surface = view.surface().clone();
+            assert!(crate::input::key(
+                &surface,
+                down(crate::keys::VK_TAB, modifiers)
+            ));
+        });
+    };
+    // The trigger takes presses, so it is a stop of its own: no field
+    // has the keyboard while it does.
+    let on_trigger = |view: &Entity<AppView>, cx: &mut VisualTestContext| {
+        let start = Instant::now();
+        loop {
+            cx.run_until_parked();
+            let custom = view.read_with(cx, |view, _| {
+                crate::key_focus::focused(view.surface())
+                    .is_some_and(|v| v.kind() != nsh_core::ViewKind::Input)
+            });
+            if custom && field_text(view, cx).is_none() {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the trigger never takes the keyboard"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    // To the trigger, into the popover, which is shown at the end of the
+    // root view, then on to the field after it, and back.
+    tab(&view, cx, false);
+    on_trigger(&view, cx);
+    tab(&view, cx, false);
+    wait_for(&view, cx, "inside");
+    tab(&view, cx, false);
+    wait_for(&view, cx, "after");
+    tab(&view, cx, true);
+    wait_for(&view, cx, "inside");
+    tab(&view, cx, true);
+    on_trigger(&view, cx);
+    tab(&view, cx, true);
+    wait_for(&view, cx, "before");
+}
+
 /// A native component that takes the keyboard and records each key down
 /// it sees, letting every key go on; it shares its focus handle once drawn.
 struct KeyLog {
@@ -527,7 +712,10 @@ impl NativeComponent for KeyLog {
             div()
                 .size_full()
                 .track_focus(&focus)
-                .on_key_down(move |e, _, _| keys.borrow_mut().push(e.keystroke.unparse()))
+                .on_key_down(move |e, _, cx| {
+                    keys.borrow_mut()
+                        .push(e.keystroke.unparse(cx.platform_info().os))
+                })
                 .into_any_element(),
         )
     }
@@ -629,7 +817,12 @@ fn the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx: &m
     // GPUI's test window sends no releases. K's release reaches the keymap
     // while the component has the focus, so the next Ctrl+K is not a repeat.
     cx.simulate_event(gpui::KeyUpEvent {
-        keystroke: gpui::Keystroke::parse(&format!("{primary}-k")).unwrap(),
+        keystroke: gpui::Keystroke::parse(if cfg!(target_os = "macos") {
+            "cmd-k"
+        } else {
+            "ctrl-k"
+        })
+        .unwrap(),
     });
     cx.simulate_keystrokes(&format!("{primary}-k shift-{primary}-n"));
     assert_eq!(
@@ -648,7 +841,7 @@ fn the_app_s_shortcuts_reach_it_while_a_native_component_has_the_keyboard(cx: &m
 
 /// Dispatches one key and does not park. The following input stays in the
 /// same turn as a shortcut that focuses a field on the next one.
-fn type_key(cx: &mut VisualTestContext, key: &str) {
+fn type_key(cx: &mut VisualTestContext, key: &'static str) {
     let keystroke = gpui::Keystroke::parse(key).unwrap();
     cx.update(|window, cx| {
         window.dispatch_keystroke(keystroke, cx);
@@ -658,18 +851,19 @@ fn type_key(cx: &mut VisualTestContext, key: &str) {
 /// A shell, then a field. The test asks the engine to mount the field
 /// after the window has drawn, with no GPUI input event after that.
 const FIELD_MOUNTED_BY_THE_ENGINE: &str = r#"
-import { Input, View, mount, signal } from "nsh";
-import { Window } from "nsh/desktop";
+import { View, mount, signal } from "nsh";
+import { Input } from "nsh/base";
+import { currentWindow } from "nsh/desktop";
 
 function App() {
   const shown = signal(false);
-  Window.setTitle("ready");
+  currentWindow().set({ title: "ready" });
   return (
     <View
       style={{ flex: 1 }}
       onPress={() => {
         shown.set(true);
-        Window.setTitle("mounted");
+        currentWindow().set({ title: "mounted" });
       }}
     >
       <If when={shown()}>
@@ -750,13 +944,13 @@ fn press_targets(view: &crate::view::NshView, ids: &mut Vec<nsh_core::NodeId>) {
 /// No field yet. `n` mounts and focuses one on the next turn. `abc` is
 /// typed in that same turn, with no wait between the two.
 const FIELD_ON_THE_NEXT_TURN: &str = r#"
-import { Input, View, mount, signal } from "nsh";
-import { keymap } from "nsh/keymap";
-import { Window } from "nsh/desktop";
+import { keymap, View, mount, signal } from "nsh";
+import { Input } from "nsh/base";
+import { currentWindow } from "nsh/desktop";
 
 function App() {
   const shown = signal(false);
-  Window.setTitle("ready");
+  currentWindow().set({ title: "ready" });
   keymap.bind("n", () => {
     setTimeout(() => shown.set(true), 0);
   }, { when: "always" });
@@ -805,7 +999,8 @@ fn text_typed_as_a_field_mounts_reaches_it(cx: &mut TestAppContext) {
 
 /// A field is on screen and not focused. Nothing arms the queue.
 const UNFOCUSED_FIELD: &str = r#"
-import { Input, View, mount } from "nsh";
+import { View, mount } from "nsh";
+import { Input } from "nsh/base";
 
 function App() {
   return (
@@ -891,13 +1086,13 @@ fn text_typed_with_no_action_does_not_reach_a_later_field(cx: &mut TestAppContex
 /// `n` mounts the field over several frames. `abc` is typed before any of
 /// those frames, and the field still receives it.
 const FIELD_AFTER_SEVERAL_TURNS: &str = r#"
-import { Input, View, mount, signal } from "nsh";
-import { keymap } from "nsh/keymap";
-import { Window } from "nsh/desktop";
+import { keymap, View, mount, signal } from "nsh";
+import { Input } from "nsh/base";
+import { currentWindow } from "nsh/desktop";
 
 function App() {
   const shown = signal(false);
-  Window.setTitle("later");
+  currentWindow().set({ title: "later" });
   keymap.bind("n", () => {
     let left = 3;
     const step = () => {
@@ -982,6 +1177,114 @@ fn text_typed_after_a_shortcut_is_dropped_once_the_second_passes(cx: &mut TestAp
         Some(""),
         "text older than a few seconds is not inserted"
     );
+}
+
+/// A native component that records what it is handed.
+struct Recorder {
+    log: Rc<std::cell::RefCell<Vec<String>>>,
+    rendered: Rc<std::cell::Cell<bool>>,
+}
+
+impl NativeComponent for Recorder {
+    fn render(&mut self, _: &mut Window, _: &mut GpuiApp) -> Option<AnyElement> {
+        self.rendered.set(true);
+        None
+    }
+
+    fn set_prop(
+        &mut self,
+        name: &str,
+        value: Option<&serde_json::Value>,
+        _: &mut Window,
+        _: &mut GpuiApp,
+    ) {
+        let value = value.map_or("none".to_owned(), |v| v.to_string());
+        self.log.borrow_mut().push(format!("{name}={value}"));
+    }
+
+    fn command(&mut self, name: &str, args: &serde_json::Value, _: &mut Window, _: &mut GpuiApp) {
+        self.log.borrow_mut().push(format!("{name} {args}"));
+    }
+}
+
+/// A component whose prop changes right before two commands.
+const COMMANDS_TO_COMPONENT: &str = r#"
+import { mount, nativeComponent, type NativeComponentRef, signal, View } from "nsh";
+
+const Recorder = nativeComponent<{ label: string }, {}>("test.recorder", {
+  props: ["label"],
+  events: [],
+});
+
+function App() {
+  const label = signal("first");
+  let recorder: NativeComponentRef | undefined;
+  setTimeout(() => {
+    label.set("second");
+    recorder?.command("go", { n: 1 });
+    recorder?.command("go", { n: 2 });
+  }, 0);
+  return (
+    <View style={{ flex: 1 }}>
+      <Recorder ref={(node) => (recorder = node)} label={label()} style={{ height: 20 }} />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+/// A view the embedding app holds but does not show (a hidden panel).
+struct Unshown(Entity<AppView>);
+
+impl gpui::Render for Unshown {
+    fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+        div().size_full()
+    }
+}
+
+fn props_and_commands_reach_a_native_component_whose_view_is_not_drawn(cx: &mut TestAppContext) {
+    use gpui::AppContext as _;
+    let code = nsh_bundler::compile_module("App.tsx", COMMANDS_TO_COMPONENT, &[]).unwrap();
+    let log = Rc::new(std::cell::RefCell::new(Vec::new()));
+    let rendered = Rc::new(std::cell::Cell::new(false));
+    let (component_log, component_rendered) = (log.clone(), rendered.clone());
+    let (unshown, cx) = cx.add_window_view(|window, cx| {
+        Unshown(cx.new(|cx| AppView::new(AppOptions::default(), window, cx)))
+    });
+    let view = unshown.read_with(cx, |unshown, _| unshown.0.clone());
+    view.update(cx, |view, _| {
+        view.register_component(
+            "test.recorder",
+            Rc::new(move |_| {
+                Box::new(Recorder {
+                    log: component_log.clone(),
+                    rendered: component_rendered.clone(),
+                })
+            }),
+        );
+        view.load(App::Js(Bundle::source(code)));
+    });
+    let expected = [
+        r#"label="first""#,
+        r#"label="second""#,
+        r#"go {"n":1}"#,
+        r#"go {"n":2}"#,
+    ];
+    let start = Instant::now();
+    while log.borrow().len() < expected.len() {
+        cx.run_until_parked();
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the component got {:?}",
+            log.borrow()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Nothing more comes later (each is delivered once), in the order sent.
+    std::thread::sleep(Duration::from_millis(50));
+    cx.run_until_parked();
+    assert_eq!(*log.borrow(), expected);
+    assert!(!rendered.get(), "the view was drawn");
 }
 
 /// The part of the embedding app a view reaches: its engine's context.
@@ -1237,13 +1540,13 @@ const log = signal<string[]>([]);
 const add = (entry: string) => log.set([...log(), entry]);
 mount(() => <View style={{ flex: 1 }}>
   <View
-    onFileDragEnter={() => add("enter outer")}
+    onFileDragEnter={(e) => add("enter outer " + e.uris.join(";"))}
     onFileDragLeave={() => add("leave outer")}
     onFileDrop={(e) => add("drop outer " + e.uris.join(";"))}
     style={{ height: 100 }}
   >
     <View
-      onFileDragEnter={() => add("enter inner")}
+      onFileDragEnter={(e) => add("enter inner " + e.uris.join(";"))}
       onFileDragLeave={() => add("leave inner")}
       onFileDrop={(e) => add("drop inner " + e.uris.join(";"))}
       style={{ height: 40 }}
@@ -1284,19 +1587,27 @@ mount(() => <View style={{ flex: 1 }}>
     // leaves it for the next one, and the drop goes there, without the
     // relative path.
     let dropped = crate::file_drop::test_url("a%20b.txt");
+    let second = crate::file_drop::test_url("c.txt");
+    let final_file = crate::file_drop::test_url("e.txt");
     enter(
         cx,
         20.0,
         &[crate::file_drop::test_path("a b.txt"), "b.txt".into()],
     );
-    wait_for(&view, cx, "enter inner");
+    wait_for(&view, cx, &format!("enter inner {dropped}"));
     send(cx, gpui::FileDropEvent::Pending { position: at(70.0) });
-    wait_for(&view, cx, "enter inner, leave inner, enter outer");
+    wait_for(
+        &view,
+        cx,
+        &format!("enter inner {dropped}, leave inner, enter outer {dropped}"),
+    );
     send(cx, gpui::FileDropEvent::Submit { position: at(70.0) });
     wait_for(
         &view,
         cx,
-        &format!("enter inner, leave inner, enter outer, drop outer {dropped}, leave outer"),
+        &format!(
+            "enter inner {dropped}, leave inner, enter outer {dropped}, drop outer {dropped}, leave outer"
+        ),
     );
     // Leaving the window leaves the destination.
     enter(cx, 20.0, &[crate::file_drop::test_path("c.txt")]);
@@ -1305,8 +1616,8 @@ mount(() => <View style={{ flex: 1 }}>
         &view,
         cx,
         &format!(
-            "enter inner, leave inner, enter outer, drop outer {dropped}, leave outer, \
-             enter inner, leave inner"
+            "enter inner {dropped}, leave inner, enter outer {dropped}, drop outer {dropped}, leave outer, \
+             enter inner {second}, leave inner"
         ),
     );
     // Where no view listens, the drop goes nowhere.
@@ -1321,8 +1632,8 @@ mount(() => <View style={{ flex: 1 }}>
         &view,
         cx,
         &format!(
-            "enter inner, leave inner, enter outer, drop outer {dropped}, leave outer, \
-             enter inner, leave inner"
+            "enter inner {dropped}, leave inner, enter outer {dropped}, drop outer {dropped}, leave outer, \
+             enter inner {second}, leave inner"
         ),
     );
     // A drag that ended schedules one clear of its destination, however
@@ -1332,8 +1643,8 @@ mount(() => <View style={{ flex: 1 }}>
         &view,
         cx,
         &format!(
-            "enter inner, leave inner, enter outer, drop outer {dropped}, leave outer, \
-             enter inner, leave inner, enter inner"
+            "enter inner {dropped}, leave inner, enter outer {dropped}, drop outer {dropped}, leave outer, \
+             enter inner {second}, leave inner, enter inner {final_file}"
         ),
     );
     view.update(cx, |view, cx| {
@@ -1349,8 +1660,8 @@ mount(() => <View style={{ flex: 1 }}>
         &view,
         cx,
         &format!(
-            "enter inner, leave inner, enter outer, drop outer {dropped}, leave outer, \
-             enter inner, leave inner, enter inner, leave inner"
+            "enter inner {dropped}, leave inner, enter outer {dropped}, drop outer {dropped}, leave outer, \
+             enter inner {second}, leave inner, enter inner {final_file}, leave inner"
         ),
     );
 }
@@ -1394,8 +1705,9 @@ fn wait_until(
 
 /// A field showing whether `test/context` exists for this engine.
 const REACHES: &str = r#"
-import { Input, mount, signal, View } from "nsh";
-import { nativeModule } from "nsh/native";
+import { mount, signal, View } from "nsh";
+import { Input } from "nsh/base";
+import { nativeModule } from "nsh";
 
 function App() {
   const text = signal("waiting");
@@ -1409,7 +1721,7 @@ function App() {
   }, 0);
   return (
     <View style={{ flex: 1 }}>
-      <Input autoFocus value={text()} onChange={(t) => text.set(t)} style={{ height: 30 }} />
+      <Input autoFocus value={text()} onChange={({ value }) => text.set(value)} style={{ height: 30 }} />
     </View>
   );
 }
@@ -1517,12 +1829,12 @@ fn height_below_title_bar(cx: &mut VisualTestContext) -> f32 {
 const OWNED_WINDOW: &str = r#"
 import { mount, signal, View } from "nsh";
 import { Input } from "nsh/base";
-import { Menu, Window } from "nsh/desktop";
+import { Menu, currentWindow } from "nsh/desktop";
 
 function App() {
   const height = signal(-1);
   const chosen = signal("");
-  Window.setTitle("Owned");
+  currentWindow().set({ title: "Owned" });
   Menu.setApplicationMenu([
     {
       label: "File",
@@ -1542,10 +1854,31 @@ function App() {
 mount(App);
 "#;
 
-/// The app's height the field reads.
+/// The app's height the field reads, once the app is laid out at the
+/// height its surface is drawn at. The engine lays the app out first at
+/// the surface's height before the app's first batch, which brings the
+/// menu bar that makes the surface shorter: the field reads that first
+/// height until the engine lays the app out again.
 fn app_height(view: &Entity<AppView>, cx: &mut VisualTestContext) -> f32 {
-    let text = wait_until(view, cx, |t| t.starts_with("h ") && !t.starts_with("h -1"));
-    text.split(' ').nth(1).and_then(|h| h.parse().ok()).unwrap()
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        let read = field_text(view, cx)
+            .as_deref()
+            .and_then(|t| t.strip_prefix("h "))
+            .and_then(|t| t.split(' ').next()?.parse::<f32>().ok());
+        let drawn = view.read_with(cx, |view, _| {
+            view.surface().root.state().frame.size.height.0.round()
+        });
+        if read == Some(drawn) {
+            return drawn;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the field reads the height {read:?}, the surface is {drawn} tall"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn an_embedded_view_that_owns_its_window_sets_its_title_and_menu(cx: &mut TestAppContext) {
@@ -1607,12 +1940,12 @@ fn quit_and_close_requests_go_to_the_handler_instead_of_acting(cx: &mut TestAppC
 const AUTO_HIDDEN_BAR: &str = r#"
 import { mount, signal, View } from "nsh";
 import { Input } from "nsh/base";
-import { Menu, Window } from "nsh/desktop";
+import { Menu } from "nsh/desktop";
 
 function App() {
   const height = signal(-1);
   const chosen = signal("");
-  Window.setMenuBar("autoHide");
+  Menu.setMenuBar("autoHide");
   Menu.setApplicationMenu([
     { label: "File", submenu: [{ label: "New", onSelect: () => chosen.set(" new") }] },
   ]);
@@ -1732,6 +2065,86 @@ fn asset_uris_resolve_in_the_first_directory_that_has_the_file(cx: &mut TestAppC
     let report = wait_until(&view, cx, |t| t.contains('|'));
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(report, "app 2x3|cover 4x5");
+}
+
+/// A box drawn in the token `primary` and a focused field showing `LABEL`
+/// and the tokens `primary` and `secondary` of the app's own theme
+/// (`setTheme`) as the app reads them.
+const THEMED_FIELD: &str = r##"
+import { mount, setTheme, token, View } from "nsh";
+import { Input } from "nsh/base";
+
+setTheme({ cssVars: { light: { primary: "#111111", secondary: "#222222" } } });
+mount(() => (
+  <View style={{ flex: 1 }}>
+    <View class="h-10 w-10 bg-primary" />
+    <Input autoFocus value={`LABEL ${token("primary")} ${token("secondary")}`} style={{ height: 30 }} />
+  </View>
+));
+"##;
+
+/// Runs the window, with no input, until its last drawn frame has a quad
+/// filled with `rgb` (`0xRRGGBB`).
+fn wait_until_painted(cx: &mut VisualTestContext, rgb: u32) {
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        let painted = cx.update(|window, _| {
+            window.painted_quads().iter().any(|quad| {
+                quad.background.as_solid().is_some_and(|color| {
+                    let c = gpui::Rgba::from(color);
+                    let channel = |v: f32, shift: u32| ((v * 255.0).round() as u32) << shift;
+                    channel(c.r, 16) | channel(c.g, 8) | channel(c.b, 0) == rgb && c.a == 1.0
+                })
+            })
+        });
+        if painted {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "no quad of #{rgb:06x} drawn"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn the_host_s_theme_overrides_win_over_the_app_s_tokens_they_name(cx: &mut TestAppContext) {
+    let code = |label| {
+        nsh_bundler::compile_module("App.tsx", &THEMED_FIELD.replace("LABEL", label), &[]).unwrap()
+    };
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| {
+        view.load(App::Js(Bundle::source(code("first"))))
+    });
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    wait_for(&view, cx, "first #111111ff #222222ff");
+    wait_until_painted(cx, 0x111111);
+    // Given to the running app, they are drawn with no input.
+    view.update(cx, |view, cx| {
+        view.set_theme_overrides(
+            Some(r##"{ "cssVars": { "light": { "primary": "#ff0000" } } }"##),
+            cx,
+        )
+        .unwrap();
+    });
+    wait_until_painted(cx, 0xff0000);
+    wait_for(&view, cx, "first #ff0000ff #222222ff");
+    // A file that does not parse changes nothing.
+    view.update(cx, |view, cx| {
+        assert!(view.set_theme_overrides(Some("{"), cx).is_err());
+    });
+    // An app loaded again starts with them.
+    view.update(cx, |view, _| {
+        view.load(App::Js(Bundle::source(code("again"))))
+    });
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    wait_for(&view, cx, "again #ff0000ff #222222ff");
+    wait_until_painted(cx, 0xff0000);
+    view.update(cx, |view, cx| view.set_theme_overrides(None, cx).unwrap());
+    wait_until_painted(cx, 0x111111);
+    wait_for(&view, cx, "again #111111ff #222222ff");
 }
 
 fn releasing_shift_before_alt_keeps_the_auto_hidden_menu_bar_hidden(cx: &mut TestAppContext) {
@@ -1996,7 +2409,7 @@ fn mouse_events_carry_the_position_button_and_modifiers(cx: &mut TestAppContext)
 /// line and in the window, and the caret offset `text_index_at` finds
 /// there.
 mod press_text_index {
-    use nsh_core::{EventKind, EventPayload, PressEvent, TextLine, ui::prelude::*};
+    use nsh_core::{EventKind, EventPayload, PressEvent, TextLine, element::input, prelude::*};
 
     #[component]
     pub(super) fn PressPoint() -> impl IntoElement {
@@ -2078,6 +2491,64 @@ fn presses_carry_the_point_text_index_at_reads(cx: &mut TestAppContext) {
     );
 }
 
+/// Pad A at (10, 10), 100 × 40, replaced by pad B in the same place when
+/// the mouse enters it, over a focused field that logs the pads' enters
+/// and leaves. Each pad's handlers hold its view through its ref: a cycle,
+/// so a removed pad outlives its removal until a collection.
+const HOVER_REMOVED: &str = r#"
+import { mount, signal, View } from "nsh";
+import { Input } from "nsh/base";
+
+function Pad(props: { name: string; note: (s: string) => void; onEnter?: () => void }) {
+  let view: unknown;
+  return (
+    <View
+      ref={(node) => (view = node)}
+      onMouseEnter={() => {
+        props.note(`enter ${props.name}`);
+        props.onEnter?.();
+      }}
+      onMouseLeave={() => view && props.note(`leave ${props.name}`)}
+      style={{ marginLeft: 10, marginTop: 10, width: 100, height: 40 }}
+    />
+  );
+}
+
+function App() {
+  const open = signal("a");
+  const log = signal("");
+  const note = (s: string) => log.set(`${log()}|${s}`);
+  return (
+    <View style={{ flex: 1 }}>
+      <If when={open() === "a"}>
+        <Pad name="a" note={note} onEnter={() => open.set("b")} />
+      </If>
+      <If when={open() === "b"}>
+        <Pad name="b" note={note} />
+      </If>
+      <Input autoFocus value={`${open()}:${log()}`} style={{ height: 30 }} />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn a_view_removed_under_the_mouse_hears_no_leave(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", HOVER_REMOVED, &[]).unwrap();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    wait_for(&view, cx, "a:");
+    let none = gpui::Modifiers::default();
+    // Entering A removes it: B, now under the still mouse, is entered, and
+    // A, gone, hears no leave then or on the next move.
+    cx.simulate_mouse_move(gpui::point(gpui::px(30.0), gpui::px(25.0)), None, none);
+    wait_for(&view, cx, "b:|enter a|enter b");
+    cx.simulate_mouse_move(gpui::point(gpui::px(120.0), gpui::px(30.0)), None, none);
+    wait_for(&view, cx, "b:|enter a|enter b|leave b");
+}
+
 /// A left click at `position` that is click `count` of a series.
 fn click(cx: &mut VisualTestContext, position: gpui::Point<gpui::Pixels>, count: usize) {
     let (button, modifiers) = (gpui::MouseButton::Left, gpui::Modifiers::default());
@@ -2120,21 +2591,22 @@ fn the_app_s_state_follows_its_window_s_activation_and_visibility(cx: &mut TestA
 const SIZED_WINDOW: &str = r#"
 import { mount, View } from "nsh";
 import { Input } from "nsh/base";
-import { Menu, Window } from "nsh/desktop";
+import { Menu, currentWindow } from "nsh/desktop";
 
 function App() {
-  Window.setFrame({ size: { width: 640, height: 480 } });
+  const win = currentWindow();
+  win.setBounds({ size: { width: 640, height: 480 } });
   Menu.setApplicationMenu([
     {
       label: "View",
       submenu: [
-        { label: "Narrow", shortcut: "mod+shift+n", onSelect: () => Window.setFrame({ size: { width: 500 } }) },
+        { label: "Narrow", shortcut: "mod+shift+n", onSelect: () => win.setBounds({ size: { width: 500 } }) },
         {
           label: "Both",
           shortcut: "mod+shift+b",
           onSelect: () => {
-            Window.setFrame({ size: { width: 600 } });
-            Window.setFrame({ size: { height: 400 } });
+            win.setBounds({ size: { width: 600 } });
+            win.setBounds({ size: { height: 400 } });
           },
         },
       ],
@@ -2149,7 +2621,7 @@ function App() {
 mount(App);
 "#;
 
-fn set_frame_sizes_the_window_and_keeps_the_size_it_leaves_out(cx: &mut TestAppContext) {
+fn set_bounds_sizes_the_window_and_keeps_the_size_it_leaves_out(cx: &mut TestAppContext) {
     let code = nsh_bundler::compile_module("App.tsx", SIZED_WINDOW, &[]).unwrap();
     let (view, cx) = owned_view(cx, code, |_| {});
     wait_for(&view, cx, "sized");
@@ -2222,4 +2694,109 @@ fn a_secondary_click_on_a_drag_area_reaches_its_on_context_menu(cx: &mut TestApp
         click_count: 1,
     });
     wait_for(&view, cx, "menu 20 15");
+}
+
+/// A command without a search field that the app focuses once mounted;
+/// the item chosen with the keyboard goes to a field.
+const UNSEARCHABLE_COMMAND: &str = r#"
+import { mount, signal, View } from "nsh";
+import { Command, Input } from "nsh/base";
+
+function App() {
+  const log = signal("start");
+  let command: any;
+  let field: any;
+  setTimeout(() => command?.focus(), 0);
+  return (
+    <View style={{ flex: 1, padding: 8, gap: 8 }}>
+      <Input ref={(node) => (field = node)} autoFocus value={log()} style={{ height: 30 }} />
+      <Command
+        ref={(node) => (command = node)}
+        searchable={false}
+        items={[{ id: "alpha", label: "Alpha" }, { id: "beta", label: "Beta" }]}
+        onSelect={({ id }) => { log.set(`selected ${id}`); field?.focus(); }}
+      />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+fn a_command_without_a_search_field_takes_the_keyboard_on_focus(cx: &mut TestAppContext) {
+    let code = nsh_bundler::compile_module("App.tsx", UNSEARCHABLE_COMMAND, &[]).unwrap();
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    // `focus()` moves the keyboard from the field to the command.
+    let start = Instant::now();
+    loop {
+        cx.run_until_parked();
+        let moved = view.read_with(cx, |view, _| {
+            crate::key_focus::focused(view.surface()).is_some()
+                && crate::text_input::focused(view.surface()).is_none()
+        });
+        if moved {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "the command never took the focus"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Its keys reach it: Down moves to the next item, Return chooses it.
+    cx.simulate_keystrokes("down");
+    cx.run_until_parked();
+    std::thread::sleep(Duration::from_millis(50));
+    cx.simulate_keystrokes("enter");
+    let text = wait_until(&view, cx, |t| t.starts_with("selected"));
+    assert!(
+        text == "selected alpha" || text == "selected beta",
+        "{text}"
+    );
+    assert!(view.read_with(cx, |view, _| {
+        crate::key_focus::focused(view.surface()).is_none()
+    }));
+}
+
+/// A field that reads whether the window has the keyboard.
+#[cfg(not(target_os = "linux"))]
+const FOCUSED_WINDOW: &str = r#"
+import { mount } from "nsh";
+import { Input } from "nsh/base";
+import { currentWindow } from "nsh/desktop";
+
+function App() {
+  const win = currentWindow();
+  return <Input autoFocus value={`focused=${win.state()?.focused}`} style={{ height: 30 }} />;
+}
+mount(App);
+"#;
+
+#[cfg(not(target_os = "linux"))]
+fn a_background_app_s_hidden_main_window_is_not_focused(cx: &mut TestAppContext) {
+    use nsh_core::desktop::WindowRequest;
+    let code = nsh_bundler::compile_module("App.tsx", FOCUSED_WINDOW, &[]).unwrap();
+    cx.update(|cx| crate::window::set_in_background(true, cx));
+    let (view, cx) = owned_view(cx, code, |_| {});
+    // Only the window that would have the keyboard in a background app
+    // has it: the system's active window is another app's.
+    cx.deactivate_window();
+    let request = |r: WindowRequest, cx: &mut VisualTestContext| {
+        view.update(cx, |view, _| {
+            crate::window::main_request(view.surface(), &r)
+        });
+    };
+    wait_for(&view, cx, "focused=false");
+    request(WindowRequest::Focus, cx);
+    wait_for(&view, cx, "focused=true");
+    // Hidden, it has the keyboard no longer, as the system gives a hidden
+    // window's to another.
+    request(WindowRequest::Hide, cx);
+    wait_for(&view, cx, "focused=false");
+    // Shown again, it takes it back.
+    request(WindowRequest::Show, cx);
+    wait_for(&view, cx, "focused=true");
+    cx.update(|_, cx| crate::window::set_in_background(false, cx));
 }

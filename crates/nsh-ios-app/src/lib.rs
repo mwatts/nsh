@@ -1,5 +1,6 @@
 //! The executable of a packaged nsh app (`nsh package`): runs the bundle
-//! shipped inside the app (`nsh/bundle.nshc`, assets in `nsh/assets`).
+//! shipped inside the app (`nsh/bundle.nshc`, assets in `nsh/assets`), or a
+//! newer signed package of its code it downloaded (`nsh_engine::updates`).
 //!
 //! A library so that an app with Rust components of its own (`nsh.json`
 //! `"rust"`) builds the release runner with them: its `main` calls
@@ -10,9 +11,9 @@
 /// Runs the release runner (until the app quits).
 #[cfg(all(target_os = "ios", feature = "js"))]
 pub fn main() {
-    use nsh_platform_ios::{AppSource, Bundle, run_app};
+    use nsh_platform_ios::{AppSource, AssetBase, Bundle, run_app};
 
-    let (dir, options) = setup();
+    let (dir, mut options) = setup();
     // SAFETY: the bytecode is a resource of this (signed) app.
     let bundle = match unsafe { Bundle::read_trusted(&dir.join("bundle.nshc")) } {
         Ok(bundle) => bundle,
@@ -21,7 +22,14 @@ pub fn main() {
             std::process::exit(1);
         }
     };
-    run_app(AppSource::Bundle(bundle), options);
+    // Where the engine keeps the app's data (`SurfaceOptions::support_dir`).
+    let support_dir = options
+        .support_dir
+        .clone()
+        .or_else(|| nsh_platform_ios::SurfaceOptions::default().support_dir);
+    let launch = nsh_engine::updates::launch(bundle, &dir, support_dir.as_deref());
+    options.asset_base = Some(AssetBase::Directory(launch.assets));
+    run_app(AppSource::Bundle(launch.bundle), options);
 }
 
 /// Runs the Rust app whose root is `root` (until the app quits), with the
@@ -40,29 +48,17 @@ pub fn main() {
 }
 
 /// Installs the logger and finds the app's resources (`nsh` in the app
-/// bundle). `NSH_DEVELOPMENT` (`nsh run` of a Rust app) logs the app's own
-/// lines too.
+/// bundle). Warnings, errors and the app's `js` lines go to the unified log
+/// (an app opened from the Home screen has no stderr anyone reads);
+/// `NSH_DEVELOPMENT` (`nsh run` of a Rust app) logs the app's own lines too,
+/// and on stderr, which `nsh run` shows.
 #[cfg(target_os = "ios")]
 fn setup() -> (std::path::PathBuf, nsh_platform_ios::AppOptions) {
     use nsh_platform_ios::{AppOptions, AssetBase};
 
-    static DEVELOPMENT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    struct Logger;
-    impl log::Log for Logger {
-        fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-            m.level() <= log::Level::Warn || m.target() == "js" || DEVELOPMENT.get() == Some(&true)
-        }
-        fn log(&self, r: &log::Record<'_>) {
-            if self.enabled(r.metadata()) {
-                eprintln!("{} {}: {}", r.level(), r.target(), r.args());
-            }
-        }
-        fn flush(&self) {}
-    }
-    static LOGGER: Logger = Logger;
-    let _ = DEVELOPMENT.set(std::env::var_os("NSH_DEVELOPMENT").is_some());
-    let _ = log::set_logger(&LOGGER);
-    log::set_max_level(log::LevelFilter::Info);
+    let mut logging = nsh_platform_apple::unified_log::Options::default();
+    logging.development = std::env::var_os("NSH_DEVELOPMENT").is_some();
+    nsh_platform_apple::unified_log::install(logging);
 
     // The app bundle directory holds the executable.
     let dir = std::env::current_exe()

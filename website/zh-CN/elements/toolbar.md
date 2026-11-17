@@ -34,7 +34,10 @@ fn formatting() -> impl IntoElement {
                 .size_8()
                 .items_center()
                 .justify_center()
-                .pressed_style(|s| s.bg(move || theme().accent))
+                .border_1()
+                .border_color(transparent_black())
+                .hover(|s| s.bg(move || theme().foreground.opacity(0.05)))
+                .pressed_style(|s| s.bg(move || theme().foreground.opacity(0.1)).border_color(move || theme().border))
                 .child(text("B")),
         )
 }
@@ -47,12 +50,12 @@ import { Button, Toggle, Toolbar, ToolbarGroup, ToolbarSeparator } from "nsh/bas
 function App() {
   const bold = signal(false);
   return (
-    <Toolbar accessibilityLabel="Formatting" class="items-center gap-1 self-start rounded-lg bg-muted p-1">
+    <Toolbar accessibilityLabel="Formatting" class="items-center gap-1 self-start rounded-lg border border-border bg-muted p-1">
       <ToolbarGroup accessibilityLabel="History">
-        <Button accessibilityLabel="Undo" class="size-8 items-center justify-center rounded-md hover:bg-accent">
+        <Button accessibilityLabel="Undo" class="size-8 items-center justify-center rounded-md hover:bg-foreground/5">
           <Text>↶</Text>
         </Button>
-        <Button accessibilityLabel="Redo" class="size-8 items-center justify-center rounded-md hover:bg-accent">
+        <Button accessibilityLabel="Redo" class="size-8 items-center justify-center rounded-md hover:bg-foreground/5">
           <Text>↷</Text>
         </Button>
       </ToolbarGroup>
@@ -61,7 +64,7 @@ function App() {
         pressed={bold()}
         accessibilityLabel="Bold"
         onChange={({ pressed }) => bold.set(pressed)}
-        class="size-8 items-center justify-center rounded-md aria-pressed:bg-accent"
+        class="size-8 items-center justify-center rounded-md border border-transparent hover:bg-foreground/5 aria-pressed:border-border aria-pressed:bg-foreground/10"
       >
         <Text>B</Text>
       </Toggle>
@@ -114,21 +117,21 @@ mount(App);
 | 分隔线 | 栏、分组 | `ToolbarSeparator` 的 `class`、`style` | |
 | 项目 | 栏、分组 | 项目自己的 `class`、`style` | 它自己的：`aria-pressed:`、`disabled:`、`hover:`、`focus:`、`active:` |
 
-用 `focus:` 样式显示键盘所在的项目，用按下的开关按钮自己的底色显示它的按下状态（见[设计指南](../docs/design-guides.md#交互状态)）。
+用 `focus-visible:` 样式显示键盘所在的项目，用按下的开关按钮自己的底色显示它的按下状态（见[设计指南](../docs/design-guides.md#交互状态)）。
 
 ## 竖排
 
 工具面板是一列：`axis="vertical"` 让项目从上到下排列，上下键沿着它们移动。
 
 ```tsx
-<Toolbar axis="vertical" accessibilityLabel="Tools" class="gap-1 self-start rounded-lg bg-muted p-1">
+<Toolbar axis="vertical" accessibilityLabel="Tools" class="gap-1 self-start rounded-lg border border-border bg-muted p-1">
   <Each of={["select", "pen", "shape", "text"]}>
     {(t) => (
       <Toggle
         pressed={tool() === t()}
         accessibilityLabel={t()}
         onChange={({ pressed }) => pressed && tool.set(t())}
-        class="size-8 items-center justify-center rounded-md aria-pressed:bg-accent"
+        class="size-8 items-center justify-center rounded-md border border-transparent hover:bg-foreground/5 aria-pressed:border-border aria-pressed:bg-foreground/10"
       >
         <Text>{t()[0].toUpperCase()}</Text>
       </Toggle>

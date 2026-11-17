@@ -9,28 +9,32 @@ use block2::RcBlock;
 use dispatch2::{DispatchQueue, MainThreadBound};
 use nsh_core::{MountBatch, Points, Size};
 use nsh_engine::{
-    App, ColorScheme, Edges, Engine, EngineConfig, Environment, Idiom, Lifecycle, MountSink, Policy,
+    App, ColorScheme, Edges, Engine, EngineConfig, Environment, Idiom, Lifecycle, MainThreadTask,
+    MountSink, Policy,
 };
 use objc2::{
     DefinedClass, MainThreadMarker, MainThreadOnly, Message, define_class, msg_send,
     rc::{Retained, Weak},
-    runtime::{AnyObject, ProtocolObject},
+    runtime::ProtocolObject,
 };
 use objc2_core_foundation::{CGRect, CGSize};
 use objc2_foundation::{
-    NSNotification, NSNotificationCenter, NSNumber, NSObject, NSObjectProtocol, NSOperationQueue,
-    NSSet, NSString, NSValue,
+    NSCurrentLocaleDidChangeNotification, NSNotification, NSNotificationCenter, NSNumber, NSObject,
+    NSObjectProtocol, NSOperationQueue, NSSet, NSSystemTimeZoneDidChangeNotification, NSTimeZone,
+    NSValue,
 };
 use objc2_ui_kit::{
     NSValueUIGeometryExtensions, UIApplication, UIApplicationDidBecomeActiveNotification,
     UIApplicationDidEnterBackgroundNotification, UIApplicationState,
     UIApplicationWillEnterForegroundNotification, UIApplicationWillResignActiveNotification,
-    UIDevice, UIFont, UIFontTextStyleBody, UIKeyboardAnimationCurveUserInfoKey,
-    UIKeyboardAnimationDurationUserInfoKey, UIKeyboardFrameEndUserInfoKey,
-    UIKeyboardWillChangeFrameNotification, UIKeyboardWillHideNotification, UIResponder,
-    UISceneActivationState, UISceneDidActivateNotification, UISceneDidEnterBackgroundNotification,
+    UIDevice, UIFocusAnimationCoordinator, UIFocusUpdateContext, UIFont, UIFontTextStyleBody,
+    UIKeyboardAnimationCurveUserInfoKey, UIKeyboardAnimationDurationUserInfoKey,
+    UIKeyboardFrameEndUserInfoKey, UIKeyboardWillChangeFrameNotification,
+    UIKeyboardWillHideNotification, UIPress, UIPressesEvent, UIResponder, UISceneActivationState,
+    UISceneDidActivateNotification, UISceneDidEnterBackgroundNotification,
     UISceneWillDeactivateNotification, UISceneWillEnterForegroundNotification, UITraitCollection,
-    UITraitEnvironment, UIUserInterfaceIdiom, UIUserInterfaceStyle, UIView, UIWindowScene,
+    UITraitEnvironment, UIUserInterfaceIdiom, UIUserInterfaceStyle, UIView, UIViewLayoutRegion,
+    UIViewLayoutRegionAdaptivityAxis, UIWindowScene,
 };
 
 use crate::{
@@ -80,6 +84,11 @@ impl MountSink for MainThreadSink {
                 mounter.request_frame();
             }
         });
+    }
+
+    fn run_on_main_thread(&self, task: MainThreadTask) {
+        // The main queue is serial: after the batches submitted before it.
+        DispatchQueue::main().exec_async(move || task.run());
     }
 
     fn hot_update_failed(&self) {
@@ -136,8 +145,12 @@ pub(crate) struct RootViewIvars {
     host: Cell<nsh_engine::HostEnvironment>,
     /// The embedding app's theme overrides ([`Surface::set_host_tokens`]).
     host_tokens: RefCell<Option<nsh_engine::Tokens>>,
+    /// Font files the embedding app registers ([`Surface::add_font`]).
+    fonts: RefCell<Vec<Vec<u8>>>,
     /// Keyboard notification registrations.
     observers: RefCell<Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,
+    /// Links that came before the engine started ([`Surface::url_scheme`]).
+    url_schemes: RefCell<Vec<String>>,
     #[cfg(feature = "dev")]
     test_model: TestModel,
 }
@@ -156,7 +169,17 @@ define_class!(
             // SAFETY: calling the superclass implementation.
             let _: () = unsafe { msg_send![super(self), layoutSubviews] };
             let size = self.bounds().size;
-            if size.width <= 0.0 || size.height <= 0.0 || size == self.ivars().size.get() {
+            if size.width <= 0.0 || size.height <= 0.0 {
+                return;
+            }
+            if size == self.ivars().size.get() {
+                // UIKit updates the layout regions as it lays the view
+                // out: publish when they moved the safe area without a
+                // resize.
+                let published = self.ivars().environment.get().map(|env| env.safe_area);
+                if published.is_some_and(|safe| safe != self.safe_area()) {
+                    self.publish_environment();
+                }
                 return;
             }
             self.ivars().size.set(size);
@@ -201,6 +224,10 @@ define_class!(
             let _: () = unsafe { msg_send![super(self), didMoveToWindow] };
             // Another window may be another scene, in another state.
             self.ivars().lifecycle.set(self.scene_state());
+            // Keys held through a window move lose their releases.
+            if let Some(target) = self.target() {
+                target.keyboard().clear();
+            }
             self.publish_environment();
             let Some(mounter) = self
                 .ivars()
@@ -250,15 +277,25 @@ define_class!(
             });
         }
 
+        /// The root owns the keyboard until a view or input takes it: a
+        /// hardware key with nothing focused reaches the surface (Tab then
+        /// moves to the first stop) instead of going to no responder.
+        #[unsafe(method(canBecomeFirstResponder))]
+        fn can_become_first_responder(&self) -> bool {
+            true
+        }
+
         /// Hardware keys no responder inside handled: the app's shortcuts
-        /// (`nsh/keymap`) take those they bind. Else a plain character,
-        /// with no text field focused, waits for the next field. The
-        /// software keyboard never comes here.
+        /// (`nsh/keymap`) take those they bind, then Tab with no focused
+        /// view moves to the first stop ([`crate::keyboard::root_tab`]).
+        /// Else a plain character, with no text field focused, waits for
+        /// the next field. The software keyboard never comes here.
         #[unsafe(method(pressesBegan:withEvent:))]
-        fn presses_began(&self, presses: &NSSet<AnyObject>, event: Option<&AnyObject>) {
-            let consumed = self
-                .target()
-                .is_some_and(|target| crate::keymap::root_began(&target, presses));
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            let consumed = self.target().is_some_and(|target| {
+                crate::keymap::root_began(&target, presses)
+                    || crate::keyboard::root_tab(self, &target, presses)
+            });
             if !consumed && !self.take_hardware_keys(presses) {
                 // SAFETY: calling the superclass implementation.
                 let _: () = unsafe { msg_send![super(self), pressesBegan: presses, withEvent: event] };
@@ -266,7 +303,7 @@ define_class!(
         }
 
         #[unsafe(method(pressesEnded:withEvent:))]
-        fn presses_ended(&self, presses: &AnyObject, event: Option<&AnyObject>) {
+        fn presses_ended(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
             let consumed = self
                 .target()
                 .is_some_and(|target| crate::keymap::ended(&target, presses));
@@ -277,7 +314,7 @@ define_class!(
         }
 
         #[unsafe(method(pressesCancelled:withEvent:))]
-        fn presses_cancelled(&self, presses: &AnyObject, event: Option<&AnyObject>) {
+        fn presses_cancelled(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
             let consumed = self
                 .target()
                 .is_some_and(|target| crate::keymap::ended(&target, presses));
@@ -286,6 +323,29 @@ define_class!(
                 let _: () =
                     unsafe { msg_send![super(self), pressesCancelled: presses, withEvent: event] };
             }
+        }
+
+        /// UIKit's focus engine moved focus (its hardware Tab traversal
+        /// from the window's initial focus, or a request made after a
+        /// responder change): the focused focusable view becomes the first
+        /// responder, so it hears hardware keys. Inputs follow too; an
+        /// embedded native component keeps its own controls' behavior.
+        #[allow(deprecated)]
+        #[unsafe(method(didUpdateFocusInContext:withAnimationCoordinator:))]
+        fn did_update_focus(
+            &self,
+            context: &UIFocusUpdateContext,
+            coordinator: &UIFocusAnimationCoordinator,
+        ) {
+            // SAFETY: calling the superclass implementation.
+            let _: () = unsafe {
+                msg_send![
+                    super(self),
+                    didUpdateFocusInContext: context,
+                    withAnimationCoordinator: coordinator
+                ]
+            };
+            crate::keyboard::adopt_focus(context);
         }
     }
 );
@@ -309,7 +369,9 @@ impl RootView {
             environment: Cell::new(None),
             host: Cell::default(),
             host_tokens: RefCell::new(None),
+            fonts: RefCell::new(Vec::new()),
             observers: RefCell::new(Vec::new()),
+            url_schemes: RefCell::new(Vec::new()),
             #[cfg(feature = "dev")]
             test_model: TestModel::default(),
         });
@@ -329,28 +391,64 @@ impl RootView {
         mounter.as_ref().map(|m| m.target().clone())
     }
 
+    /// The surface's safe area (`safe_area()`): UIKit's, and from iOS 26
+    /// on the corner a windowed iPad app's window controls cover, as an
+    /// inset of the whole leading edge. That inset comes from the safe-area
+    /// layout region adapted horizontally to the corners, which also pads
+    /// both sides alike for the display's rounded corners (9pt on an iPad
+    /// Pro 11-inch in full screen): only a side the region insets further
+    /// than the other, where the window controls are, takes it, so full
+    /// screen and iPhone keep the plain safe area.
+    fn safe_area(&self) -> Edges<Points> {
+        let mut insets = self.safeAreaInsets();
+        if os_version(self.mtm()).0 >= 26 {
+            let region = UIViewLayoutRegion::safeAreaLayoutRegionWithCornerAdaptation(
+                UIViewLayoutRegionAdaptivityAxis::Horizontal,
+            );
+            let corner = self.edgeInsetsForLayoutRegion(&region);
+            if corner.left > corner.right {
+                insets.left = insets.left.max(corner.left);
+            } else if corner.right > corner.left {
+                insets.right = insets.right.max(corner.right);
+            }
+        }
+        Edges {
+            top: Points(insets.top as f32),
+            right: Points(insets.right as f32),
+            bottom: Points(insets.bottom as f32),
+            left: Points(insets.left as f32),
+        }
+    }
+
     /// What JS sees through `windowSize()`, `safeArea()`, `keyboard()`...
     fn environment(&self) -> Environment {
         let size = self.bounds().size;
-        let insets = self.safeAreaInsets();
         let (keyboard_height, keyboard_duration) = self.ivars().keyboard.get();
         // SAFETY: plain getters.
-        let (style, body, scale) = unsafe {
+        let (style, body, scale, horizontal, vertical) = unsafe {
             let traits = self.traitCollection();
             (
                 traits.userInterfaceStyle(),
                 UIFont::preferredFontForTextStyle(UIFontTextStyleBody).pointSize(),
                 traits.displayScale(),
+                traits.horizontalSizeClass(),
+                traits.verticalSizeClass(),
             )
         };
+        let size_class = |value| match value {
+            objc2_ui_kit::UIUserInterfaceSizeClass::Compact => {
+                Some(nsh_core::platform::SizeClass::Compact)
+            }
+            objc2_ui_kit::UIUserInterfaceSizeClass::Regular => {
+                Some(nsh_core::platform::SizeClass::Regular)
+            }
+            _ => None,
+        };
         let mut env = Environment {
+            horizontal_size_class: size_class(horizontal),
+            vertical_size_class: size_class(vertical),
             window: Size::new(Points(size.width as f32), Points(size.height as f32)),
-            safe_area: Edges {
-                top: Points(insets.top as f32),
-                right: Points(insets.right as f32),
-                bottom: Points(insets.bottom as f32),
-                left: Points(insets.left as f32),
-            },
+            safe_area: self.safe_area(),
             // UIKit draws no title bar an app could hide.
             title_bar: Edges::default(),
             keyboard_height: Points(keyboard_height),
@@ -375,18 +473,35 @@ impl RootView {
                 _ => Idiom::Phone,
             },
             locale: current_locale(),
+            locale_settings: locale_settings(),
             lifecycle: self.ivars().lifecycle.get(),
             // Only read for the web: iOS keys are always Apple's.
             apple_keyboard: true,
+            file_requests: true,
             // No host answers `nsh/host` here: an embedding app talks to its
             // apps through its own UI sets (`nsh/native`).
             host: false,
             // UIKit has no screen color sampler.
             screen_color: false,
+            // Drawings replayed into Core Graphics bitmaps
+            // ([`crate::canvas::Offscreen`]).
+            canvas_render: true,
+            // `UIActivityViewController` (`crate::share`).
+            share: true,
+            // `ASWebAuthenticationSession` (`crate::auth_session`).
+            auth_session: true,
             // The Speech framework fed by the microphone.
             speech: true,
             // The notification center.
             notifications: true,
+            // AVAudioEngine and AVPlayer.
+            audio: true,
+            web_evaluate: true,
+            // Download decisions and cancellations reach the web view
+            // (`nsh_platform_apple::web_download`).
+            webview_requests: true,
+            // wgpu on Metal, in builds with it, until it finds no GPU.
+            shaders: nsh_engine::shader::LINKED,
             // No file dialogs, file manager or trash (Catalyst included):
             // the default, so the core answers those requests.
             ..Environment::default()
@@ -407,6 +522,52 @@ impl RootView {
             self.ivars().environment.set(Some(env));
             running.engine.control().set_environment(env);
         }
+    }
+
+    /// The environment follows the system's time zone: the user changed
+    /// it, or the device moved to another zone. Foundation caches the
+    /// system's zone until it is reset.
+    fn observe_time_zone(this: &Retained<Self>) {
+        let center = NSNotificationCenter::defaultCenter();
+        let weak = Weak::from_retained(this);
+        let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+            let Some(view) = weak.load() else { return };
+            NSTimeZone::resetSystemTimeZone();
+            view.publish_environment();
+        });
+        // SAFETY: as in `observe_keyboard`; the block only touches the view
+        // on the main queue it is delivered on.
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSSystemTimeZoneDidChangeNotification),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &block,
+            )
+        };
+        this.ivars().observers.borrow_mut().push(observer);
+    }
+
+    /// The environment follows the region's settings: the region format,
+    /// 24-hour time, the first day of the week, the measurement system and
+    /// the temperature unit, which iOS changes while apps run.
+    fn observe_locale(this: &Retained<Self>) {
+        let center = NSNotificationCenter::defaultCenter();
+        let weak = Weak::from_retained(this);
+        let block = RcBlock::new(move |_: NonNull<NSNotification>| {
+            let Some(view) = weak.load() else { return };
+            view.publish_environment();
+        });
+        // SAFETY: as in `observe_time_zone`.
+        let observer = unsafe {
+            center.addObserverForName_object_queue_usingBlock(
+                Some(NSCurrentLocaleDidChangeNotification),
+                None,
+                Some(&NSOperationQueue::mainQueue()),
+                &block,
+            )
+        };
+        this.ivars().observers.borrow_mut().push(observer);
     }
 
     /// Tracks whether the app is in use where the surface shows
@@ -457,6 +618,13 @@ impl RootView {
             };
             if ours {
                 view.ivars().lifecycle.set(state);
+                // The keys held in a surface that stopped taking input lose
+                // their releases; forget them without inventing one.
+                if state != Lifecycle::Active
+                    && let Some(target) = view.target()
+                {
+                    target.keyboard().clear();
+                }
                 view.publish_environment();
             }
         });
@@ -589,23 +757,15 @@ impl RootView {
 
     /// Queues hardware characters while no input is focused. True when one
     /// was queued.
-    fn take_hardware_keys(&self, presses: &NSSet<AnyObject>) -> bool {
-        let objects = presses.allObjects();
+    fn take_hardware_keys(&self, presses: &NSSet<UIPress>) -> bool {
+        let mtm = self.mtm();
         let mut queued = false;
         self.with_mounter(|m| {
             if m.input_is_focused() {
                 return;
             }
-            for index in 0..objects.count() {
-                let press = objects.objectAtIndex(index);
-                // SAFETY: `UIPress.key` is a `UIKey`, and
-                // `charactersIgnoringModifiers` is its unmodified text.
-                let key: Option<Retained<AnyObject>> = unsafe { msg_send![&*press, key] };
-                let Some(key) = key else { continue };
-                let chars: Option<Retained<NSString>> =
-                    unsafe { msg_send![&*key, charactersIgnoringModifiers] };
-                let Some(chars) = chars else { continue };
-                queued |= m.hardware_character(&chars.to_string());
+            for key in presses.iter().filter_map(|press| press.key(mtm)) {
+                queued |= m.hardware_character(&key.charactersIgnoringModifiers().to_string());
             }
         });
         queued
@@ -733,6 +893,7 @@ impl RootView {
             app,
             viewport,
             trace: self.ivars().options.trace,
+            content_culling: true,
             network: Some(crate::net::network()),
             websocket: None,
             refuse_connections: None,
@@ -744,8 +905,9 @@ impl RootView {
             header_heights: header_heights(mtm),
             limits: self.ivars().options.limits,
             ui_sets: crate::ui_sets(),
-            runtime: None,
-            data_dir: self.ivars().options.data_dir.clone(),
+            runtime: self.ivars().options.runtime.clone(),
+            support_dir: self.ivars().options.support_dir.clone(),
+            data_dir: None,
             cache: system_cache(self.ivars().options.cache.clone()),
             storage: self.ivars().options.storage.as_ref().map(|dir| {
                 nsh_engine::FileStorage::open(dir) as Arc<dyn nsh_engine::StorageBackend>
@@ -757,6 +919,9 @@ impl RootView {
             host: self.ivars().options.host.clone(),
             picker: None,
             speech: None,
+            audio: None,
+            windows: None,
+            login_item: None,
         };
         // A test session's app: the test's storage, network and trace.
         #[cfg(feature = "dev")]
@@ -775,11 +940,21 @@ impl RootView {
             #[cfg(feature = "dev")]
             test_model: self.ivars().test_model.clone(),
         };
-        // The embedding app's theme overrides are in the first frame.
+        // The embedding app's theme overrides are in the first frame, and
+        // the links that came before are the app's address when its code
+        // first runs (`UrlScheme.url()`).
         let tokens = self.ivars().host_tokens.borrow().clone();
+        let links = std::mem::take(&mut *self.ivars().url_schemes.borrow_mut());
+        let fonts = self.ivars().fonts.borrow().clone();
         let engine = match Engine::start_with(config, CoreTextEngine::default, sink, |control| {
             if tokens.is_some() {
                 control.set_tokens(tokens);
+            }
+            for font in fonts {
+                control.register_font(font);
+            }
+            for url in links {
+                send_url_scheme(control, url);
             }
         }) {
             Ok(engine) => engine,
@@ -808,14 +983,25 @@ impl RootView {
             access,
             self.ivars().options.components.clone(),
         );
+        installed.watch_scrolls(self.ivars().options.scroll_watchers.clone());
+        if self.ivars().options.handoff {
+            installed.hand_off();
+        }
         // The app's downloaded images go through its disk cache.
         installed.set_image_cache(engine.image_cache());
-        if self.ivars().options.fps {
+        if self.ivars().options.fps || nsh_engine::perf::enabled_by_env() {
             installed.measure();
         }
         *mounter.get(mtm).borrow_mut() = Some(installed);
         *self.ivars().running.borrow_mut() = Some(Running { engine, mounter });
         self.ivars().environment.set(Some(self.environment()));
+        // Take hardware keys only if the host has no focused responder.
+        // Defer so an autoFocus input mounted this turn keeps its focus.
+        if let Some(target) = self.target()
+            && let Some(window) = self.window()
+        {
+            target.restore_root_focus(Retained::into_super(self.retain()), window);
+        }
     }
 
     /// Stops the engine and removes all native views.
@@ -845,6 +1031,7 @@ fn header_heights(mtm: MainThreadMarker) -> (Points, Points) {
 
 /// Options of a [`Surface`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct SurfaceOptions {
     /// Log per-commit timings.
     pub trace: bool,
@@ -852,16 +1039,20 @@ pub struct SurfaceOptions {
     pub asset_base: Option<AssetBase>,
     /// The VM limits of the apps it runs.
     pub limits: nsh_engine::Limits,
+    /// The runtime for async tasks; `None` uses NSH's shared runtime.
+    /// The embedding app owns it and must keep it running until the view
+    /// stops. Dropping the view does not shut the runtime down.
+    pub runtime: Option<tokio::runtime::Handle>,
     /// What the embedding app grants the apps it runs at most (`None`: what
     /// each app declares).
     pub granted: Option<nsh_engine::Capabilities>,
-    /// Where the apps keep their data: each app in `<data_dir>/<app id>`
-    /// ([`nsh_engine::EngineConfig::data_dir`]). Default: `nsh` in the
+    /// Where the apps keep their data: each app in `<support_dir>/<app id>`
+    /// ([`nsh_engine::EngineConfig::support_dir`]). Default: `nsh` in the
     /// app's Application Support; `None`: nothing is kept.
-    pub data_dir: Option<std::path::PathBuf>,
+    pub support_dir: Option<std::path::PathBuf>,
     /// The directory the apps' storage (`nsh/storage`) is kept in
     /// (`storage.json` in it), overriding their own in
-    /// [`SurfaceOptions::data_dir`]; `None`: theirs.
+    /// [`SurfaceOptions::support_dir`]; `None`: theirs.
     pub storage: Option<std::path::PathBuf>,
     /// Where the apps keep their caches (the images they downloaded) and
     /// how much each keeps: by default `nsh` in the app's Caches
@@ -874,13 +1065,23 @@ pub struct SurfaceOptions {
     /// these options ([`nsh_engine::EngineConfig::context`]): its UI sets'
     /// functions read it with `nsh_core::element::engine_context`.
     pub context: nsh_engine::EngineContext,
+    /// The scroll views the embedding app watches by `nativeID`
+    /// ([`crate::AppView::watch_scroll`]).
+    pub scroll_watchers: crate::ScrollWatchers,
     /// The embedding app's channel with the apps (`nsh/host`): launch
     /// parameters, events and handlers of their calls and posts, one for
     /// every app the surface runs.
     pub host: nsh_engine::HostChannel,
     /// Logs the performance monitor's readings once a second (target
-    /// `nsh::perf`): frame rate, frame and commit costs, CPU, memory.
+    /// `nsh::fps`): frame rate, frame and commit costs, CPU, memory.
     pub fps: bool,
+    /// Gives the app's address (`UrlScheme.setUrl`) to the system as the
+    /// current `NSUserActivity`, so Handoff continues it on the user's other
+    /// devices (`nsh_platform_apple::handoff`). An address that is no web page needs
+    /// `<bundle id>.url` in the app's Info.plist `NSUserActivityTypes`.
+    /// False by default; the release runner sets it when the bundle declares
+    /// that type (`nsh.json` `"handoff": true`).
+    pub handoff: bool,
 }
 
 impl Default for SurfaceOptions {
@@ -889,14 +1090,17 @@ impl Default for SurfaceOptions {
             trace: false,
             asset_base: None,
             limits: nsh_engine::Limits::default(),
+            runtime: None,
             granted: None,
-            data_dir: data_dir(),
+            support_dir: support_dir(),
             storage: None,
             cache: nsh_engine::CacheOptions::default(),
             components: crate::component::Components::default(),
             context: nsh_engine::EngineContext::default(),
+            scroll_watchers: crate::ScrollWatchers::default(),
             host: nsh_engine::HostChannel::default(),
             fps: false,
+            handoff: false,
         }
     }
 }
@@ -904,8 +1108,8 @@ impl Default for SurfaceOptions {
 /// Where apps NSH runs on iOS keep their data: `nsh` in the (embedding or
 /// standalone) app's Application Support, each app in a directory named by
 /// its id.
-fn data_dir() -> Option<std::path::PathBuf> {
-    nsh_engine::data_dir().map(|dir| dir.join("nsh"))
+fn support_dir() -> Option<std::path::PathBuf> {
+    nsh_engine::support_dir().map(|dir| dir.join("nsh"))
 }
 
 /// `cache` with [`nsh_engine::CacheLocation::System`] made iOS's: `nsh` in
@@ -949,6 +1153,8 @@ impl Surface {
         let view = RootView::new(mtm, frame, app.into(), options);
         RootView::observe_keyboard(&view);
         RootView::observe_lifecycle(&view);
+        RootView::observe_time_zone(&view);
+        RootView::observe_locale(&view);
         Ok(Surface { view })
     }
 
@@ -1031,6 +1237,32 @@ impl Surface {
         }
     }
 
+    /// Replaces the fonts registered before the app starts. The engine reads
+    /// them when it starts.
+    pub fn set_host_fonts(&self, fonts: Vec<Vec<u8>>) {
+        *self.view.ivars().fonts.borrow_mut() = fonts;
+    }
+
+    /// Registers one more font file for the running app and every app
+    /// started later.
+    pub fn add_font(&self, data: Vec<u8>) {
+        self.view.ivars().fonts.borrow_mut().push(data.clone());
+        if let Some(running) = &*self.view.ivars().running.borrow() {
+            running.engine.control().register_font(data);
+        }
+    }
+
+    /// Hands `url`, a link the system opened the app with, to the app's
+    /// engine, whose core keeps it until the app listens (`UrlScheme`);
+    /// kept until the engine starts, which applies it before the app's code
+    /// first runs.
+    pub(crate) fn url_scheme(&self, url: String) {
+        match &*self.view.ivars().running.borrow() {
+            Some(running) => send_url_scheme(&running.engine.control(), url),
+            None => self.view.ivars().url_schemes.borrow_mut().push(url),
+        }
+    }
+
     /// Replaces the running app with `app` (state is reset).
     pub fn reload(&self, app: impl Into<App>) {
         let app = app.into();
@@ -1045,6 +1277,18 @@ impl Surface {
             *self.view.ivars().pending.borrow_mut() = Some(app);
         }
     }
+}
+
+/// Reports `url` as a link the system opened the app with.
+fn send_url_scheme(control: &nsh_engine::EngineControl, url: String) {
+    control.dispatch_event(
+        nsh_core::ROOT_ID,
+        nsh_core::EventKind::UrlScheme,
+        nsh_core::EventPayload::Map(vec![(
+            nsh_core::url_scheme::URL,
+            nsh_core::PayloadValue::Str(url),
+        )]),
+    );
 }
 
 impl Drop for Surface {
@@ -1070,6 +1314,73 @@ fn preferred_language_rtl() -> bool {
         })
 }
 
+/// The user's preferred languages, most preferred first:
+/// `NSLocale.preferredLanguages`, Settings' list (the app's own language
+/// first when the user chose one for it). iOS restarts apps when the user
+/// changes the list, so it is read as the environment is published.
+fn preferred_languages() -> nsh_engine::Languages {
+    let tags: Vec<String> = objc2_foundation::NSLocale::preferredLanguages()
+        .iter()
+        .map(|tag| tag.to_string())
+        .collect();
+    nsh_engine::Languages::parse(tags.iter().map(String::as_str))
+        .unwrap_or_else(|| nsh_engine::Languages::one(current_locale()))
+}
+
+/// The user's locale settings (`localeSettings()`): the preferred
+/// languages, the time zone, and Settings' time format (the hours of
+/// `NSDateFormatter`'s format for the `j` template, which 24-hour time
+/// changes), `NSCalendar`'s first weekday, `NSLocale`'s measurement system
+/// and the `AppleTemperatureUnit` default, over the region's.
+fn locale_settings() -> nsh_engine::LocaleSettings {
+    use nsh_engine::{HourCycle, MeasurementSystem, TemperatureUnit, Weekday};
+    use objc2_foundation::{
+        NSCalendar, NSDateFormatter, NSLocale, NSLocaleMeasurementSystem, NSString, NSUserDefaults,
+        ns_string,
+    };
+    let locale = NSLocale::currentLocale();
+    let mut preferences = nsh_engine::LocaleSettings::parse(&locale.localeIdentifier().to_string());
+    preferences.languages = preferred_languages();
+    preferences.time_zone = time_zone();
+    // The hours of the user's time format, which 24-hour time changes.
+    let hours =
+        NSDateFormatter::dateFormatFromTemplate_options_locale(ns_string!("j"), 0, Some(&locale));
+    if let Some(cycle) = hours.and_then(|format| HourCycle::of_pattern(&format.to_string())) {
+        preferences.hour_cycle = cycle;
+    }
+    // From 1 for Sunday to 7 for Saturday.
+    let first = match NSCalendar::currentCalendar().firstWeekday() {
+        1 => Some(Weekday::Sunday),
+        n => u8::try_from(n)
+            .ok()
+            .and_then(|n| Weekday::from_number(n.wrapping_sub(1))),
+    };
+    if let Some(day) = first {
+        preferences.first_day_of_week = day;
+    }
+    // SAFETY: a key Foundation defines.
+    let system = locale.objectForKey(unsafe { NSLocaleMeasurementSystem });
+    match system
+        .and_then(|s| s.downcast::<NSString>().ok())
+        .map(|s| s.to_string())
+        .as_deref()
+    {
+        Some("Metric") => preferences.measurement_system = MeasurementSystem::Metric,
+        Some("U.S.") => preferences.measurement_system = MeasurementSystem::Us,
+        Some("U.K.") => preferences.measurement_system = MeasurementSystem::Uk,
+        _ => {}
+    }
+    // Set once the user picks one.
+    let unit =
+        NSUserDefaults::standardUserDefaults().stringForKey(ns_string!("AppleTemperatureUnit"));
+    match unit.map(|u| u.to_string()).as_deref() {
+        Some("Celsius") => preferences.temperature_unit = TemperatureUnit::Celsius,
+        Some("Fahrenheit") => preferences.temperature_unit = TemperatureUnit::Fahrenheit,
+        _ => {}
+    }
+    preferences
+}
+
 /// The user's region format (`NSLocale.currentLocale`: language and
 /// region, as Settings sets them), `Intl`'s default.
 fn current_locale() -> nsh_engine::Locale {
@@ -1077,6 +1388,12 @@ fn current_locale() -> nsh_engine::Locale {
         .localeIdentifier()
         .to_string();
     nsh_engine::Locale::parse(&identifier).unwrap_or_default()
+}
+
+/// The system's time zone: its IANA name.
+fn time_zone() -> nsh_engine::TimeZone {
+    nsh_engine::TimeZone::parse(&NSTimeZone::systemTimeZone().name().to_string())
+        .unwrap_or_default()
 }
 
 /// The app's state as UIApplication reports it now, before its

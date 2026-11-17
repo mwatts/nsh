@@ -11,8 +11,8 @@
 //! view shows it ([`Want`]: the size bucket covering its box in device
 //! pixels, never above its natural size) with ImageIO thumbnails
 //! (`CGImageSourceCreateThumbnailAtIndex`); a view that grows past its
-//! bucket loads the next one. A picture's pixels are its CGImages'; Core
-//! Animation draws them from there, so they count once.
+//! bucket loads the next one. The budget reserves page-rounded backing
+//! storage for both the CGImages and Core Animation's display copies.
 //!
 //! A blur (`blurRadius`, `blur()`) and the color matrix of the view's other
 //! filters are baked into the pixels ([`crate::blur`]): such a picture is a
@@ -25,8 +25,8 @@
 //! SVG images (sniffed from their bytes) are drawn by
 //! [`nsh_core::svg`] at the bucket's size, then go through the same blur,
 //! color matrix, tint and budget as decoded bitmaps; their size is their
-//! intrinsic size in points (CSS pixels of the SVG). Canvases draw bitmaps
-//! only.
+//! intrinsic size in points (CSS pixels of the SVG). Canvases draw them as
+//! their rasterized bitmap.
 //!
 //! Animated GIF / PNG / WebP images play through a keyframe animation of the
 //! layer's `contents`. The `placeholder` shows until the image arrives (and
@@ -58,6 +58,8 @@ use nsh_core::{
         loader::{Context, Get, Priority, Ticket, Transport, loader},
     },
 };
+use nsh_platform_apple::image_source;
+pub(crate) use nsh_platform_apple::image_source::source_size;
 use objc2::{
     AnyThread, DefinedClass, define_class, msg_send,
     rc::{Retained, Weak},
@@ -135,7 +137,8 @@ fn context(surface: &Surface, uri: &str) -> Context {
     Context {
         asset_base: surface.asset_base.borrow().clone(),
         read_asset: None,
-        access: Arc::default(),
+        access: surface.native.access(),
+        media_files: surface.media_files.borrow().clone(),
         disk: remote
             .then(|| surface.image_cache.borrow().clone())
             .flatten(),
@@ -160,9 +163,9 @@ enum Heard {
 
 struct DownloadIvars {
     heard: Mutex<mpsc::Sender<Heard>>,
-    /// The URL of the hop it is at, the redirects so far, and why one was
-    /// refused.
-    hop: Mutex<(String, usize, Option<String>)>,
+    /// The URL of the hop it is at, the redirects followed so far, and why
+    /// one was refused.
+    hop: Mutex<(String, Vec<String>, Option<String>)>,
     access: Access,
 }
 
@@ -205,16 +208,15 @@ define_class!(
                 .map(|u| u.to_string())
                 .unwrap_or_default();
             let mut hop = self.ivars().hop.lock().unwrap_or_else(|e| e.into_inner());
-            let granted = match hop.1 {
-                n if n >= nsh_core::image::loader::MAX_REDIRECTS => {
-                    Err("too many redirects".to_owned())
-                }
-                _ => nsh_core::image::loader::redirect(&self.ivars().access, &hop.0, &next),
+            let granted = if hop.1.len() >= nsh_core::image::loader::MAX_REDIRECTS {
+                Err("too many redirects".to_owned())
+            } else {
+                nsh_core::image::loader::redirect(&self.ivars().access, &hop.0, &next)
             };
             match granted {
                 Ok(url) => {
-                    hop.0 = url;
-                    hop.1 += 1;
+                    hop.0.clone_from(&url);
+                    hop.1.push(url);
                     drop(hop);
                     completion.call((request as *const NSURLRequest as *mut NSURLRequest,));
                 }
@@ -297,7 +299,7 @@ impl Transport for UrlSession {
         let (tx, rx) = mpsc::channel();
         let delegate = ImageDownload::alloc().set_ivars(DownloadIvars {
             heard: Mutex::new(tx),
-            hop: Mutex::new((get.url.to_owned(), 0, None)),
+            hop: Mutex::new((get.url.to_owned(), Vec::new(), None)),
             access: get.access.clone(),
         });
         // SAFETY: NSObject's designated initializer.
@@ -349,19 +351,25 @@ impl Transport for UrlSession {
                     (get.progress)(bytes.len() as u64, total);
                 }
                 Ok(Heard::Done(error)) => {
-                    let refused = delegate
-                        .ivars()
-                        .hop
-                        .lock()
-                        .ok()
-                        .and_then(|mut h| h.2.take());
+                    let (redirects, refused) = {
+                        let mut hop = delegate
+                            .ivars()
+                            .hop
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        (std::mem::take(&mut hop.1), hop.2.take())
+                    };
+                    // The redirect not followed is the response (`status`):
+                    // the disk cache drops its copy of the URL.
                     if let Some(refused) = refused {
-                        return Err(refused);
+                        return Ok(Fetched::refused(status, refused));
                     }
                     if let Some(error) = error {
                         return Err(error);
                     }
-                    return Ok(Fetched::new(status, headers, bytes));
+                    // The disk cache keeps the redirects with the copy and
+                    // checks them again before it serves it.
+                    return Ok(Fetched::new(status, headers, bytes).redirected(redirects));
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Err("download lost".into()),
@@ -403,13 +411,41 @@ impl Picture {
         CGImage::width(first).max(CGImage::height(first)) as u32
     }
 
-    /// Bytes its pixels take (4 per pixel, every frame).
+    /// Conservative backing storage, including Core Animation's display copy.
+    /// Reserving it before display also covers prefetched and filtered pictures.
     fn cost(&self) -> usize {
         self.frames
             .iter()
-            .map(|f| CGImage::width(Some(f)) * CGImage::height(Some(f)) * 4)
-            .sum()
+            .map(|f| {
+                backing_cost(
+                    CGImage::bytes_per_row(Some(f)),
+                    CGImage::height(Some(f)),
+                    page_size(),
+                )
+            })
+            .fold(0, usize::saturating_add)
     }
+}
+
+/// ImageIO and Core Animation allocate separate page-rounded stores. Use
+/// the CGImage stride, which includes padding (and higher bit depths),
+/// rather than assuming tightly packed four-byte pixels.
+fn backing_cost(bytes_per_row: usize, height: usize, page: usize) -> usize {
+    let bytes = bytes_per_row.saturating_mul(height);
+    let rounded = bytes.saturating_add(page - 1) / page;
+    rounded.saturating_mul(page).saturating_mul(2)
+}
+
+fn page_size() -> usize {
+    static PAGE: LazyLock<usize> = LazyLock::new(|| {
+        // SAFETY: sysconf reads the process's page size and takes no pointers.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        usize::try_from(page)
+            .ok()
+            .filter(|p| *p > 0)
+            .unwrap_or(16384)
+    });
+    *PAGE
 }
 
 /// What a view's filters bake into a picture's pixels: a blur radius in
@@ -463,7 +499,10 @@ fn images() -> &'static Images<Picture> {
         Images::new(
             nsh_core::image::budget(),
             |bytes: &ImageData, target: &Target| {
-                let picture = decode(bytes, target)?;
+                let picture = match bytes.rgba() {
+                    Some(_) => from_rgba(bytes)?,
+                    None => decode(bytes, target)?,
+                };
                 let cost = picture.cost();
                 Ok((picture.clone(), picture.natural, cost))
             },
@@ -652,7 +691,8 @@ fn fetch(
 
 /// Decodes `bytes` at `target` with ImageIO (a thumbnail when it shrinks:
 /// `CGImageSourceCreateThumbnailAtIndex`), every frame of an animation
-/// when it asks; any thread.
+/// when it asks, the one image of a still file of several (an icon's that
+/// fits, any other's primary image); any thread.
 fn decode(bytes: &[u8], target: &Target) -> Result<Picture, String> {
     if nsh_core::svg::sniff(bytes) {
         return decode_svg(bytes, target.longest);
@@ -664,8 +704,16 @@ fn decode(bytes: &[u8], target: &Target) -> Result<Picture, String> {
             CGImageSource::with_data(&data, None).ok_or("not an image ImageIO can read")?;
         let yes: &CFType = kCFBooleanTrue.ok_or("no kCFBooleanTrue")?;
         let (width, height) = source_size(&source);
+        // An animation's frames, or the one image of a still file (an
+        // icon's that fits the size shown, any other's primary image).
+        let max_frames = match target.frames {
+            Frames::First => 1,
+            Frames::All => MAX_FRAMES,
+        };
+        let shown = image_source::shown(&source, target.longest, max_frames);
+        let (w, h) = image_source::image_size(&source, shown.start);
         // Never above its own size (a thumbnail can grow it).
-        let shrinks = target.longest > 0 && target.longest < width.max(height);
+        let shrinks = target.longest > 0 && target.longest < w.max(h);
         let max = CFNumber::new_cgfloat(target.longest as CGFloat);
         let mut keys: Vec<&CFString> = vec![
             kCGImageSourceCreateThumbnailFromImageAlways,
@@ -679,19 +727,16 @@ fn decode(bytes: &[u8], target: &Target) -> Result<Picture, String> {
         }
         let options = CFDictionary::from_slices(&keys, &values);
         let options: &CFDictionary = options.as_opaque();
-        let count = match target.frames {
-            Frames::First => 1,
-            Frames::All => source.count().clamp(1, MAX_FRAMES),
-        };
+        let count = shown.len();
         let mut frames = Vec::with_capacity(count);
         let mut delays = Vec::with_capacity(count);
-        for i in 0..count {
+        for i in shown {
             let Some(image) = source.thumbnail_at_index(i, Some(options)) else {
                 break;
             };
             frames.push(image);
             delays.push(if count > 1 {
-                frame_delay(&source, i)
+                image_source::frame_delay(&source, i)
             } else {
                 1
             });
@@ -721,6 +766,92 @@ fn decode(bytes: &[u8], target: &Target) -> Result<Picture, String> {
             natural,
         })
     }
+}
+
+/// A pixel buffer ([`ImageSrc::rgba`](nsh_core::element::ImageSrc::rgba)),
+/// taken as it is: no decode, at its own size; any thread.
+fn from_rgba(data: &ImageData) -> Result<Picture, String> {
+    let (width, height, rgba) = data.rgba().ok_or("not an RGBA image")?;
+    let image = if rgba.as_chunks::<4>().0.iter().all(|px| px[3] == 255) {
+        opaque_image(data)
+    } else {
+        premultiplied_image(width, height, rgba)
+    }
+    .ok_or("cannot make a CGImage")?;
+    Ok(Picture {
+        frames: Arc::new([image]),
+        key_times: Arc::new([0.0, 1.0]),
+        duration: 0.0,
+        natural: Natural::Pixels(width, height),
+    })
+}
+
+/// Keep the source alive until CoreGraphics releases its last reference.
+fn opaque_image(source: &ImageData) -> Option<CFRetained<CGImage>> {
+    let (width, height, rgba) = source.rgba()?;
+    use std::{ffi::c_void, ptr::NonNull};
+
+    use objc2_core_graphics::{
+        CGBitmapInfo, CGColorRenderingIntent, CGColorSpace, CGDataProvider, CGImageAlphaInfo,
+        CGImageByteOrderInfo, kCGColorSpaceSRGB,
+    };
+
+    unsafe extern "C-unwind" fn release(info: *mut c_void, _: NonNull<c_void>, _: usize) {
+        // SAFETY: `info` is the Box transferred to this provider below,
+        // and CoreGraphics calls this exactly once when it releases it.
+        drop(unsafe { Box::from_raw(info.cast::<ImageData>()) });
+    }
+
+    // SAFETY: a constant of CoreGraphics.
+    let space = CGColorSpace::with_name(Some(unsafe { kCGColorSpaceSRGB }))?;
+    let owner = Box::into_raw(Box::new(source.clone()));
+    // SAFETY: ImageData shares the immutable pixels with `source`. The
+    // provider owns that clone, so the bytes outlive all its readers.
+    let provider = unsafe {
+        CGDataProvider::with_data(
+            owner.cast(),
+            rgba.as_ptr().cast(),
+            rgba.len(),
+            Some(release),
+        )
+    };
+    let Some(provider) = provider else {
+        // SAFETY: no provider was created to take ownership of the Box.
+        drop(unsafe { Box::from_raw(owner) });
+        return None;
+    };
+    // SAFETY: ImageData validates the dimensions and buffer length. The
+    // image retains the provider; null decode uses the default mapping.
+    unsafe {
+        CGImage::new(
+            width as usize,
+            height as usize,
+            8,
+            32,
+            width as usize * 4,
+            Some(&space),
+            CGBitmapInfo(CGImageAlphaInfo::NoneSkipLast.0 | CGImageByteOrderInfo::Order32Big.0),
+            Some(&provider),
+            std::ptr::null(),
+            true,
+            CGColorRenderingIntent::RenderingIntentDefault,
+        )
+    }
+}
+
+fn premultiplied_image(width: u32, height: u32, rgba: &[u8]) -> Option<CFRetained<CGImage>> {
+    let mut pixels = rgba.to_vec();
+    for px in pixels.as_chunks_mut::<4>().0 {
+        let a = u16::from(px[3]);
+        for c in &mut px[..3] {
+            *c = ((u16::from(*c) * a + 127) / 255) as u8;
+        }
+    }
+    let mut raster = nsh_core::svg::Raster::default();
+    raster.width = width;
+    raster.height = height;
+    raster.pixels = pixels;
+    rgba_image(&raster)
 }
 
 /// Draws an SVG, its longest side `longest` pixels; any thread.
@@ -795,99 +926,29 @@ fn rgba_image(raster: &nsh_core::svg::Raster) -> Option<CFRetained<CGImage>> {
     }
 }
 
-/// The pixel size of the first image, as displayed (EXIF orientations 5–8
-/// turn it a quarter).
-pub(crate) fn source_size(source: &CGImageSource) -> (u32, u32) {
-    use objc2_image_io::{
-        kCGImagePropertyOrientation, kCGImagePropertyPixelHeight, kCGImagePropertyPixelWidth,
-    };
-    // SAFETY: a CoreFoundation dictionary of CFString keys, read with the
-    // documented ImageIO keys and value types.
-    unsafe {
-        let Some(props) = source.properties_at_index(0, None) else {
-            return (0, 0);
-        };
-        let props: &CFDictionary<CFString, CFType> = props.cast_unchecked();
-        let number = |key: &CFString| {
-            props
-                .get(key)
-                .and_then(|v| v.downcast_ref::<CFNumber>().and_then(|n| n.as_i64()))
-                .unwrap_or(0)
-                .max(0) as u32
-        };
-        let (w, h) = (
-            number(kCGImagePropertyPixelWidth),
-            number(kCGImagePropertyPixelHeight),
-        );
-        match number(kCGImagePropertyOrientation) {
-            5..=8 => (h, w),
-            _ => (w, h),
-        }
-    }
-}
-
-/// The delay of frame `i` in centiseconds (GIF's unit), at least 2 (as
-/// browsers: shorter ones show for 10).
-fn frame_delay(source: &CGImageSource, i: usize) -> u32 {
-    use objc2_image_io::{
-        kCGImagePropertyAPNGDelayTime, kCGImagePropertyAPNGUnclampedDelayTime,
-        kCGImagePropertyGIFDelayTime, kCGImagePropertyGIFDictionary,
-        kCGImagePropertyGIFUnclampedDelayTime, kCGImagePropertyPNGDictionary,
-        kCGImagePropertyWebPDelayTime, kCGImagePropertyWebPDictionary,
-        kCGImagePropertyWebPUnclampedDelayTime,
-    };
-    // SAFETY: CoreFoundation dictionaries of CFString keys, read with the
-    // documented ImageIO keys and value types.
-    let seconds = unsafe {
-        source.properties_at_index(i, None).and_then(|props| {
-            let props: &CFDictionary<CFString, CFType> = props.cast_unchecked();
-            [
-                (
-                    kCGImagePropertyGIFDictionary,
-                    kCGImagePropertyGIFUnclampedDelayTime,
-                    kCGImagePropertyGIFDelayTime,
-                ),
-                (
-                    kCGImagePropertyPNGDictionary,
-                    kCGImagePropertyAPNGUnclampedDelayTime,
-                    kCGImagePropertyAPNGDelayTime,
-                ),
-                (
-                    kCGImagePropertyWebPDictionary,
-                    kCGImagePropertyWebPUnclampedDelayTime,
-                    kCGImagePropertyWebPDelayTime,
-                ),
-            ]
-            .into_iter()
-            .find_map(|(dict, unclamped, clamped)| {
-                let format = props.get(dict)?;
-                let format: &CFDictionary<CFString, CFType> =
-                    format.downcast_ref::<CFDictionary>()?.cast_unchecked();
-                let number = |key| {
-                    format
-                        .get(key)
-                        .and_then(|v| v.downcast_ref::<CFNumber>().and_then(|n| n.as_cgfloat()))
-                        .filter(|s| *s > 0.0)
-                };
-                number(unclamped).or_else(|| number(clamped))
-            })
-        })
-    };
-    match seconds {
-        Some(s) if s >= 0.02 => (s * 100.0).round() as u32,
-        _ => 10,
-    }
+/// An image a canvas draws: its pixels, and how many of them make one unit
+/// of the image's own size (what `drawImage`'s source rectangle and its
+/// default size are in).
+#[derive(Clone)]
+pub(crate) struct CanvasBitmap {
+    pub(crate) image: CFRetained<CGImage>,
+    /// 1 for a bitmap decoded whole, whose units are its pixels; an SVG's
+    /// pixels per point, as it was rasterized.
+    pub(crate) scale: f64,
 }
 
 /// Loads the bitmap `uri` (`https://…`, `asset:/…`, a file path, `data:`)
 /// for a canvas, at its natural size, and hands over its (first) frame;
 /// `done` runs on the main thread (before this returns when it is in
-/// memory: callers must not hold a borrow `done` takes). Canvases draw
-/// bitmaps: an SVG is an image that failed to load.
+/// memory: callers must not hold a borrow `done` takes). An SVG is
+/// rasterized by the shared SVG renderer at `scale` pixels per point (the
+/// canvas's), so that it stays sharp on the screen, and its frame handed
+/// over as a bitmap.
 pub(crate) fn load(
     surface: &Rc<Surface>,
     uri: &str,
-    done: impl FnOnce(Result<CFRetained<CGImage>, String>) + 'static,
+    scale: f32,
+    done: impl FnOnce(Result<CanvasBitmap, String>) + 'static,
 ) {
     let name = uri.to_owned();
     let done =
@@ -902,7 +963,7 @@ pub(crate) fn load(
     if let Some(load) = fetch(
         surface,
         &source,
-        Want::natural(1.0),
+        Want::natural(scale.max(1.0)),
         Frames::First,
         Look::default(),
         Priority::Normal,
@@ -929,6 +990,17 @@ pub(crate) fn load_menu_icon(
     scale: f32,
     done: impl FnOnce(Result<MenuIcon, String>) + 'static,
 ) -> Option<Load> {
+    let want = nsh_core::desktop::menu_icon::want(scale);
+    load_icon(surface, source, want, done)
+}
+
+/// Loads a menu item's or the tray's icon as `want` says.
+pub(crate) fn load_icon(
+    surface: &Surface,
+    source: &ImageSource,
+    want: Want,
+    done: impl FnOnce(Result<MenuIcon, String>) + 'static,
+) -> Option<Load> {
     let done = move |result: Result<(Picture, Lease), String>| {
         done(result.map(|(picture, _)| MenuIcon {
             image: picture.frames[0].clone(),
@@ -937,8 +1009,8 @@ pub(crate) fn load_menu_icon(
     };
     fetch(
         surface,
-        &source.at_pixel_ratio(scale),
-        nsh_core::desktop::menu_icon::want(scale),
+        &source.at_pixel_ratio(want.scale),
+        want,
         Frames::First,
         Look::default(),
         Priority::Visible,
@@ -947,14 +1019,21 @@ pub(crate) fn load_menu_icon(
     )
 }
 
-/// The first frame of `picture`, loaded from `uri`, unless it is an SVG.
-fn bitmap(uri: &str, picture: Picture) -> Result<CFRetained<CGImage>, String> {
-    match picture.natural {
-        Natural::Vector(_) => Err(format!(
-            "{uri} is an SVG image: canvases draw bitmaps (PNG, JPEG, ...)"
-        )),
-        Natural::Pixels(..) => Ok(picture.frames[0].clone()),
-    }
+/// The first frame of `picture`, loaded from `uri`; an SVG is rasterized
+/// by the shared SVG renderer, so its frame is a bitmap here too.
+fn bitmap(_uri: &str, picture: Picture) -> Result<CanvasBitmap, String> {
+    let image = picture.frames[0].clone();
+    // What it was decoded at over its own size.
+    let own = match picture.natural {
+        Natural::Vector(points) => f64::from(points.width.0),
+        Natural::Pixels(width, _) => f64::from(width),
+    };
+    let scale = if own > 0.0 {
+        CGImage::width(Some(&image)) as f64 / own
+    } else {
+        1.0
+    };
+    Ok(CanvasBitmap { image, scale })
 }
 
 /// `Command::ImageInfo` (`Image.getSize`, `Image.prefetch`): reads the
@@ -1043,7 +1122,7 @@ pub(crate) struct ImageState {
 
 /// Sets up an image view.
 pub(crate) fn create(view: &NshView) {
-    view.state_mut().image = Some(ImageState::default());
+    view.state_mut().image = Some(Box::default());
 }
 
 /// An image view's source changed.
@@ -1058,7 +1137,7 @@ pub(crate) fn set(
         let mut guard = view.state_mut();
         let s = &mut *guard;
         s.decor.set_fit(mode, options.position);
-        let image = s.image.get_or_insert_with(ImageState::default);
+        let image = s.image.get_or_insert_with(Box::default);
         image.surface = surface.key();
         let same_source = image.source.as_ref().map(|i| &i.uri) == source.map(|i| &i.uri);
         let same_look = image.options.placeholder == options.placeholder
@@ -1134,7 +1213,7 @@ fn wait_for_frame(surface: &Rc<Surface>, view: &NshView) {
         return;
     }
     let weak = Weak::from_retained(&Retained::from(&**view as &ViewObj));
-    surface.add_frame_callback(move |surface, _| {
+    surface.add_draw_callback(move |surface, _| {
         if let Some(view) = weak.load().and_then(|v| NshView::from_ns(&v))
             && view.state().image.as_ref().is_some_and(|i| i.pending)
         {
@@ -1502,6 +1581,151 @@ mod tests {
         pixels[i..i + 4].try_into().unwrap()
     }
 
+    // Obtain ImageData through the same Rust component/mount path as apps.
+    fn pixel_source(width: u32, height: u32, pixels: Arc<[u8]>) -> ImageData {
+        use nsh_core::{
+            Core, MountItem,
+            element::{ImageSrc, Root},
+            prelude::*,
+        };
+
+        thread_local! {
+            static SOURCE: RefCell<Option<ImageSrc>> = const { RefCell::new(None) };
+        }
+        #[component]
+        fn TestImage() -> impl IntoElement {
+            image(SOURCE.with_borrow_mut(|source| source.take().unwrap()))
+        }
+        SOURCE.with_borrow_mut(|source| *source = Some(ImageSrc::rgba(width, height, pixels)));
+        let mut core = Core::new(
+            crate::text::CoreTextEngine::default(),
+            Size::new(Points(100.0), Points(100.0)),
+        );
+        core.mount_root(&Root::of::<TestImage>());
+        core.commit()
+            .unwrap()
+            .items
+            .into_iter()
+            .find_map(|item| match item {
+                MountItem::Image {
+                    source: Some(source),
+                    ..
+                } => source.data,
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn opaque_rgba_keeps_source_alive_and_renders_without_premultiplication() {
+        use objc2_core_graphics::CGImageAlphaInfo;
+
+        let pixels: Arc<[u8]> = Arc::from([255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]);
+        let weak = Arc::downgrade(&pixels);
+        let data = pixel_source(3, 1, pixels);
+        let picture = from_rgba(&data).unwrap();
+        drop(data);
+        assert!(weak.upgrade().is_some());
+        assert_eq!(
+            CGImage::alpha_info(Some(&picture.frames[0])),
+            CGImageAlphaInfo::NoneSkipLast
+        );
+        assert_eq!(
+            rgba(&picture.frames[0]).2,
+            [255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255]
+        );
+        let image = picture.frames[0].clone();
+        drop(picture);
+        assert!(weak.upgrade().is_some());
+        drop(image);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn rgba_with_transparency_still_premultiplies_every_channel() {
+        use objc2_core_graphics::CGImageAlphaInfo;
+
+        // The last pixel alone rules out the opaque path.
+        let data = pixel_source(2, 1, Arc::from([255, 0, 0, 255, 200, 100, 50, 128]));
+        let picture = from_rgba(&data).unwrap();
+        assert_eq!(
+            CGImage::alpha_info(Some(&picture.frames[0])),
+            CGImageAlphaInfo::PremultipliedLast
+        );
+        assert_eq!(
+            rgba(&picture.frames[0]).2,
+            [255, 0, 0, 255, 100, 50, 25, 128]
+        );
+        assert_eq!(data.rgba().unwrap().2, [255, 0, 0, 255, 200, 100, 50, 128]);
+        let data = pixel_source(1, 1, Arc::from([255, 128, 64, 0]));
+        let picture = from_rgba(&data).unwrap();
+        assert_eq!(rgba(&picture.frames[0]).2, [0, 0, 0, 0]);
+    }
+
+    /// Run in separate processes for independent peak RSS measurements:
+    /// NSH_RGBA_BASELINE=1 cargo test --release -p nsh-platform-macos bench_rgba_page -- --ignored --nocapture
+    /// cargo test --release -p nsh-platform-macos bench_rgba_page -- --ignored --nocapture
+    #[test]
+    #[ignore = "2560x3313 pixel-buffer timing and memory benchmark"]
+    fn bench_rgba_page() {
+        let (width, height) = (2560, 3313);
+        let data = pixel_source(
+            width,
+            height,
+            vec![255u8; width as usize * height as usize * 4].into(),
+        );
+        let baseline = std::env::var_os("NSH_RGBA_BASELINE").is_some();
+        let usage = || {
+            // SAFETY: getrusage initializes the writable structure.
+            let mut value: libc::rusage = unsafe { std::mem::zeroed() };
+            // SAFETY: value is valid writable storage for this process's usage.
+            assert_eq!(unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut value) }, 0);
+            value
+        };
+        let cpu = |value: &libc::rusage| {
+            value.ru_utime.tv_sec as f64
+                + value.ru_utime.tv_usec as f64 / 1e6
+                + value.ru_stime.tv_sec as f64
+                + value.ru_stime.tv_usec as f64 / 1e6
+        };
+        let before = usage();
+        let mut times = Vec::new();
+        for _ in 0..30 {
+            let start = Instant::now();
+            let image = if baseline {
+                premultiplied_image(width, height, std::hint::black_box(data.rgba().unwrap().2))
+                    .unwrap()
+            } else {
+                from_rgba(std::hint::black_box(&data)).unwrap().frames[0].clone()
+            };
+            times.push(start.elapsed().as_secs_f64() * 1000.0);
+            std::hint::black_box(&image);
+        }
+        times.sort_by(f64::total_cmp);
+        let after = usage();
+        println!(
+            "baseline={baseline} median_ms={:.3} peak_rss_mib={:.2} cpu_ms_per_page={:.3}",
+            times[15],
+            after.ru_maxrss as f64 / 1048576.0,
+            (cpu(&after) - cpu(&before)) * 1000.0 / 30.0
+        );
+    }
+
+    #[test]
+    fn backing_storage_counts_stride_pages_and_display_copies() {
+        assert_eq!(backing_cost(4, 1, 16384), 32768);
+        assert_eq!(backing_cost(448, 100, 16384), 98304);
+        assert_eq!(backing_cost(256, 64, 16384), 32768);
+        assert_eq!(backing_cost(256, 65, 16384), 65536);
+        assert_eq!(backing_cost(448, 100, 4096), 90112);
+        assert_eq!(backing_cost(usize::MAX, 2, 16384), usize::MAX);
+        let picture = decoded(&png_pixel(), 0).unwrap();
+        assert!(picture.cost() >= page_size() * 2);
+        let mut animated = picture.clone();
+        animated.frames = vec![picture.frames[0].clone(); 3].into();
+        assert_eq!(animated.cost(), picture.cost() * 3);
+    }
+
     #[test]
     fn svg_decodes_at_the_size_shown() {
         let icon = decoded(SVG_ICON, 54).unwrap();
@@ -1570,11 +1794,59 @@ mod tests {
         nsh_core::image::decode_data_uri("data:;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==").unwrap().1
     }
 
+    /// An ICO of PNGs `sides` pixels square, in that order, as favicons
+    /// are.
+    fn ico(sides: &[usize]) -> Vec<u8> {
+        use nsh_core::canvas::render::ImageFormat;
+        use nsh_platform_apple::canvas_image::{bitmap_context, encode};
+        use objc2_core_graphics::CGBitmapContextCreateImage;
+        let pngs: Vec<Vec<u8>> = sides
+            .iter()
+            .map(|side| {
+                let context = bitmap_context(*side, *side).unwrap();
+                let image = CGBitmapContextCreateImage(Some(&context)).unwrap();
+                encode(&image, ImageFormat::Png).unwrap()
+            })
+            .collect();
+        let mut out = vec![0, 0, 1, 0, sides.len() as u8, 0];
+        let mut offset = 6 + 16 * sides.len();
+        for (side, png) in sides.iter().zip(&pngs) {
+            let side = (*side % 256) as u8;
+            out.extend([side, side, 0, 0, 1, 0, 32, 0]);
+            out.extend((png.len() as u32).to_le_bytes());
+            out.extend((offset as u32).to_le_bytes());
+            offset += png.len();
+        }
+        for png in &pngs {
+            out.extend(png);
+        }
+        out
+    }
+
     #[test]
-    fn svg_is_no_canvas_image() {
+    fn a_multi_size_icon_is_one_still_image() {
+        let icon = ico(&[16, 32, 48]);
+        let picture = decoded(&icon, 24).unwrap();
+        assert_eq!(picture.frames.len(), 1, "no animation of its sizes");
+        assert_eq!(picture.pixel_longest(), 24, "from the 32-pixel image");
+        assert_eq!(picture.natural, Natural::Pixels(48, 48), "its largest");
+        let picture = decoded(&icon, 32).unwrap();
+        assert_eq!((picture.frames.len(), picture.pixel_longest()), (1, 32));
+        let picture = decoded(&icon, 64).unwrap();
+        assert_eq!(
+            (picture.frames.len(), picture.pixel_longest()),
+            (1, 48),
+            "the largest, never grown"
+        );
+        assert_eq!(info_size(&icon), Some(Natural::Pixels(48, 48)));
+    }
+
+    #[test]
+    fn svg_is_a_canvas_image() {
         let logo = decoded(SVG_LOGO, 48).unwrap();
-        let error = bitmap("asset:/logo.svg", logo).unwrap_err();
-        assert!(error.starts_with("asset:/logo.svg"), "{error}");
+        let image = bitmap("asset:/logo.svg", logo).unwrap();
+        assert_eq!(CGImage::width(Some(&*image.image)), 48);
+        assert_eq!(CGImage::height(Some(&*image.image)), 24);
         let png = decoded(&png_pixel(), 0).unwrap();
         assert_eq!(png.natural, Natural::Pixels(1, 1));
         assert!(bitmap("asset:/a.png", png).is_ok());

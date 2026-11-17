@@ -47,6 +47,7 @@ use nsh_core::{
     Points, ResolvedTextStyle, SubmitBehavior, TextAlign,
     geometry::{Point, Size, point, px, size},
     tailwind::state,
+    text_edit::clip_chars,
 };
 
 use crate::{surface::Surface, view::NshView};
@@ -571,15 +572,15 @@ impl Ctx {
         }
     }
 
-    /// The part of `text` an insertion into `current` may add
-    /// (`maxLength`).
-    fn allowed<'a>(&self, current: impl FnOnce() -> String, text: &'a str) -> &'a str {
+    /// The part of `text` an insertion into a text of `current` characters
+    /// may add (`maxLength`, [`clip_chars`]).
+    fn allowed<'a>(&self, current: impl FnOnce() -> usize, text: &'a str) -> &'a str {
         let max = self
             .input
             .upgrade()
             .and_then(|input| input.config.borrow().max_length);
         match max {
-            Some(max) => clip_utf16(text, (max as usize).saturating_sub(utf16_len(&current()))),
+            Some(max) => clip_chars(text, (max as usize).saturating_sub(current())),
             None => text,
         }
     }
@@ -748,7 +749,7 @@ fn attach(cx: &Ctx, editor: &Editor, input: &InputState) {
             let c = cx.clone();
             t.connect_insert_text(move |t, text, pos| {
                 let Some(input) = c.user_edit() else { return };
-                let fit = c.allowed(|| t.text().into(), text);
+                let fit = c.allowed(|| usize::from(t.text_length()), text);
                 if !fit.is_empty() {
                     c.inserted(&input, fit);
                 }
@@ -801,10 +802,7 @@ fn attach(cx: &Ctx, editor: &Editor, input: &InputState) {
                     input.lines.borrow_mut().edit(start, end);
                 }
                 let Some(input) = c.user_edit() else { return };
-                let fit = c.allowed(
-                    || b.text(&b.start_iter(), &b.end_iter(), false).into(),
-                    text,
-                );
+                let fit = c.allowed(|| b.char_count().max(0) as usize, text);
                 if !fit.is_empty() {
                     c.inserted(&input, fit);
                 }
@@ -1400,18 +1398,22 @@ fn purpose(config: &InputConfig) -> (gtk::InputPurpose, gtk::InputHints) {
         (false, KeyboardType::Phone) => gtk::InputPurpose::Phone,
         (false, KeyboardType::Url) => gtk::InputPurpose::Url,
     };
+    // A visible password is typed as it is: never capitalized, checked,
+    // completed or learned.
+    let password = config.visible_password();
     let mut hints = match config.auto_capitalize {
+        _ if password => gtk::InputHints::NONE,
         AutoCapitalize::None => gtk::InputHints::NONE,
         AutoCapitalize::Sentences => gtk::InputHints::UPPERCASE_SENTENCES,
         AutoCapitalize::Words => gtk::InputHints::UPPERCASE_WORDS,
         AutoCapitalize::Characters => gtk::InputHints::UPPERCASE_CHARS,
     };
-    hints |= if config.auto_correct {
+    hints |= if config.auto_correct && !password {
         gtk::InputHints::SPELLCHECK | gtk::InputHints::WORD_COMPLETION
     } else {
         gtk::InputHints::NO_SPELLCHECK
     };
-    if config.secure {
+    if config.secure || password {
         hints |= gtk::InputHints::PRIVATE;
     }
     (purpose, hints)
@@ -1580,15 +1582,20 @@ pub(crate) fn blur(view: &NshView) {
     }
 }
 
-/// Unfocuses whatever input of the surface has focus.
+/// Unfocuses whatever input of the surface has focus, in any of its
+/// windows (the main one and the app's own).
 pub(crate) fn blur_all(surface: &Rc<Surface>) {
-    let root = surface.root.upcast_ref::<gtk::Widget>();
-    if let Some(window) = root.root()
-        && let Some(focus) = window.focus()
-        && (focus.is::<gtk::Text>() || focus.is::<gtk::TextView>())
-        && focus.is_ancestor(root)
-    {
-        window.set_focus(None::<&gtk::Widget>);
+    let mut roots = vec![surface.root.clone()];
+    roots.extend(crate::window::roots(surface).into_iter().map(|(_, r)| r));
+    for root in roots {
+        let root = root.upcast_ref::<gtk::Widget>();
+        if let Some(window) = root.root()
+            && let Some(focus) = window.focus()
+            && (focus.is::<gtk::Text>() || focus.is::<gtk::TextView>())
+            && focus.is_ancestor(root)
+        {
+            window.set_focus(None::<&gtk::Widget>);
+        }
     }
 }
 
@@ -1603,6 +1610,57 @@ pub(crate) fn set_selection(view: &NshView, start: u32, end: u32) {
         utf16_to_char(&text, start) as i32,
         utf16_to_char(&text, end) as i32,
     );
+}
+
+/// `Command::InsertText`: `text` in place of the selection, as the user's
+/// edit, through the editors' own keybinding signals, so GTK records it in
+/// the undo history (`gtk_editable_insert_text` from outside an edit would
+/// clear it, as a new `value` does). The input's handlers see it as a
+/// paste: `maxLength` clips it, `onChangeText` reports it, no key does. A
+/// text view inserts in one user action, one undo step; a line records a
+/// replaced selection as its own step, as its own paste does.
+pub(crate) fn insert_text(view: &NshView, text: &str) {
+    let Some(input) = view.state().input.clone() else {
+        return;
+    };
+    let (editable, multiline) = {
+        let config = input.config.borrow();
+        (config.editable, config.multiline)
+    };
+    if !editable {
+        log::warn!("insertText: the input is read-only");
+        return;
+    }
+    if input.composition.borrow().is_some() {
+        // The input method's text would be committed around it.
+        log::warn!("insertText: an input method is composing; nothing inserted");
+        return;
+    }
+    let text = nsh_core::text_edit::pasted(text, multiline);
+    let editor = input.editor.borrow().clone();
+    // Neither the deletion nor the insertion types a key.
+    input.pasting.set(true);
+    match &editor {
+        Editor::Line(t) => {
+            if t.selection_bounds().is_some() {
+                t.emit_by_name::<()>("delete-from-cursor", &[&gtk::DeleteType::Chars, &1i32]);
+            }
+            if !text.is_empty() {
+                t.emit_by_name::<()>("insert-at-cursor", &[&text]);
+            }
+        }
+        Editor::Area { view, .. } => {
+            let buffer = view.buffer();
+            buffer.begin_user_action();
+            buffer.delete_selection(true, view.is_editable());
+            if !text.is_empty() {
+                buffer.insert_interactive_at_cursor(&text, view.is_editable());
+            }
+            buffer.end_user_action();
+            view.scroll_mark_onscreen(&buffer.get_insert());
+        }
+    }
+    input.pasting.set(false);
 }
 
 /// Return or Enter.
@@ -1639,11 +1697,6 @@ fn key_of(text: &str) -> &str {
     if text == "\n" { "Enter" } else { text }
 }
 
-/// Length of `s` in UTF-16 units.
-fn utf16_len(s: &str) -> usize {
-    s.chars().map(char::len_utf16).sum()
-}
-
 /// The UTF-16 offset of character `chars` of `s` (clamped to its end).
 fn char_to_utf16(s: &str, chars: usize) -> u32 {
     s.chars().take(chars).map(char::len_utf16).sum::<usize>() as u32
@@ -1660,19 +1713,6 @@ fn utf16_to_char(s: &str, units: u32) -> usize {
         at += c.len_utf16();
     }
     s.chars().count()
-}
-
-/// The longest prefix of `s` that fits in `max` UTF-16 units, cut between
-/// characters.
-fn clip_utf16(s: &str, max: usize) -> &str {
-    let mut units = 0;
-    for (i, c) in s.char_indices() {
-        units += c.len_utf16();
-        if units > max {
-            return &s[..i];
-        }
-    }
-    s
 }
 
 #[cfg(test)]
@@ -1882,7 +1922,6 @@ mod tests {
     #[test]
     fn utf16_offsets() {
         let s = "a😀b";
-        assert_eq!(utf16_len(s), 4);
         assert_eq!(char_to_utf16(s, 0), 0);
         assert_eq!(char_to_utf16(s, 1), 1);
         assert_eq!(char_to_utf16(s, 2), 3);
@@ -1894,17 +1933,6 @@ mod tests {
         assert_eq!(utf16_to_char(s, 3), 2);
         assert_eq!(utf16_to_char(s, 4), 3);
         assert_eq!(utf16_to_char(s, 99), 3);
-    }
-
-    #[test]
-    fn max_length_clipping() {
-        assert_eq!(clip_utf16("hello", 3), "hel");
-        assert_eq!(clip_utf16("hello", 9), "hello");
-        assert_eq!(clip_utf16("hello", 0), "");
-        // A pair is never split.
-        assert_eq!(clip_utf16("a😀", 2), "a");
-        assert_eq!(clip_utf16("a😀", 3), "a😀");
-        assert_eq!(clip_utf16("中文", 1), "中");
     }
 
     #[test]

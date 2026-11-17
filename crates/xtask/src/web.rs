@@ -25,7 +25,7 @@ use anyhow::Context as _;
 
 use crate::{
     android,
-    dist::{cargo, copy},
+    dist::{cargo, copy, remove},
     term::{self, run},
 };
 
@@ -37,7 +37,16 @@ pub(crate) fn build(out: &Path) -> anyhow::Result<()> {
     let out = root.join(out);
     // The playground: the browser runtime plus the TSX compiler, in its own
     // target directory: switching the feature would rebuild the
-    // other one every time.
+    // other one every time. huacnlee/cargo ignores `--target-dir` (its
+    // builds are kept apart by their features anyway) and puts the file in
+    // `target/`, where the embedded runtime below lands too: the file is
+    // taken from whichever of the two the build wrote, before that build
+    // replaces it.
+    let playground = [root.join("target/web-playground"), root.join("target")]
+        .map(|dir| dir.join(WASM).join("web/nsh_platform_web.wasm"));
+    for file in &playground {
+        remove(file)?;
+    }
     cargo(
         &[
             "build",
@@ -55,15 +64,13 @@ pub(crate) fn build(out: &Path) -> anyhow::Result<()> {
         ],
         "nsh-playground.wasm",
     )?;
+    let built = playground
+        .iter()
+        .find(|file| file.exists())
+        .context("the playground's build wrote no nsh_platform_web.wasm")?;
+    copy(built, &out.join("nsh-playground.wasm"))?;
     cargo(&["build", "--release", "-p", "nsh-cli"], "nsh")?;
     fs::create_dir_all(out.join("demos"))?;
-    copy(
-        &root
-            .join("target/web-playground")
-            .join(WASM)
-            .join("web/nsh_platform_web.wasm"),
-        &out.join("nsh-playground.wasm"),
-    )?;
     let web = root.join("crates/nsh-platform-web/web");
     // The runtime `nsh package --target web` ships (`WebKind::Browser`), in
     // the same target directory and profile: packaging the gallery below
@@ -171,16 +178,20 @@ pub(crate) fn build(out: &Path) -> anyhow::Result<()> {
     step.done("packaged the gallery");
 
     copy(&web.join("index.html"), &out.join("index.html"))?;
-    // The embedded player and playground share the gallery's syntax data.
-    let syntaxes = fs::read_dir(&gallery)?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("nsh-syntaxes."))
-        })
-        .context("the gallery has no syntax data")?;
-    copy(&syntaxes, &out.join("nsh-syntaxes.bin"))?;
+    // The embedded player and playground share the gallery's syntax data
+    // and `EmojiPicker`'s emoji.
+    for (data, what) in [("syntaxes", "syntax data"), ("emoji", "emoji")] {
+        let prefix = format!("nsh-{data}.");
+        let file = fs::read_dir(&gallery)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .find(|path| {
+                path.file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with(&prefix))
+            })
+            .with_context(|| format!("the gallery has no {what}"))?;
+        copy(&file, &out.join(format!("nsh-{data}.bin")))?;
+    }
     term::note(out.strip_prefix(&root).unwrap_or(&out).display());
     Ok(())
 }

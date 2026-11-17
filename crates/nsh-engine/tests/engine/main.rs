@@ -33,9 +33,12 @@ mod hot;
 mod hover;
 mod images;
 mod js_touch;
+mod keyboard;
 mod keymap;
+mod lazy_each;
 mod list;
 mod list_bench;
+mod login_item;
 mod logs;
 mod native;
 mod net;
@@ -45,6 +48,7 @@ mod package;
 mod parity;
 mod platform;
 mod process;
+mod runtime;
 mod rust_animation;
 mod rust_app;
 mod rust_classes;
@@ -60,11 +64,13 @@ mod rust_touch;
 mod shader;
 mod shutdown;
 mod split;
+mod split_view;
 mod storage;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod system;
 mod test_ui;
 mod theme;
+mod url_scheme;
 mod websocket;
 
 /// Hands the engine's batches to the test.

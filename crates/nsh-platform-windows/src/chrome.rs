@@ -13,14 +13,19 @@
 //!   style, following the app's appearance; non-client clicks on them are
 //!   handled here, never by `DefWindowProc`, which would draw Windows 95's.
 //! - **Drag regions** work with the system title bar too: a view marked
-//!   `windowDrag` answers `HTCAPTION` anywhere.
+//!   `windowDrag` answers `HTCAPTION` anywhere. A primary press there is
+//!   held with the mouse captured ([`WindowPress`]): moved past the
+//!   system's drag rectangle, it becomes the system's move of the window;
+//!   released before that, it reaches the app as a click, so overlays see
+//!   a press outside them and close.
 //! - **Menus** are Win32 menus: the menu bar (`SetMenu`, not shown while
 //!   the title bar is hidden) and `TrackPopupMenuEx` for context menus,
 //!   both themed dark with the app (uxtheme's `SetPreferredAppMode` for the
 //!   menus, the `WM_UAHDRAWMENU*` messages for the bar, which has no dark
 //!   theme of its own). Their shortcuts are matched here before the keys
 //!   reach the app; the editing roles act on the focused text field by
-//!   sending it their keys.
+//!   sending it their keys. A popup for a selectable view's context-menu
+//!   request sends Copy and Select All to that view's selection instead.
 //! - **Menu icons** are `hbmpItem` bitmaps: 32-bit premultiplied DIB sections
 //!   of `SM_CXSMICON` at the window's DPI, which Windows alpha blends, set
 //!   as each icon arrives from the image loader and kept with their menu
@@ -41,8 +46,8 @@ use std::{
 use nsh_core::{
     Color, EventKind, EventPayload, ImageSource, PayloadValue, ROOT_ID,
     desktop::{
-        DesktopCommand, Key, MenuAction, MenuItem, MenuRole, Shortcut, TitleBarStyle, WindowFrame,
-        WindowLevel, menu_icon,
+        DesktopCommand, Key, MenuAction, MenuItem, MenuLabels, MenuRole, Shortcut, WindowEvent,
+        WindowRequest, menu_icon,
     },
     geometry::{Edges, Points},
 };
@@ -54,8 +59,9 @@ use windows::{
             Gdi::{
                 BI_RGB, BITMAPINFO, BITMAPINFOHEADER, COLOR_GRAYTEXT, COLOR_MENUTEXT,
                 CreateDIBSection, CreateSolidBrush, DIB_RGB_COLORS, DT_CENTER, DT_HIDEPREFIX,
-                DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetSysColor,
-                GetWindowDC, HBITMAP, HDC, ReleaseDC, SetBkMode, SetTextColor, TRANSPARENT,
+                DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, FillRect, GetMonitorInfoW,
+                GetSysColor, GetWindowDC, HBITMAP, HDC, MONITOR_DEFAULTTONEAREST, MONITORINFO,
+                MonitorFromWindow, ReleaseDC, SetBkMode, SetTextColor, TRANSPARENT,
             },
         },
         System::LibraryLoader::{GetProcAddress, LoadLibraryW},
@@ -66,11 +72,11 @@ use windows::{
             },
             HiDpi::GetSystemMetricsForDpi,
             Input::KeyboardAndMouse::{
-                TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VIRTUAL_KEY, VK_BACK,
-                VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE, VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT,
-                VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3, VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7,
-                VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PRIOR, VK_RETURN,
-                VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
+                ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT,
+                TrackMouseEvent, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+                VK_F1, VK_F24, VK_HOME, VK_INSERT, VK_LEFT, VK_NEXT, VK_OEM_1, VK_OEM_2, VK_OEM_3,
+                VK_OEM_4, VK_OEM_5, VK_OEM_6, VK_OEM_7, VK_OEM_COMMA, VK_OEM_MINUS, VK_OEM_PERIOD,
+                VK_OEM_PLUS, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SPACE, VK_TAB, VK_UP,
             },
             WindowsAndMessaging::*,
         },
@@ -83,20 +89,13 @@ use crate::{
     input::{KeyEvent, Modifiers},
     render::{color_f, rect_f},
     surface::Surface,
+    view::NshView,
 };
 
 /// The hidden title bar's height when the app gives none, in points
 /// (Windows 11's caption).
 const DEFAULT_CAPTION_HEIGHT: f32 = 32.0;
 
-/// The hidden title bar's height, in points: the app's, else Windows'.
-fn caption_height(surface: &Surface) -> f32 {
-    surface
-        .chrome
-        .height
-        .get()
-        .unwrap_or(DEFAULT_CAPTION_HEIGHT)
-}
 /// A caption button's width, in points.
 const BUTTON_WIDTH: f32 = 46.0;
 
@@ -134,9 +133,18 @@ struct Entry {
 struct Popup {
     items: Arc<[MenuItem]>,
     at: Option<(f32, f32)>,
+    /// `at` is the menu's top-end corner rather than its top-start one: it
+    /// opens towards the left (a right-to-left layout's, anchored to a
+    /// view's bottom-end corner).
+    end: bool,
     /// What the items of a menu of the platform's own do, by id - 1 (the
     /// app's menus report their ids instead).
     actions: Vec<Action>,
+    /// The selectable area this popup was requested on, if any.
+    area: Option<NshView>,
+    /// The app's `Menu.popup` waits for it to close (the tray's menu is
+    /// not one the app awaits).
+    awaited: bool,
 }
 
 /// What an item of a menu of the platform's own does.
@@ -145,17 +153,10 @@ pub(crate) type Action = Rc<dyn Fn(&Rc<Surface>)>;
 /// A surface's chrome.
 #[derive(Default)]
 pub(crate) struct Chrome {
-    style: Cell<TitleBarStyle>,
-    /// The app's title bar's height (`Window.setTitleBar`'s).
-    height: Cell<Option<f32>>,
-    /// The caption button under the mouse (`HT*`, 0 for none).
-    hover: Cell<u32>,
-    /// The caption button pressed.
-    pressed: Cell<u32>,
-    /// The mouse is tracked for `WM_NCMOUSELEAVE`.
-    tracking: Cell<bool>,
-    /// The window is inactive (its caption buttons dim).
-    inactive: Cell<bool>,
+    /// The labels the core translates for this surface's language: the
+    /// platform's own menus and the role items with no label of their own
+    /// show them.
+    pub(crate) labels: RefCell<MenuLabels>,
     /// The application menu.
     menu: RefCell<Option<Arc<[MenuItem]>>>,
     /// The menu bar shown (`HMENU`, 0 for none).
@@ -166,6 +167,8 @@ pub(crate) struct Chrome {
     bar_icons: RefCell<MenuIcons>,
     /// The context menu to show once the batch is applied.
     popup: RefCell<Option<Popup>>,
+    /// The last context-menu request, consumed by the app's next popup.
+    pub(crate) context_area: RefCell<Option<NshView>>,
     /// The loads of its icons, which it opens once it has or after
     /// [`ICON_WAIT`].
     popup_icons: RefCell<Vec<crate::image::Load>>,
@@ -175,6 +178,25 @@ pub(crate) struct Chrome {
     tracked_popup: RefCell<Option<Arc<[MenuItem]>>>,
     #[cfg(feature = "dev")]
     test_choice: Cell<Option<(u32, Option<MenuRole>)>>,
+    /// The app listens to quit requests
+    /// (`DesktopCommand::SetQuitOnRequest(false)`): the Quit item and its
+    /// Ctrl+Q ask it ([`ask_quit`]).
+    asks_quit: Cell<bool>,
+}
+
+impl Chrome {
+    /// Captures and consumes this surface's context-menu request. Native
+    /// tracking starts later; cancellation still consumes the request.
+    fn app_popup(&self, items: Arc<[MenuItem]>, at: Option<(f32, f32)>) -> Popup {
+        Popup {
+            items,
+            at,
+            end: false,
+            actions: Vec::new(),
+            area: self.context_area.take(),
+            awaited: true,
+        }
+    }
 }
 
 /// Chooses the item of the app's open context menu at the end of `path`
@@ -228,9 +250,7 @@ pub(crate) fn close_open_menu(surface: &Surface) -> Result<(), String> {
 }
 
 fn top_level(hwnd: HWND) -> bool {
-    // SAFETY: a plain query of a window of this thread.
-    let style = unsafe { GetWindowLongW(hwnd, GWL_STYLE) } as u32;
-    !hwnd.is_invalid() && style & WS_CHILD.0 == 0
+    crate::window_state::top_level(hwnd)
 }
 
 fn zoomed(hwnd: HWND) -> bool {
@@ -238,12 +258,37 @@ fn zoomed(hwnd: HWND) -> bool {
     unsafe { IsZoomed(hwnd) }.as_bool()
 }
 
-/// The title bar is hidden now (not in full screen, which has none).
-pub(crate) fn hidden(surface: &Surface) -> bool {
-    let c = &surface.chrome;
-    c.style.get() == TitleBarStyle::Hidden
-        && !crate::window::is_full_screen(surface.hwnd())
-        && top_level(surface.hwnd())
+/// The attributes of top-level window `hwnd` (the main one or one of the
+/// app's own), outside full screen, which has no frame of any kind.
+fn framed_attrs(hwnd: HWND) -> Option<crate::shell::Attrs> {
+    if hwnd.is_invalid() || !top_level(hwnd) || crate::window::is_full_screen(hwnd) {
+        return None;
+    }
+    crate::window::shell(hwnd).map(|s| s.attrs())
+}
+
+/// The window's title bar is hidden now: the system frame stays, the
+/// caption buttons are drawn over the app.
+fn hidden(hwnd: HWND) -> bool {
+    framed_attrs(hwnd).is_some_and(|a| a.hidden_title_bar())
+}
+
+/// The window has no system frame now: its client area is all of it.
+fn frameless(hwnd: HWND) -> bool {
+    framed_attrs(hwnd).is_some_and(|a| a.frameless())
+}
+
+/// The window's title bar is the app's now (hidden, or no frame): the menu
+/// bar does not show.
+fn custom_caption(hwnd: HWND) -> bool {
+    framed_attrs(hwnd).is_some_and(|a| a.custom_caption())
+}
+
+/// The hidden title bar's height, in points: the app's, else Windows'.
+fn caption_height(hwnd: HWND) -> f32 {
+    crate::window::shell(hwnd)
+        .and_then(|s| s.attrs().title_bar.height)
+        .map_or(DEFAULT_CAPTION_HEIGHT, |h| h.0)
 }
 
 /// The resize border's thickness in pixels (also what a maximized window
@@ -256,24 +301,57 @@ fn frame_thickness(hwnd: HWND) -> i32 {
     }
 }
 
-/// Tells the app the title bar's area.
-fn update_area(surface: &Surface) {
-    let mut env = surface.environment.get();
-    env.title_bar = if hidden(surface) {
-        Edges {
-            top: Points(caption_height(surface)),
-            right: Points(3.0 * BUTTON_WIDTH),
-            bottom: Points(0.0),
-            left: Points(0.0),
-        }
-    } else {
-        Edges::default()
-    };
-    surface.set_environment(env);
+/// Pixels per point of window `hwnd`: the surface's for its own window, the
+/// monitor's for one of the app's own.
+fn scale_of(surface: &Surface, hwnd: HWND) -> f32 {
+    match crate::window::app_window_root(hwnd) {
+        Some(_) => crate::window::dpi(hwnd) as f32 / 96.0,
+        None => surface.scale(),
+    }
 }
 
-/// The frame changed: the window recomputes its client area.
-fn frame_changed(hwnd: HWND) {
+/// The width of the window's client area, in points.
+fn client_width(surface: &Surface, hwnd: HWND) -> f32 {
+    let mut rect = RECT::default();
+    // SAFETY: a query with a local out value.
+    let _ = unsafe { GetClientRect(hwnd, &mut rect) };
+    (rect.right - rect.left) as f32 / scale_of(surface, hwnd)
+}
+
+/// The area of window `hwnd`'s title bar while the app's: its height and
+/// the width the drawn caption buttons take; nothing while the system's.
+pub(crate) fn title_bar_area(hwnd: HWND) -> Edges<Points> {
+    match framed_attrs(hwnd) {
+        Some(attrs) if attrs.hidden_title_bar() => Edges {
+            top: Points(caption_height(hwnd)),
+            right: Points(crate::shell::caption_buttons(&attrs).len() as f32 * BUTTON_WIDTH),
+            bottom: Points(0.0),
+            left: Points(0.0),
+        },
+        _ => Edges::default(),
+    }
+}
+
+/// Tells the app the title bar's area of window `hwnd`: the environment's
+/// for the main window, an event for one of the app's own.
+fn update_area(surface: &Surface, hwnd: HWND) {
+    let area = title_bar_area(hwnd);
+    match crate::window::app_window_root(hwnd) {
+        Some(id) => crate::app_window::title_bar_changed(surface, id, area),
+        None => {
+            let mut env = surface.environment.get();
+            if env.title_bar != area {
+                env.title_bar = area;
+                surface.set_environment(env);
+            }
+        }
+    }
+}
+
+/// The frame of window `hwnd` changed (its title bar, its frame, its
+/// buttons): it recomputes its client area, and the menu bar and the
+/// title bar's area follow.
+pub(crate) fn frame_changed(surface: &Surface, hwnd: HWND) {
     // SAFETY: a plain call on a live window.
     let _ = unsafe {
         SetWindowPos(
@@ -286,128 +364,100 @@ fn frame_changed(hwnd: HWND) {
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
         )
     };
+    if crate::window::app_window_root(hwnd).is_none() {
+        show_menu_bar(surface);
+    }
+    update_area(surface, hwnd);
+    crate::window::invalidate(hwnd);
+    surface.invalidate();
 }
 
 // --- Commands ---------------------------------------------------------------------------
 
-/// A desktop command (on the root).
+/// A desktop command on the main window (on the root).
 pub(crate) fn command(surface: &Rc<Surface>, command: &DesktopCommand) {
     let hwnd = surface.hwnd();
     if hwnd.is_invalid() {
         return;
     }
-    // The embedding app owns its window: only context menus work there.
-    if !top_level(hwnd) && !matches!(command, DesktopCommand::PopupMenu { .. }) {
-        return;
+    // The embedding app owns its window and the shell's integration: only
+    // context menus, and the labels of the menus the view makes, work
+    // there.
+    if !top_level(hwnd) {
+        match command {
+            DesktopCommand::PopupMenu { .. } | DesktopCommand::SetMenuLabels(_) => {}
+            DesktopCommand::RegisterGlobalShortcut { id, .. } => {
+                crate::global_shortcut::answer(surface, *id, false);
+                return;
+            }
+            _ => return,
+        }
     }
     let c = &surface.chrome;
     match command {
-        DesktopCommand::SetTitle(title) => {
-            // SAFETY: a plain call with a NUL-terminated string.
-            let _ = unsafe { SetWindowTextW(hwnd, &windows::core::HSTRING::from(title.as_str())) };
-        }
-        DesktopCommand::SetTitleBar { style, height } => {
-            let height = height.map(|h| h.0);
-            let changed = c.height.replace(height) != height;
-            if c.style.replace(*style) != *style || changed {
-                show_menu_bar(surface);
-                frame_changed(hwnd);
-                update_area(surface);
-                surface.invalidate();
-            }
-        }
-        DesktopCommand::Minimize => {
-            // SAFETY: a plain call.
-            let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
-        }
-        DesktopCommand::ToggleMaximize => toggle_maximize(surface),
-        DesktopCommand::ToggleFullScreen => toggle_fullscreen(surface),
-        DesktopCommand::SetFrame(frame) => set_frame(surface, hwnd, frame),
-        DesktopCommand::SetLevel(level) => set_level(hwnd, *level),
-        DesktopCommand::OrderFront => {
-            // Restoring an already maximized or snapped window would change
-            // its bounds when the caller only asked to focus it.
-            // SAFETY: hwnd is the surface's live top-level window.
-            unsafe {
-                if IsIconic(hwnd).as_bool() {
-                    let _ = ShowWindow(hwnd, SW_RESTORE);
+        DesktopCommand::SetAttributes(diff) => crate::shell::apply(surface, hwnd, diff),
+        DesktopCommand::Request(request) => {
+            // SAFETY: a plain query on the surface's live window.
+            let visible = unsafe { IsWindowVisible(hwnd) }.as_bool();
+            match request {
+                // A main window hidden at launch (nsh.json
+                // `defaultVisible: false`) shows as it would have then:
+                // drawn before DWM composites it, in the mode it opens in.
+                WindowRequest::Show | WindowRequest::Focus
+                    if surface.main_unshown.get() && !visible =>
+                {
+                    crate::app::show_main(surface, hwnd);
                 }
-                let _ = SetForegroundWindow(hwnd);
+                // The app's own mode replaces the one it was to open in.
+                WindowRequest::SetMode(_) | WindowRequest::SetPlacement(_) => {
+                    surface.main_opening_mode.take();
+                }
+                _ => {}
+            }
+            if !crate::shell::request(hwnd, request) {
+                // `Request(Close)`: past `closeOnPress`.
+                crate::window_close::close(surface);
             }
         }
-        DesktopCommand::Close => close(hwnd),
+        // A window of the app's own's ([`crate::app_window`]).
+        DesktopCommand::OpenWindow(_) => {}
+        DesktopCommand::Quit => quit(surface),
+        DesktopCommand::SetQuitOnRequest(quit) => c.asks_quit.set(!quit),
+        // Additional quit request sources are currently macOS-only.
+        DesktopCommand::SetQuitRequestOptions(_) | DesktopCommand::CancelQuitRequest => {}
+        // Quits as above, then the runner starts the app again; an
+        // embedding app's window is its own.
+        DesktopCommand::Restart => {
+            if crate::app::request_restart() {
+                quit(surface);
+            }
+        }
         DesktopCommand::SetMenu(menu) => {
             *c.menu.borrow_mut() = menu.clone();
             show_menu_bar(surface);
         }
         // The Win32 menu bar always shows.
         DesktopCommand::SetMenuBar(_) => {}
+        // The edit menus read them as they open, a top-level window's menu
+        // bar now.
+        DesktopCommand::SetMenuLabels(labels) => {
+            c.labels.replace((**labels).clone());
+            if top_level(hwnd) {
+                show_menu_bar(surface);
+            }
+        }
         DesktopCommand::PopupMenu { items, at } => popup(
             surface,
-            Popup {
-                items: items.clone(),
-                at: at.map(|p| (p.x.0, p.y.0)),
-                actions: Vec::new(),
-            },
+            c.app_popup(items.clone(), at.map(|p| (p.x.0, p.y.0))),
         ),
+        DesktopCommand::SetTray(tray) => crate::tray::set(surface, tray.as_ref()),
+        DesktopCommand::RegisterGlobalShortcut { id, shortcut } => {
+            crate::global_shortcut::register(surface, *id, shortcut);
+        }
+        DesktopCommand::UnregisterGlobalShortcut(id) => {
+            crate::global_shortcut::unregister(surface, *id)
+        }
     }
-}
-
-/// Moves and sizes the window: a field left out keeps its value. The
-/// points of `Window.setFrame` are pixels at `surface.scale()`; Win32
-/// works on the outer frame (non-client area included), as does
-/// `GetWindowRect`.
-fn set_frame(surface: &Surface, hwnd: HWND, frame: &WindowFrame) {
-    let mut rect = RECT::default();
-    // SAFETY: a plain query with a local out value.
-    if unsafe { GetWindowRect(hwnd, &mut rect) }.is_err() {
-        return;
-    }
-    let scale = surface.scale();
-    let x = frame.x.map_or(rect.left, |v| (v.0 * scale).round() as i32);
-    let y = frame.y.map_or(rect.top, |v| (v.0 * scale).round() as i32);
-    let width = frame
-        .width
-        .map_or(rect.right - rect.left, |v| (v.0 * scale).round() as i32);
-    let height = frame
-        .height
-        .map_or(rect.bottom - rect.top, |v| (v.0 * scale).round() as i32);
-    // SAFETY: a plain call on a live window; SWP_NOZORDER keeps the level
-    // `set_level` may have set.
-    let _ = unsafe {
-        SetWindowPos(
-            hwnd,
-            None,
-            x,
-            y,
-            width,
-            height,
-            SWP_NOZORDER | SWP_NOACTIVATE,
-        )
-    };
-}
-
-/// The window's level: `HWND_TOPMOST` floats, `HWND_NOTOPMOST` is the
-/// normal level, `HWND_BOTTOM` is the closest Windows has to the
-/// desktop's icons (nothing draws below them).
-fn set_level(hwnd: HWND, level: WindowLevel) {
-    let order = match level {
-        WindowLevel::Normal => HWND_NOTOPMOST,
-        WindowLevel::Floating => HWND_TOPMOST,
-        WindowLevel::DesktopIcon => HWND_BOTTOM,
-    };
-    // SAFETY: a plain call on a live window.
-    let _ = unsafe {
-        SetWindowPos(
-            hwnd,
-            Some(order),
-            0,
-            0,
-            0,
-            0,
-            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-        )
-    };
 }
 
 /// Asks the message loop to show the context menu waiting; it takes the
@@ -458,7 +508,7 @@ pub(crate) enum LocalItem {
         /// work).
         role: Option<MenuRole>,
         /// A label of its own (else the role's).
-        label: &'static str,
+        label: String,
         /// It can be chosen.
         enabled: bool,
         /// What choosing it does.
@@ -469,6 +519,18 @@ pub(crate) enum LocalItem {
 /// Shows a context menu of the platform's own (a text field's) at the
 /// pointer.
 pub(crate) fn popup_actions(surface: &Surface, items: Vec<LocalItem>) {
+    popup_actions_at(surface, items, None, false);
+}
+
+/// Shows a context menu of the platform's own at `at` (in the window's
+/// points), or at the pointer; with `end`, `at` is its top-end corner (it
+/// opens towards the left).
+pub(crate) fn popup_actions_at(
+    surface: &Surface,
+    items: Vec<LocalItem>,
+    at: Option<(f32, f32)>,
+    end: bool,
+) {
     let mut actions = Vec::new();
     let items: Vec<MenuItem> = items
         .into_iter()
@@ -483,10 +545,11 @@ pub(crate) fn popup_actions(surface: &Surface, items: Vec<LocalItem>) {
                 actions.push(action);
                 MenuItem::Action(MenuAction {
                     id: actions.len() as u32,
-                    label: if label.is_empty() {
-                        role.map_or("", MenuRole::label).to_owned()
-                    } else {
-                        label.to_owned()
+                    label: match role {
+                        Some(role) if label.is_empty() => {
+                            surface.chrome.labels.borrow().label(role).to_owned()
+                        }
+                        _ => label,
                     },
                     shortcut: role.and_then(|r| r.shortcut(false)),
                     enabled,
@@ -494,6 +557,8 @@ pub(crate) fn popup_actions(surface: &Surface, items: Vec<LocalItem>) {
                     role: None,
                     when: nsh_core::keymap::When::Always,
                     icon: None,
+                    symbol: None,
+                    destructive: false,
                 })
             }
         })
@@ -502,19 +567,58 @@ pub(crate) fn popup_actions(surface: &Surface, items: Vec<LocalItem>) {
         surface,
         Popup {
             items: items.into(),
-            at: None,
+            at,
+            end,
             actions,
+            area: None,
+            awaited: false,
         },
     );
 }
 
-fn close(hwnd: HWND) {
-    // SAFETY: posting to a live window.
-    let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+/// Shows the tray icon's menu at `at` (in the window's points): its items
+/// are reported as the app's context menus' are.
+pub(crate) fn popup_tray(surface: &Surface, items: Arc<[MenuItem]>, at: (f32, f32)) {
+    surface.chrome.context_area.take();
+    popup(
+        surface,
+        Popup {
+            items,
+            at: Some(at),
+            end: false,
+            actions: Vec::new(),
+            area: None,
+            awaited: false,
+        },
+    );
 }
 
-fn toggle_maximize(surface: &Surface) {
-    let hwnd = surface.hwnd();
+/// The user asked to quit (the Quit item, its Ctrl+Q): while the app
+/// listens to quit requests, it hears this one ([`WindowEvent::QuitRequest`])
+/// and decides, and this is true; false when quitting goes on.
+fn ask_quit(surface: &Surface) -> bool {
+    if !surface.chrome.asks_quit.get() {
+        return false;
+    }
+    surface.event(
+        ROOT_ID,
+        EventKind::Window,
+        EventPayload::Window(Box::new(WindowEvent::QuitRequest)),
+    );
+    true
+}
+
+/// Quits the app, as its `quit` role: the windows close without asking
+/// (`closeOnPress` is not read), then the message loop ends, also while a
+/// tray icon would keep it running.
+fn quit(surface: &Surface) {
+    crate::window_close::close(surface);
+    // SAFETY: a plain call. The loop gets `WM_QUIT` only after the posted
+    // close: the window closes first.
+    unsafe { PostQuitMessage(0) };
+}
+
+fn toggle_maximize(hwnd: HWND) {
     if crate::window::is_full_screen(hwnd) {
         return;
     }
@@ -527,35 +631,47 @@ fn toggle_maximize(surface: &Surface) {
     let _ = unsafe { ShowWindow(hwnd, show) };
 }
 
-/// Enters or leaves full screen (`crate::window::toggle_full_screen`, which
-/// F11 runs too; it tells [`full_screen_changed`]).
-fn toggle_fullscreen(surface: &Surface) {
-    crate::window::toggle_full_screen(surface.hwnd());
-}
-
-/// The window entered or left full screen: the menu bar and the title
+/// Window `hwnd` entered or left full screen: the menu bar and the title
 /// bar's area follow (neither shows in full screen).
-pub(crate) fn full_screen_changed(surface: &Surface) {
-    show_menu_bar(surface);
-    update_area(surface);
+pub(crate) fn full_screen_changed(surface: &Surface, hwnd: HWND) {
+    if crate::window::app_window_root(hwnd).is_none() {
+        show_menu_bar(surface);
+    }
+    update_area(surface, hwnd);
+    crate::window::invalidate(hwnd);
     surface.invalidate();
 }
 
-// --- The hidden title bar ---------------------------------------------------------------
+// --- The app's title bar ----------------------------------------------------------------
 
 /// `WM_NCCALCSIZE`: with the title bar hidden, the client area reaches the
-/// window's top.
-pub(crate) fn nc_calc_size(
-    surface: &Surface,
-    hwnd: HWND,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> Option<LRESULT> {
-    if wparam.0 == 0 || !hidden(surface) {
+/// window's top; without a frame, it is the whole window.
+pub(crate) fn nc_calc_size(hwnd: HWND, wparam: WPARAM, lparam: LPARAM) -> Option<LRESULT> {
+    if wparam.0 == 0 {
         return None;
     }
-    // SAFETY: with `wparam` TRUE, `lparam` is the window's
-    // NCCALCSIZE_PARAMS, valid for the message.
+    if frameless(hwnd) {
+        // SAFETY: with `wparam` TRUE, `lparam` is the window's
+        // NCCALCSIZE_PARAMS, valid for the message.
+        unsafe {
+            let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
+            // A maximized window hangs off its monitor by its resize
+            // border: the content stays on the monitor.
+            if zoomed(hwnd) {
+                let inset = frame_thickness(hwnd);
+                let r = &mut params.rgrc[0];
+                r.left += inset;
+                r.top += inset;
+                r.right -= inset;
+                r.bottom -= inset;
+            }
+        }
+        return Some(LRESULT(0));
+    }
+    if !hidden(hwnd) {
+        return None;
+    }
+    // SAFETY: as above.
     unsafe {
         let params = &mut *(lparam.0 as *mut NCCALCSIZE_PARAMS);
         let top = params.rgrc[0].top;
@@ -572,6 +688,55 @@ pub(crate) fn nc_calc_size(
             };
     }
     Some(LRESULT(0))
+}
+
+/// `WM_GETMINMAXINFO`: a frameless window's maximized rect is its
+/// monitor's work area grown by the frame border, which `WM_NCCALCSIZE`
+/// insets back out when zoomed. The client then lands on the work area
+/// and the taskbar keeps its strip; left to the system, a frameless
+/// window's maximized rect covers the whole monitor.
+pub(crate) fn nc_max_size(hwnd: HWND, info: &mut MINMAXINFO) {
+    if !frameless(hwnd) {
+        return;
+    }
+    let mut monitor = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    // SAFETY: plain calls with a local out value.
+    let ok = unsafe {
+        let m = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        GetMonitorInfoW(m, &mut monitor).as_bool()
+    };
+    if !ok {
+        return;
+    }
+    let (work, origin) = (monitor.rcWork, monitor.rcMonitor);
+    let inset = frame_thickness(hwnd);
+    // `ptMaxPosition` is relative to the monitor's origin, not the
+    // virtual screen: the system places it on the monitor the window
+    // maximizes on. The track sizes stay `track_sizes`', so a user can
+    // still drag the window across monitors.
+    info.ptMaxPosition = POINT {
+        x: work.left - origin.left - inset,
+        y: work.top - origin.top - inset,
+    };
+    info.ptMaxSize = POINT {
+        x: (work.right - work.left) + inset * 2,
+        y: (work.bottom - work.top) + inset * 2,
+    };
+}
+
+/// What the system's frame of `hwnd` leaves invisible around a window in
+/// the normal mode, in pixels (left, top, right, bottom): its resize
+/// borders past the visible one, on every side but the top. A window
+/// without the system's frame has none.
+pub(crate) fn invisible_frame(hwnd: HWND) -> crate::window_state::Margins {
+    if frameless(hwnd) {
+        return (0, 0, 0, 0);
+    }
+    let side = (frame_thickness(hwnd) - top_border(hwnd)).max(0);
+    (side, 0, side, side)
 }
 
 /// The visible border the system draws along a window's top edge, in
@@ -594,27 +759,42 @@ fn top_border(hwnd: HWND) -> i32 {
     if ok { thickness.min(8) as i32 } else { 0 }
 }
 
-/// The caption button at `(x, y)` (points), as its hit test code.
-fn caption_at(surface: &Surface, x: f32, y: f32) -> Option<u32> {
-    if !hidden(surface) || !(0.0..caption_height(surface)).contains(&y) {
+/// The drawn caption button at `(x, y)` (points) of window `hwnd`, as its
+/// hit test code.
+fn caption_at(surface: &Surface, hwnd: HWND, x: f32, y: f32) -> Option<u32> {
+    let attrs = framed_attrs(hwnd).filter(|a| a.hidden_title_bar())?;
+    if !(0.0..caption_height(hwnd)).contains(&y) {
         return None;
     }
-    let from_right = surface.size().0 - x;
-    match (from_right / BUTTON_WIDTH).floor() {
-        0.0 => Some(HTCLOSE),
-        1.0 => Some(HTMAXBUTTON),
-        2.0 => Some(HTMINBUTTON),
-        _ => None,
+    let from_right = client_width(surface, hwnd) - x;
+    if from_right < 0.0 {
+        return None;
     }
+    let i = (from_right / BUTTON_WIDTH).floor() as usize;
+    crate::shell::caption_buttons(&attrs).get(i).copied()
 }
 
-/// `WM_NCHITTEST`: the hidden title bar's resize border and caption
-/// buttons, and the views that drag the window.
+/// `WM_NCHITTEST`: what the pointer is over, for the system to move,
+/// resize and snap the window by. In order: a click-through window is
+/// not there; the system's borders; a frameless window's own border and a
+/// hidden title bar's top border; the drawn caption buttons; the views
+/// marked `windowResize`, `windowControl` and `windowDrag`.
 pub(crate) fn nc_hit_test(surface: &Surface, hwnd: HWND, lparam: LPARAM) -> Option<LRESULT> {
+    let attrs = crate::window::shell(hwnd)
+        .map(|s| s.attrs())
+        .unwrap_or_default();
+    if attrs.click_through {
+        return Some(LRESULT(HTTRANSPARENT as isize));
+    }
+    let result = |code: u32| {
+        Some(LRESULT(
+            crate::shell::allowed(code, &attrs, zoomed(hwnd)) as isize
+        ))
+    };
     // SAFETY: default handling finds the non-client resize borders.
-    let default = unsafe { DefWindowProcW(hwnd, WM_NCHITTEST, WPARAM(0), lparam) };
-    if default.0 as u32 != HTCLIENT {
-        return Some(default);
+    let default = unsafe { DefWindowProcW(hwnd, WM_NCHITTEST, WPARAM(0), lparam) }.0 as u32;
+    if default != HTCLIENT {
+        return result(default);
     }
     let mut p = POINT {
         x: (lparam.0 & 0xFFFF) as i16 as i32,
@@ -622,50 +802,97 @@ pub(crate) fn nc_hit_test(surface: &Surface, hwnd: HWND, lparam: LPARAM) -> Opti
     };
     // SAFETY: a plain call with a local value.
     let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p) };
-    let scale = surface.scale();
+    let scale = scale_of(surface, hwnd);
     let (x, y) = (p.x as f32 / scale, p.y as f32 / scale);
-    if hidden(surface) {
-        let border = frame_thickness(hwnd);
-        if !zoomed(hwnd) && p.y < border {
-            let width = surface.pixel_size().0 as i32;
+    let border = frame_thickness(hwnd);
+    if frameless(hwnd) && attrs.resizable && !zoomed(hwnd) {
+        let mut client = RECT::default();
+        // SAFETY: a query with a local out value.
+        let _ = unsafe { GetClientRect(hwnd, &mut client) };
+        if let Some(code) = crate::shell::border_code(p, (client.right, client.bottom), border) {
+            return result(code);
+        }
+    }
+    if hidden(hwnd) {
+        if attrs.resizable && !zoomed(hwnd) && p.y < border {
+            let mut client = RECT::default();
+            // SAFETY: a query with a local out value.
+            let _ = unsafe { GetClientRect(hwnd, &mut client) };
             let code = if p.x < border * 2 {
                 HTTOPLEFT
-            } else if p.x >= width - border * 2 {
+            } else if p.x >= client.right - border * 2 {
                 HTTOPRIGHT
             } else {
                 HTTOP
             };
-            return Some(LRESULT(code as isize));
+            return result(code);
         }
-        if let Some(code) = caption_at(surface, x, y) {
+        if let Some(code) = caption_at(surface, hwnd, x, y) {
             return Some(LRESULT(code as isize));
         }
     }
-    let code = if crate::input::window_drag(surface, x, y) {
-        HTCAPTION
-    } else {
-        HTCLIENT
+    let code = match crate::input::window_part(surface, x, y) {
+        Some(crate::input::WindowPart::Resize(edge)) => crate::shell::edge_code(edge),
+        Some(crate::input::WindowPart::Control(control)) => {
+            crate::shell::control_code(control, &attrs)
+        }
+        Some(crate::input::WindowPart::Drag) => HTCAPTION,
+        None => HTCLIENT,
     };
-    Some(LRESULT(code as isize))
+    result(code)
 }
 
 fn is_button(code: u32) -> bool {
     matches!(code, HTMINBUTTON | HTMAXBUTTON | HTCLOSE)
 }
 
-fn set_hover(surface: &Surface, code: u32) {
-    if surface.chrome.hover.replace(code) != code {
+fn set_hover(surface: &Surface, hwnd: HWND, code: u32) {
+    if let Some(shell) = crate::window::shell(hwnd)
+        && shell.hover.replace(code) != code
+    {
+        crate::window::invalidate(hwnd);
         surface.invalidate();
     }
 }
 
-/// Non-client mouse messages over the caption buttons.
-pub(crate) fn nc_mouse(surface: &Surface, hwnd: HWND, msg: u32, wparam: WPARAM) -> Option<LRESULT> {
-    let c = &surface.chrome;
+/// Non-client mouse messages over the caption buttons, drawn or the app's
+/// (`windowControl`): their presses are carried out here, never by
+/// `DefWindowProc`, which would draw Windows 95's buttons. The views of the
+/// app's title bar hear the pointer move over them (their hover styles).
+pub(crate) fn nc_mouse(
+    surface: &Rc<Surface>,
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> Option<LRESULT> {
+    let shell = crate::window::shell(hwnd)?;
+    // A left press on the frame activates a focusable window, as the system's
+    // non-client path does for the parts Windows handles. NSH carries out
+    // these presses itself, so it must do this too: otherwise a click from
+    // another app deactivates that app and leaves no foreground window, and
+    // this window never comes to the front. The app hears a title-bar press
+    // only on release, which is far too late.
+    // SAFETY: plain calls on this live window.
+    if msg == WM_NCLBUTTONDOWN
+        && shell.attrs().focusable
+        && unsafe { GetForegroundWindow() } != hwnd
+    {
+        let _ = unsafe { SetForegroundWindow(hwnd) };
+    }
     let code = wparam.0 as u32;
+    let mut p = POINT {
+        x: (lparam.0 & 0xFFFF) as i16 as i32,
+        y: ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    };
+    // SAFETY: a plain call with a local value.
+    let _ = unsafe { windows::Win32::Graphics::Gdi::ScreenToClient(hwnd, &mut p) };
+    let scale = scale_of(surface, hwnd);
+    let (x, y) = (p.x as f32 / scale, p.y as f32 / scale);
+    let drawn = caption_at(surface, hwnd, x, y).is_some();
     match msg {
         WM_NCMOUSEMOVE => {
-            if !c.tracking.replace(true) {
+            if !shell.nc_tracking.replace(true) {
                 let mut track = TRACKMOUSEEVENT {
                     cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
                     dwFlags: TME_LEAVE | TME_NONCLIENT,
@@ -675,32 +902,57 @@ pub(crate) fn nc_mouse(surface: &Surface, hwnd: HWND, msg: u32, wparam: WPARAM) 
                 // SAFETY: a valid structure for this window.
                 let _ = unsafe { TrackMouseEvent(&mut track) };
             }
-            set_hover(surface, if is_button(code) { code } else { 0 });
+            set_hover(
+                surface,
+                hwnd,
+                if is_button(code) && drawn { code } else { 0 },
+            );
+            // Over the app's title bar's views (not the drawn buttons, not
+            // the borders): they hear it as the client area's moves.
+            let on_view = !drawn && matches!(code, HTCAPTION | HTMINBUTTON | HTMAXBUTTON | HTCLOSE);
+            if on_view || shell.view_hover.get() {
+                shell.view_hover.set(on_view);
+                crate::window::nc_pointer(surface, on_view.then_some((x, y)));
+            }
             None
         }
         WM_NCMOUSELEAVE => {
-            c.tracking.set(false);
-            c.pressed.set(0);
-            set_hover(surface, 0);
+            shell.nc_tracking.set(false);
+            shell.pressed.set(0);
+            set_hover(surface, hwnd, 0);
+            if shell.view_hover.replace(false) {
+                crate::window::nc_pointer(surface, None);
+            }
             None
         }
-        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if is_button(code) && hidden(surface) => {
-            c.pressed.set(code);
+        WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if is_button(code) => {
+            shell.pressed.set(code);
+            crate::window::invalidate(hwnd);
             surface.invalidate();
             Some(LRESULT(0))
         }
-        WM_NCLBUTTONUP if is_button(code) && hidden(surface) => {
-            if c.pressed.replace(0) == code {
+        WM_NCLBUTTONDOWN if code == HTCAPTION && !crate::window::from_touch() => {
+            hold_press(surface, hwnd, (p.x, p.y), (x, y), lparam)
+        }
+        WM_NCLBUTTONUP if is_button(code) => {
+            if shell.pressed.replace(0) == code {
+                let attrs = shell.attrs();
                 match code {
-                    HTMINBUTTON => {
-                        set_hover(surface, 0);
+                    HTMINBUTTON if attrs.minimizable => {
+                        set_hover(surface, hwnd, 0);
                         // SAFETY: a plain call.
                         let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
                     }
-                    HTMAXBUTTON => toggle_maximize(surface),
-                    _ => close(hwnd),
+                    HTMAXBUTTON if attrs.can_maximize() => toggle_maximize(hwnd),
+                    HTCLOSE if attrs.closable => {
+                        shell.close_caption.set(true);
+                        // SAFETY: posting to a live window.
+                        let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+                    }
+                    _ => {}
                 }
             }
+            crate::window::invalidate(hwnd);
             surface.invalidate();
             Some(LRESULT(0))
         }
@@ -708,15 +960,240 @@ pub(crate) fn nc_mouse(surface: &Surface, hwnd: HWND, msg: u32, wparam: WPARAM) 
     }
 }
 
-/// The mouse moved over the client area: off the caption buttons.
-pub(crate) fn client_mouse_moved(surface: &Surface) {
-    if surface.chrome.hover.get() != 0 {
-        set_hover(surface, 0);
+/// A primary press on a view of the app's that drags the window
+/// (`windowDrag`), held with the mouse captured until it moves past the
+/// system's drag rectangle (the window's move) or is released (a click
+/// the app gets). `DefWindowProc` would start the move on the press
+/// itself and keep the release, so a press outside an open overlay on
+/// such a view would never reach the app.
+pub(crate) struct WindowPress {
+    hwnd: HWND,
+    /// Where it went down, in client pixels: the drag rectangle's center.
+    pixels: (i32, i32),
+    /// The same in client points: where the click goes down.
+    at: (f32, f32),
+    /// `WM_NCLBUTTONDOWN`'s `lparam` (screen pixels), for the move.
+    screen: LPARAM,
+    /// The innermost view it went down on.
+    view: crate::view::NshView,
+}
+
+/// `WM_NCLBUTTONDOWN` on `HTCAPTION` at `pixels` / `at` (client pixels /
+/// points): held when a view of the app's that drags the window is there;
+/// `None` for the system's title bar, which moves the window at once.
+fn hold_press(
+    surface: &Surface,
+    hwnd: HWND,
+    pixels: (i32, i32),
+    at: (f32, f32),
+    screen: LPARAM,
+) -> Option<LRESULT> {
+    let view = crate::input::drag_view(surface, at.0, at.1)?;
+    // SAFETY: a plain call on this window.
+    unsafe { SetCapture(hwnd) };
+    *surface.input.window_press.borrow_mut() = Some(WindowPress {
+        hwnd,
+        pixels,
+        at,
+        screen,
+        view,
+    });
+    Some(LRESULT(0))
+}
+
+/// Takes window `hwnd`'s held press, if any.
+fn take_press(surface: &Surface, hwnd: HWND) -> Option<WindowPress> {
+    let mut held = surface.input.window_press.borrow_mut();
+    if held.as_ref().is_some_and(|p| p.hwnd == hwnd) {
+        held.take()
+    } else {
+        None
+    }
+}
+
+/// Whether a press at `from` moved to `at` (client pixels) has left the
+/// system's drag rectangle of half-size `slop` (`SM_CXDRAG`, `SM_CYDRAG`,
+/// as `DragDetect` uses).
+fn past_drag_rect(from: (i32, i32), at: (i32, i32), slop: (i32, i32)) -> bool {
+    (at.0 - from.0).abs() > slop.0 || (at.1 - from.1).abs() > slop.1
+}
+
+/// Where the window's top-left corner `origin` (screen pixels) moves before
+/// `SC_MOVE | HTCAPTION` starts: `SC_MOVE` anchors at the cursor where its
+/// modal loop begins, so moving the window by the pointer's offset from the
+/// press (`at - from`, client pixels) keeps the grabbed point under the
+/// pointer.
+fn drag_start_origin(origin: (i32, i32), from: (i32, i32), at: (i32, i32)) -> (i32, i32) {
+    (origin.0 + at.0 - from.0, origin.1 + at.1 - from.1)
+}
+
+/// Whether releasing a press that went down on `pressed` delivers a click
+/// when `now` is the `windowDrag` view at the press's point on release:
+/// only when the same view is still there and still drags the window.
+fn delivers_click(pressed: &crate::view::NshView, now: Option<crate::view::NshView>) -> bool {
+    now.is_some_and(|v| v == *pressed)
+}
+
+/// `WM_MOUSEMOVE` at `lparam` (client pixels) while window `hwnd` holds a
+/// press: past the system's drag rectangle (`SM_CXDRAG` / `SM_CYDRAG` on
+/// either side, as `DragDetect`'s), the system moves the window as a press
+/// on its title bar would, and the app never hears of the press. True
+/// when a press is held (the move is not the app's).
+pub(crate) fn press_moved(surface: &Surface, hwnd: HWND, lparam: LPARAM) -> bool {
+    let Some((px, py)) = surface
+        .input
+        .window_press
+        .borrow()
+        .as_ref()
+        .filter(|p| p.hwnd == hwnd)
+        .map(|p| p.pixels)
+    else {
+        return false;
+    };
+    let (x, y) = (
+        (lparam.0 & 0xFFFF) as i16 as i32,
+        ((lparam.0 >> 16) & 0xFFFF) as i16 as i32,
+    );
+    let dpi = crate::window::dpi(hwnd);
+    // SAFETY: plain queries.
+    let (cx, cy) = unsafe {
+        (
+            GetSystemMetricsForDpi(SM_CXDRAG, dpi),
+            GetSystemMetricsForDpi(SM_CYDRAG, dpi),
+        )
+    };
+    if !past_drag_rect((px, py), (x, y), (cx, cy)) {
+        return true;
+    }
+    let Some(press) = take_press(surface, hwnd) else {
+        return true;
+    };
+    let movable = crate::window::shell(hwnd).is_none_or(|s| s.attrs().movable);
+    // When the window is not maximized, moving it by the pointer's offset
+    // from the press before `SC_MOVE` starts keeps the grabbed point under
+    // the cursor (`SC_MOVE` anchors at the message's cursor position).
+    // SAFETY: plain calls on this window.
+    unsafe {
+        let _ = ReleaseCapture();
+        if movable {
+            if !zoomed(hwnd) && !crate::window::is_full_screen(hwnd) {
+                let mut rect = RECT::default();
+                if GetWindowRect(hwnd, &mut rect).is_ok() {
+                    let (left, top) =
+                        drag_start_origin((rect.left, rect.top), press.pixels, (x, y));
+                    let _ = SetWindowPos(
+                        hwnd,
+                        None,
+                        left,
+                        top,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                    );
+                }
+            }
+            let _ = SendMessageW(
+                hwnd,
+                WM_SYSCOMMAND,
+                Some(WPARAM((SC_MOVE | HTCAPTION) as usize)),
+                Some(press.screen),
+            );
+        }
+    }
+    true
+}
+
+/// `WM_LBUTTONUP` at `at` (client points) while window `hwnd` holds a
+/// press: a click, which the app gets pressed where it went down, if the
+/// view it went down on is still there and still drags the window (a view
+/// that appeared under the pointer meanwhile gets no press it never saw).
+/// True when a press was held.
+pub(crate) fn press_released(surface: &Rc<Surface>, hwnd: HWND, at: (f32, f32)) -> bool {
+    let Some(press) = take_press(surface, hwnd) else {
+        return false;
+    };
+    // SAFETY: a plain call.
+    let _ = unsafe { ReleaseCapture() };
+    if delivers_click(
+        &press.view,
+        crate::input::drag_view(surface, press.at.0, press.at.1),
+    ) {
+        crate::window::click(surface, press.at, at);
+    }
+    true
+}
+
+/// Window `hwnd` lost the mouse capture: its held press is forgotten.
+pub(crate) fn press_cancelled(surface: &Surface, hwnd: HWND) {
+    take_press(surface, hwnd);
+}
+
+/// Presses window `hwnd`'s close button as the user does (`nsh test`):
+/// the system command its click sends, at a point on it, so that the
+/// window's own close path tells the app `closeButton`. An error when the
+/// window has none (no frame, a hidden title bar without one, or
+/// `closable: false`).
+#[cfg(feature = "dev")]
+pub(crate) fn press_close_button(hwnd: HWND) -> Result<(), String> {
+    use windows::Win32::Graphics::{
+        Dwm::{DWMWA_CAPTION_BUTTON_BOUNDS, DwmGetWindowAttribute},
+        Gdi::ClientToScreen,
+    };
+    let attrs = crate::window::shell(hwnd)
+        .map(|s| s.attrs())
+        .ok_or("not a window of the app's")?;
+    if !attrs.closable {
+        return Err("the window cannot be closed by the user (closable: false)".into());
+    }
+    if crate::window::is_full_screen(hwnd) || attrs.frameless() {
+        return Err("the window has no close button (no frame, or full screen)".into());
+    }
+    let mut p = POINT::default();
+    // SAFETY: queries with local out values on a live window.
+    unsafe {
+        if attrs.hidden_title_bar() {
+            let mut client = RECT::default();
+            let _ = GetClientRect(hwnd, &mut client);
+            let scale = crate::window::dpi(hwnd) as f32 / 96.0;
+            p.x = client.right - (BUTTON_WIDTH * scale / 2.0) as i32;
+            p.y = (caption_height(hwnd) * scale / 2.0) as i32;
+            let _ = ClientToScreen(hwnd, &mut p);
+        } else {
+            let mut buttons = RECT::default();
+            let mut window = RECT::default();
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_CAPTION_BUTTON_BOUNDS,
+                &mut buttons as *mut RECT as *mut _,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .map_err(|e| format!("the window's caption buttons: {e}"))?;
+            GetWindowRect(hwnd, &mut window).map_err(|e| e.to_string())?;
+            // The close button is the rightmost.
+            let height = buttons.bottom - buttons.top;
+            p.x = window.left + buttons.right - height / 2;
+            p.y = window.top + buttons.top + height / 2;
+        }
+        let at = LPARAM(((p.y as u16 as isize) << 16) | p.x as u16 as isize);
+        let code = SendMessageW(hwnd, WM_NCHITTEST, None, Some(at)).0 as u32;
+        if code != HTCLOSE {
+            return Err("the window has no close button".into());
+        }
+        PostMessageW(Some(hwnd), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), at)
+            .map_err(|e| e.to_string())
+    }
+}
+
+/// The mouse moved over window `hwnd`'s client area: off the caption
+/// buttons.
+pub(crate) fn client_mouse_moved(surface: &Surface, hwnd: HWND) {
+    if crate::window::shell(hwnd).is_some_and(|s| s.hover.get() != 0) {
+        set_hover(surface, hwnd, 0);
     }
 }
 
 /// `WM_NCACTIVATE`: the caption buttons dim in an inactive window. With
-/// the title bar hidden, the default handling must not paint the old
+/// the title bar the app's, the default handling must not paint the old
 /// caption over the app (`lparam` -1).
 pub(crate) fn nc_activate(
     surface: &Surface,
@@ -724,36 +1201,47 @@ pub(crate) fn nc_activate(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> Option<LRESULT> {
-    surface.chrome.inactive.set(wparam.0 == 0);
+    if let Some(shell) = crate::window::shell(hwnd) {
+        shell.inactive.set(wparam.0 == 0);
+    }
+    crate::window::invalidate(hwnd);
     surface.invalidate();
-    if !hidden(surface) {
+    if !custom_caption(hwnd) {
         // SAFETY: default handling, then the dark menu bar's line.
         let r = unsafe { DefWindowProcW(hwnd, WM_NCACTIVATE, wparam, lparam) };
-        paint_menu_bar_line(surface, hwnd);
+        if crate::window::app_window_root(hwnd).is_none() {
+            paint_menu_bar_line(surface, hwnd);
+        }
         return Some(r);
     }
     // SAFETY: default handling, told not to repaint the frame.
     Some(unsafe { DefWindowProcW(hwnd, WM_NCACTIVATE, wparam, LPARAM(-1)) })
 }
 
-/// Draws the caption buttons over the app (with the title bar hidden).
-pub(crate) fn draw(surface: &Surface, dc: &ID2D1DeviceContext, scale: f32) {
-    if !hidden(surface) {
+/// Draws the caption buttons over the app in window `hwnd` (`width`
+/// points wide), with its title bar hidden.
+pub(crate) fn draw(surface: &Surface, hwnd: HWND, dc: &ID2D1DeviceContext, scale: f32, width: f32) {
+    let Some(attrs) = framed_attrs(hwnd).filter(|a| a.hidden_title_bar()) else {
         return;
-    }
-    let c = &surface.chrome;
-    let dark = crate::system::dark(surface);
-    let hwnd = surface.hwnd();
-    let width = surface.size().0;
+    };
+    let Some(shell) = crate::window::shell(hwnd) else {
+        return;
+    };
+    let dark = crate::shell::dark(surface, hwnd);
     // Lines one device pixel wide, on pixel centers.
     let px = 1.0 / scale;
     let snap = |v: f32| (v * scale).round() / scale + px / 2.0;
     let glyph = 10.0;
-    let caption = caption_height(surface);
-    for (i, code) in [HTCLOSE, HTMAXBUTTON, HTMINBUTTON].into_iter().enumerate() {
+    let caption = caption_height(hwnd);
+    for (i, code) in crate::shell::caption_buttons(&attrs)
+        .into_iter()
+        .enumerate()
+    {
         let x = width - BUTTON_WIDTH * (i + 1) as f32;
-        let hovered = c.hover.get() == code;
-        let pressed = hovered && c.pressed.get() == code;
+        // A window that cannot close shows its close button dimmed, inert.
+        let enabled = code != HTCLOSE || attrs.closable;
+        let hovered = enabled && shell.hover.get() == code;
+        let pressed = hovered && shell.pressed.get() == code;
         let background = match (code == HTCLOSE, hovered, pressed, dark) {
             (_, false, ..) => None,
             (true, true, false, _) => Some(Color::rgba(0xc4, 0x2b, 0x1c, 0xff)),
@@ -766,7 +1254,7 @@ pub(crate) fn draw(surface: &Surface, dc: &ID2D1DeviceContext, scale: f32) {
         let foreground = if code == HTCLOSE && hovered {
             Color(0xffff_ffff)
         } else {
-            let alpha = if c.inactive.get() && !hovered {
+            let alpha = if !enabled || (shell.inactive.get() && !hovered) {
                 0x70
             } else {
                 0xff
@@ -779,6 +1267,9 @@ pub(crate) fn draw(surface: &Surface, dc: &ID2D1DeviceContext, scale: f32) {
         };
         // SAFETY: drawing on the context between its BeginDraw / EndDraw.
         unsafe {
+            use windows::Win32::Graphics::{
+                Direct2D::D2D1_DRAW_TEXT_OPTIONS_NONE, DirectWrite::DWRITE_MEASURING_MODE_NATURAL,
+            };
             if let Some(bg) = background
                 && let Ok(brush) = dc.CreateSolidColorBrush(&color_f(bg), None)
             {
@@ -787,6 +1278,28 @@ pub(crate) fn draw(surface: &Surface, dc: &ID2D1DeviceContext, scale: f32) {
             let Ok(brush) = dc.CreateSolidColorBrush(&color_f(foreground), None) else {
                 continue;
             };
+            // The system's own caption glyphs (Windows 11's Segoe Fluent
+            // Icons, Windows 10's Segoe MDL2 Assets), as native title bars
+            // draw them; lines where neither font is installed.
+            if let Some(format) = icon_format() {
+                let ch = match code {
+                    HTMINBUTTON => '\u{E921}',
+                    HTMAXBUTTON if zoomed(hwnd) => '\u{E923}',
+                    HTMAXBUTTON => '\u{E922}',
+                    _ => '\u{E8BB}',
+                };
+                let mut buf = [0u16; 2];
+                let units = ch.encode_utf16(&mut buf);
+                dc.DrawText(
+                    units,
+                    &format,
+                    &rect_f(x, 0.0, BUTTON_WIDTH, caption),
+                    &brush,
+                    D2D1_DRAW_TEXT_OPTIONS_NONE,
+                    DWRITE_MEASURING_MODE_NATURAL,
+                );
+                continue;
+            }
             let left = snap(x + (BUTTON_WIDTH - glyph) / 2.0);
             let top = snap((caption - glyph) / 2.0);
             let (right, bottom) = (left + glyph - px, top + glyph - px);
@@ -830,6 +1343,67 @@ pub(crate) fn draw(surface: &Surface, dc: &ID2D1DeviceContext, scale: f32) {
     }
 }
 
+/// The caption glyphs' font, the one the system's title bars use, centered
+/// in a button; `None` when no such font is installed.
+fn icon_format() -> Option<IDWriteTextFormat> {
+    thread_local! {
+        static FORMAT: Option<IDWriteTextFormat> = icon_font().and_then(|family| {
+            let factory = crate::gfx::dwrite();
+            // SAFETY: COM calls with valid strings.
+            unsafe {
+                let format = factory
+                    .CreateTextFormat(
+                        &HSTRING::from(family),
+                        None,
+                        DWRITE_FONT_WEIGHT_NORMAL,
+                        DWRITE_FONT_STYLE_NORMAL,
+                        DWRITE_FONT_STRETCH_NORMAL,
+                        // The size Windows' caption buttons use.
+                        10.0,
+                        &HSTRING::new(),
+                    )
+                    .ok()?;
+                let _ = format.SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+                let _ = format.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                let _ = format.SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+                Some(format)
+            }
+        });
+    }
+    FORMAT.with(Clone::clone)
+}
+
+/// The installed icon font with the caption glyphs, newest first.
+fn icon_font() -> Option<&'static str> {
+    let factory = crate::gfx::dwrite();
+    let mut collection = None;
+    // SAFETY: COM calls with local out values.
+    unsafe {
+        factory
+            .GetSystemFontCollection(&mut collection, false)
+            .ok()?;
+        let collection = collection?;
+        ["Segoe Fluent Icons", "Segoe MDL2 Assets"]
+            .into_iter()
+            .find(|name| {
+                let (mut index, mut exists) = (0u32, windows::core::BOOL(0));
+                collection
+                    .FindFamilyName(&HSTRING::from(*name), &mut index, &mut exists)
+                    .is_ok()
+                    && exists.as_bool()
+            })
+    }
+}
+
+use windows::{
+    Win32::Graphics::DirectWrite::{
+        DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_WEIGHT_NORMAL,
+        DWRITE_PARAGRAPH_ALIGNMENT_CENTER, DWRITE_TEXT_ALIGNMENT_CENTER,
+        DWRITE_WORD_WRAPPING_NO_WRAP, IDWriteTextFormat,
+    },
+    core::HSTRING,
+};
+
 // --- Menus ------------------------------------------------------------------------------
 
 type SetPreferredAppMode = unsafe extern "system" fn(i32) -> i32;
@@ -870,12 +1444,12 @@ fn theme_menus(dark: bool) {
     });
 }
 
-/// A menu item's text: `&` shows as itself, the shortcut after a tab.
-fn item_text(action: &MenuAction) -> Vec<u16> {
-    let label = if action.label.is_empty() {
-        action.role.map_or("", MenuRole::label)
-    } else {
-        &action.label
+/// A menu item's text: `&` shows as itself, the shortcut after a tab; a
+/// role's label from `labels` when it has none of its own.
+fn item_text(action: &MenuAction, labels: &MenuLabels) -> Vec<u16> {
+    let label = match action.role {
+        Some(role) if action.label.is_empty() => labels.label(role),
+        _ => &action.label,
     };
     let mut text = label.replace('&', "&&");
     if let Some(shortcut) = &action.shortcut {
@@ -1056,10 +1630,12 @@ fn load_icons(
 
 /// Appends `items` to `menu`, numbering their commands in `entries`
 /// (command id = index + 1) and adding the items with an icon to `icons`,
-/// but for this level's without `with_icons` (a menu bar's titles are text).
+/// but for this level's without `with_icons` (a menu bar's titles are text);
+/// roles with no label of their own read `labels`.
 fn append(
     menu: HMENU,
     items: &[MenuItem],
+    labels: &MenuLabels,
     entries: &mut Vec<Entry>,
     icons: &mut Vec<PendingIcon>,
     with_icons: bool,
@@ -1094,7 +1670,7 @@ fn append(
                     if action.checked == Some(true) {
                         flags |= MF_CHECKED;
                     }
-                    let text = item_text(action);
+                    let text = item_text(action, labels);
                     let _ = AppendMenuW(menu, flags, entries.len(), PCWSTR(text.as_ptr()));
                     if let Some(source) = action.icon.clone().filter(|_| with_icons) {
                         icons.push(PendingIcon {
@@ -1111,9 +1687,10 @@ fn append(
                     enabled,
                     items,
                     icon,
+                    ..
                 } => {
                     let Ok(sub) = CreatePopupMenu() else { continue };
-                    append(sub, items, entries, icons, true);
+                    append(sub, items, labels, entries, icons, true);
                     let mut flags = MF_POPUP | MF_STRING;
                     if !enabled {
                         flags |= MF_GRAYED;
@@ -1141,9 +1718,7 @@ fn show_menu_bar(surface: &Surface) {
     let hwnd = surface.hwnd();
     let c = &surface.chrome;
     let menu = c.menu.borrow().clone();
-    let shown = menu.filter(|_| {
-        c.style.get() == TitleBarStyle::Default && !crate::window::is_full_screen(hwnd)
-    });
+    let shown = menu.filter(|_| !custom_caption(hwnd) && !crate::window::is_full_screen(hwnd));
     let mut entries = Vec::new();
     let mut icons = Vec::new();
     // The old bar's loads end now: they set items of a menu about to go.
@@ -1152,9 +1727,10 @@ fn show_menu_bar(surface: &Surface) {
     // destroyed once the window no longer shows it, then its bitmaps freed.
     unsafe {
         let bar = match &shown {
-            Some(items) => CreateMenu()
-                .ok()
-                .inspect(|bar| append(*bar, items, &mut entries, &mut icons, false)),
+            Some(items) => CreateMenu().ok().inspect(|bar| {
+                let labels = c.labels.borrow();
+                append(*bar, items, &labels, &mut entries, &mut icons, false);
+            }),
             None => None,
         };
         theme_menus(crate::system::dark(surface));
@@ -1184,22 +1760,38 @@ pub(crate) fn menu_command(surface: &Rc<Surface>, command: u16) {
         .get((command as usize).wrapping_sub(1))
         .copied();
     if let Some(entry) = entry {
-        choose(surface, entry.id, entry.role);
+        choose(surface, entry.id, entry.role, None);
     }
 }
 
 /// An item was chosen: the platform carries out its role, the app hears
 /// about the rest.
-fn choose(surface: &Rc<Surface>, id: u32, role: Option<MenuRole>) {
+fn choose(surface: &Rc<Surface>, id: u32, role: Option<MenuRole>, area: Option<&NshView>) {
     let hwnd = surface.hwnd();
     match role {
-        Some(MenuRole::Quit | MenuRole::Close) => close(hwnd),
+        // An embedding app's window is its own to close or keep.
+        Some(MenuRole::Quit) if top_level(hwnd) => {
+            if !ask_quit(surface) {
+                quit(surface);
+            }
+        }
+        Some(MenuRole::Quit | MenuRole::Close) => {
+            // As the window menu's Close: the app hears a close press.
+            if let Some(shell) = crate::window::shell(hwnd) {
+                shell.close_command.set(Some(crate::shell::SysClose::Menu));
+            }
+            // SAFETY: posting to a live window.
+            let _ = unsafe { PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)) };
+        }
         Some(MenuRole::Minimize) => {
             // SAFETY: a plain call.
             let _ = unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
         }
-        Some(MenuRole::Zoom) => toggle_maximize(surface),
-        Some(MenuRole::ToggleFullScreen) => toggle_fullscreen(surface),
+        Some(MenuRole::Zoom) => toggle_maximize(hwnd),
+        Some(MenuRole::ToggleFullScreen) => crate::window::toggle_full_screen(hwnd),
+        // The area the app's menu is for, as its own menu would.
+        Some(role)
+            if area.is_some_and(|area| crate::selectable_view::menu_role(surface, area, role)) => {}
         Some(role) if role.edits_text() => {
             // The focused field's own keys.
             let (vk, shift) = match role {
@@ -1221,6 +1813,10 @@ fn choose(surface: &Rc<Surface>, id: u32, role: Option<MenuRole>) {
                         shift,
                         ..Default::default()
                     },
+                    scan: 0,
+                    extended: false,
+                    sys: false,
+                    translated: false,
                 },
             );
         }
@@ -1237,7 +1833,15 @@ fn choose(surface: &Rc<Surface>, id: u32, role: Option<MenuRole>) {
 
 /// `WM_NSH_MENU`: shows the context menu asked for.
 pub(crate) fn show_popup(surface: &Rc<Surface>) {
-    let Some(Popup { items, at, actions }) = surface.chrome.popup.borrow_mut().take() else {
+    let Some(Popup {
+        items,
+        at,
+        end,
+        actions,
+        area,
+        awaited,
+    }) = surface.chrome.popup.borrow_mut().take()
+    else {
         return;
     };
     let hwnd = surface.hwnd();
@@ -1247,7 +1851,14 @@ pub(crate) fn show_popup(surface: &Rc<Surface>) {
     // SAFETY: a menu made, tracked and destroyed on this thread.
     let chosen = unsafe {
         let Ok(menu) = CreatePopupMenu() else { return };
-        append(menu, &items, &mut entries, &mut icons, true);
+        append(
+            menu,
+            &items,
+            &surface.chrome.labels.borrow(),
+            &mut entries,
+            &mut icons,
+            true,
+        );
         // What loaded in time is in memory, on the items now; what did not
         // goes on them while the menu is open.
         let loads = load_icons(surface, icons, &bitmaps);
@@ -1266,15 +1877,22 @@ pub(crate) fn show_popup(surface: &Rc<Surface>) {
         }
         theme_menus(crate::system::dark(surface));
         // The window must be in front for the menu to close when clicking
-        // elsewhere.
-        let _ = SetForegroundWindow(hwnd);
+        // elsewhere; a background app's stays behind (the test agent closes
+        // its menus itself).
+        if !crate::window::in_background() {
+            let _ = SetForegroundWindow(hwnd);
+        }
         #[cfg(feature = "dev")]
         if actions.is_empty() {
             *surface.chrome.tracked_popup.borrow_mut() = Some(items.clone());
         }
         let chosen = TrackPopupMenuEx(
             menu,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_LEFTALIGN | TPM_TOPALIGN).0,
+            (TPM_RETURNCMD
+                | TPM_RIGHTBUTTON
+                | if end { TPM_RIGHTALIGN } else { TPM_LEFTALIGN }
+                | TPM_TOPALIGN)
+                .0,
             p.x,
             p.y,
             hwnd,
@@ -1289,17 +1907,17 @@ pub(crate) fn show_popup(surface: &Rc<Surface>) {
     {
         surface.chrome.tracked_popup.borrow_mut().take();
         if let Some((id, role)) = surface.chrome.test_choice.take() {
-            choose(surface, id, role);
+            choose(surface, id, role, area.as_ref());
         }
     }
     if let Some(entry) = entries.get(chosen.wrapping_sub(1)).copied() {
         match actions.get((entry.id as usize).wrapping_sub(1)) {
             Some(action) => action(surface),
-            None => choose(surface, entry.id, entry.role),
+            None => choose(surface, entry.id, entry.role, area.as_ref()),
         }
     }
     // The app's `Menu.popup` promise settles.
-    if actions.is_empty() {
+    if awaited {
         surface.event(
             ROOT_ID,
             EventKind::Menu,
@@ -1312,7 +1930,7 @@ pub(crate) fn show_popup(surface: &Rc<Surface>) {
 }
 
 /// The shortcut key of virtual key `vk`, if it can be one.
-fn shortcut_key(vk: u16) -> Option<Key> {
+pub(crate) fn shortcut_key(vk: u16) -> Option<Key> {
     let k = VIRTUAL_KEY(vk);
     Some(match vk {
         0x30..=0x39 | 0x41..=0x5A => Key::Char((vk as u8 as char).to_ascii_lowercase()),
@@ -1375,7 +1993,7 @@ pub(crate) fn shortcut(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
     };
     match found {
         Some((id, role)) => {
-            choose(surface, id, role);
+            choose(surface, id, role, None);
             true
         }
         None => false,
@@ -1539,4 +2157,257 @@ pub(crate) fn appearance_changed(surface: &Surface) {
         let _ = unsafe { DrawMenuBar(hwnd) };
     }
     surface.invalidate();
+}
+
+#[cfg(test)]
+mod tests {
+    use nsh_core::{
+        AttributedText, Bounds, NodeId, Points, TextLayout, ViewKind, platform::Environment,
+    };
+
+    use super::*;
+    use crate::{geom::rect, view::NshView};
+
+    fn view(parent: &NshView, id: NodeId, kind: ViewKind, frame: Bounds<Points>) -> NshView {
+        let v = NshView::new(id, kind);
+        v.state_mut().frame = frame;
+        v.insert_before(parent, None);
+        v
+    }
+
+    fn pack(x: i32, y: i32) -> LPARAM {
+        LPARAM(((x as i16 as u16 as usize) | ((y as i16 as u16 as usize) << 16)) as isize)
+    }
+
+    #[test]
+    fn drag_rect_and_start_origin() {
+        assert!(!past_drag_rect((100, 20), (100, 20), (4, 4)));
+        assert!(!past_drag_rect((100, 20), (104, 24), (4, 4)));
+        assert!(!past_drag_rect((100, 20), (96, 16), (4, 4)));
+        assert!(past_drag_rect((100, 20), (105, 20), (4, 4)));
+        assert!(past_drag_rect((100, 20), (95, 20), (4, 4)));
+        assert!(past_drag_rect((100, 20), (100, 25), (4, 4)));
+        assert!(past_drag_rect((100, 20), (100, 15), (4, 4)));
+        assert_eq!(drag_start_origin((52, 52), (100, 20), (110, 25)), (62, 57));
+        assert_eq!(drag_start_origin((52, 52), (100, 20), (92, 17)), (44, 49));
+    }
+
+    #[test]
+    fn window_press_delivers_click_only_when_same_view_stays_draggable() {
+        let surface = Surface::new(Default::default());
+        surface.root.state_mut().frame = rect(0.0, 0.0, 200.0, 100.0);
+        let bar = view(
+            &surface.root,
+            2,
+            ViewKind::View,
+            rect(0.0, 0.0, 200.0, 40.0),
+        );
+        bar.state_mut().props.window_drag = Some(true);
+        let label = view(&bar, 4, ViewKind::View, rect(10.0, 5.0, 80.0, 30.0));
+        let other = view(&bar, 6, ViewKind::View, rect(100.0, 5.0, 80.0, 30.0));
+
+        assert!(delivers_click(&label, Some(label.clone())));
+        assert!(!delivers_click(&label, Some(other)));
+        assert!(!delivers_click(&label, None));
+
+        let hwnd = HWND::default();
+        // Pressing on a child inside the drag region holds the innermost view.
+        assert!(hold_press(&surface, hwnd, (20, 15), (20.0, 15.0), LPARAM(0)).is_some());
+        // A move within the drag rectangle stays held.
+        assert!(press_moved(&surface, hwnd, pack(22, 16)));
+        assert!(surface.input.window_press.borrow().is_some());
+        assert!(press_released(&surface, hwnd, (22.0, 16.0)));
+        assert!(surface.input.window_press.borrow().is_none());
+
+        // A view appearing over the press point before release suppresses the click.
+        assert!(hold_press(&surface, hwnd, (20, 15), (20.0, 15.0), LPARAM(0)).is_some());
+        let overlay = view(&bar, 8, ViewKind::View, rect(0.0, 0.0, 200.0, 40.0));
+        overlay.state_mut().props.window_drag = Some(true);
+        assert!(!delivers_click(
+            &label,
+            crate::input::drag_view(&surface, 20.0, 15.0)
+        ));
+        assert!(press_released(&surface, hwnd, (20.0, 15.0)));
+        overlay.unparent();
+
+        // Turning `windowDrag` off before release suppresses the click.
+        assert!(hold_press(&surface, hwnd, (20, 15), (20.0, 15.0), LPARAM(0)).is_some());
+        bar.state_mut().props.window_drag = Some(false);
+        assert!(!delivers_click(
+            &label,
+            crate::input::drag_view(&surface, 20.0, 15.0)
+        ));
+        assert!(press_released(&surface, hwnd, (20.0, 15.0)));
+        bar.state_mut().props.window_drag = Some(true);
+
+        // Moving past the drag rectangle hands the press to the window move.
+        assert!(hold_press(&surface, hwnd, (20, 15), (20.0, 15.0), LPARAM(0)).is_some());
+        assert!(press_moved(&surface, hwnd, pack(30, 20)));
+        assert!(surface.input.window_press.borrow().is_none());
+        assert!(!press_released(&surface, hwnd, (30.0, 20.0)));
+
+        // Losing capture drops the held press.
+        assert!(hold_press(&surface, hwnd, (20, 15), (20.0, 15.0), LPARAM(0)).is_some());
+        press_cancelled(&surface, hwnd);
+        assert!(!press_released(&surface, hwnd, (20.0, 15.0)));
+    }
+
+    /// A role-only item reads the translated label, else the English
+    /// default, with its shortcut after a tab.
+    #[test]
+    fn a_role_item_reads_the_translated_label() {
+        let action = MenuAction {
+            id: 1,
+            label: String::new(),
+            shortcut: MenuRole::Copy.shortcut(false),
+            enabled: true,
+            checked: None,
+            role: Some(MenuRole::Copy),
+            when: nsh_core::keymap::When::Always,
+            icon: None,
+            symbol: None,
+            destructive: false,
+        };
+        let text = |labels: &MenuLabels| String::from_utf16(&item_text(&action, labels)).unwrap();
+        assert_eq!(text(&MenuLabels::default()), "Copy\tCtrl+C\0");
+        let mut labels = MenuLabels::default();
+        labels.roles.insert(MenuRole::Copy, "コピー".into());
+        assert_eq!(text(&labels), "コピー\tCtrl+C\0");
+    }
+
+    fn selectable_text(surface: &Surface) -> (NshView, NshView) {
+        let area = NshView::new(2, ViewKind::View);
+        area.state_mut().props.selectable_view = true;
+        area.state_mut().events.set(EventKind::ContextMenu, true);
+        area.insert_before(&surface.root, None);
+        let text = NshView::new(4, ViewKind::Text);
+        text.insert_before(&area, None);
+        let content = AttributedText {
+            text: "Selected text".into(),
+            ..Default::default()
+        };
+        crate::text::set(
+            &text,
+            &Arc::new(content),
+            &TextLayout(Arc::new(())),
+            crate::geom::rect(0.0, 0.0, 100.0, 20.0),
+        );
+        (area, text)
+    }
+
+    fn selection(text: &NshView) -> Option<(u32, u32)> {
+        text.state().text.as_ref().unwrap().area_range.get()
+    }
+
+    #[test]
+    fn quit_requests_ask_the_app_only_while_it_listens() {
+        let surface = Surface::new(Environment::default());
+        assert!(!ask_quit(&surface), "quits as before");
+        surface.chrome.asks_quit.set(true);
+        assert!(ask_quit(&surface), "the app decides");
+        surface.chrome.asks_quit.set(false);
+        assert!(!ask_quit(&surface), "quits again");
+    }
+
+    #[test]
+    fn only_the_requested_popup_selects_its_context_area() {
+        let surface = Surface::new(Environment::default());
+        let (_, text) = selectable_text(&surface);
+        assert!(crate::input::show_context_menu(&surface, &text));
+        let popup = surface.chrome.app_popup(Arc::from([]), None);
+        choose(&surface, 0, Some(MenuRole::SelectAll), popup.area.as_ref());
+        assert_eq!(selection(&text), Some((0, 13)));
+        crate::selectable_view::clear();
+
+        // The request was consumed even if the popup was cancelled.
+        let popup = surface.chrome.app_popup(Arc::from([]), None);
+        choose(&surface, 0, Some(MenuRole::SelectAll), popup.area.as_ref());
+        assert_eq!(selection(&text), None);
+    }
+
+    #[test]
+    fn an_unopened_context_menu_cannot_take_over_bar_roles() {
+        let surface = Surface::new(Environment::default());
+        let (_, text) = selectable_text(&surface);
+        surface.chrome.entries.borrow_mut().push(Entry {
+            id: 0,
+            role: Some(MenuRole::SelectAll),
+        });
+        assert!(crate::input::show_context_menu(&surface, &text));
+        menu_command(&surface, 1);
+        assert_eq!(selection(&text), None);
+    }
+
+    #[test]
+    fn modifiers_keep_the_context_request_but_another_key_discards_it() {
+        for vk in [0x10, 0x41] {
+            let surface = Surface::new(Environment::default());
+            let (_, text) = selectable_text(&surface);
+            assert!(crate::input::show_context_menu(&surface, &text));
+            crate::input::key(
+                &surface,
+                KeyEvent {
+                    vk,
+                    down: true,
+                    repeat: true,
+                    modifiers: Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    scan: 0,
+                    extended: false,
+                    sys: false,
+                    translated: false,
+                },
+            );
+            let popup = surface.chrome.app_popup(Arc::from([]), None);
+            choose(&surface, 0, Some(MenuRole::SelectAll), popup.area.as_ref());
+            assert_eq!(
+                selection(&text),
+                if vk == 0x10 { Some((0, 13)) } else { None }
+            );
+            crate::selectable_view::clear();
+        }
+    }
+
+    #[test]
+    fn an_accessibility_press_discards_an_unanswered_context_request() {
+        let surface = Surface::new(Environment::default());
+        let (_, text) = selectable_text(&surface);
+        assert!(crate::input::show_context_menu(&surface, &text));
+        let button = NshView::new(8, ViewKind::View);
+        button.state_mut().events.set(EventKind::Press, true);
+        button.insert_before(&surface.root, None);
+        assert!(crate::access::activate(&surface, &button));
+        let popup = surface.chrome.app_popup(Arc::from([]), None);
+        choose(&surface, 0, Some(MenuRole::SelectAll), popup.area.as_ref());
+        assert_eq!(selection(&text), None);
+    }
+
+    #[test]
+    fn a_bar_action_cannot_open_a_popup_for_an_old_context_request() {
+        let surface = Surface::new(Environment::default());
+        let (_, text) = selectable_text(&surface);
+        assert!(crate::input::show_context_menu(&surface, &text));
+        surface
+            .chrome
+            .entries
+            .borrow_mut()
+            .push(Entry { id: 7, role: None });
+        menu_command(&surface, 1);
+        let popup = surface.chrome.app_popup(Arc::from([]), None);
+        choose(&surface, 0, Some(MenuRole::SelectAll), popup.area.as_ref());
+        assert_eq!(selection(&text), None);
+    }
+
+    #[test]
+    fn a_context_request_belongs_to_its_surface() {
+        let first = Surface::new(Environment::default());
+        let (_, text) = selectable_text(&first);
+        assert!(crate::input::show_context_menu(&first, &text));
+        let second = Surface::new(Environment::default());
+        let popup = second.chrome.app_popup(Arc::from([]), None);
+        choose(&second, 0, Some(MenuRole::SelectAll), popup.area.as_ref());
+        assert_eq!(selection(&text), None);
+    }
 }

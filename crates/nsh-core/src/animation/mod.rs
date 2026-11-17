@@ -17,7 +17,9 @@ mod driver;
 mod graph;
 mod motion;
 mod ops;
+mod reach;
 
+pub(crate) use self::reach::Reach;
 pub use self::{
     animator::{AnimValues, Animator},
     driver::{MAX_SAMPLES, sample_driver, sample_easing},
@@ -29,5 +31,6 @@ pub use self::{
     ops::{
         AnimatedPropValue, AnimationId, AnimationOp, AnimationProp, Composite, Curve, Driver,
         EaseMode, Easing, Extrapolate, MathOp, NodeId, Operand, Output, StepPosition,
+        highest_frame_rate,
     },
 };

@@ -9,8 +9,8 @@ use std::{
 use tungstenite::{Message, WebSocket, stream::MaybeTlsStream};
 
 use crate::protocol::{
-    BundleFormat, ClientMessage, HostPlatform, LogLevel, PROTOCOL_VERSION, ServerMessage,
-    StepOutcome, TestStep,
+    BundleFormat, ClientMessage, HostPlatform, LogLevel, PROTOCOL_VERSION, RunningBuild,
+    ServerMessage, StepOutcome, TestStep,
 };
 
 /// Something the dev server told the host.
@@ -97,6 +97,9 @@ pub enum DevEvent {
         /// The app's id (`nsh.json` `"id"`): give it to the bundle
         /// (`Bundle::with_app_id`), as it names where the app keeps its data.
         app_id: Option<String>,
+        /// The main window's launch-time options (`nsh.json` `"window"`,
+        /// JSON): give them to the bundle (`Bundle::with_main_window`).
+        window: Option<String>,
         /// The VM limits to run it with (`nsh run --limits`, see
         /// [`ServerMessage::Bundle`]): `nsh_core::js::Limits::development`
         /// reads them; `None` is none.
@@ -142,14 +145,19 @@ impl DevClient {
     ) -> std::io::Result<DevClient> {
         let (logs, log_rx) = mpsc::sync_channel(LOG_QUEUE);
         let (replies, reply_rx) = mpsc::channel();
-        let hello = ClientMessage::Hello {
+        let mut hello = ClientMessage::Hello {
             protocol: PROTOCOL_VERSION,
             bytecode_version: host.bytecode_version,
             device: host.device,
             platform: Some(host.platform),
             ui_sets: Some(host.ui_sets),
             tests: host.tests,
+            running: None,
         };
+        // The build the app reached, across reconnects. Hosts check each
+        // patch's base themselves, so a patch the app could not apply only
+        // makes the server's catch-up patches fall through to the bundle.
+        let mut running: Option<RunningBuild> = None;
         thread::Builder::new()
             .name("nsh-dev-client".into())
             .spawn(move || {
@@ -163,9 +171,17 @@ impl DevClient {
                         Ok((socket, _)) => {
                             backoff = Duration::from_millis(100);
                             on_event(DevEvent::Connected);
-                            if let Err(SessionEnd::Shutdown) =
-                                session(socket, &hello, &log_rx, &reply_rx, &mut on_event)
-                            {
+                            if let ClientMessage::Hello { running: said, .. } = &mut hello {
+                                *said = running;
+                            }
+                            if let Err(SessionEnd::Shutdown) = session(
+                                socket,
+                                &hello,
+                                &log_rx,
+                                &reply_rx,
+                                &mut running,
+                                &mut on_event,
+                            ) {
                                 return;
                             }
                             on_event(DevEvent::Disconnected);
@@ -221,6 +237,7 @@ fn session(
     hello: &ClientMessage,
     logs: &Receiver<ClientMessage>,
     replies: &Receiver<ClientMessage>,
+    running: &mut Option<RunningBuild>,
     on_event: &mut impl FnMut(DevEvent),
 ) -> Result<(), SessionEnd> {
     if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
@@ -238,6 +255,7 @@ fn session(
         source_map: bool,
         capabilities: Option<String>,
         app_id: Option<String>,
+        window: Option<String>,
         limits: Option<String>,
         bytes: Option<Vec<u8>>,
     }
@@ -282,7 +300,10 @@ fn session(
                     environment,
                 }),
                 Ok(ServerMessage::Fetch { id, reply }) => on_event(DevEvent::Fetch { id, reply }),
-                Ok(ServerMessage::Root) => on_event(DevEvent::Root),
+                Ok(ServerMessage::Root) => {
+                    *running = None;
+                    on_event(DevEvent::Root)
+                }
                 Ok(ServerMessage::Building) => on_event(DevEvent::Building),
                 Ok(ServerMessage::BuildFailed { message }) => {
                     on_event(DevEvent::BuildFailed(message))
@@ -296,6 +317,7 @@ fn session(
                     source_map,
                     capabilities,
                     app_id,
+                    window,
                     limits,
                 }) => {
                     pending = Some(Pending {
@@ -305,6 +327,7 @@ fn session(
                         source_map,
                         capabilities,
                         app_id,
+                        window,
                         limits,
                         bytes: None,
                     })
@@ -321,6 +344,7 @@ fn session(
                         source_map,
                         capabilities: None,
                         app_id: None,
+                        window: None,
                         limits: None,
                         bytes: None,
                     })
@@ -343,25 +367,44 @@ fn session(
                 };
                 match p.base {
                     Some(base) => match String::from_utf8(bytes) {
-                        Ok(code) => on_event(DevEvent::Patch {
-                            session: server_session,
-                            version: p.version,
-                            base,
-                            code,
-                            source_map,
-                        }),
+                        Ok(code) => {
+                            let from = RunningBuild {
+                                session: server_session,
+                                version: base,
+                            };
+                            if *running == Some(from) {
+                                *running = Some(RunningBuild {
+                                    session: server_session,
+                                    version: p.version,
+                                });
+                            }
+                            on_event(DevEvent::Patch {
+                                session: server_session,
+                                version: p.version,
+                                base,
+                                code,
+                                source_map,
+                            })
+                        }
                         Err(_) => log::warn!("dev server sent a non-UTF-8 patch"),
                     },
-                    None => on_event(DevEvent::Bundle {
-                        session: server_session,
-                        version: p.version,
-                        format: p.format,
-                        bytes,
-                        source_map,
-                        capabilities: p.capabilities,
-                        app_id: p.app_id,
-                        limits: p.limits,
-                    }),
+                    None => {
+                        *running = Some(RunningBuild {
+                            session: server_session,
+                            version: p.version,
+                        });
+                        on_event(DevEvent::Bundle {
+                            session: server_session,
+                            version: p.version,
+                            format: p.format,
+                            bytes,
+                            source_map,
+                            capabilities: p.capabilities,
+                            app_id: p.app_id,
+                            window: p.window,
+                            limits: p.limits,
+                        })
+                    }
                 }
             }
             Message::Close(_) => return Err(SessionEnd::Disconnected),

@@ -19,12 +19,18 @@ from `nsh_core::element::desktop` in Rust ([Desktop title bars](./rust.md#deskto
 - **GTK 4.14** or later. To build a Rust app's runner or NSH's Linux runtime (from a checkout, or `cargo xtask
   dist` on Linux) you need their development packages and clang: `libgtk-4-dev clang` on Debian and Ubuntu (24.04 or
   later), `gtk4 clang` on Arch, `gtk4-devel clang` on Fedora.
-- **WebKitGTK 6.0** (2.40 or later) for web views: `libwebkitgtk-6.0-dev` on Debian and Ubuntu, `webkitgtk-6.0` on
+- **WebKitGTK 6.0** (2.42 or later) for web views and download decisions: `libwebkitgtk-6.0-dev` on Debian and Ubuntu, `webkitgtk-6.0` on
   Arch, `webkitgtk6.0-devel` on Fedora to build the runtime. The development host and the release runner use it by
   default, so packaged apps need WebKitGTK 6.0 where they run (`libwebkitgtk-6.0-4` on Debian and Ubuntu; GNOME
   desktops have it). `cargo xtask dist` on a machine without its development files builds a runtime whose web views
   are placeholders, and whose apps need only GTK.
-- **GStreamer** plugins for the video formats your app plays (GTK plays video through GStreamer).
+- **GStreamer** 1.14 or later, which GTK plays video through and NSH plays sound with: to build the runtime its
+  development packages, `libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev` on Debian and Ubuntu, `gstreamer
+  gst-plugins-base` on Arch, `gstreamer1-devel gstreamer1-plugins-base-devel` on Fedora. Where apps run, GStreamer and
+  its base plug-ins (desktops have them), and the plug-ins for the video and audio formats your app plays. The
+  development packages are for `Sound`, the runtime's Cargo feature `sound`: a Rust app that plays no sounds builds
+  without them by leaving that feature out (`default-features = false` on `nsh-platform-linux`), and video and
+  `AudioPlayer` still play through GTK.
 
 ## Running an app
 
@@ -71,7 +77,7 @@ Writes a directory and the same as an archive:
   <Name>                 the executable: a Rust app's own runner, built with its crate; nsh's release runner for TSX
   nsh/bundle.nshc        a TSX app, compiled
   nsh/assets/…           the assets it imports (a Rust crate's `assets!()` too)
-  nsh/app.json           the window title and the application id
+  nsh/app.json           the window title, the application id and nsh.json's window options
   <id>.desktop           a desktop entry (StartupWMClass is the id)
   <id>.png               the icon, when nsh.json names one
 .nsh/out/<Name>.tar.gz
@@ -130,6 +136,10 @@ view.load(Bundle::source(code).into());
 QuickJS bytecode is trusted input, so only load it from your own app's files. A standalone window is
 `nsh_platform_linux::run_app(source, options)`, with `AppSource::Rust(root)` or `AppSource::Bundle(bundle)`.
 
+`AppOptions::login_item` gives the app `run_app` runs its [login item](../modules/nsh-desktop.md#opening-at-login): an
+XDG autostart entry, `~/.config/autostart/<app_id>.desktop`, starting this executable. It is off by default and read
+by `run_app` alone, so an embedded app never launches at login; the runner of the apps `nsh package` builds sets it.
+
 `AppOptions::cache` (or `AppView::set_cache`, for the apps loaded next) sets where the apps keep their caches, the
 [images they download](./images-and-assets.md#kept-on-disk), and how much each keeps (`CacheOptions`: the system's
 cache directory and 256 MiB of images by default).
@@ -142,6 +152,44 @@ follow at once ([Device and environment](./device-and-environment.md#in-an-embed
 in the format of `nsh.json`'s `"theme"`, whose tokens win over the app's of the same names in light and dark mode
 while the app's others stay; classes such as `bg-primary` restyle at once, and apps loaded later start with it
 (`None` gives the app its own theme back; a file that does not parse is an error and changes nothing).
+
+### Several windows sharing data
+
+A Rust host opens as many windows as it likes, an `AppView` in each, and shares its data between them as any Rust
+program does: one process, an `Arc` the roots' props carry. There is nothing to send between the windows; each root
+reads the shared value and listens for its changes the way it listens to any other source (a channel, a watch, a
+callback the store calls):
+
+```rust
+use std::sync::{Arc, Mutex};
+use nsh_platform_linux::{gtk4 as gtk, AppOptions, AppView, Root};
+use gtk::prelude::*;
+
+#[derive(Default)]
+struct Store { count: Mutex<u32> }
+
+fn open(app: &gtk::Application, title: &str, root: Root) {
+    let window = gtk::ApplicationWindow::builder().application(app).title(title).build();
+    let view = AppView::new(AppOptions::default());
+    view.load(root.into());
+    window.set_child(Some(&view.widget()));
+    let keep = std::cell::RefCell::new(Some(view));
+    window.connect_destroy(move |_| if let Some(view) = keep.take() { view.stop() });
+    window.present();
+}
+
+app.connect_activate(|app| {
+    let store = Arc::new(Store::default());
+    let main = Arc::clone(&store);
+    open(app, "Main", Root::new::<my_app::Main>(move || my_app::MainProps { store: Arc::clone(&main) }));
+    let chat = Arc::clone(&store);
+    open(app, "Chat", Root::new::<my_app::Chat>(move || my_app::ChatProps { store: Arc::clone(&chat) }));
+});
+```
+
+A TSX app opens its windows with [`<Window>` and `Window.open`](../modules/nsh-desktop.md#windows): they run in the
+app's one JS runtime, so they share its signals and modules directly. Dialogs, panels and popups are transient for
+their parent window, and the window manager places every window.
 
 Native components are registered with `AppView::register_component`; see [Native components](./native-components.md#registering-on-linux-rust).
 `set_ui_sets(sets)` sets the UI sets every engine serves: NSH's (`nsh_base::registry()`) and your crates'
@@ -186,8 +234,8 @@ Not supported:
 
 - **Video `rate`**: GTK plays at normal speed only. `onEnd` only comes for videos that do not loop.
 - **Zooming scroll views** (`zoomTo`, the zoom props).
-- **`mixBlendMode` and `backdropFilter`** (the background color still draws); `borderCurve: "continuous"` draws
-  circular corners.
+- **`mixBlendMode` and `backdropFilter`** (the background color still draws). Backdrop blur is not implemented;
+  experiments using GTK 4.22's copy and paste nodes are not part of the renderer.
 - **Input accessory views** and the **status bar** (no desktop equivalent).
 - **Accessibility**: `accessible` grouping, custom `accessibilityActions`; live regions are announced instead.
 

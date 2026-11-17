@@ -38,25 +38,16 @@ fn main_thread() -> MainThreadMarker {
 fn init_logging() {
     #[cfg(feature = "dev")]
     crate::dev::init_logging();
+    // Warnings, errors and the app's `js` lines go to the unified log, under
+    // the host app's bundle identifier, where Xcode's console, Console and
+    // `log stream` show them. A logger the host app installed keeps them
+    // instead.
     #[cfg(not(feature = "dev"))]
     {
-        struct Stderr;
-        impl log::Log for Stderr {
-            fn enabled(&self, m: &log::Metadata<'_>) -> bool {
-                m.level() <= log::Level::Warn || m.target() == "js"
-            }
-            fn log(&self, r: &log::Record<'_>) {
-                if self.enabled(r.metadata()) {
-                    eprintln!("[nsh] {} {}: {}", r.level(), r.target(), r.args());
-                }
-            }
-            fn flush(&self) {}
-        }
-        static LOGGER: Stderr = Stderr;
-        // Keep the host app's logger if it installed one.
-        if log::set_logger(&LOGGER).is_ok() {
-            log::set_max_level(log::LevelFilter::Info);
-        }
+        let mut logging = nsh_platform_apple::unified_log::Options::default();
+        // Lines on a terminal's stderr share it with the host app's own.
+        logging.stderr_prefix = "[nsh] ";
+        nsh_platform_apple::unified_log::install(logging);
     }
 }
 
@@ -228,6 +219,22 @@ pub unsafe extern "C" fn nsh_app_set_limits(
     app.view.set_limits(limits.limits());
 }
 
+/// Gives the address of the apps `app` loads (`UrlScheme.setUrl`) to the
+/// system as the current `NSUserActivity`, for Handoff. An address
+/// that is no web page needs `<bundle id>.url` in the embedding app's
+/// Info.plist `NSUserActivityTypes`. Off by default; applies from the next
+/// load.
+///
+/// # Safety
+///
+/// `app` must come from [`nsh_app_create`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_app_set_handoff(app: *mut NshApp, handoff: bool) {
+    // SAFETY: guaranteed by the caller.
+    let app = unsafe { &*app };
+    app.view.set_handoff(handoff);
+}
+
 /// The directory the storage (`nsh/storage`) of the apps `app` loads is
 /// kept in (`storage.json` in it); `NULL`: each app's own,
 /// `nsh/<app id>` in the embedding app's Application Support (the id of
@@ -387,6 +394,34 @@ pub unsafe extern "C" fn nsh_app_set_font_scale(app: *mut NshApp, scale: f32) {
         .set_font_scale((scale.is_finite() && scale > 0.0).then_some(scale));
 }
 
+/// Registers a font file (TrueType, OpenType, WOFF or WOFF2) the host
+/// ships. Returns why `bytes` is not a font, or `NULL`.
+///
+/// # Safety
+///
+/// `app` must come from [`nsh_app_create`]. `bytes` must be `NULL` or point
+/// at `len` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_app_register_font(
+    app: *mut NshApp,
+    bytes: *const u8,
+    len: usize,
+) -> *mut c_char {
+    // SAFETY: guaranteed by the caller.
+    let app = unsafe { &*app };
+    let data = if bytes.is_null() {
+        if len == 0 {
+            Ok([].as_slice())
+        } else {
+            Err("the font is missing".to_owned())
+        }
+    } else {
+        // SAFETY: guaranteed by the caller.
+        Ok(unsafe { std::slice::from_raw_parts(bytes, len) })
+    };
+    status(data.and_then(|data| app.view.register_font(data)))
+}
+
 /// The embedding app's theme overrides: a theme file of shadcn/ui's
 /// (`{ "cssVars": { "theme": { … }, "light": { … }, "dark": { … } } }`, as
 /// `nsh.json`'s `"theme"`), whose tokens win over the app's of the same
@@ -463,6 +498,13 @@ impl Drop for Callback {
     }
 }
 
+impl Callback {
+    fn call(&self, message: &CStr) {
+        // SAFETY: the contract of `nsh_app_set_error_handler`.
+        unsafe { (self.handler)(self.context, message.as_ptr()) };
+    }
+}
+
 /// Receives fatal app errors (load failures, uncaught JS exceptions) on the
 /// main thread, replacing the previous handler. `context` is passed back
 /// unchanged; `release` (optional) is called with it when the handler is
@@ -490,16 +532,23 @@ pub unsafe extern "C" fn nsh_app_set_error_handler(
         }
         return;
     };
-    let callback = Callback {
+    app.view.set_error_handler(error_handler(Callback {
         handler,
         context,
         release,
-    };
-    app.view.set_error_handler(move |message| {
+    }));
+}
+
+/// The handler [`nsh_app_set_error_handler`] installs: it owns `callback`,
+/// so `release` runs once, when the handler is replaced or the app destroyed.
+/// It calls a method of the whole `callback`: a closure using only its `Copy`
+/// fields would copy those, and `callback` (its `release`) would be dropped
+/// here.
+fn error_handler(callback: Callback) -> impl Fn(&str) + 'static {
+    move |message| {
         let message = CString::new(message.replace('\0', " ")).unwrap_or_default();
-        // SAFETY: guaranteed by the caller of `nsh_app_set_error_handler`.
-        unsafe { (callback.handler)(callback.context, message.as_ptr()) };
-    });
+        callback.call(&message);
+    }
 }
 
 /// The status bar style the app asked for, for a host view controller's
@@ -522,6 +571,15 @@ pub extern "C" fn nsh_status_bar_hidden() -> bool {
 pub extern "C" fn nsh_status_bar_animation() -> objc2_ui_kit::UIStatusBarAnimation {
     main_thread();
     crate::status_bar_animation()
+}
+
+/// Internal: the bridge behind `NshAppView.supportedInterfaceOrientations`
+/// (`NativeShell.swift`), which host apps use: the orientations the page
+/// shown asked for (`supportedOrientations`), empty when no page asks.
+#[unsafe(no_mangle)]
+pub extern "C" fn nsh_supported_orientations() -> objc2_ui_kit::UIInterfaceOrientationMask {
+    main_thread();
+    crate::system::page_orientations().unwrap_or(objc2_ui_kit::UIInterfaceOrientationMask(0))
 }
 
 /// The keys, revocations and accepted builds that signed packages are
@@ -1015,6 +1073,278 @@ pub unsafe extern "C" fn nsh_component_context_free(context: *mut NshComponentCo
     }
 }
 
+/// A scroll view the host watches (opaque to C): a [`crate::ScrollHandle`].
+/// Free with [`nsh_scroll_handle_free`].
+pub struct NshScrollHandle(crate::ScrollHandle);
+
+/// What nsh calls on a watcher of [`nsh_app_watch_scroll`], with its
+/// context, on the main thread.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct NshScrollWatcherCallbacks {
+    /// The scroll view is there (again: a new handle). The handle is the
+    /// caller's to free with [`nsh_scroll_handle_free`].
+    pub on_attached: unsafe extern "C" fn(context: *mut c_void, handle: *mut NshScrollHandle),
+    /// The scroll view is gone: the handle is dead.
+    pub on_detached: unsafe extern "C" fn(context: *mut c_void),
+    /// The watcher is replaced, removed or the app destroyed: release
+    /// `context` (`NULL`: nothing to release).
+    pub release: Option<unsafe extern "C" fn(context: *mut c_void)>,
+}
+
+struct CScrollWatcher {
+    context: *mut c_void,
+    callbacks: NshScrollWatcherCallbacks,
+}
+
+impl crate::ScrollWatcher for CScrollWatcher {
+    fn on_attached(&self, handle: crate::ScrollHandle) {
+        let handle = Box::into_raw(Box::new(NshScrollHandle(handle)));
+        // SAFETY: the contract of `nsh_app_watch_scroll`.
+        unsafe { (self.callbacks.on_attached)(self.context, handle) };
+    }
+
+    fn on_detached(&self) {
+        // SAFETY: the contract of `nsh_app_watch_scroll`.
+        unsafe { (self.callbacks.on_detached)(self.context) };
+    }
+}
+
+impl Drop for CScrollWatcher {
+    fn drop(&mut self) {
+        if let Some(release) = self.callbacks.release {
+            // SAFETY: the contract of `nsh_app_watch_scroll`.
+            unsafe { release(self.context) };
+        }
+    }
+}
+
+/// Watches the app's `<Scroll>` whose `nativeID` is `native_id`, for native
+/// UI of the host that follows or drives the app's scrolling in the frame of
+/// the scroll, without JS: `callbacks.on_attached` gets a handle when the
+/// scroll view is there (at once when it already is). One watcher per
+/// `nativeID`; `callbacks` `NULL` stops watching. Main thread.
+///
+/// # Safety
+///
+/// `app` must come from [`nsh_app_create`], `native_id` be NUL-terminated
+/// and `callbacks` (if not `NULL`) safe to call with `context` on the main
+/// thread until its `release` is called (or, without `release`, until `app`
+/// is destroyed).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_app_watch_scroll(
+    app: *mut NshApp,
+    native_id: *const c_char,
+    context: *mut c_void,
+    callbacks: *const NshScrollWatcherCallbacks,
+) {
+    // SAFETY: guaranteed by the caller.
+    let (app, native_id, callbacks) = unsafe {
+        (
+            &*app,
+            CStr::from_ptr(native_id),
+            callbacks.as_ref().copied(),
+        )
+    };
+    let Ok(native_id) = native_id.to_str() else {
+        return log::error!("scroll view native id is not UTF-8");
+    };
+    let watcher = callbacks.map(|callbacks| {
+        std::rc::Rc::new(CScrollWatcher { context, callbacks })
+            as std::rc::Rc<dyn crate::ScrollWatcher>
+    });
+    app.view.watch_scroll(native_id, watcher);
+}
+
+/// Whether the scroll view is still the app's, with the watched `nativeID`.
+///
+/// # Safety
+///
+/// `handle` must be a handle from `on_attached`, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_is_alive(handle: *const NshScrollHandle) -> bool {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*handle }.0.is_alive()
+}
+
+macro_rules! scroll_handle_reads {
+    ($($(#[$doc:meta])* $name:ident => $method:ident;)*) => {$(
+        $(#[$doc])*
+        ///
+        /// # Safety
+        ///
+        /// As [`nsh_scroll_handle_is_alive`].
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn $name(handle: *const NshScrollHandle) -> f64 {
+            // SAFETY: guaranteed by the caller.
+            unsafe { &*handle }.0.$method()
+        }
+    )*};
+}
+
+scroll_handle_reads! {
+    /// The horizontal offset (points, from the start of the content); 0
+    /// once dead.
+    nsh_scroll_handle_scroll_x => scroll_x;
+    /// The vertical offset (points, from the top of the content); 0 once
+    /// dead.
+    nsh_scroll_handle_scroll_y => scroll_y;
+    /// The content's width (points, at least the viewport's); 0 once dead.
+    nsh_scroll_handle_content_width => content_width;
+    /// The content's height (points, at least the viewport's); 0 once dead.
+    nsh_scroll_handle_content_height => content_height;
+    /// The visible width (points); 0 once dead.
+    nsh_scroll_handle_viewport_width => viewport_width;
+    /// The visible height (points); 0 once dead.
+    nsh_scroll_handle_viewport_height => viewport_height;
+}
+
+/// The view the app's content is laid out in (not retained: valid while the
+/// handle is alive); `NULL` once dead.
+///
+/// # Safety
+///
+/// As [`nsh_scroll_handle_is_alive`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_content_view(
+    handle: *const NshScrollHandle,
+) -> *const UIView {
+    // SAFETY: guaranteed by the caller.
+    let view = unsafe { &*handle }.0.content_view();
+    // The view hierarchy keeps it while the handle is alive.
+    view.as_deref()
+        .map_or(std::ptr::null(), |v| v as *const UIView)
+}
+
+/// Scrolls by `dx`, `dy` points, clamped to the content, as the user's
+/// scroll would; `animated` uses UIKit's animation.
+///
+/// # Safety
+///
+/// As [`nsh_scroll_handle_is_alive`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_scroll_by(
+    handle: *const NshScrollHandle,
+    dx: f64,
+    dy: f64,
+    animated: bool,
+) {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*handle }.0.scroll_by(dx, dy, animated);
+}
+
+/// Ends a fling or an animated scroll where it is; nothing at rest.
+///
+/// # Safety
+///
+/// As [`nsh_scroll_handle_is_alive`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_stop_scrolling(handle: *const NshScrollHandle) {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*handle }.0.stop_scrolling();
+}
+
+/// Releases a listener's context when the listener goes.
+struct ListenerContext {
+    context: *mut c_void,
+    release: Option<unsafe extern "C" fn(context: *mut c_void)>,
+}
+
+impl Drop for ListenerContext {
+    fn drop(&mut self) {
+        if let Some(release) = self.release {
+            // SAFETY: the contract of `nsh_scroll_handle_on_scroll`.
+            unsafe { release(self.context) };
+        }
+    }
+}
+
+/// Calls `on_scroll(context, scroll_x, scroll_y, dx, dy)` on every offset
+/// change (points; `dx` / `dy` positive: the content moved left / up), on
+/// the main thread in the frame of the scroll. Returns an id for
+/// [`nsh_scroll_handle_remove_listener`] (0: the handle is dead, and
+/// `release` was called).
+///
+/// # Safety
+///
+/// As [`nsh_scroll_handle_is_alive`]; `on_scroll` must be safe to call with
+/// `context` until `release` is called (when the listener is removed or the
+/// handle dies).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_on_scroll(
+    handle: *const NshScrollHandle,
+    on_scroll: unsafe extern "C" fn(
+        context: *mut c_void,
+        scroll_x: f64,
+        scroll_y: f64,
+        dx: f64,
+        dy: f64,
+    ),
+    context: *mut c_void,
+    release: Option<unsafe extern "C" fn(context: *mut c_void)>,
+) -> u64 {
+    let listener = ListenerContext { context, release };
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*handle }.0.on_scroll(move |offset, delta| {
+        // The whole context, not just its pointer: it releases with the
+        // listener.
+        let listener = &listener;
+        // SAFETY: the contract above.
+        unsafe { on_scroll(listener.context, offset.x, offset.y, delta.x, delta.y) };
+    })
+}
+
+/// Calls `on_change(context, content_width, content_height)` when the
+/// content gets larger or smaller without a scroll. As
+/// [`nsh_scroll_handle_on_scroll`].
+///
+/// # Safety
+///
+/// As [`nsh_scroll_handle_on_scroll`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_on_content_size_change(
+    handle: *const NshScrollHandle,
+    on_change: unsafe extern "C" fn(context: *mut c_void, content_width: f64, content_height: f64),
+    context: *mut c_void,
+    release: Option<unsafe extern "C" fn(context: *mut c_void)>,
+) -> u64 {
+    let listener = ListenerContext { context, release };
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*handle }.0.on_content_size_change(move |size| {
+        // As in `nsh_scroll_handle_on_scroll`: the closure keeps the context.
+        let listener = &listener;
+        // SAFETY: the contract above.
+        unsafe { on_change(listener.context, size.width, size.height) };
+    })
+}
+
+/// Removes listener `id` (its `release` is called).
+///
+/// # Safety
+///
+/// As [`nsh_scroll_handle_is_alive`].
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_remove_listener(
+    handle: *const NshScrollHandle,
+    id: u64,
+) {
+    // SAFETY: guaranteed by the caller.
+    unsafe { &*handle }.0.remove_listener(id);
+}
+
+/// Frees a handle (its listeners stay while the scroll view is alive).
+///
+/// # Safety
+///
+/// `handle` must be `NULL` or a handle from `on_attached`, not yet freed.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_scroll_handle_free(handle: *mut NshScrollHandle) {
+    if !handle.is_null() {
+        // SAFETY: guaranteed by the caller.
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
+
 /// JSON text from C (`NULL`: `null`), or why it is not JSON.
 ///
 /// # Safety
@@ -1079,6 +1409,22 @@ pub unsafe extern "C" fn nsh_app_send_host_event(
         )
     };
     status(name.and_then(|name| app.view.host().send(name, data?)))
+}
+
+/// Hands `url`, one the embedding app was opened with, to the running app
+/// (`UrlScheme.on("open")`, `nsh`); before an app runs, the next one loaded
+/// gets it. Returns why it cannot (`url` is not UTF-8), or `NULL`.
+///
+/// # Safety
+///
+/// `app` must come from [`nsh_app_create`]; `url` must be a NUL-terminated
+/// string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nsh_app_open_url(app: *mut NshApp, url: *const c_char) -> *mut c_char {
+    main_thread();
+    // SAFETY: guaranteed by the caller.
+    let (app, url) = unsafe { (&*app, utf8(url, "the URL")) };
+    status(url.map(|url| app.view.open_url(url)))
 }
 
 /// A call of the app (`host.call`) its handler answers (opaque to C): once,
@@ -1300,5 +1646,124 @@ pub unsafe extern "C" fn nsh_host_call_free(call: *mut NshHostCall) {
     if !call.is_null() {
         // SAFETY: guaranteed by the caller.
         drop(unsafe { Box::from_raw(call) });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        cell::RefCell,
+        ffi::{CStr, c_char, c_void},
+        rc::Rc,
+    };
+
+    use super::{Callback, error_handler};
+
+    /// What a handler's context saw: the messages and how often it was released.
+    #[derive(Default)]
+    struct Probe {
+        messages: RefCell<Vec<String>>,
+        releases: RefCell<u32>,
+    }
+
+    /// The context as `NshAppView.onError` passes it (a retained box the
+    /// release frees), so a handler called after its release reads freed
+    /// memory (`MallocScribble=1` makes that visible at once).
+    struct HandlerBox(Rc<Probe>);
+
+    unsafe extern "C" fn handler(context: *mut c_void, message: *const c_char) {
+        // SAFETY: `context` is a live `HandlerBox` until `release`.
+        let probe = unsafe { &(*context.cast::<HandlerBox>()).0 };
+        // SAFETY: a C string from `error_handler`.
+        let message = unsafe { CStr::from_ptr(message) }
+            .to_string_lossy()
+            .into_owned();
+        probe.messages.borrow_mut().push(message);
+    }
+
+    unsafe extern "C" fn release(context: *mut c_void) {
+        // SAFETY: `context` came from `Box::into_raw` in `callback`.
+        let handler_box = unsafe { Box::from_raw(context.cast::<HandlerBox>()) };
+        *handler_box.0.releases.borrow_mut() += 1;
+    }
+
+    fn callback(probe: &Rc<Probe>) -> Callback {
+        Callback {
+            handler,
+            context: Box::into_raw(Box::new(HandlerBox(probe.clone()))).cast(),
+            release: Some(release),
+        }
+    }
+
+    /// Stored as `AppView::set_error_handler` stores a handler.
+    type Slot = Option<Rc<dyn Fn(&str)>>;
+
+    #[test]
+    fn an_error_handler_keeps_its_context_until_it_is_dropped() {
+        let probe = Rc::new(Probe::default());
+        let slot: Slot = Some(Rc::new(error_handler(callback(&probe))));
+        assert_eq!(*probe.releases.borrow(), 0, "released while installed");
+        (slot.as_ref().unwrap())("boom\0two");
+        (slot.as_ref().unwrap())("again");
+        assert_eq!(*probe.messages.borrow(), ["boom two", "again"]);
+        assert_eq!(*probe.releases.borrow(), 0);
+        drop(slot);
+        assert_eq!(*probe.releases.borrow(), 1);
+    }
+
+    #[test]
+    fn replacing_or_clearing_an_error_handler_releases_it_once() {
+        let first = Rc::new(Probe::default());
+        let second = Rc::new(Probe::default());
+        let mut slot: Slot = Some(Rc::new(error_handler(callback(&first))));
+        drop(slot.replace(Rc::new(error_handler(callback(&second)))));
+        assert_eq!(*first.releases.borrow(), 1);
+        assert_eq!(*second.releases.borrow(), 0);
+        (slot.as_ref().unwrap())("to the second");
+        assert!(first.messages.borrow().is_empty());
+        assert_eq!(*second.messages.borrow(), ["to the second"]);
+        drop(slot.take());
+        assert_eq!(*first.releases.borrow(), 1);
+        assert_eq!(*second.releases.borrow(), 1);
+    }
+
+    #[test]
+    fn an_error_handler_without_release_still_dispatches() {
+        let probe = Rc::new(Probe::default());
+        let context = Box::into_raw(Box::new(HandlerBox(probe.clone())));
+        let handle = error_handler(Callback {
+            handler,
+            context: context.cast(),
+            release: None,
+        });
+        handle("no release");
+        drop(handle);
+        assert_eq!(*probe.messages.borrow(), ["no release"]);
+        // SAFETY: never released by the handler (no `release`).
+        drop(unsafe { Box::from_raw(context) });
+    }
+
+    /// A Swift host cannot call `set_ui_sets`: a part missing from the
+    /// default fails every app that imports it.
+    #[test]
+    fn the_sdk_serves_every_part_of_nsh_base() {
+        let exports = |sets: &[nsh_core::element::Registry]| {
+            sets.iter()
+                .flat_map(nsh_core::element::Registry::sets)
+                .flat_map(nsh_core::element::Registry::specs)
+                .map(|spec| spec.export.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+        };
+        let served = exports(&crate::ui_sets());
+        assert_eq!(served, exports(&[nsh_base::registry()]));
+        for name in [
+            "TextView",
+            #[cfg(feature = "emoji-picker")]
+            "EmojiPicker",
+            #[cfg(feature = "rich-editor")]
+            "RichEditor",
+        ] {
+            assert!(served.contains(name), "{name} is not served");
+        }
     }
 }

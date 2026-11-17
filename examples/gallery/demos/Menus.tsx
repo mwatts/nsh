@@ -1,54 +1,16 @@
-import { type JSX, LayoutAnimation, reduceMotion, Scroll, setColorScheme, signal, Text, token, View } from "nsh";
-import { ContextMenu, Menu, MenuItem, MenuSeparator, type OpenChangeReason, Submenu, Toolbar } from "nsh/base";
+import { type JSX, LayoutAnimation, reduceMotion, Scroll, signal, Text, token, View } from "nsh";
+import { ContextMenu, Menu, MenuButton, MenuItem, MenuSeparator, type OpenChangeReason, Submenu, Toolbar } from "nsh/base";
+import { SegmentedControl } from "nsh/mobile";
 import { platform } from "nsh";
 import { keymap } from "nsh";
-import { Icon, LucideIcon, type LucideIconName } from "../icons";
+import { Icon, type IconName, LucideIcon, type LucideIconName } from "../icons";
 import { toast, updateToast } from "../toast";
-import { alpha, Badge, Button, Caption, Card, colors, DemoPage, finish, isDark, menuIndicator, MenuMark, mono, PopIn, type PopupSide, popupSurface, Row, Segmented, terminal, Tip } from "../ui";
+import { alpha, Button, Caption, Card, colors, DemoPage, finish, isDark, menuHighlight, setAppearance, menuIndicator, menuItemGlyph, menuItemLabel, menuItemLook, menuItemNote, menuItemSize, menuIsPopup, MenuLabel, MenuMark, menuPressed, menuSeparator, mono, Row, Segmented, SubmenuBack, SubmenuRow, terminal, Tip, menuPopup, Kbd, placementWords } from "../ui";
 
-// The look of every menu here is the gallery's: `nsh/base` draws none.
+// The look of every menu here is the gallery's (`look/menu.tsx`):
+// `nsh/base` draws none.
 
 const pointer = platform.desktop;
-
-/** The sheet at the bottom on touch screens; on desktops the popup's box
- * keeps no look, its `Panel` has it. */
-const sheet = pointer
-  ? undefined
-  : {
-      backgroundColor: colors.surface,
-      borderTopLeftRadius: 20,
-      borderTopRightRadius: 20,
-      paddingHorizontal: 10,
-      paddingTop: 10,
-      paddingBottom: 34,
-    };
-
-/**
- * A menu's items on their surface: on desktops the gallery's popup surface
- * coming in from the trigger's side (`PopIn`: a fade, 96 % to full size,
- * 4 points of slide, 150 ms), on touch screens the items alone, in the
- * sheet that slides up. `flush` drops the padding (a menu that scrolls).
- */
-function Panel(props: { side?: PopupSide; flush?: boolean; children: JSX.Element }) {
-  if (!pointer) return props.children;
-  return (
-    <PopIn side={props.side} style={{ ...popupSurface(), minWidth: 200, padding: props.flush ? 0 : 4 }}>
-      {props.children}
-    </PopIn>
-  );
-}
-
-const backdrop = { backgroundColor: "rgba(0,0,0,0.45)" };
-
-/** An item under the pointer or the keyboard, and pressed: a flat neutral
- * fill, the theme's `accent`, a shade deeper when pressed. */
-const hovered = () => ({ backgroundColor: token("accent") });
-const pressed = () => ({ backgroundColor: alpha(colors.text, 0.1) });
-
-/** An item's height, corners and type. */
-/** An item's inset from the popup's sides: in a terminal the popup's own padding is its Cell from the frame. */
-const inset = terminal ? 0 : 8;
-const item = pointer ? { height: 26, radius: 6, font: 13, note: 11.5, icon: 14 } : { height: 46, radius: 10, font: 16, note: 14, icon: 18 };
 
 /**
  * One row of a menu: an icon, the label, a note (a shortcut, a value). A
@@ -76,18 +38,15 @@ function Item(props: {
       role={props.radio ? "menuitemradio" : undefined}
       closeOnSelect={!props.keepOpen}
       indicatorClass={menuIndicator}
-      indicator={props.checked === undefined ? undefined : <MenuMark kind={props.radio ? "dot" : "check"} size={item.icon} tint={colors.accent} />}
-      hoverStyle={hovered()}
-      activeStyle={pressed()}
-      disabledStyle={{ opacity: 0.35 }}
-      style={{ flexDirection: "row", alignItems: "center", gap: 8, height: item.height, paddingHorizontal: inset, borderRadius: item.radius }}
+      indicator={props.checked === undefined ? undefined : <MenuMark kind={props.radio ? "dot" : "check"} size={menuItemSize.icon} tint={colors.accent} />}
+      {...menuItemLook()}
     >
       <If when={props.icon && props.checked === undefined}>
-        <LucideIcon name={props.icon!} size={item.icon} tint={props.danger ? colors.danger : colors.muted} />
+        <LucideIcon name={props.icon!} {...menuItemGlyph({ danger: props.danger })} />
       </If>
-      <Text style={{ numberOfLines: 1, flexGrow: 1, flexShrink: 0, fontSize: item.font, color: props.danger ? colors.danger : colors.text }}>{props.label}</Text>
+      <Text style={menuItemLabel({ danger: props.danger })}>{props.label}</Text>
       <If when={props.shortcut ?? props.note}>
-        <Text style={{ fontSize: item.note, color: colors.faint }}>{props.shortcut ?? props.note}</Text>
+        <Text style={menuItemNote()}>{props.shortcut ?? props.note}</Text>
       </If>
     </MenuItem>
   );
@@ -99,51 +58,20 @@ function SubmenuOf(props: { label: string; icon?: LucideIconName; children: JSX.
     <Submenu
       offset={4}
       disabled={props.disabled}
-      trigger={
-        <View
-          hoverStyle={hovered()}
-          activeStyle={pressed()}
-          style={{ flexDirection: "row", alignItems: "center", gap: 8, height: item.height, paddingHorizontal: inset, borderRadius: item.radius, opacity: props.disabled ? 0.35 : 1 }}
-        >
-          <If when={props.icon}>
-            <LucideIcon name={props.icon!} size={item.icon} tint={colors.muted} />
-          </If>
-          <Text style={{ numberOfLines: 1, flexGrow: 1, flexShrink: 0, fontSize: item.font, color: colors.text }}>{props.label}</Text>
-          <Icon name="chevron" size={pointer ? 12 : 14} tint={colors.faint} />
-        </View>
-      }
-      back={
-        <View activeStyle={pressed()} style={{ flexDirection: "row", alignItems: "center", gap: 6, height: item.height, paddingHorizontal: inset, borderRadius: item.radius }}>
-          <Icon name="back" size={14} tint={colors.accent} />
-          <Text style={{ fontSize: item.font, fontWeight: "600", color: colors.accent }}>{props.label}</Text>
-        </View>
-      }
+      trigger={<SubmenuRow label={props.label} disabled={props.disabled} lead={props.icon ? <LucideIcon name={props.icon} {...menuItemGlyph()} /> : undefined} />}
+      back={<SubmenuBack label={props.label} />}
     >
-      <Panel side="right">{props.children}</Panel>
+      {props.children}
     </Submenu>
   );
 }
 
-/** A group's title: not an item, nothing to press. */
-function Label(props: { text: string }) {
-  return (
-    <Text style={{ fontSize: pointer ? 11 : 13, fontWeight: "600", color: colors.faint, paddingHorizontal: inset, paddingTop: 6, paddingBottom: 2 }}>
-      {props.text}
-    </Text>
-  );
-}
-
 function Separator() {
-  // A groove: a hairline with a lip of light under it.
-  return (
-    <MenuSeparator
-      style={{ height: 1, marginTop: 4, marginBottom: 5, marginHorizontal: 4, backgroundColor: colors.line, boxShadow: `0 1px 0 ${isDark() ? "rgba(255,255,255,0.05)" : "#ffffff"}` }}
-    />
-  );
+  return <MenuSeparator style={menuSeparator()} />;
 }
 
 /** What opens a menu: a quiet menu bar title (`bar`), else a raised button. */
-function Chip(props: { label: string; icon?: "plus" | "search" | "star"; bar?: boolean; open?: boolean }) {
+function Chip(props: { label: string; icon?: "plus" | "search" | "star"; lucide?: LucideIconName; bar?: boolean; open?: boolean }) {
   // Open: selected, as the shared `Button`'s `selected` (a menu bar title
   // keeps the hover's accent fill, a raised button its pressed look).
   const look = () =>
@@ -171,6 +99,10 @@ function Chip(props: { label: string; icon?: "plus" | "search" | "star"; bar?: b
     >
       <If when={props.icon}>
         <Icon name={props.icon!} size={pointer ? 13 : 14} tint={colors.muted} />
+      </If>
+      {/* The terminal draws no icons. */}
+      <If when={props.lucide && !terminal}>
+        <LucideIcon name={props.lucide!} size={pointer ? 13 : 14} tint={colors.muted} />
       </If>
       <Text style={{ fontSize: pointer ? 13 : 15, fontWeight: "500", color: colors.text }}>{props.label}</Text>
     </View>
@@ -257,10 +189,10 @@ function Preview(props: { sidebar: boolean; minimap: boolean; sort: SortBy; zoom
  * shortcuts, submenus three levels deep, checkable settings and choices of
  * one that arrange a preview, group titles, disabled and destructive items; menus on the rows of a list
  * (the secondary button or a held finger, and a ⋯ button); where a popup
- * goes; a long menu that scrolls; a menu a shortcut opens. On desktops they
- * are popups with cascading submenus that grow out of their trigger, on
- * touch screens sheets that slide up, whose submenus take the place of
- * their items.
+ * goes; a long menu that scrolls; a menu a shortcut opens. On desktops and
+ * on an iPad in a regular width they are popups with cascading submenus that
+ * grow out of their trigger, on phones sheets that slide up, whose submenus
+ * take the place of their items.
  */
 export function Menus() {
   const events = signal<string[]>([]);
@@ -316,60 +248,54 @@ export function Menus() {
     });
     const key = (k: string) => (platform.desktop ? keymap.label(k) : undefined);
     return (
-      <Card icon="lists" title="Menu bar" subtitle={platform.desktop ? "Hover across submenus; the shortcuts work too" : "Each menu a sheet; submenus take its place"}>
+      <Card icon="lists" title="Menu bar" subtitle={platform.desktop ? "Hover across submenus; the shortcuts work too" : menuIsPopup() ? "Submenus open beside their items" : "Each menu a sheet; submenus take its place"}>
         {/* A toolbar: with one menu open, the pointer over another title opens it. */}
         <Toolbar accessibilityLabel="Menu bar" style={{ flexDirection: "row", gap: 2, marginLeft: pointer ? -10 : 0 }}>
-          <Menu offset={4} margin={8} popupStyle={sheet} backdropStyle={backdrop} onOpenChange={changed("File")} trigger={<Chip bar label="File" open={isOpen("File")} />}>
-            <Panel>
-              <Item label="New document" icon="file-plus" shortcut={key("mod+alt+n")} onSelect={() => act("New document")} />
-              <Item label="New window" icon="panel-top" onSelect={() => act("New window")} />
-              <SubmenuOf label="Open recent" icon="clock">
-                <Each of={recent()}>{(name) => <Item label={name()} onSelect={() => act(`Open ${name()}`)} />}</Each>
-                <Separator />
-                <Item label="Clear recent" disabled={recent().length === 0} onSelect={() => recent.set([])} />
-              </SubmenuOf>
+          <Menu offset={4} margin={8} {...menuPopup()} onOpenChange={changed("File")} trigger={<Chip bar label="File" open={isOpen("File")} />}>
+            <Item label="New document" icon="file-plus" shortcut={key("mod+alt+n")} onSelect={() => act("New document")} />
+            <Item label="New window" icon="panel-top" onSelect={() => act("New window")} />
+            <SubmenuOf label="Open recent" icon="clock">
+              <Each of={recent()}>{(name) => <Item label={name()} onSelect={() => act(`Open ${name()}`)} />}</Each>
               <Separator />
-              <Item label="Save" icon="download" shortcut={key("mod+alt+s")} onSelect={() => act("Save")} />
-              <SubmenuOf label="Export as" icon="share-2">
-                <Item label="PDF" onSelect={() => act("Export PDF")} />
-                <SubmenuOf label="Image">
-                  <Item label="PNG" onSelect={() => act("Export PNG")} />
-                  <Item label="JPEG" onSelect={() => act("Export JPEG")} />
-                  <Item label="WebP" onSelect={() => act("Export WebP")} />
-                </SubmenuOf>
-                <SubmenuOf label="Web page" disabled>
-                  <Item label="HTML" />
-                </SubmenuOf>
+              <Item label="Clear recent" disabled={recent().length === 0} onSelect={() => recent.set([])} />
+            </SubmenuOf>
+            <Separator />
+            <Item label="Save" icon="download" shortcut={key("mod+alt+s")} onSelect={() => act("Save")} />
+            <SubmenuOf label="Export as" icon="share-2">
+              <Item label="PDF" onSelect={() => act("Export PDF")} />
+              <SubmenuOf label="Image">
+                <Item label="PNG" onSelect={() => act("Export PNG")} />
+                <Item label="JPEG" onSelect={() => act("Export JPEG")} />
+                <Item label="WebP" onSelect={() => act("Export WebP")} />
               </SubmenuOf>
-              <Separator />
-              <Item label="Delete document" icon="trash" danger onSelect={() => act("Delete document")} />
-            </Panel>
+              <SubmenuOf label="Web page" disabled>
+                <Item label="HTML" />
+              </SubmenuOf>
+            </SubmenuOf>
+            <Separator />
+            <Item label="Delete document" icon="trash" danger onSelect={() => act("Delete document")} />
           </Menu>
-          <Menu offset={4} margin={8} popupStyle={sheet} backdropStyle={backdrop} onOpenChange={changed("Edit")} trigger={<Chip bar label="Edit" open={isOpen("Edit")} />}>
-            <Panel>
-              <Item label={history().length ? `Undo ${history().at(-1)}` : "Undo"} icon="undo-2" shortcut={key("mod+alt+z")} disabled={history().length === 0} onSelect={undo} />
-              <Item label={undone().length ? `Redo ${undone().at(-1)}` : "Redo"} icon="redo-2" shortcut={key("mod+alt+shift+z")} disabled={undone().length === 0} onSelect={redo} />
-              <Separator />
-              <Label text="Clipboard" />
-              <Item label="Cut" icon="scissors" onSelect={() => act("Cut")} />
-              <Item label="Copy" icon="copy" onSelect={() => act("Copy")} />
-              <Item label="Paste" icon="clipboard-paste" onSelect={() => act("Paste")} />
-            </Panel>
+          <Menu offset={4} margin={8} {...menuPopup()} onOpenChange={changed("Edit")} trigger={<Chip bar label="Edit" open={isOpen("Edit")} />}>
+            <Item label={history().length ? `Undo ${history().at(-1)}` : "Undo"} icon="undo-2" shortcut={key("mod+alt+z")} disabled={history().length === 0} onSelect={undo} />
+            <Item label={undone().length ? `Redo ${undone().at(-1)}` : "Redo"} icon="redo-2" shortcut={key("mod+alt+shift+z")} disabled={undone().length === 0} onSelect={redo} />
+            <Separator />
+            <MenuLabel text="Clipboard" />
+            <Item label="Cut" icon="scissors" onSelect={() => act("Cut")} />
+            <Item label="Copy" icon="copy" onSelect={() => act("Copy")} />
+            <Item label="Paste" icon="clipboard-paste" onSelect={() => act("Paste")} />
           </Menu>
-          <Menu offset={4} margin={8} popupStyle={sheet} backdropStyle={backdrop} onOpenChange={changed("View")} trigger={<Chip bar label="View" open={isOpen("View")} />}>
-            <Panel>
-              {/* Settings keep the menu open, so each shows its new value at once. */}
-              <Item label="Show sidebar" checked={sidebar()} keepOpen shortcut={key("mod+alt+b")} onSelect={() => arrange(() => sidebar.set(!sidebar()))} />
-              <Item label="Show minimap" checked={minimap()} keepOpen onSelect={() => arrange(() => minimap.set(!minimap()))} />
-              <Separator />
-              <Label text="Sort by" />
-              {/* One choice of a group: choosing closes the menu. */}
-              <Each of={SORTS}>{(by) => <Item label={by()} radio checked={sort() === by()} onSelect={() => arrange(() => sort.set(by()))} />}</Each>
-              <Separator />
-              <SubmenuOf label="Zoom" icon="maximize-2">
-                <Each of={ZOOMS}>{(size) => <Item label={size()} radio checked={zoom() === size()} keepOpen onSelect={() => arrange(() => zoom.set(size()))} />}</Each>
-              </SubmenuOf>
-            </Panel>
+          <Menu offset={4} margin={8} {...menuPopup()} onOpenChange={changed("View")} trigger={<Chip bar label="View" open={isOpen("View")} />}>
+            {/* Settings keep the menu open, so each shows its new value at once. */}
+            <Item label="Show sidebar" checked={sidebar()} keepOpen shortcut={key("mod+alt+b")} onSelect={() => arrange(() => sidebar.set(!sidebar()))} />
+            <Item label="Show minimap" checked={minimap()} keepOpen onSelect={() => arrange(() => minimap.set(!minimap()))} />
+            <Separator />
+            <MenuLabel text="Sort by" />
+            {/* One choice of a group: choosing closes the menu. */}
+            <Each of={SORTS}>{(by) => <Item label={by()} radio checked={sort() === by()} onSelect={() => arrange(() => sort.set(by()))} />}</Each>
+            <Separator />
+            <SubmenuOf label="Zoom" icon="maximize-2">
+              <Each of={ZOOMS}>{(size) => <Item label={size()} radio checked={zoom() === size()} keepOpen onSelect={() => arrange(() => zoom.set(size()))} />}</Each>
+            </SubmenuOf>
           </Menu>
         </Toolbar>
         <Preview sidebar={sidebar()} minimap={minimap()} sort={sort()} zoom={zoom()} />
@@ -378,6 +304,12 @@ export function Menus() {
       </Card>
     );
   }
+
+  /** A file's icon by its kind (its extension). */
+  const kindIcon = (name: string): IconName => {
+    const ext = name.slice(name.lastIndexOf(".") + 1).toLowerCase();
+    return ext === "pdf" ? "document" : ext === "jpg" || ext === "png" ? "photos" : ext === "key" ? "layers" : "file";
+  };
 
   function Rows() {
     let next = 5;
@@ -389,7 +321,7 @@ export function Menus() {
     ]);
     const update = (id: number, change: (f: File) => File) => files.set(files().map((f) => (f.id === id ? change(f) : f)));
     const actions = (file: () => File) => (
-      <Panel>
+      <>
         <Item label="Open" icon="external-link" onSelect={() => log(`open ${file().name}`)} />
         <Item label="Starred" checked={file().starred} onSelect={() => update(file().id, (f) => ({ ...f, starred: !f.starred }))} />
         <Item
@@ -408,7 +340,7 @@ export function Menus() {
         </SubmenuOf>
         <Separator />
         <Item label="Delete" icon="trash" danger onSelect={() => files.set(files().filter((f) => f.id !== file().id))} />
-      </Panel>
+      </>
     );
     return (
       <Card icon="photos" title="On the rows of a list" subtitle={platform.desktop ? "Right click a row, or its ⋯ button" : "Hold a finger on a row, or press its ⋯"}>
@@ -416,17 +348,23 @@ export function Menus() {
           <View>
             <Each of={files()} key={(f) => f.id}>
               {(file, i) => (
-                <ContextMenu margin={8} popupStyle={sheet} backdropStyle={backdrop} onOpenChange={changed(file().name)} trigger={
-                  <Row first={i() === 0}>
-                    <Icon name={file().starred ? "star" : "text"} size={16} tint={file().starred ? colors.accent : colors.muted} />
-                    <Text style={{ numberOfLines: 1, flex: 1, fontSize: 14, color: colors.text }}>{file().name}</Text>
-                    <Menu align="end" offset={4} margin={8} popupStyle={sheet} backdropStyle={backdrop} onOpenChange={changed(`${file().name} ⋯`)} trigger={
+                <ContextMenu margin={8} {...menuPopup()} onOpenChange={changed(file().name)} trigger={
+                  <Row first={i() === 0} focusable>
+                    <Icon name={kindIcon(file().name)} size={16} tint={colors.muted} />
+                    {/* The star follows the name, so the kind's icon stays in its column. */}
+                    <View style={{ flex: 1, minWidth: 0, flexDirection: "row", alignItems: "center", gap: 6 }}>
+                      <Text style={{ numberOfLines: 1, flexShrink: 1, fontSize: 14, color: colors.text }}>{file().name}</Text>
+                      <If when={file().starred}>
+                        <Icon name="star" size={12} tint={colors.accent} />
+                      </If>
+                    </View>
+                    <Menu align="end" offset={4} margin={8} {...menuPopup()} onOpenChange={changed(`${file().name} ⋯`)} trigger={
                       <View
                         accessibilityLabel={`Actions for ${file().name}`}
                         tooltip={<Tip label="More actions" />}
                         hitSlop={8}
-                        hoverStyle={hovered()}
-                        activeStyle={{ backgroundColor: alpha(colors.text, 0.1) }}
+                        hoverStyle={menuHighlight()}
+                        activeStyle={menuPressed()}
                         style={{
                           width: 28,
                           height: 28,
@@ -458,7 +396,7 @@ export function Menus() {
     const placement = signal<"top" | "bottom" | "left" | "right">("bottom");
     const align = signal<"start" | "center" | "end">("start");
     return (
-      <Card icon="components" title="Where it goes" subtitle={platform.desktop ? "The side and alignment; it flips where there is no room" : "Phones show menus as sheets: try a desktop"}>
+      <Card icon="components" title="Where it goes" subtitle={menuIsPopup() ? "The side and alignment; it flips where there is no room" : "Menus are sheets here: try a desktop"}>
         <Segmented
           size="small"
           options={[{ value: "top", label: "Top" }, { value: "bottom", label: "Bottom" }, { value: "left", label: "Left" }, { value: "right", label: "Right" }]}
@@ -472,12 +410,10 @@ export function Menus() {
           onChange={(v) => align.set(v)}
         />
         <View style={{ alignItems: "center", paddingVertical: 24 }}>
-          <Menu placement={placement()} align={align()} offset={6} margin={8} popupStyle={sheet} backdropStyle={backdrop} onOpenChange={changed("Placed")} trigger={<Chip label={`${placement()} · ${align()}`} open={isOpen("Placed")} />}>
-            <Panel side={placement()}>
-              <Item label="One" onSelect={() => log("chose One")} />
-              <Item label="Two" onSelect={() => log("chose Two")} />
-              <Item label="Three" onSelect={() => log("chose Three")} />
-            </Panel>
+          <Menu placement={placement()} align={align()} offset={6} margin={8} {...menuPopup({ get side() { return placement(); } })} onOpenChange={changed("Placed")} trigger={<Chip label={placementWords(placement(), align())} lucide="map-pin" open={isOpen("Placed")} />}>
+            <Item label="One" onSelect={() => log("chose One")} />
+            <Item label="Two" onSelect={() => log("chose Two")} />
+            <Item label="Three" onSelect={() => log("chose Three")} />
           </Menu>
         </View>
       </Card>
@@ -488,12 +424,9 @@ export function Menus() {
     const zone = signal("UTC+8 Hong Kong");
     return (
       <Card icon="scroll" title="A long menu" subtitle="Twenty choices in a menu that scrolls">
-        <Menu offset={4} margin={8} popupStyle={sheet} backdropStyle={backdrop} onOpenChange={changed("Time zone")} trigger={<Chip label={zone()} icon="search" open={isOpen("Time zone")} />}>
-          <Panel flush>
-            <Scroll style={{ maxHeight: platform.desktop ? 280 : 360 }} contentStyle={{ padding: 6 }}>
-              <Each of={ZONES}>{(z) => <Item label={z()} radio checked={zone() === z()} onSelect={() => zone.set(z())} />}</Each>
-            </Scroll>
-          </Panel>
+        <Menu offset={4} margin={8} {...menuPopup()} onOpenChange={changed("Time zone")} trigger={<Chip label={zone()} icon="search" open={isOpen("Time zone")} />}>
+          {/* As many as the room on its side takes: the rest scroll in the popup. */}
+          <Each of={ZONES}>{(z) => <Item label={z()} radio checked={zone() === z()} onSelect={() => zone.set(z())} />}</Each>
         </Menu>
       </Card>
     );
@@ -509,7 +442,7 @@ export function Menus() {
     };
     keymap.bind("mod+shift+p", () => open.set(!open()));
     return (
-      <Card icon="spark" title="Opened by the app" subtitle="A controlled menu: a button or a shortcut opens it" right={platform.desktop ? <Badge label={keymap.label("mod+shift+p")} /> : undefined}>
+      <Card icon="spark" title="Opened by the app" subtitle="A button or a shortcut opens it" right={platform.desktop ? <Kbd label={keymap.label("mod+shift+p")} /> : undefined}>
         <Menu
           open={open()}
           onOpenChange={({ open: next, reason }) => {
@@ -518,23 +451,20 @@ export function Menus() {
           }}
           offset={4}
           margin={8}
-          popupStyle={sheet}
-          backdropStyle={backdrop}
+          {...menuPopup()}
           trigger={<Chip label="Commands" icon="plus" open={open()} />}
         >
-          <Panel>
-            <Label text="Commands" />
-            <Item label="New note" icon="file-plus" onSelect={() => log("ran New note")} />
-            <Item
-              label={isDark() ? "Light appearance" : "Dark appearance"}
-              icon={isDark() ? "sun" : "moon"}
-              onSelect={() => {
-                setColorScheme(isDark() ? "light" : "dark");
-                log("ran Toggle theme");
-              }}
-            />
-            <Item label="Sync now" icon="refresh-cw" onSelect={sync} />
-          </Panel>
+          <MenuLabel text="Commands" />
+          <Item label="New note" icon="file-plus" onSelect={() => log("ran New note")} />
+          <Item
+            label={isDark() ? "Light appearance" : "Dark appearance"}
+            icon={isDark() ? "sun" : "moon"}
+            onSelect={() => {
+              setAppearance(isDark() ? "light" : "dark");
+              log("ran Toggle theme");
+            }}
+          />
+          <Item label="Sync now" icon="refresh-cw" onSelect={sync} />
         </Menu>
         <Button label="Open the commands" variant="secondary" onPress={() => open.set(true)} />
       </Card>
@@ -555,5 +485,108 @@ export function Menus() {
     );
   }
 
-  return <DemoPage cards={[MenuBar, Rows, Placement, LongList, Commands, Events]} />;
+  /**
+   * The system's own controls: `MenuButton` shows UIKit's menu from the
+   * gallery's chip on iOS (the platform's context menu on the desktops),
+   * a `ContextMenu` given `items` lifts its note into UIKit's context menu
+   * on iOS (the gallery's drawn menu elsewhere), and `SegmentedControl` is
+   * a `UISegmentedControl` on iOS, the gallery's drawn segments elsewhere.
+   */
+  function SystemMenu() {
+    const sort = signal<"Name" | "Date" | "Size">("Date");
+    const starred = signal(false);
+    const folder = signal<"Documents" | "Archive">("Documents");
+    const note = "Design review";
+    const choose = (id: string) => {
+      if (id === "star") starred.set(!starred());
+      if (id.startsWith("move:")) folder.set(id.slice(5) as "Documents" | "Archive");
+      log(`context menu · ${id}`);
+    };
+    const layout = signal(0);
+    const layouts = ["List", "Grid", "Columns"] as const;
+    const ios = platform.os === "ios";
+    const menuOff = !ios && !platform.desktop;
+    return (
+      <Card icon="system" title="The system's menu" subtitle={ios ? "UIKit's menu and segmented control" : platform.desktop ? "The platform's menu at the pointer" : "Phones without a system menu use Menu"}>
+        <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
+          <MenuButton
+            testID="system-menu"
+            accessibilityLabel="Arrange"
+            title="Arrange"
+            disabled={menuOff}
+            items={[
+              { id: "", label: "Sort by", inline: true, items: (["Name", "Date", "Size"] as const).map((by) => ({ id: `sort:${by}`, label: by, checked: sort() === by })) },
+              { id: "share", label: "Share", icon: "square.and.arrow.up" },
+              { id: "duplicate", label: "Duplicate", icon: "plus.square.on.square" },
+              { id: "", label: "", inline: true, items: [{ id: "delete", label: "Delete", icon: "trash", destructive: true }] },
+            ]}
+            onSelect={({ id }) => {
+              if (id.startsWith("sort:")) sort.set(id.slice(5) as "Name" | "Date" | "Size");
+              log(`system menu · ${id}`);
+            }}
+          >
+            <Chip label={`Sorted by ${sort()}`} lucide="list-filter" />
+          </MenuButton>
+        </View>
+        <ContextMenu
+          margin={8}
+          {...menuPopup()}
+          title={`${note}.key`}
+          items={[
+            { id: "star", label: starred() ? "Unstar" : "Star", icon: starred() ? "star.slash" : "star" },
+            { id: "share", label: "Share", icon: "square.and.arrow.up" },
+            { id: "", label: "Move to", icon: "folder", items: (["Documents", "Archive"] as const).map((to) => ({ id: `move:${to}`, label: to, checked: folder() === to })) },
+            { id: "", label: "", inline: true, items: [{ id: "delete", label: "Delete", icon: "trash", destructive: true }] },
+          ]}
+          onSelect={({ id }) => choose(id)}
+          onOpenChange={changed(note)}
+          trigger={
+            <View
+              focusable
+              accessibilityLabel={`${note}, in ${folder()}`}
+              style={{
+                flexDirection: "row",
+                alignItems: "center",
+                gap: 12,
+                padding: 12,
+                borderRadius: 12,
+                borderWidth: 1,
+                borderColor: colors.border,
+                backgroundColor: isOpen(note) ? token("accent") : colors.raised,
+              }}
+            >
+              <View style={{ width: 36, height: 36, borderRadius: 8, alignItems: "center", justifyContent: "center", backgroundColor: colors.inset }}>
+                <Icon name="layers" size={18} tint={colors.muted} />
+              </View>
+              <View style={{ flex: 1, minWidth: 0, gap: 2 }}>
+                <View style={{ flexDirection: "row", alignItems: "center", gap: 6 }}>
+                  <Text style={{ numberOfLines: 1, flexShrink: 1, fontSize: 14, fontWeight: "600", color: colors.text }}>{note}</Text>
+                  <If when={starred()}>
+                    <Icon name="star" size={12} tint={colors.accent} />
+                  </If>
+                </View>
+                <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.muted }}>{`Keynote · ${folder()}`}</Text>
+              </View>
+            </View>
+          }
+        >
+          <Item label="Starred" checked={starred()} onSelect={() => choose("star")} />
+          <Item label="Share" icon="share-2" onSelect={() => choose("share")} />
+          <SubmenuOf label="Move to" icon="folder-input">
+            <Item label="Documents" radio checked={folder() === "Documents"} onSelect={() => choose("move:Documents")} />
+            <Item label="Archive" radio checked={folder() === "Archive"} onSelect={() => choose("move:Archive")} />
+          </SubmenuOf>
+          <Separator />
+          <Item label="Delete" icon="trash" danger onSelect={() => choose("delete")} />
+        </ContextMenu>
+        <Caption label={ios ? "Hold the note: UIKit lifts it into its context menu" : platform.desktop ? "Right click the note" : "Hold the note"} />
+        <If when={ios} else={<Segmented size="small" options={layouts.map((l, i) => ({ value: String(i), label: l }))} value={String(layout())} onChange={(v) => layout.set(Number(v))} />}>
+          <SegmentedControl testID="system-segments" items={layouts.map((title) => ({ title }))} selectedIndex={layout()} onChange={({ index }) => layout.set(index)} />
+        </If>
+        <Caption label={`${layouts[layout()]} · sorted by ${sort()}`} />
+      </Card>
+    );
+  }
+
+  return <DemoPage cards={[MenuBar, Rows, Placement, LongList, Commands, SystemMenu, Events]} />;
 }

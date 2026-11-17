@@ -149,10 +149,14 @@ pub(crate) fn decode_command<'js>(name: &str, arg: Value<'js>) -> compat::Result
         "stopLoading" => Command::StopLoading,
         "injectJavaScript" => Command::InjectJavaScript(string(&arg)?),
         "postMessage" => Command::PostMessage(string(&arg)?),
+        "insertText" => Command::InsertText(string(&arg)?),
         "sendInput" => match web_input(&arg) {
             Some(input) => Command::SendInput(input),
             None => return Ok(None),
         },
+        // An iframe cannot send headers with its request: `load` does
+        // nothing here rather than load the page without them.
+        "load" => return Ok(None),
         "seek" => Command::Seek(arg.as_number().unwrap_or(0.0)),
         "native" => {
             let o = arg.as_object();
@@ -206,6 +210,15 @@ pub(crate) fn decode_command<'js>(name: &str, arg: Value<'js>) -> compat::Result
                 .and_then(|o| o.get::<_, Option<bool>>("animated").ok().flatten())
                 .unwrap_or(true),
         },
+        "reveal" => Command::Reveal(
+            <nsh_core::RevealOptions as HostValue>::decode(&Js(arg.clone()), &mut HostCx::default())
+                .ok_or_else(|| {
+                    Exception::throw_type(
+                        arg.ctx(),
+                        "reveal: vertical and horizontal must be \"start\", \"center\", \"end\" or \"nearest\"",
+                    )
+                })?,
+        ),
         "layoutAnimation" => Command::LayoutAnimation(
             <LayoutAnimation as HostValue>::decode(&Js(arg), &mut HostCx::default())
                 .unwrap_or_default(),
@@ -424,7 +437,17 @@ pub(crate) fn decode_prop<'js>(
     }
     let mut cx = tag.map_or_else(HostCx::default, HostCx::for_element);
     let input = Js(value);
-    let decoded = <Prop as HostProps>::decode(name, &input, &mut cx);
+    // `captureKeys` holds keystrokes: `mod` is Command where the page's
+    // platform follows Apple's conventions, which this bridge knows from
+    // the environment the page sent, not from an engine's ambient one.
+    let decoded = if name == "captureKeys" {
+        Some(
+            nsh_core::js::host::decode_capture_keys(&input, &mut cx, super::apple_keyboard())
+                .map(Prop::KeyCapture),
+        )
+    } else {
+        <Prop as HostProps>::decode(name, &input, &mut cx)
+    };
     for message in cx.warnings {
         warnings.warn(message);
     }
@@ -836,8 +859,8 @@ fn decode_animation(r: &mut Reader<'_, '_>) -> compat::Result<AnimationOp> {
         ANIMATION_DIFF_CLAMP => AnimationOp::CreateDiffClamp {
             node,
             input: r.int()? as nsh_core::animation::NodeId,
-            min: r.number()?,
-            max: r.number()?,
+            min: r.operand()?,
+            max: r.operand()?,
             snap: r.value()?.as_bool().unwrap_or(false),
         },
         ANIMATION_START_COMPOSITE => {
@@ -976,6 +999,7 @@ fn decode_driver(cx: &Ctx<'_>, config: &Value<'_>) -> compat::Result<Driver> {
             easing: nsh_core::js::animation::easing(&Js(c.get::<_, Value>("easing")?))
                 .unwrap_or(Easing::EaseInOut),
             delay_ms: num("delay")?.unwrap_or(0.0),
+            frame_rate: num("frameRate")?,
         },
         "spring" => Driver::Spring {
             to: num("to")?.unwrap_or(0.0),
@@ -983,6 +1007,7 @@ fn decode_driver(cx: &Ctx<'_>, config: &Value<'_>) -> compat::Result<Driver> {
             damping: num("damping")?.unwrap_or(26.0),
             mass: num("mass")?.unwrap_or(1.0),
             velocity: num("velocity")?,
+            frame_rate: num("frameRate")?,
         },
         "decay" => Driver::Decay {
             velocity: num("velocity")?,
@@ -998,6 +1023,7 @@ fn decode_driver(cx: &Ctx<'_>, config: &Value<'_>) -> compat::Result<Driver> {
                 None => None,
             },
             bounce: num("bounce")?.unwrap_or(0.0),
+            frame_rate: num("frameRate")?,
         },
         other => {
             return Err(Exception::throw_type(

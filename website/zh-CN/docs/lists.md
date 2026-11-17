@@ -137,17 +137,17 @@ const toggle = (id: number) =>
 
 ## 修改数据
 
-在 Rust 中，把行数写成 signal 或闭包（`move || posts.with(Vec::len)`）：列表会原地增长和收缩。只在末尾增删的行不需要做别的；在其他位置增删行时，用 `.keys(move || posts.with(|p| p.iter().map(|p| p.id).collect::<Vec<_>>()))` 给出各行的标识，列表会保留相同的开头和结尾，中间部分视为删除和插入。
+在 Rust 中，把行数写成 signal 或闭包（`move || posts.with(Vec::len)`）：列表会原地增长和收缩。只在末尾增删的行不需要做别的；在其他位置增删行时，用 `.keys(move || posts.with(|p| p.iter().map(|p| p.id).collect::<Vec<_>>()))` 给出各行的标识，列表会按键匹配各行。
 
-在 TSX 中，传入新数组即可改变条目：`posts.set([...posts(), ...more])`。列表会**按条目标识**（`===`）比较新旧数组，保留相同的开头和结尾，中间部分视为删除和插入。
+在 TSX 中，传入新数组即可改变条目：`posts.set([...posts(), ...more])`。列表会**按条目标识**（`===`）比较新旧数组，或者按 `keyExtractor` 返回的键比较。
 
-两种方式下，测量结果都跟随各自的行；在屏幕上可见的行之上插入行时，可见行保持原位，不会跳动。
+两种方式下，留下的行无论挪到哪里，都保留自己的单元格、内容和测量结果（例如条目更新后排到最前），它经过的那些行也一样：其中获得焦点的输入框、打开的菜单都保持原样。只有新条目才会新建行。在屏幕上可见的行之上插入行时，可见行保持原位，不会跳动。
 
 - 在 TSX 中用不可变的方式更新：新数组，未改变的条目对象原样复用。原地修改数组（`push`）不会被察觉。
 - 改动过的条目应是一个新对象（`{ ...post, title }`），这样它的行才会显示变化。
 - 在前面插入（新消息、刷新后的信息流）会保留用户的阅读位置。
 
-`keyExtractor` 为可见性回调中的条目命名（见下文）；默认依次取 `item.key`、`item.id`、索引。在 TSX 中它不影响改动的匹配方式，匹配总是按标识进行。
+`keyExtractor` 给出匹配改动所用的键，因此重建为新对象的条目仍保留各自的行；它也为可见性回调中的条目命名（见下文）。不传时按标识匹配改动，可见性回调依次取 `item.key`、`item.id`、索引为条目命名。
 
 ## 属性
 
@@ -163,6 +163,7 @@ const toggle = (id: number) =>
 | `numColumns` | `.columns(n)` | `number` | `1` | 每行的条目数（纵向列表）。 |
 | `inverted` | `.inverted()` | `boolean` | `false` | 第 0 项在底部（聊天）；初始滚动到末尾，并保持与末尾的距离。 |
 | `maintainVisibleContentPosition` | `.follow_end(px(..))` | `{ autoscrollToBottomThreshold?: number }` | | 非倒置列表在距离末尾不超过该点数时，随内容增长停留在末尾（见下文）。 |
+| `alignment` | `.alignment(ListAlignment::..)` | `"top" \| "bottom"` | `"top"` | 列表停靠的位置。`"bottom"`：打开时位于末尾，内容增长时保持在末尾，行按阅读顺序排列（见下文）。 |
 | `stickyHeaderIndices` | `.sticky_header_indices(..)` | `number[]` | | 滚过时吸附在顶部的条目（单列且非倒置）。 |
 | `stickyHeaderOffset` | `.sticky_header_offset(px(..))`、`.bind_sticky_header_offset(&node)` | `number \| AnimatedNode` | `0` | 吸顶条目吸附在距顶部多远的位置，同 CSS `position: sticky` 的 `top`；内容继续在其上方的空间下滚动。动画值让它们逐帧移动。 |
 | `contentStyle` | `.content_padding(..)`、`.content_padding_x(..)` 等、`.row_gap(..)`、`.column_gap(..)` | `{ padding*, gap, rowGap, columnGap }` | | 内容的内边距和间距，只接受数字。 |
@@ -172,19 +173,20 @@ const toggle = (id: number) =>
 | `empty` | `.empty(..)` | 组件或元素 | | 没有条目时代替条目显示。 |
 | `separator` | `.separator(\|\| ..)` | 组件或元素 | | 条目之间（单列）。 |
 | `initialScrollIndex` | `.initial_scroll_index(i)` | `number` | | 第一帧之前滚动到该条目。 |
+| `initialScrollAtEnd` | `.initial_scroll_at_end()` | `boolean` | `false` | 首帧前滚动到末尾并在行高测量时保持末尾位置。短内容从顶部排列；TSX 中优先于 `initialScrollIndex`；Rust 中最后调用的初始滚动方法生效。 |
 | `onLoadMore` | `.on_load_more(..)` | `() => void` | | 接近末尾（见下文）。 |
 | `loadMoreThreshold` | `.load_more_threshold(..)` | `number` | `1` | 距离末尾多少个视口时触发 `onLoadMore`。 |
 | `onLoadMoreAtStart` | `.on_load_more_at_start(..)` | `() => void` | | 滚动后接近开头（见下文）。 |
 | `loadMoreAtStartThreshold` | `.load_more_at_start_threshold(..)` | `number` | `1` | 距离开头多少个视口时触发 `onLoadMoreAtStart`。 |
 | `onViewableItemsChange` | `.on_viewable_items_change(..)` | `(info) => void` | | 有条目变为可见或不再可见。 |
 | `viewabilityConfig` | `.viewability(..)`、`.minimum_view_time(..)` | `ViewabilityConfig` | | 什么情况下条目算作可见。 |
-| `keyExtractor` | `.keys(..)` | `(item, index) => string` | | 可见性回调中的键；在 Rust 中是各行的标识。 |
+| `keyExtractor` | `.keys(..)` | `(item, index) => string` | | 各行的标识，用来匹配改动；也是可见性回调中的键。 |
 | `refreshing` / `onRefresh` | `.refreshing(..)` / `.on_refresh(..)` | `boolean` / `() => void` | | 下拉刷新。 |
 | `refreshIndicator` | `.refresh_indicator(..)` | `{ height: number }` | | 应用自己的下拉刷新指示器，取代平台的转圈（见[滚动](./scrolling.md#自己的指示器)）。 |
-| `scrollbar` | `.scrollbar(..)` | `boolean \| ScrollbarTheme` | `true` | 显示滚动条：平台的滚动指示器，或应用设置主题后的[内置滚动条](../elements/scrollbar.md#内置滚动条)；对象是该视图自己的主题。在桌面和桌面浏览器中，横向视图始终保留滚动条：它是鼠标的滚动条。 |
-| `ref` | `.element_ref(&list)` | `ListRef` | | `scrollToIndex`、`scrollToOffset`、`scrollToEnd`、`scrollTo`。 |
+| `scrollbar` | `.scrollbar(..)` | `boolean \| ScrollbarTheme` | `true` | 显示滚动条：平台的滚动指示器，或应用设置主题后的[内置滚动条](../elements/scrollbar.md#内置滚动条)；对象是该视图自己的主题。 |
+| `ref` | `.element_ref(&list)` | `ListRef` | | `scrollToIndex`、`scrollToOffset`、`scrollToEnd`、`scrollTo`、`measureScrollPosition`。 |
 
-头部、尾部和空状态插槽接受元素（在 TSX 中也可以是组件：`header={Header}`）。它们是独立的单元格，从不被复用，并且和其他元素一样是响应式的。
+头部、尾部和空状态插槽接受元素（在 TSX 中也可以是组件：`header={Header}`）。它们是独立的单元格，从不被复用，并且和其他元素一样是响应式的：整个插槽是一个 `<If>` 或 `<Each>` 时，它随条件或数据更新；组件只调用一次。
 
 ## 多列与网格
 
@@ -465,6 +467,25 @@ mount(Chat);
 ```
 
 在倒置列表上调用 `scroll_to_end(..)` / `scrollToEnd()` 会滚动到它的开头，也就是最新的消息。
+
+### 底部对齐
+
+`alignment="bottom"`（Rust 中为 `.alignment(ListAlignment::Bottom)`）是构建聊天界面最简单的方式：消息按阅读顺序排列，最旧的在前，列表打开时显示最新消息。回复流式输出、追加消息或键盘弹出时，列表保持在末尾；用户向上滚动后，可见内容保持不动，滚回末尾后继续跟随。消息不足一屏时位于视口底部。
+
+列表增长时，各行在内容中的位置不变，所以追加一条消息不会移动其他行：列表只放置新行并滚动一次。通过 `onLoadMoreAtStart` 在前面插入的旧消息也不会移动可见的行。
+
+```rust tabs
+virtual_list(move || messages.with(Vec::len), move |at| bubble(messages, at))
+    .keys(move || messages.with(|m| m.iter().map(|m| m.id).collect::<Vec<_>>()))
+    .alignment(ListAlignment::Bottom)
+    .flex_1()
+```
+
+```tsx tabs
+<List each={messages()} keyExtractor={(m) => m.id} alignment="bottom" style={{ flex: 1 }}>
+  {(m) => <Bubble message={m()} />}
+</List>
+```
 
 ### 让非倒置列表跟随末尾
 
@@ -759,7 +780,48 @@ let list!: ListRef;
 list.scrollToIndex({ index: 120, viewPosition: 0.5 });
 ```
 
-滚动到索引（以及滚动到末尾）由原生根据当时已知的尺寸计算：已测量的行用实测值，其余用预估尺寸。之后在目标附近的行被测量时，列表会持续跟随目标，因此能准确落位，直到用户自己滚动或数据变化为止。要让列表一打开就停在某个条目，请用 `initialScrollIndex`（`.initial_scroll_index(..)`），而不是在第一帧之后再滚动。
+滚动到索引（以及滚动到末尾）由原生根据当时已知的尺寸计算：已测量的行用实测值，其余用预估尺寸。之后在目标附近的行被测量时，列表会持续跟随目标，因此能准确落位，直到用户自己滚动或数据变化为止。要让列表一打开就停在某个条目，请用 `initialScrollIndex`（`.initial_scroll_index(..)`），停在末尾则用 `initialScrollAtEnd`（`.initial_scroll_at_end()`），而不是在第一帧之后再滚动。
+
+<a id="keeping-a-reading-position"></a>
+
+### 记住阅读位置
+
+`measureScrollPosition()`（`measure_scroll_position()`）在本轮改动排版后给出视口起点落在哪一行：`{ index, offset }`，即那一行和视口起点在行内多深，用的是列表自己排行的位置（已测量的行按实测尺寸，其余按预估尺寸）。在列表滚动时读取并保存；`scrollToIndex({ index, viewOffset: -offset })` 能把视口起点放回原处，无论是同一个列表还是重新创建的列表（它会随该行被测量而跟随）。没有条目的列表返回 `null`。它沿列表主轴、从第 0 项所在的一侧算起（倒置列表是底部）；视口起点在第一行之前的列表头里时，`index` 为 0，`offset` 为负。
+
+```rust tabs
+let list = element_ref();
+let reading = signal(None::<ListScrollPosition>);
+
+virtual_list(count, row)
+    .estimated_item_size(px(48.0))
+    .on_scroll(move |_| {
+        spawn(async move { reading.set(list.measure_scroll_position().await) });
+    })
+    .element_ref(&list)
+
+// 之后，在重新创建的列表里：
+if let Some(at) = reading.get() {
+    list.scroll_to_index(at.index, percentage(0.0), -at.offset, false);
+}
+```
+
+```tsx tabs
+let list!: ListRef;
+let reading: { index: number; offset: number } | null = null;
+
+<List
+  ref={list}
+  each={items}
+  estimatedItemSize={48}
+  onScroll={async () => (reading = await list.measureScrollPosition())}
+  style={{ flex: 1 }}
+>
+  …
+</List>;
+
+// 之后，在重新创建的列表里：
+if (reading) list.scrollToIndex({ index: reading.index, viewOffset: -reading.offset, animated: false });
+```
 
 <a id="a-settings-style-list"></a>
 

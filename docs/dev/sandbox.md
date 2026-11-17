@@ -19,7 +19,24 @@ trusted: every limit and check is enforced in Rust, never in JS.
   rendering it causes, one list bind, one timer, one frame's callbacks, the microtask drain; nested calls share the
   outermost budget), and quotas for what the heap limit does not cover: changes at once (the op queue,
   `max_op_values`: ops are Rust memory), ops per canvas drawing, nodes in the core (`Core::set_max_nodes`; each may hold a native view) and dense
-  node ids (an id far past the ids in use would grow the id table: `ApplyError::IdOutOfRange`).
+  node ids (an id far past the ids in use would grow the id table: `ApplyError::IdOutOfRange`). Arrays the runtime
+  reads natively, where the time budget cannot interrupt (children, nested arrays counted together; `<Each>`; menus,
+  submenus counted together; a tray's title; `Animated.sequence` / `parallel` / `stagger`; `split`'s keys; a navigation
+  stack's routes; a native component's `props` and `events`; a pan's `touches`; a canvas call's arguments, counted
+  together; what the decoders of `protocol.rs` read of one value, counted together: a style and its shadows and
+  transforms, a host prop's lists, an animation's ranges and easing, a composite's runs, a native component's JSON),
+  hold at most `dom::MAX_ARRAY_ITEMS` (2^20) items, each loop running over the length it checked: a sparse array is as
+  long as it says, and one nested in itself multiplies its length, so more is refused (a `RangeError`; a menu's or the
+  tray's error; a canvas argument is ignored with a warning; an animation's `start` rejects) rather than read index by
+  index. Lengths are never read with rquickjs's `Array::len` (`protocol::take_len`): it asserts an integer, and the
+  length of an array of 2^31 items or more is a float, so the panic, in a call from QuickJS that cannot unwind, aborts
+  the process. A navigation stack does not grow past the bound either (`push` throws), so it can always be navigated.
+  Two arrays read together are looked up, never compared pairwise (`setRoutes`'s old and new routes, `split`'s keys
+  and the props' names, the keys a style's objects merge). Children, submenus and styles nested more than
+  `dom::MAX_DEPTH` (64) levels deep are refused, and a scrollbar theme's JSON reads `null` past that depth or 2^20
+  entries: they are read by native recursion, which the interpreter's stack limit does not cover. A composite keeps
+  the values it animates once each, however many places of its tree hold them. A list's rows (`<List each>`) are not
+  bounded: a long list is what it is for.
 - An overrun call is cut off by the interrupt handler with an exception no `catch` swallows, reported with the budget it
   exceeded; the VM goes on. Running out of memory or going over a quota **stops the VM** (`Host::fatal`), also when the
   app catches the error: the heap's allocator (`HeapAllocator`) enforces the limit and records reaching it, since QuickJS
@@ -35,50 +52,65 @@ trusted: every limit and check is enforced in Rust, never in JS.
   libraries such as axios. Hot updates are evaluated from Rust and need none of it.
 - **Capabilities** (`nsh_core::access`): an app declares what it may reach in `nsh.json` `"capabilities"` — `network`
   (`hosts`: `*`, `*.example.com` or a host; `http`: a host narrowed by methods, schemes, a port, paths and path prefixes),
-  `webview` (`hosts` a web view may show and navigate to; `input`: its ref's `sendInput`, trusted input that carries
+  `webview` (`hosts` a web view may show and navigate to, a page's own `blob:` URLs following the origin they embed;
+  `input`: its ref's `sendInput`, trusted input that carries
   user activation, so never granted without a declaration, `Capabilities::all` leaves it off), `statusBar`, `process` (`execute`: exact executable names or absolute paths; `exit`: host exit requests; `env`: additional
   visible environment names), `fs` (`read` / `write`: trusted path roots), `clipboard` (`nsh`'s `Clipboard`: reading and
   writing the system clipboard; the copy menu of selectable text is the user's own act and needs none), `picker`
-  (`nsh`'s `Picker`: showing the system's picker, whose picked files reach the app; denied, a pick rejects), `speech`
+  (`nsh`'s `Picker`: showing the system's picker, whose picked files reach the app; denied, a pick rejects), `share` (`nsh`'s `Share`:
+  showing the system's share sheet; denied, `Share.show` rejects; each shared file also needs `fs.read`), `speech`
   (`nsh`'s `Speech`: the microphone and the system's speech recognizer, whose transcript reaches the app; denied,
-  `Speech.start` throws), `host`
+  `Speech.start` throws), `audio` (`nsh`'s `Sound` and `AudioPlayer`: making sound; denied, `Sound.load` rejects and
+  `new AudioPlayer` throws; a remote source also needs `network`), `host`
   (`nsh`'s `host`: the embedding app's functions `host.call` may call, names or prefixes ending in `*`, `true` for all;
   names and grants are 1 to 128 of `[A-Za-z0-9_.:-]` without `..` (`access::valid_host_name`), and the core refuses
   the call of any other name before it reads the grants, since hosts may put names in paths or URLs;
   never granted without it, also in apps without a declaration (`Capabilities::all` leaves it empty), and the bundler
   warns of an app importing `host` from `nsh` without it (`bundle.rs` `ungranted_host`); the host's events need none, the
   host sends them), `openUrl`
-  (`openUrl` of `nsh`: `true`, or `{ "schemes": [...] }` for the schemes listed). `nsh`'s `Storage`
-  is no capability: an app's storage holds only its own data, and the host decides where it is kept. Everything not listed is denied and unknown keys
-  are build errors (`Capabilities::from_json`); a signed package's declaration is read with `from_json_lenient`, as a
-  newer signer may have written it: an unknown capability is not granted, an unknown key inside one drops that
+  (`openUrl` of `nsh`: `true`, or `{ "schemes": [...] }` for the schemes listed), `application` (what acts on the application as a whole:
+  the main window, the application menu, the tray, global shortcuts, quitting, restarting and launching at login,
+  `nsh/desktop`'s; refused commands are dropped in the core with a warning, `setLaunchAtLogin` rejects with
+  `ERR_ACCESS_DENIED`; context menus show in the app's own view and windows the app opens are `windows`', so they need
+  none), `homeDir` (`os.homedir()`, which fails with
+  `ERR_ACCESS_DENIED` without it). `nsh`'s `Storage`
+  is no capability: an app's storage holds only its own data, and the host decides where it is kept. Everything not listed is denied. `nsh.json`, bundles' `capabilities.json`, packages and embedders' grants are all
+  read with `from_json_lenient` (the bundler warns of what it dropped, `nsh_engine::parse_capabilities` logs it), as a newer NSH may have written them: an unknown capability is not granted, an unknown key inside one drops that
   capability or `http` grant (it may be a restriction), so unknown keys never widen access; an app without the key
-  retains unrestricted network, webview, status bar, clipboard, picker, speech and URL opening access. Process execution, filesystem access,
+  retains unrestricted network, webview, status bar, clipboard, picker, share, speech, audio, URL opening, window and home directory access. Process execution, filesystem access,
   trusted web view input and the host's functions always require explicit declarations, including standalone apps. The embedding app
   may grant less (`NshAppView.grantCapabilities` / `NshView.setGrantedCapabilities`, the same JSON): a request must be
   allowed by both (`Access`). The declaration travels with the bundle (`capabilities.json` next to it, written by
   `nsh build` / `nsh package`; the dev protocol's `Bundle` message, so development enforces the same capabilities; a change
-  reloads instead of patching) into `Policy::declared`.
+  reloads instead of patching) into `Policy::declared`. A Rust root (`nsh.json` `"root"`) carries it compiled in
+  (`Root::capabilities`, set by `rust_app.rs`'s generated `app_root()`), so every host checks a Rust app as a TSX one;
+  without it the root reaches what an app without a declaration does.
 - Enforced in Rust: `fetch` in the engine (`access.rs`; refused requests never reach the network, and redirects are
   followed by the engine with `follow_redirects` off for the platform, so every hop is checked — hops are issued on the
   engine thread when a hop's head arrives; a streamed request body is not sent again, so a 307 / 308 then fails); remote images, placeholders, canvas images, `Image.getSize` / `prefetch`, video sources, web view
-  sources, trusted web view input (`Command::SendInput`), the status bar, the clipboard, the picker, speech sessions and host calls in the core (`Core::check_prop`, the commit's commands and actions;
+  sources and inline HTML's base URLs, trusted web view input (`Command::SendInput`), the status bar, the clipboard, the picker, the share sheet, the main window and the application menu (`Command::Desktop` but `PopupMenu`, `OpenWindow` and
+  the app's own windows' commands), speech sessions, sounds and players (`AudioAction::Open`) and host calls in the core (`Core::check_prop`, the commit's commands and actions;
   each refusal is logged once, target `js`, saying which key to add); top-level web view navigations on the platforms
   (`WKNavigationDelegate decidePolicyForNavigationAction` / `WebViewClient.shouldOverrideUrlLoading` → `Native.allowsWebview`).
 - What a refusal does: every call JS makes fails with `JsError::access_denied` (`ERR_ACCESS_DENIED`, `permission` the
   capability's key, `resource` what was asked for, `""` when the capability has none), which its promise rejects with.
   The modules check in the call, on the `System` the call gets, so the error is typed and nothing is queued:
-  `Clipboard`'s functions (`runtime/clipboard.rs`), `Picker.pickImages`, `Speech.start` (`runtime/speech.rs`; it throws), `openUrl` (`runtime/device.rs`,
+  `Clipboard`'s functions (`runtime/clipboard.rs`), `Picker.pickImages`, `Picker.pickFiles`, `Speech.start` (`runtime/speech.rs`; it throws), `Sound.load` / `new AudioPlayer` (`runtime/audio.rs`), `openUrl` (`runtime/device.rs`,
   `open_url::not_granted`) and `Image.getSize` / `prefetch` (`runtime/image.rs`, `resource` the URL). `host.call` is
   refused by the core (the commit's `Command::HostCall`) and by the SDK channel (`nsh-js` `host_channel.rs`) with
   `nsh_core::host_channel::not_granted`. A refused `fetch` rejects as every failed fetch, with a `TypeError`, which
   carries `code`, `permission` `"network"` and `resource` the request's or the redirect's URL (`access::Refused`,
-  `Host::fetch_refused`). A refused source (image, placeholder, video, web view `src` or `html`) shows nothing and
+  `Host::fetch_refused`). A refused source (image, placeholder, video, web view `src` or `html`) shows nothing (a refused `baseUrl` is dropped and
+  the HTML loads without it) and
   reports `onError` with `code` `ERR_ACCESS_DENIED`, as the platforms report a refused navigation. What has no caller
   to answer (the status bar, a canvas image) only logs. Rust components' calls keep their Rust types: the core's
   checks answer them as the system would with nothing there (an empty clipboard, no picked files, `open_url` `false`)
   and an `Err` with the message for `fetch`.
   `asset:` URIs are always allowed. Host checks take the host after the last `@` (`https://ok.com@evil.io` is evil.io).
+  A URL that parsers read differently (`access::read_url`: a backslash before the query, which WHATWG's parser, the
+  web views', ends the host at and Foundation's `NSURL` keeps in the user info; an ASCII control character; a host
+  with percent-encoding or a WHATWG forbidden host code point) names no one host, port or path: only a grant of every
+  host with no port or path covers it (`*`, or no `capabilities`), and `parse_url` gives `None` for it.
 - **Desktop system APIs**: `process` and `fs/promises` (the only process and file APIs) check the intersection of the
   declaration and the optional host grant in Rust. Process commands match exactly: a grant for `codex` grants that
   command, while `/usr/bin/codex` requires its own entry. The runtime launches the executable directly with an
@@ -117,12 +149,21 @@ one form) names a `host` pattern; every other key narrows it and is optional: `m
 (any of `http`, `https`, `ws`, `wss`), `port` (any; a URL without one has its scheme's default), `paths` (exact,
 without the query) and `pathPrefixes` / `pathPrefix` / `path_prefixes` (whole segments: `/v1` covers `/v1/x`, not
 `/v10`; a prefix ending in `/` covers what follows). Without paths or prefixes a rule covers every path, so
-`{host, methods}` means what it always did. The spellings of a key are merged and may appear together (gpui-shell's
+`{host, methods}` means what it always did. Paths match the path WHATWG's parser (the `url` crate) sends, and what
+loads is what was checked: `Access::http_url` (the engine's requests) and `Access::media_url` (every media source; the
+core writes the result back over it) return the checked URL's serialization. For media, `//` and relative paths take
+the bundle's base URL (the page's on the web) and are refused without one; `asset:` paths stay inside the app's files
+(`access::is_inside_assets`, shared with `fetch`); a local file (`file:`, or with no base an absolute path) is read
+under `capabilities.fs.read` (`MediaFiles`: held to the roots by its text, then resolved on every check, since the
+platforms' loaders open what they get); a source that platforms read differently is granted only by `*` (#979). The
+spellings of a key are merged and may appear together (gpui-shell's
 `scheme` and `path_prefixes` read as they are); rules serialize in one form (`schemes`, `pathPrefixes`). What cannot
 match is a parse error rather than a silent grant of nothing: a scheme outside the four, port 0, a path without a
-leading `/` or with `*`, `?` or `#`, a method that is not a token. WebSockets (the global and the `websocket` module)
-go through `Access::allows_websocket`: a handshake is an HTTP GET, so `ws` / `wss` are checked as GETs over `http` /
-`https` (or under their own scheme, for rules listing `ws` / `wss`), on the parsed URL the handshake then connects
+leading `/`, with `*`, `?` or `#`, or with a `.` or `..` segment, a method that is not a token. A rule's paths are kept
+as requests send them (`path_as_sent`: WHATWG's serialization, `/my photos` → `/my%20photos`). WebSockets (the
+global and the `websocket` module) go through `Access::allows_websocket`: a handshake is an HTTP GET, so `ws` / `wss`
+are checked as GETs over `http` / `https` (or under their own scheme, for rules listing `ws` / `wss`), on the parsed
+URL the handshake then connects
 to, before DNS; redirects are rejected; both APIs share one cap of 32 per VM (the `Quotas` kind `runtime::WEBSOCKETS`). A
 `websocket` connection's unread messages are bounded by back pressure: it stops reading from the network while 8
 messages or 8 MiB wait (`runtime/websocket.rs`), so the native memory one keeps stays under 16 MiB. Raw TCP

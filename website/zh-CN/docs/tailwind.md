@@ -78,7 +78,8 @@ Rust 组件（`nsh/base` 的以及应用自己 crate 中的组件）在 TSX 中�
 |---|---|---|
 | `active:` | 视图被按下 | `.active(\|s\| ..)` |
 | `hover:` | 指针悬停在视图上（iPad 和 Mac 的指针） | `.hover(\|s\| ..)` |
-| `focus:`、`focus-visible:` | 输入框获得焦点 | `.focus(\|s\| ..)` |
+| `focus:` | 元素获得焦点 | `.focus(\|s\| ..)` |
+| `focus-visible:` | 元素获得焦点并显示焦点：键盘把焦点移到了这里 | `.focus_visible(\|s\| ..)` |
 | `focus-within:` | 视图或其后代获得焦点（`Overlay` 的内容是它所在视图的后代） | `.focus_within(..)` |
 | `disabled:`、`enabled:` | 元素的 `disabled` 属性为 true / false | `.disabled_style(\|s\| ..)` |
 | `selected:` | 元素处于选中状态（`Button` 的 `selected`、`accessibilityState.selected`） | `.selected_style(..)` |
@@ -86,9 +87,9 @@ Rust 组件（`nsh/base` 的以及应用自己 crate 中的组件）在 TSX 中�
 | `indeterminate:` | 元素处于半选状态（`accessibilityState.checked` 为 `"mixed"`） | `.indeterminate_style(..)` |
 | `aria-expanded:` | 元素处于展开状态（`accessibilityState.expanded` 为 `true`）：弹出层打开时 `Popover`、`Menu` 的触发器 | `.expanded_style(..)` |
 | `aria-pressed:` | 元素是处于开启状态的切换按钮（`accessibilityState.pressed` 为 `true`；`"mixed"` 不算按下）。不同于 `active:`（正在按压） | `.aria_pressed(..)`、`.pressed_style(..)` |
-| `aria-busy:`、`aria-checked:`、`aria-selected:` | `accessibilityState.busy`、`checked`（`true`，不含 `"mixed"`）或 `selected` 为 `true`，与 Tailwind 的 `aria-*` 变体一致：排在伪类之后，按名称排序 | |
+| `aria-busy:`、`aria-checked:`、`aria-invalid:`、`aria-selected:` | `accessibilityState.busy`、`checked`（`true`，不含 `"mixed"`）、`invalid` 或 `selected` 为 `true`，与 Tailwind 的 `aria-*` 变体一致：排在伪类之后，按名称排序 | |
 | `data-<name>:` | 元素带有名为 `name` 的 `data-*` 属性，与 Tailwind 的布尔 `data-*` 变体一致（`&[data-range-start]`）：组件的部件在状态之外显示的信息，比如日历中区间起点的那一天（`data-range-start:`）。排在 `aria-*` 变体之后，按名称排序 | 组件的部件上用 `Interactive::project_data(name, ..)` 设置 |
-| `group-active:`、`group-hover:`、`group-focus:`、`group-focus-within:`、`group-disabled:`、`group-selected:`、`group-checked:`、`group-indeterminate:`、`group-aria-expanded:`、`group-aria-pressed:`、`group-aria-busy:`、`group-aria-checked:`、`group-aria-selected:`、`group-data-<name>:` | 最近的带 `group` 类的祖先处于该状态，或带有该 `data-*` 属性 | 祖先上 `.group()`；内部 `.group_active(..)`、`.group_hover(..)`、`.group_focus_within(..)` |
+| `group-active:`、`group-hover:`、`group-focus:`、`group-focus-within:`、`group-disabled:`、`group-selected:`、`group-checked:`、`group-indeterminate:`、`group-aria-expanded:`、`group-aria-pressed:`、`group-aria-busy:`、`group-aria-checked:`、`group-aria-invalid:`、`group-aria-selected:`、`group-data-<name>:` | 最近的带 `group` 类的祖先处于该状态，或带有该 `data-*` 属性 | 祖先上 `.group()`；内部 `.group_active(..)`、`.group_hover(..)`、`.group_focus_within(..)` |
 | `group-active/name:` ... | 同上，针对标记为 `group/name` 的祖先 | `.group_named("name")`；`.group_active_named("name", ..)` 等 |
 | `first:`、`last:`、`odd:`、`even:`、`only:` | 元素自身在兄弟节点中的位置。要按行的位置给行内标签上色，把 `last:text-*` 写在行上，标签会继承它 | 根据行的索引用普通 Rust 判断（`at.is_first()`、`at.is_last()`、`at.index() % 2`） |
 | `placeholder:` | 设置输入框占位文字的样式（`placeholder:text-zinc-400`） | `.placeholder_color(..)` |
@@ -99,6 +100,8 @@ Rust 组件（`nsh/base` 的以及应用自己 crate 中的组件）在 TSX 中�
 | `min-[600px]:`、`max-[600px]:` | 任意断点 | 同上 |
 | `portrait:`、`landscape:` | 窗口方向 | `window().width > window().height` |
 | `ios:`、`android:`、`web:` | 平台 | `.when(os() == Os::Ios, \|v\| ..)` |
+| `terminal:` | 在终端中绘制 | `.when(idiom() == Idiom::Terminal, \|v\| ..)` |
+| `pointer-fine:`、`pointer-coarse:` | 主要指针是鼠标或触控板（桌面、桌面浏览器、终端）/ 手指 | `.when(is_desktop(), \|v\| ..)` |
 | `rtl:`、`ltr:` | [布局方向](./layout.md#从右到左) | 视图的 `.direction(LayoutDirection::..)` |
 | `motion-safe:`、`motion-reduce:` | 用户的“减弱动态效果”设置 | `reduce_motion()` |
 
@@ -161,12 +164,12 @@ view()
 - **每个视图都是独立的盒子。** `overflow-x-hidden` 和 `overflow-y-hidden` 与 `overflow-hidden` 一样裁剪两个方向（滚动由 [scroll](../elements/scroll.md) 元素负责）；`invisible` 隐藏视图及其中的一切；`mix-blend-*` 让视图与其后绘制的一切混合；`block` 盒子的外边距与其子元素的外边距互不合并；`absolute` 视图与 CSS 一样，相对最近的定位祖先放置；`fixed` 让视图在其根视图中布局（其他元素按 `absolute` 定位）。
 - **文本保留空白。** 字符串中的空格和换行按原样绘制，`whitespace-*` 设置换行方式；JSX 编译器会像 JSX 一样合并字面 JSX 文本中的空白。
 - **过渡按属性组生效**：`transition` 对颜色、不透明度、阴影和变换做动画，`transition-all` 还包括圆角和边框宽度；滤镜、背景滤镜、渐变和布局会直接取新值。
-- **`focus-visible:` 即 `focus:`**：元素获得焦点时就会应用。
+- **`focus-visible:` 与浏览器的 `:focus-visible` 一致**：在焦点显示时应用。Tab、组内的方向键和快捷键会显示焦点；按压或轻点不会；应用移动的焦点（`focus()`、日历或对话框打开时）在按键之后显示，在按压之后不显示；文本输入框获得焦点时总是显示。`focus:` 在元素获得焦点时就会应用，因此键盘的焦点环写在 `focus-visible:` 上。组件自己保留焦点时，按键作用的那一行（树的行、列表高亮的选项）在作为这一行时应用 `focus:`，组件的焦点显示时还应用 `focus-visible:`。
 - **状态背景色显示在渐变之上。** 在 CSS 中渐变会盖住 `background-color`，因此 `bg-linear-*` 表面上的 `active:bg-*` 永远看不到；在 NSH 中，来自 `active:`、`hover:`、`focus:` 或 `group-*:` 的背景色会在该状态期间替换渐变（除非该状态设置了自己的渐变，例如 `active:from-*`）。`activeStyle` 等状态样式以及动画背景色也是如此。
 - **文字与触摸的设置都是样式键**：`line-clamp-*` 设置 `numberOfLines`，`text-ellipsis` 和 `text-clip` 设置 `textOverflow`，`truncate` 两者都设置，`select-*` 设置 `userSelect`，`pointer-events-*` 设置 `pointerEvents`，因此它们可以用在状态变体中，并且和所有类一样会被内联 `style` 覆盖；`caret-*`、`placeholder:text-*` 和 `selection:bg-*` 同样设置 `caretColor`、`placeholderColor` 和 `selectionColor` 样式。在 Rust 中它们是 `Styled` 方法（`.number_of_lines(..)`、`.truncate()`、`.text_overflow(..)`、`.select_text()`、`.pointer_events(..)` 等）。`whitespace-nowrap` 以类的形式让文本保持一行。`object-*` 设置图片和视频的 `objectFit` 与 `objectPosition` 样式，样式中的同名键会像其他样式一样替换它们。
 - **支持的范围**：Tailwind 4 中在原生层有意义的工具类和变体。`peer-*` 变体、伪元素（`before:`、`after:`）和任意属性（`[mask-type:luminance]`）会报告为未知类；NSH 在原生层没有对应含义的工具类也都是未知类，因此一个类不会有与浏览器不同的含义。渲染提示类（`antialiased`、`will-change-transform`、`appearance-none`、`box-border` 等）会被接受，但不改变任何东西。
 
-其余部分都与 Tailwind 4 文档一致：调色板、透明度修饰符（`bg-black/40`）、任意值（`bg-[#34c759]`、`w-[72px]`、`grid-cols-[1fr_2fr]`；`p`、`px`、`py`、`pt`、`pr`、`pb`、`pl` 和 `m` 系列工具类还接受环境变量，`pt-[env(safe-area-inset-top)]`、`pb-[calc(env(keyboard-inset-height)+49px)]`，见[安全区域](../elements/safe-area.md)和[键盘](../elements/keyboard.md)）、分数（`w-1/2`、`translate-x-1/2`）、阴影和 ring、渐变（`bg-linear-to-r`、`bg-radial`、`bg-conic` 配合 `from-` / `via-` / `to-`）、滤镜、`backdrop-blur-*`、`mix-blend-*`、变换、`transition-*` 和 `duration-*`、`animate-spin` / `ping` / `pulse` / `bounce`，以及网格，每一项在 Rust 中都有对应的类型化方法。[滤镜与混合](./styling.md#滤镜与混合) 的平台限制对类名同样适用。
+其余部分都与 Tailwind 4 文档一致：调色板、透明度修饰符（`bg-black/40`）、任意值（`bg-[#34c759]`、`w-[72px]`、`grid-cols-[1fr_2fr]`；`p`、`px`、`py`、`pt`、`pr`、`pb`、`pl` 和 `m` 系列工具类还接受环境变量，`pt-[env(safe-area-inset-top)]`、`pb-[calc(env(keyboard-inset-height)+49px)]`，见[安全区域](../elements/safe-area.md)和[键盘](../elements/keyboard.md)）、分数（`w-1/2`、`translate-x-1/2`）、阴影和 ring、渐变（`bg-linear-to-r`、`bg-radial`、`bg-conic` 配合 `from-` / `via-` / `to-`，或直接写出的渐变 `bg-[linear-gradient(45deg,#f00,#00f)]`，也可带 Tailwind 的 `image:` 提示）、滤镜、`backdrop-blur-*`、`mix-blend-*`、变换、`transition-*` 和 `duration-*`、`animate-spin` / `ping` / `pulse` / `bounce`，以及网格，每一项在 Rust 中都有对应的类型化方法。[滤镜与混合](./styling.md#滤镜与混合) 的平台限制对类名同样适用。
 
 ## 主题
 
@@ -207,7 +210,7 @@ view()
 | `aspect` | 比例（`1.5`） | `aspect-*` |
 | `ease` | `[x1, y1, x2, y2]` | `ease-*` |
 
-未知的键和无效的值会导致构建错误（`nsh.json: tailwind: unknown theme key 'colours'`）。主题会编译进 bundle，并在第一帧之前生效。
+NSH 读不懂的条目（不认识的键，或形式不认识的值）会给出警告并单独略过（`nsh.json: tailwind: unknown key 'colours', ignored`），运行时也一样，因此为更新的 NSH 写的主题在较旧的 NSH 上其余条目照常生效。主题会编译进 bundle，并在第一帧之前生效。
 
 Tailwind 主题影响你的类名。类型化方法保持 Tailwind 的默认刻度，因此 Rust 组件在任何应用中看起来都一样，它们从应用主题的设计令牌，即 `nsh.json` 中的 `"theme"` 获取应用的外观（[用 Rust 开发](./rust.md#主题)）。
 
@@ -261,7 +264,8 @@ token 的名称就是主题文件中 CSS 变量去掉 `--` 后的名称：`muted
 - **两种外观。** token 带有主题的浅色值和深色值：`bg-primary`、`theme().primary` 和 `token("primary")` 都会随外观自动切换，不需要 `dark:` 类。只在一种外观里设置的颜色在两种外观下都使用该值。
 - **你的 Tailwind 颜色优先。** `"tailwind"` 的 `colors` 或 Tailwind 调色板里的名称就是那个颜色，所以 Tailwind 主题里没有 `primary` 这个颜色时，`bg-primary` 是主题 token。
 - **主题可以在运行时改变。** 嵌入原生应用的 NSH 应用拿到宿主的主题时，以及主题每次变化时，引用 token 的类、读取 `theme()` 的 Rust 绑定和读取 `token()` 的 TSX 代码都会更新，其中类和绑定在原生侧更新。宿主主题里没有的 token 使用应用自己 `"theme"` 中的值（再没有则用默认主题的值）。只想加上自己品牌的宿主给出主题覆盖，即用同样的文件格式写出其品牌要改的 token（[iOS](./ios.md#主题覆盖)、[Android](./android.md#主题覆盖)，桌面端为 `AppView::set_theme_overrides`）。
-- **与其他类名一样检查。** 既不是默认主题、也不是应用 `"theme"` 中 token 的名称，在构建时会报告为未知类（`unknown class 'bg-chart-up'`）。要使用只有宿主提供的 token，在应用的 `"theme"` 里也给它一个值：应用单独运行时显示这个值。
+- **应用可以换一个主题。** `nsh` 的 [`setTheme(theme)`](../modules/nsh.md#settheme) 在应用运行时把一个同样格式的主题设为应用的主题，取代它的 `"theme"`，在每个平台和 `nsh test` 里都一样；`setTheme(null)` 恢复应用自己的主题。`token()` 立即读到新的 token。主题要整个读得懂：有读不懂的值时抛出列出该值的 `TypeError`，正在显示的主题保持不变。请从应用自己的主题文件出发构造新主题，这样类名引用的每个 token 都还有值。Rust 应用用 `set_tokens(theme.into())` 设置一个 `nsh_base::Theme` 的 token。
+- **与其他类名一样检查。** 既不是默认主题、也不是应用 `"theme"` 中 token 的名称，在构建时会报告为未知类（`unknown class 'bg-chart-up'`）。要使用只有宿主或运行时设置的主题提供的 token，在应用的 `"theme"` 里也给它一个值：应用单独运行时显示这个值。
 
 引用 token 的类和其他类一样，每套主题只解析一次：绘制时的开销与调色板颜色相同。
 

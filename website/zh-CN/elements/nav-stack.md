@@ -146,6 +146,7 @@ mount(App);
 - 在 Rust 中，栈的子元素就是它的页面：放入 `nav_stack()` 的 `nav_page()` 被推入，移除的被弹出。把路由保存在一个信号里，用按路由设置 key 的 `each(..)` 渲染页面，下面的页面就会保留各自的状态。
 - 每次推入都是一个独立的页面，同一个路由值推入两次也是如此。
 - 用户以原生方式离开页面时（返回按钮、侧滑返回、Android 返回键、桌面平台的返回键、浏览器的后退），页面随之离开。在 TSX 中，栈会从状态里移除它的路由，所以 `nav.routes()` 始终与用户看到的一致。在 Rust 中，页面会报告 `on_dismiss`，你在其中移除它的路由（以及它上面的路由）。
+- Android 返回键、桌面平台的返回键和浏览器的后退只作用于正在显示的栈：尺寸为 0 的栈，或者位于尺寸为 0 的视图里的栈（例如未选中的 tab，`display: none`），保留它的页面，直到再次显示。
 - 在 TSX 中，子函数返回的不是 `<NavPage>` 时，会得到一个使用默认选项的页面。返回 `<NavPage>` 即可设置它的标题栏和其他选项。
 
 <a id="createnavstack"></a>
@@ -194,6 +195,7 @@ const depth = () => nav.routes().length;
 | `children` | `.child(..)` | `(route: R, index: Accessor<number>) => JSX.Element` | 渲染一个路由。返回 `<NavPage>` 以设置它的选项。必填。 |
 | `style`、`class` | 样式方法 | | 栈的样式；通常为 `flex: 1`。 |
 | `testID` | `.test_id(..)` | `string` | 在测试和 `nsh test --trace` 中找到这个栈。 |
+| `onChange` | 读取路由 signal 的 `effect` | `({ routes }: { routes: readonly R[] }) => void` | 路由变化了：应用压入、弹出、替换或设置了路由，或用户从某个页面返回（返回按钮、滑动返回、浏览器的后退）。它在变化渲染之后运行，栈最初的路由不触发它。可用于统计页面、保存导航状态，或用 [`UrlScheme.setUrl`](../modules/nsh.md#urlscheme) 设置页面的地址。 |
 
 TSX 的子函数接收路由值本身，以及一个表示它在栈中位置的 accessor。
 
@@ -222,6 +224,7 @@ TSX 的子函数接收路由值本身，以及一个表示它在栈中位置的 
 | `animation` | `.animation(..)` | `"default" \| "slide" \| "fade" \| "none"` | `"default"` | 页面进入和离开的方式。 |
 | `transitionShader` | `.transition_shader(TransitionShader::new(program))` | `{ source: string; uniforms?: Record<string, ShaderUniform>; duration?: number }` | 无 | 页面通过一个 WGSL 着色器进入和离开，取代它的 `animation`：`shade(uv)` 以 `sample_from` 读取下面的页面、以 `sample_to` 读取这个页面，`nsh.progress` 在 `duration` 毫秒内（默认 350）从 0 走到 1，页面离开时从 1 回到 0。系统要求减少动态效果时，页面使用自己的 `animation`。见 [Shader](./shader.md)。 |
 | `statusBar` | `.status_bar(..)` | `{ foreground?, hidden?, animated? }` | 无 | iOS 和 Android：页面位于顶部时的状态栏。见[状态栏](../modules/nsh-base.md#status-bar)。 |
+| `ios={{ supportedOrientations }}`、`android={{ supportedOrientations }}` | `.supported_orientations(..)` | `("portrait" \| "portrait-upside-down" \| "landscape" \| "landscape-left" \| "landscape-right")[]` | 应用自身的 | 页面显示时屏幕可以采用的方向：例如应用保持竖屏，而某个查看器页面可以旋转，或者相反。在显示中的页面里，最近显示且设置了它的页面决定方向；它离开后，下面那个页面的设置重新生效。保留在未显示的标签页（`display: none`）中的页面不参与决定。iOS：由 `nsh package` 打包的应用的窗口根控制器（嵌入原生应用时为宿主的控制器，它在 `supportedInterfaceOrientations` 中返回 `NshAppView.supportedInterfaceOrientations`，见 [iOS](../docs/ios.md#nshappview)）。Android：Activity 请求的方向，没有页面设置时恢复为原来的值。在两个平台上，`landscape-left` 都是设备顺时针转动、主屏幕一侧在左边（UIKit 的 `landscapeLeft`）。 |
 | `style`、`class` | 样式方法 | | 无 | 页面的样式。 |
 | `children` | `.child(..)` | `JSX.Element` | 无 | 内容。 |
 | `testID` | `.test_id(..)` | `string` | 无 | 在测试和 `nsh test --trace` 中找到这个页面。 |

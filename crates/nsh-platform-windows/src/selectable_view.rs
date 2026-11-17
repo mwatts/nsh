@@ -18,12 +18,13 @@
 
 use std::{
     cell::RefCell,
+    ops::Range,
     rc::{Rc, Weak},
     sync::Arc,
 };
 
 use nsh_core::{
-    AttributedText, Bounds, EventKind, Point, Points,
+    AttributedText, Bounds, EventKind, EventPayload, NodeId, PayloadValue, Point, Points,
     geometry::point,
     selection::{
         KeptRows, SelectionModel, SelectionTexts, autoscroll_step, reading_order, reorder,
@@ -143,6 +144,10 @@ impl SelectionTexts for Texts {
         &self.texts[i].text
     }
 
+    fn copied(&self, i: usize, range: std::ops::Range<u32>) -> String {
+        self.texts[i].copied_text(range)
+    }
+
     fn frame(&self, i: usize) -> Bounds<Points> {
         self.frames[i]
     }
@@ -162,6 +167,11 @@ impl SelectionTexts for Texts {
 
     fn continues(&self, i: usize) -> bool {
         self.views[i].state().props.continues_text
+    }
+
+    fn range_bounds(&self, i: usize, range: Range<u32>) -> Option<Bounds<Points>> {
+        let local = crate::text::range_bounds(&self.views[i].state(), range.start, range.end)?;
+        self.to_area(&self.to_root[i], local)
     }
 }
 
@@ -204,7 +214,7 @@ pub(crate) fn is_area_text(view: &NshView) -> bool {
         .text
         .as_ref()
         .is_some_and(|d| takes_part(&d.text));
-    part && area_of(view).is_some()
+    part && area_of(view).is_some() && !in_control(view)
 }
 
 /// The current area: its selection and the mouse's press on it.
@@ -226,6 +236,18 @@ struct Current {
     autoscrolling: bool,
     /// The virtual list rows its ends are in, kept rendered.
     kept: KeptRows,
+    /// The selected text and its box last reported to the area's
+    /// `onSelectionChange`.
+    reported: Selected,
+}
+
+/// What `onSelectionChange` reports: the selected text, where it starts and
+/// the box around it in the area.
+#[derive(Debug, Clone, Default, PartialEq)]
+struct Selected {
+    text: String,
+    start: u32,
+    bounds: Option<Bounds<Points>>,
 }
 
 impl Current {
@@ -241,6 +263,7 @@ impl Current {
             last: None,
             autoscrolling: false,
             kept: KeptRows::default(),
+            reported: Selected::default(),
         }
     }
 
@@ -305,6 +328,32 @@ thread_local! {
     static DIRTY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+/// A Copy or Select All of the app's menu for an area: acts on that area,
+/// as its own menu does; true when handled.
+pub(crate) fn menu_role(
+    surface: &Surface,
+    area: &NshView,
+    role: nsh_core::desktop::MenuRole,
+) -> bool {
+    use nsh_core::desktop::MenuRole;
+    if !area.attached() {
+        return false;
+    }
+    match role {
+        MenuRole::Copy => {
+            if let Some(text) = selected_text(surface.key(), Some(area)) {
+                crate::system::set_clipboard_text(&text);
+            }
+            true
+        }
+        MenuRole::SelectAll => {
+            select_all(surface.key(), area);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// The current area of `surface`, taken out (put it back with
 /// [`put`]).
 fn take(surface: u64, area: Option<&NshView>) -> Option<Current> {
@@ -318,6 +367,7 @@ fn take(surface: u64, area: Option<&NshView>) -> Option<Current> {
 }
 
 fn put(current: Current) {
+    let surface = current.surface;
     // Something made another current meanwhile: that one stays.
     let mut current = Some(current);
     CURRENT.with_borrow_mut(|c| {
@@ -325,20 +375,82 @@ fn put(current: Current) {
             *c = current.take();
         }
     });
-    if let Some(mut lost) = current {
-        lost.unhighlight();
+    match current {
+        Some(lost) => end(lost),
+        None => report(surface),
     }
+}
+
+/// Ends `current`'s selection: its highlights go, and an area that
+/// reported a selected text (and is still there) reports `""`.
+fn end(mut current: Current) {
+    current.unhighlight();
+    if current.reported != Selected::default() && current.area.attached() {
+        let id = current.area.state().id;
+        if let Some(surface) = Surface::by_key(current.surface) {
+            send(&surface, id, Selected::default());
+        }
+    }
+}
+
+/// Reports the current area's selected text to its `onSelectionChange`
+/// when it changed, or its box moved (after it is put back: the handler
+/// may change what is shown).
+fn report(surface: u64) {
+    let Some(mut current) = take(surface, None) else {
+        return;
+    };
+    let (id, listens) = {
+        let s = current.area.state();
+        (s.id, s.events.contains(EventKind::SelectionChange))
+    };
+    let mut change = None;
+    if listens {
+        let selected = if current.model.is_empty() {
+            Selected::default()
+        } else {
+            let texts = Texts::of(&current.area);
+            Selected {
+                text: current.model.text(&texts),
+                start: current.model.start_offset(&texts),
+                bounds: current.model.selected_bounds(&texts),
+            }
+        };
+        if selected != current.reported {
+            current.reported.clone_from(&selected);
+            change = Some(selected);
+        }
+    }
+    CURRENT.set(Some(current));
+    if let Some(selected) = change
+        && let Some(surface) = Surface::by_key(surface)
+    {
+        send(&surface, id, selected);
+    }
+}
+
+/// Sends `onSelectionChange` with `selected` to view `id`.
+fn send(surface: &Surface, id: NodeId, selected: Selected) {
+    let mut fields = vec![
+        ("text", PayloadValue::Str(selected.text)),
+        ("start", PayloadValue::Number(f64::from(selected.start))),
+    ];
+    if let Some(bounds) = selected.bounds {
+        fields.push(("bounds", PayloadValue::Bounds(bounds)));
+    }
+    surface.event(id, EventKind::SelectionChange, EventPayload::Map(fields));
 }
 
 /// Ends the current area's selection (a single text was selected).
 pub(crate) fn clear() {
-    if let Some(mut current) = CURRENT.take() {
-        current.unhighlight();
+    if let Some(current) = CURRENT.take() {
+        end(current);
     }
 }
 
-/// A mount item changed texts or the tree: the selection is clamped to
-/// them at the end of the batch.
+/// A mount item changed texts, the tree or where views are: the selection
+/// is clamped to them, and its box measured again, at the end of the
+/// batch.
 pub(crate) fn tree_changed() {
     DIRTY.set(true);
 }
@@ -355,7 +467,7 @@ pub(crate) fn end_batch(surface: &Rc<Surface>) {
     DIRTY.set(false);
     let gone = !current.area.attached() || !current.area.state().props.selectable_view;
     if gone {
-        current.unhighlight();
+        end(current);
         return;
     }
     let texts = Texts::of(&current.area);
@@ -368,7 +480,7 @@ pub(crate) fn end_batch(surface: &Rc<Surface>) {
 /// the views get it: ends the area's selection when the press is outside
 /// it.
 pub(crate) fn window_pressed(surface: &Surface, x: f32, y: f32) {
-    let Some(mut current) = take(surface.key(), None) else {
+    let Some(current) = take(surface.key(), None) else {
         return;
     };
     let inside = current
@@ -382,7 +494,7 @@ pub(crate) fn window_pressed(surface: &Surface, x: f32, y: f32) {
     if inside {
         put(current);
     } else {
-        current.unhighlight();
+        end(current);
     }
 }
 
@@ -435,8 +547,8 @@ pub(crate) fn pointer(
             let mut current = match CURRENT.take() {
                 Some(c) if c.surface == key && c.area == *area => c,
                 other => {
-                    if let Some(mut other) = other {
-                        other.unhighlight();
+                    if let Some(other) = other {
+                        end(other);
                     }
                     Current::new(key, area.clone())
                 }
@@ -599,6 +711,8 @@ fn selected_text(surface: u64, area: Option<&NshView>) -> Option<String> {
         let texts = Texts::of(&current.area);
         current.model.text(&texts)
     });
+    // A selection of hidden characters only copies nothing.
+    let text = text.filter(|t| !t.is_empty());
     put(current);
     text
 }
@@ -608,8 +722,8 @@ fn select_all(surface: u64, area: &NshView) {
     let mut current = match CURRENT.take() {
         Some(c) if c.surface == surface && c.area == *area => c,
         other => {
-            if let Some(mut other) = other {
-                other.unhighlight();
+            if let Some(other) = other {
+                end(other);
             }
             Current::new(surface, area.clone())
         }
@@ -622,7 +736,43 @@ fn select_all(surface: u64, area: &NshView) {
     put(current);
 }
 
-/// A right click in `area`: Copy (its selection) and Select All.
+/// The app's items of `area`'s selection menu (`selectionMenu`), after a
+/// separator: each reports its id as the root's `Menu` event.
+fn app_items(area: &NshView, out: &mut Vec<crate::chrome::LocalItem>) {
+    use nsh_core::desktop::MenuItem;
+
+    use crate::chrome::LocalItem;
+    let menu = area.state().props.selection_menu.clone();
+    if menu.is_empty() {
+        return;
+    }
+    out.push(LocalItem::Separator);
+    for item in menu.iter() {
+        match item {
+            MenuItem::Action(action) => {
+                let id = action.id;
+                out.push(LocalItem::Item {
+                    role: None,
+                    label: action.label.clone(),
+                    enabled: action.enabled,
+                    action: Rc::new(move |s| {
+                        if id != 0 {
+                            s.event(
+                                nsh_core::ROOT_ID,
+                                EventKind::Menu,
+                                EventPayload::Map(vec![("id", PayloadValue::Number(id as f64))]),
+                            );
+                        }
+                    }),
+                });
+            }
+            MenuItem::Separator => out.push(LocalItem::Separator),
+            MenuItem::Submenu { .. } => {}
+        }
+    }
+}
+
+/// A right click in `area`: Copy (its selection), Select All and the app's items.
 pub(crate) fn context_menu(surface: &Rc<Surface>, area: &NshView) {
     use nsh_core::desktop::MenuRole;
 
@@ -630,27 +780,35 @@ pub(crate) fn context_menu(surface: &Rc<Surface>, area: &NshView) {
     let key = surface.key();
     let selected = selected_text(key, Some(area)).is_some_and(|t| !t.is_empty());
     let (copy, all) = (area.clone(), area.clone());
-    crate::chrome::popup_actions(
-        surface,
-        vec![
-            LocalItem::Item {
-                role: Some(MenuRole::Copy),
-                label: "",
-                enabled: selected,
-                action: Rc::new(move |s| {
-                    if let Some(text) = selected_text(s.key(), Some(&copy)) {
-                        crate::system::set_clipboard_text(&text);
-                    }
-                }),
-            },
-            LocalItem::Item {
-                role: Some(MenuRole::SelectAll),
-                label: "",
-                enabled: true,
-                action: Rc::new(move |s| select_all(s.key(), &all)),
-            },
-        ],
-    );
+    let mut items = vec![
+        LocalItem::Item {
+            role: Some(MenuRole::Copy),
+            label: String::new(),
+            enabled: selected,
+            action: Rc::new(move |s| {
+                if let Some(text) = selected_text(s.key(), Some(&copy)) {
+                    crate::system::set_clipboard_text(&text);
+                }
+            }),
+        },
+        LocalItem::Item {
+            role: Some(MenuRole::SelectAll),
+            label: String::new(),
+            enabled: true,
+            action: Rc::new(move |s| select_all(s.key(), &all)),
+        },
+    ];
+    app_items(area, &mut items);
+    crate::chrome::popup_actions(surface, items);
+}
+
+/// True when the current area of `surface` has a selection, which [`key`]
+/// copies. Only looks: nothing is taken out or reported.
+pub(crate) fn has_selection(surface: &Surface) -> bool {
+    CURRENT.with_borrow(|c| {
+        c.as_ref()
+            .is_some_and(|c| c.surface == surface.key() && c.area.attached() && !c.model.is_empty())
+    })
 }
 
 /// Keys for the current area's selection (Ctrl+C / Ctrl+Insert, Ctrl+A,
@@ -692,4 +850,27 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Whether `view` sits in a control (a button, link, tab…) inside its
+/// area, or in a view that takes presses: its text then keeps the control's pointer, not the I-beam.
+fn in_control(view: &NshView) -> bool {
+    let mut current = Some(view.clone());
+    while let Some(v) = current {
+        let s = v.state();
+        if s.props.selectable_view {
+            return false;
+        }
+        // A role, or a press handler on a row the app built itself.
+        if s.props.accessibility.role.is_control()
+            || [EventKind::Press, EventKind::LongPress, EventKind::PressDown]
+                .iter()
+                .any(|&k| s.events.contains(k))
+        {
+            return true;
+        }
+        drop(s);
+        current = v.parent_view();
+    }
+    false
 }

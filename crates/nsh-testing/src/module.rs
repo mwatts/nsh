@@ -21,6 +21,7 @@ use nsh_core::{
         Arg, Exception, JsClass, JsError, JsHost, JsIn, JsKind, JsOwned, JsValue, PropError,
         Registry, TsTypes,
     },
+    host_channel::ModuleFake,
     prelude::*,
 };
 use nsh_engine::{HostCall, HostChannel, HttpBody, HttpRequest};
@@ -256,7 +257,7 @@ impl Testing {
     /// platform cannot honor rejects (`ERR_NSH_TEST_UNSUPPORTED`, naming
     /// it): `width` and `height` on iOS and Android, a `platform` the
     /// target is not (a phone's on a desktop, a desktop's on a phone, the
-    /// other phone), `host.handlers`.
+    /// other phone), `host.handlers`, `modules`, `url`.
     pub async fn open(entry: String, options: Option<OpenOptions>) -> Result<App, JsError> {
         let session = Session::current().map_err(JsError::Error)?;
         let options = options.unwrap_or_default();
@@ -266,7 +267,8 @@ impl Testing {
             .as_ref()
             .and_then(|h| h.handlers.as_ref())
             .is_some_and(|h| !h.0.is_empty());
-        let (host, record) = host_setup(options.host, &mut server);
+        let module_fakes = options.modules.as_ref().is_some_and(|m| !m.0.is_empty());
+        let (host, record) = host_setup(options.host, options.modules, &mut server);
         let manual_clock = options.clock.is_some();
         let launch = Launch {
             storage: options.storage.unwrap_or_default(),
@@ -277,6 +279,7 @@ impl Testing {
             clipboard: options.clipboard,
             color_scheme: options.color_scheme,
             locale: options.locale,
+            locale_settings: options.locale_settings.unwrap_or_default(),
             reduced_motion: options.reduced_motion,
             platform: options.platform,
             clock: options
@@ -285,6 +288,8 @@ impl Testing {
             keyboard_height: options.keyboard_height,
             host,
             host_handlers,
+            module_fakes,
+            url_scheme: options.url_scheme,
         };
         let opening = blocking(move || session.open(&entry, launch));
         let (app, storage, requests) = serve(server.as_ref(), opening)
@@ -406,6 +411,10 @@ pub struct OpenOptions {
     pub color_scheme: Option<ColorScheme>,
     /// The device's locale, a BCP 47 tag (`"en-US"`).
     pub locale: Option<String>,
+    /// The user's locale settings (`localeSettings()`): the ones it names,
+    /// over the locale's (it alone as the languages, its region's
+    /// preferences) in UTC.
+    pub locale_settings: Option<LocaleSettingsOptions>,
     /// The user asked for less motion (false).
     pub reduced_motion: Option<bool>,
     /// The platform the app believes it runs on headless (`"ios"`; a
@@ -430,6 +439,194 @@ pub struct OpenOptions {
     /// launch parameters it reads as `host.params` and the handlers of its
     /// `host.call` and `host.post`.
     pub host: Option<HostOptions>,
+    /// The link that launched the app (none): its `UrlScheme.on("open")`
+    /// listener gets it when the app claims its scheme (`nsh.json`
+    /// `schemes`), as from the system. Headless runs only: with
+    /// `--target` it rejects (`ERR_NSH_TEST_UNSUPPORTED`).
+    pub url_scheme: Option<String>,
+    /// Stand-ins for exports of the native modules the app imports (its
+    /// crate's, `nsh/base`'s, the runtime's), by the module's specifier,
+    /// then by export (`"save"`) or member of one (`"Keychain.get"`): a
+    /// value takes the export's place (a function's stand-in returns it at
+    /// once, synchronously); a function answers each of the app's calls,
+    /// which return a promise even where the export returns at once: of
+    /// what it returns (or of what its promise resolves to), rejected with
+    /// what it throws. The app's imports get them; Rust
+    /// code calling the module directly runs the module. Headless runs
+    /// only: with `--target` it rejects (`ERR_NSH_TEST_UNSUPPORTED`).
+    pub modules: Option<ModuleFakes>,
+}
+
+/// `open`'s `modules`: by specifier, the stand-ins of its exports.
+#[derive(Debug, Default)]
+pub struct ModuleFakes(pub Vec<(String, Vec<(String, ModuleFakeOption)>)>);
+
+/// A stand-in of `open`'s `modules`.
+#[derive(Debug)]
+pub enum ModuleFakeOption {
+    /// The value in the export's place.
+    Value(JsonValue),
+    /// The function answering the app's calls, with their arguments.
+    Function(Callback<FakeArgs, JsonValue>),
+}
+
+/// The arguments of an app's call of a stand-in, as the test's function
+/// gets them: one by one.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct FakeArgs(pub Vec<JsonValue>);
+
+impl nsh_core::element::CallbackArgs for FakeArgs {
+    const ARITY: usize = 0;
+
+    fn ts_params(_types: &mut TsTypes, _names: &[&str]) -> String {
+        "...args: any[]".into()
+    }
+
+    fn into_js_args<'a>(self, host: &'a dyn JsHost) -> Result<Vec<JsOwned<'a>>, PropError> {
+        self.0
+            .into_iter()
+            .map(|value| nsh_core::element::Ret::into_js(value, host))
+            .collect()
+    }
+
+    fn classes(_out: &mut Vec<&'static nsh_core::element::ClassDef>) {}
+}
+
+impl JsValue for ModuleFakes {
+    fn ts_type(_types: &mut TsTypes) -> String {
+        // Not `unknown | …`, which is `unknown` and leaves the arrows untyped.
+        "Record<string, Record<string, {} | null | ((...args: any[]) => unknown)>>".into()
+    }
+
+    fn from_js(value: JsIn<'_>) -> Result<Self, PropError> {
+        if value.kind() != JsKind::Object {
+            return Err(value.expected("an object of modules"));
+        }
+        let mut modules = Vec::new();
+        for specifier in value.keys()? {
+            let exports = value.field(&specifier)?;
+            let exports = exports.get();
+            if exports.kind() != JsKind::Object {
+                return Err(PropError(format!(
+                    "`{specifier}`: {}",
+                    exports.expected("an object of exports").0
+                )));
+            }
+            let mut fakes = Vec::new();
+            for path in exports.keys()? {
+                let field = exports.field(&path)?;
+                let field = field.get();
+                let fake = if field.kind() == JsKind::Function {
+                    <Callback<FakeArgs, JsonValue> as Arg>::from_js(field)
+                        .map(ModuleFakeOption::Function)
+                } else {
+                    field.to_json().map(ModuleFakeOption::Value)
+                };
+                fakes.push((
+                    path.clone(),
+                    fake.map_err(|e| PropError(format!("`{specifier}`: `{path}`: {}", e.0)))?,
+                ));
+            }
+            modules.push((specifier, fakes));
+        }
+        Ok(ModuleFakes(modules))
+    }
+
+    fn to_js<'a>(&self, host: &'a dyn JsHost) -> Result<JsOwned<'a>, PropError> {
+        // A stand-in's function stays JS's: only values go back.
+        let json = JsonValue::Object(
+            self.0
+                .iter()
+                .map(|(specifier, fakes)| {
+                    let values = fakes
+                        .iter()
+                        .filter_map(|(path, fake)| match fake {
+                            ModuleFakeOption::Value(v) => Some((path.clone(), v.clone())),
+                            ModuleFakeOption::Function(_) => None,
+                        })
+                        .collect();
+                    (specifier.clone(), JsonValue::Object(values))
+                })
+                .collect(),
+        );
+        Ok(JsOwned::new(host, host.json(&json)?))
+    }
+}
+
+/// Locale settings a test gives the user (`open`'s `localeSettings`,
+/// `app.setLocaleSettings`; `localeSettings()`): the ones it names change,
+/// the others stay.
+#[derive(Debug, Default, Clone, PartialEq, JsObject)]
+#[non_exhaustive]
+pub struct LocaleSettingsOptions {
+    /// The preferred languages, BCP 47 tags, most preferred first.
+    pub languages: Option<Vec<String>>,
+    /// The device's time zone, an IANA name. It names the zone: local
+    /// times, `Date`'s and `Intl`'s, stay the machine's, and so does the
+    /// zone `Intl` names.
+    pub time_zone: Option<String>,
+    /// 12- or 24-hour time.
+    pub hour_cycle: Option<nsh_core::platform::HourCycle>,
+    /// The day weeks start on, 1 for Monday to 7 for Sunday.
+    pub first_day_of_week: Option<u32>,
+    /// The units of lengths, weights and volumes.
+    pub measurement_system: Option<nsh_core::platform::MeasurementSystem>,
+    /// The unit of temperatures.
+    pub temperature_unit: Option<nsh_core::platform::TemperatureUnit>,
+}
+
+impl LocaleSettingsOptions {
+    /// The ones these name, as pins of the environment; `what` (the call)
+    /// begins the error of a value that names none.
+    pub(crate) fn pins(&self, what: &str) -> Result<nsh_engine::EnvironmentPins, String> {
+        use nsh_core::platform::{Languages, TimeZone, Weekday};
+        let mut pins = nsh_engine::EnvironmentPins::default();
+        if let Some(tags) = &self.languages {
+            let languages = Languages::parse(tags.iter().map(String::as_str))
+                .ok_or_else(|| format!("{what}: {tags:?} names no language"))?;
+            pins.languages = Some(languages);
+        }
+        if let Some(name) = &self.time_zone {
+            let zone = TimeZone::parse(name)
+                .ok_or_else(|| format!("{what}: {name:?} is not a time zone"))?;
+            pins.time_zone = Some(zone);
+        }
+        pins.hour_cycle = self.hour_cycle;
+        if let Some(day) = self.first_day_of_week {
+            let weekday = u8::try_from(day)
+                .ok()
+                .and_then(Weekday::from_number)
+                .ok_or_else(|| {
+                    format!("{what}: {day} is not a day of the week (1 Monday to 7 Sunday)")
+                })?;
+            pins.first_day_of_week = Some(weekday);
+        }
+        pins.measurement_system = self.measurement_system;
+        pins.temperature_unit = self.temperature_unit;
+        Ok(pins)
+    }
+
+    /// The ones these name, as a test writes them (`{ hourCycle: "h23" }`).
+    pub(crate) fn label(&self) -> String {
+        let named = [
+            self.languages
+                .as_ref()
+                .map(|tags| format!("languages: {tags:?}")),
+            self.time_zone
+                .as_ref()
+                .map(|name| format!("timeZone: {name:?}")),
+            self.hour_cycle
+                .map(|c| format!("hourCycle: {:?}", c.name())),
+            self.first_day_of_week
+                .map(|d| format!("firstDayOfWeek: {d}")),
+            self.measurement_system
+                .map(|s| format!("measurementSystem: {:?}", s.name())),
+            self.temperature_unit
+                .map(|u| format!("temperatureUnit: {:?}", u.name())),
+        ];
+        let named: Vec<String> = named.into_iter().flatten().collect();
+        format!("{{ {} }}", named.join(", "))
+    }
 }
 
 /// The embedding app a test plays (`open`'s `host`; `nsh/host`).
@@ -543,11 +740,12 @@ pub struct HostMessage {
 type HostRecord = Arc<Mutex<Vec<(HostMessage, bool)>>>;
 
 /// The embedding app's channel `options` describe, for the app the test
-/// opens, and the record of what its handlers get. The handlers' JS
-/// functions join `server`, which answers their calls on the test file's
-/// VM.
+/// opens, with the stand-ins of `modules`, and the record of what its
+/// handlers get. The handlers' and the stand-ins' JS functions join
+/// `server`, which answers their calls on the test file's VM.
 fn host_setup(
     options: Option<HostOptions>,
+    modules: Option<ModuleFakes>,
     server: &mut Option<RouteServer>,
 ) -> (HostChannel, HostRecord) {
     let channel = HostChannel::new();
@@ -557,7 +755,8 @@ fn host_setup(
         channel.set_params(params.0);
     }
     let handlers = options.handlers.unwrap_or_default().0;
-    if handlers.is_empty() {
+    let modules = modules.unwrap_or_default().0;
+    if handlers.is_empty() && modules.is_empty() {
         return (channel, record);
     }
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
@@ -580,7 +779,7 @@ fn host_setup(
             }),
             HostHandlerOption::Function(function) => {
                 let index = functions.len();
-                functions.push((name.clone(), function));
+                functions.push((name.clone(), HostFunction::Host(function)));
                 let tx = tx.clone();
                 channel.handle(name, move |call| {
                     remember(&call);
@@ -588,6 +787,24 @@ fn host_setup(
                     let _ = tx.send((index, call));
                 });
             }
+        }
+    }
+    for (specifier, fakes) in modules {
+        for (path, fake) in fakes {
+            let fake = match fake {
+                ModuleFakeOption::Value(value) => ModuleFake::Value(value),
+                ModuleFakeOption::Function(function) => {
+                    let name = format!("{specifier}#{path}");
+                    let index = functions.len();
+                    functions.push((name.clone(), HostFunction::Module(function)));
+                    let tx = tx.clone();
+                    channel.handle_module_fake(name.clone(), move |call| {
+                        let _ = tx.send((index, call));
+                    });
+                    ModuleFake::Call(name)
+                }
+            };
+            channel.fake_module_export(specifier.clone(), path, fake);
         }
     }
     if !functions.is_empty() {
@@ -741,9 +958,12 @@ pub struct Dialog {
     pub sheet: bool,
 }
 
-/// A pick the app asked for (`Picker.pickImages`), as a test reads it.
+/// A pick the app asked for (`Picker.pickImages`, `Picker.pickFiles`), as a
+/// test reads it.
 #[derive(Debug, Clone, PartialEq, JsObject)]
 pub struct PickRequest {
+    /// What was asked for: `"images"` or `"files"`.
+    pub kind: String,
     /// The user may pick several.
     pub multiple: bool,
     /// At most this many.
@@ -753,22 +973,106 @@ pub struct PickRequest {
     pub max_dimension: Option<u32>,
     /// The quality of the JPEGs encoded (0 to 1); `null`: the default.
     pub quality: Option<f64>,
-    /// The formats asked for: `"compatible"` or `"current"`.
+    /// The formats asked for: `"compatible"` or `"current"` (files come as
+    /// they are: `"current"`).
     pub format: String,
+    /// The file types offered (`pickFiles`); empty: any.
+    pub filters: Vec<PickFilter>,
+    /// The largest file read, in bytes (`pickFiles`' `maxSize`, at most
+    /// 512 MiB); `null` for images. A larger file the handler gives answers
+    /// with its name and size only.
+    pub max_size: Option<f64>,
 }
 
-impl From<&nsh_core::picker::PickRequest> for PickRequest {
-    fn from(request: &nsh_core::picker::PickRequest) -> Self {
-        PickRequest {
-            multiple: request.multiple(),
-            limit: request.limit,
-            max_dimension: request.max_dimension.map(|d| d.0.max(0) as u32),
-            quality: request.quality.map(|q| f64::from(q.0)),
-            format: match request.format {
-                nsh_core::picker::PickFormat::Current => "current",
-                _ => "compatible",
-            }
-            .into(),
+/// A group of file types a pick offers, as a test reads it.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct PickFilter {
+    /// What the picker shows for it.
+    pub name: String,
+    /// Its file extensions, without the dot, lower case.
+    pub extensions: Vec<String>,
+}
+
+impl From<&nsh_core::picker::Pick> for PickRequest {
+    fn from(pick: &nsh_core::picker::Pick) -> Self {
+        use nsh_core::picker::{Pick, PickFormat};
+        match pick {
+            Pick::Images(request) => PickRequest {
+                kind: "images".into(),
+                multiple: request.multiple(),
+                limit: request.limit,
+                max_dimension: request.max_dimension.map(|d| d.0.max(0) as u32),
+                quality: request.quality.map(|q| f64::from(q.0)),
+                format: match request.format {
+                    PickFormat::Current => "current",
+                    _ => "compatible",
+                }
+                .into(),
+                filters: Vec::new(),
+                max_size: None,
+            },
+            Pick::Files(request) => PickRequest {
+                kind: "files".into(),
+                multiple: request.multiple(),
+                limit: request.limit,
+                max_dimension: None,
+                quality: None,
+                format: "current".into(),
+                filters: request
+                    .filters
+                    .iter()
+                    .map(|filter| PickFilter {
+                        name: filter.name.clone(),
+                        extensions: filter.extensions.clone(),
+                    })
+                    .collect(),
+                max_size: Some(request.size_limit() as f64),
+            },
+        }
+    }
+}
+
+/// How the user answers the share sheet (`app.onShare`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, PropEnum)]
+pub enum ShareAnswerAction {
+    /// The user shares.
+    Shared,
+    /// The user closes the sheet without sharing.
+    #[default]
+    Dismissed,
+}
+
+/// How the user answers every share sheet (`app.onShare`).
+#[derive(Debug, Clone, Default, PartialEq, JsObject)]
+#[prop(exact)]
+pub struct ShareAnswer {
+    /// `"shared"` or `"dismissed"`.
+    pub action: ShareAnswerAction,
+    /// The target chosen when shared (`"com.apple.UIKit.activity.Mail"`);
+    /// none: the platform names none.
+    pub target: Option<String>,
+}
+
+/// What the app shared (`Share.show`), as a test reads it.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+pub struct SharedContent {
+    /// The title; `null` when none was given.
+    pub title: Option<String>,
+    /// The text; `null` when none was given.
+    pub text: Option<String>,
+    /// The link; `null` when none was given.
+    pub url: Option<String>,
+    /// The files' real paths.
+    pub files: Vec<String>,
+}
+
+impl From<&nsh_core::share::ShareSheet> for SharedContent {
+    fn from(sheet: &nsh_core::share::ShareSheet) -> Self {
+        SharedContent {
+            title: sheet.title.clone(),
+            text: sheet.text.clone(),
+            url: sheet.url.clone(),
+            files: sheet.files.clone(),
         }
     }
 }
@@ -792,34 +1096,38 @@ impl From<&nsh_core::speech::SpeechRequest> for SpeechRequest {
     }
 }
 
-/// A pick the app asked for (`Picker.pickImages`), as a test reads it.
+/// What the app asked of the speaker (`Sound`, `AudioPlayer`), as a test
+/// reads it.
 #[derive(Debug, Clone, PartialEq, JsObject)]
-pub(crate) struct Pick {
-    /// The user may pick several.
-    pub multiple: bool,
-    /// At most this many.
-    pub limit: u32,
-    /// The longest side, in pixels, images are scaled down to; `null`:
-    /// kept.
-    pub max_dimension: Option<u32>,
-    /// The quality of the JPEGs encoded (0 to 1); `null`: the default.
-    pub quality: Option<f64>,
-    /// The formats asked for: `"compatible"` or `"current"`.
-    pub format: String,
+pub struct AudioCall {
+    /// `"load"`, `"play"`, `"stop"`, `"unload"` for sounds; `"open"`,
+    /// `"preload"`, `"resume"`, `"pause"`, `"seek"`, `"set"`, `"close"` for
+    /// players.
+    pub command: String,
+    /// The sound's or player's source.
+    pub src: String,
+    /// `play`'s, `open`'s and `set`'s volume.
+    pub volume: Option<f64>,
+    /// `play`'s, `open`'s and `set`'s rate.
+    pub rate: Option<f64>,
+    /// `seek`'s position, in seconds.
+    pub position: Option<f64>,
 }
 
-impl From<&nsh_core::picker::PickRequest> for Pick {
-    fn from(request: &nsh_core::picker::PickRequest) -> Self {
-        Pick {
-            multiple: request.multiple(),
-            limit: request.limit,
-            max_dimension: request.max_dimension.map(|d| d.0.max(0) as u32),
-            quality: request.quality.map(|q| f64::from(q.0)),
-            format: match request.format {
-                nsh_core::picker::PickFormat::Current => "current",
-                _ => "compatible",
-            }
-            .into(),
+/// `value` as the shortest decimal that reads back as it (`0.8`, not
+/// `0.800000011920929`): what the app wrote.
+fn shortest(value: f32) -> f64 {
+    value.to_string().parse().unwrap_or(f64::from(value))
+}
+
+impl From<&crate::headless::AudioCall> for AudioCall {
+    fn from(call: &crate::headless::AudioCall) -> Self {
+        AudioCall {
+            command: call.command.into(),
+            src: call.src.clone(),
+            volume: call.volume.map(shortest),
+            rate: call.rate.map(shortest),
+            position: call.position.map(|p| p.as_secs_f64()),
         }
     }
 }
@@ -973,6 +1281,32 @@ impl From<nsh_core::ResolvedTextStyle> for SpanStyle {
             italic: style.italic,
             underline: style.decoration.underline,
             line_through: style.decoration.line_through,
+        }
+    }
+}
+
+/// The style of a view as the app set it (`app.viewStyle`). Colors are
+/// `#rrggbbaa`. The values are those the app set last: while an animation
+/// runs, its end value. A background the platform draws itself (a native
+/// control's) is not here; check it with a screenshot.
+#[derive(Debug, Clone, PartialEq, JsObject)]
+#[non_exhaustive]
+pub struct ViewStyle {
+    /// Its `backgroundColor`, absent when transparent.
+    #[prop(skip_none)]
+    pub background_color: Option<String>,
+    /// Its own `opacity`.
+    pub opacity: f64,
+    /// The opacity it shows with: its own times every view's around it.
+    pub effective_opacity: f64,
+}
+
+impl From<crate::screen::ViewStyle> for ViewStyle {
+    fn from(style: crate::screen::ViewStyle) -> Self {
+        ViewStyle {
+            background_color: style.background_color.map(|c| format!("#{c:08x}")),
+            opacity: f64::from(style.opacity),
+            effective_opacity: f64::from(style.effective_opacity),
         }
     }
 }
@@ -1198,6 +1532,7 @@ pub(crate) struct Launch {
     pub(crate) clipboard: Option<String>,
     pub(crate) color_scheme: Option<ColorScheme>,
     pub(crate) locale: Option<String>,
+    pub(crate) locale_settings: LocaleSettingsOptions,
     pub(crate) reduced_motion: Option<bool>,
     /// The platform `open` named (headless: iOS when it named none).
     pub(crate) platform: Option<Platform>,
@@ -1210,6 +1545,10 @@ pub(crate) struct Launch {
     pub(crate) host: HostChannel,
     /// Whether `open`'s `host` has handlers (a headless run's only).
     pub(crate) host_handlers: bool,
+    /// Whether `open` has `modules` (a headless run's only).
+    pub(crate) module_fakes: bool,
+    /// The link that launched the app (a headless run's only).
+    pub(crate) url_scheme: Option<String>,
 }
 
 /// The network an app opens with, made where it starts (it is `Send`).
@@ -1230,15 +1569,23 @@ struct RouteCall {
     reply: StubReply,
 }
 
+/// A JS function of the test that answers the app's calls.
+enum HostFunction {
+    /// Of `open`'s `host.handlers`: it gets the call's data.
+    Host(Callback<JsonValue, JsonValue>),
+    /// Of `open`'s `modules`: it gets the call's arguments.
+    Module(Callback<FakeArgs, JsonValue>),
+}
+
 /// The JS functions of an app's routes, and the requests waiting for them:
 /// answered while the app's steps run ([`serve`]).
 pub(crate) struct RouteServer {
     keys: Vec<String>,
     handlers: Vec<Callback<StubRequest, JsonValue>>,
     calls: RefCell<tokio::sync::mpsc::UnboundedReceiver<RouteCall>>,
-    /// The JS functions of `open`'s `host.handlers`, by name, and the
-    /// app's calls and posts waiting for them.
-    host_handlers: Vec<(String, Callback<JsonValue, JsonValue>)>,
+    /// The JS functions of `open`'s `host.handlers` and `modules`, by
+    /// name, and the app's calls and posts waiting for them.
+    host_handlers: Vec<(String, HostFunction)>,
     host_calls: RefCell<tokio::sync::mpsc::UnboundedReceiver<(usize, HostCall)>>,
 }
 
@@ -1259,7 +1606,16 @@ impl RouteServer {
     /// to handle, not the test's failure).
     async fn answer_host(&self, index: usize, mut call: HostCall) {
         let data = call.take_data();
-        let answer = self.host_handlers[index].1.call_async(data).await;
+        let answer = match &self.host_handlers[index].1 {
+            HostFunction::Host(function) => function.call_async(data).await,
+            HostFunction::Module(function) => {
+                let args = match data {
+                    JsonValue::Array(args) => args,
+                    other => vec![other],
+                };
+                function.call_async(FakeArgs(args)).await
+            }
+        };
         match answer {
             Ok(value) => call.resolve(value),
             Err(error) => call.reject(error.to_string()),
@@ -1448,7 +1804,8 @@ fn stub_response(value: &JsonValue) -> Result<StubResponse, PropError> {
 /// is on screen, when it cannot be taken or the app threw. The failures a
 /// test may expect carry a `code` to match (messages may change):
 /// `ERR_NSH_TEST_NOT_FOUND` (nothing matches the selector),
-/// `ERR_NSH_TEST_DISABLED` (what it names is disabled), `ETIMEDOUT` (a wait
+/// `ERR_NSH_TEST_DISABLED` (what it names is disabled),
+/// `ERR_NSH_TEST_COVERED` (another view is drawn over it), `ETIMEDOUT` (a wait
 /// ran out of time), `ERR_NSH_TEST_NO_BACK` (nothing to go back from).
 /// The app closes when the test that opened it ends.
 #[class]
@@ -1567,6 +1924,59 @@ impl Clock {
     }
 }
 
+/// A window of an app (`app.window(id)`), on a desktop: what the platform
+/// reports of it, and its close button. Headless, the driver plays the
+/// platform's windows: one display, and windows whose content fills them.
+#[class]
+pub struct AppWindow {
+    steps: Steps,
+    id: String,
+}
+
+#[class]
+impl AppWindow {
+    /// The app's id for the window (`"main"`: the main window).
+    #[getter]
+    pub fn id(&self) -> String {
+        self.id.clone()
+    }
+
+    /// Its state as the platform reports it to the app now (its mode,
+    /// whether it is minimized, shown and focused, its bounds and content
+    /// bounds in screen points, its display); `null` while it is not open.
+    pub fn state(&self) -> Result<Option<nsh_core::desktop::WindowState>, JsError> {
+        let mut app = self.steps.app.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(app) = app.as_deref_mut() else {
+            return Err(JsError::Error(CLOSED.to_owned()));
+        };
+        app.window_state(&self.id).map_err(step_error)
+    }
+
+    /// Presses its close button as the user does: the window reports the
+    /// press (`onClosePress`, reason `"closeButton"`) and closes when its
+    /// `closeOnPress` lets it (the default); resolves once the app is quiet.
+    /// Rejects when it is not open or has no close button (`closable:
+    /// false`).
+    pub async fn press_close(this: Instance<Self>) -> Result<(), JsError> {
+        let (steps, id) = this.with(|w| (w.steps.clone(), w.id.clone()));
+        steps.run(move |app| app.press_window_close(&id)).await
+    }
+
+    /// A picture of the window as `app.screenshot` takes of the main one:
+    /// PNG bytes of its content, also saved at `path` (relative to the
+    /// current directory, on this machine) when given. A real platform's
+    /// (`nsh test --target`), which draws the window; a headless run draws
+    /// nothing. Rejects when the window is not open.
+    pub async fn screenshot(this: Instance<Self>, path: Option<String>) -> Result<Vec<u8>, String> {
+        let (app, id) = this.with(|w| (w.steps.app.clone(), w.id.clone()));
+        let bytes = on_app(&app, move |a| a.window_screenshot(&id)).await?;
+        if let Some(path) = path {
+            save_screenshot(path, bytes.clone()).await?;
+        }
+        Ok(bytes)
+    }
+}
+
 /// The keyboard of an app (`app.keyboard`), as Playwright's
 /// `page.keyboard`: a hardware keyboard's keys.
 #[class]
@@ -1578,8 +1988,9 @@ pub struct Keyboard {
 impl Keyboard {
     /// Presses `keys`, a keystroke as `nsh/keymap` names it (`"mod+k"`,
     /// `"shift+/"`, `"escape"`; `mod` is the platform's command key): the
-    /// app's shortcut of it hears it (`onKeyCommand`), else the focused
-    /// input takes it, else Escape goes back.
+    /// app's shortcut of it hears it (`onKeyCommand`), else on a desktop
+    /// the application menu's item with that shortcut is chosen, else the
+    /// focused input takes it, else Escape goes back.
     pub async fn press(this: Instance<Self>, keys: String) -> Result<(), JsError> {
         let steps = this.with(|k| k.steps.clone());
         steps.run(move |app| app.press_key(&keys)).await
@@ -1587,7 +1998,8 @@ impl Keyboard {
 
     /// Holds modifier keys down (`"mod"`, `"shift"`, `"alt"`, `"ctrl"`,
     /// `"meta"`, joined by `+`) until `up`: the presses, drags and hovers
-    /// meanwhile carry them (a Mod-click, a Shift-drag). Headless and on Linux.
+    /// meanwhile carry them (a Mod-click, a Shift-drag). Headless and on Linux;
+    /// elsewhere it rejects (`ERR_NSH_TEST_UNSUPPORTED`).
     pub async fn down(this: Instance<Self>, keys: String) -> Result<(), JsError> {
         let steps = this.with(|k| k.steps.clone());
         steps.run(move |app| app.hold_keys(&keys, true)).await
@@ -1691,7 +2103,8 @@ impl App {
 
     /// Drops local files (`file:` URLs, as a file manager drags them) on
     /// the middle of what `selector` names: it, or the nearest view around
-    /// it listening, hears `onFileDrop`. Desktops, headless and on Linux for now.
+    /// it listening, hears `onFileDrop`. Desktops, headless, on Linux and
+    /// on macOS for now.
     pub async fn drop_files(
         this: Instance<Self>,
         selector: String,
@@ -1711,6 +2124,21 @@ impl App {
     /// with `menu()`). Desktops and the web only: a phone has no mouse.
     pub async fn right_click(this: Instance<Self>, selector: String) -> Result<(), JsError> {
         step(&this, move |app| app.right_click(&selector)).await
+    }
+
+    /// An input method composes `text` in the input `selector` names (or
+    /// the first input in it), as a user typing pinyin or kana sees it: the
+    /// input takes the focus and `text` shows marked at the caret, in
+    /// place of what it composed, without changing its value
+    /// (`onCompositionChange`); the input is laid out with it. An empty
+    /// `text` ends the composition with nothing committed: end it so before
+    /// the next step on the input. Headless and on macOS for now.
+    pub async fn compose(
+        this: Instance<Self>,
+        selector: String,
+        text: String,
+    ) -> Result<(), JsError> {
+        step(&this, move |app| app.compose(&selector, &text)).await
     }
 
     /// Pastes `content` into the input `selector` names (or the first input
@@ -1812,11 +2240,10 @@ impl App {
             let clock_left = moved.map(|moved| timeout.saturating_sub(moved));
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() && clock_left.is_none_or(|l| l.is_zero()) {
-                let screen = on_app(&app, |a| Ok(format!("{:?}", a.texts()?)))
-                    .await
-                    .map_err(step_error)?;
+                let texts = on_app(&app, |a| a.texts()).await.map_err(step_error)?;
+                let screen = failure::screen_texts(&texts, Some(failure::SCREEN_TEXT_LIMIT));
                 return Err(JsError::Error(format!(
-                    "the condition never held in {} ms; on screen: {screen}",
+                    "the condition never held in {} ms; on screen: [{screen}]",
                     timeout.as_millis()
                 ))
                 .with_code(failure::TIMED_OUT));
@@ -1894,6 +2321,14 @@ impl App {
         self.with(|app| app.span_style(&selector).map(SpanStyle::from))
     }
 
+    /// The style of the view `selector` names: `backgroundColor` (absent
+    /// when transparent), its own `opacity` and `effectiveOpacity` (times
+    /// every view's around it); `null` when none matches. The values are
+    /// those the app set last, an animation's end value while it runs.
+    pub fn view_style(&self, selector: String) -> Result<Option<ViewStyle>, JsError> {
+        self.with(|app| app.view_style(&selector).map(|s| s.map(ViewStyle::from)))
+    }
+
     /// What the app's storage holds now.
     pub fn storage(&self) -> Result<Entries, String> {
         if let Some(storage) = &self.storage {
@@ -1914,6 +2349,13 @@ impl App {
         step(&this, |app| app.back()).await
     }
 
+    /// Goes forward in the browser's history, as its forward button does.
+    /// Only `nsh test --target web` has one; elsewhere it rejects
+    /// (`ERR_NSH_TEST_UNSUPPORTED`).
+    pub async fn forward(this: Instance<Self>) -> Result<(), JsError> {
+        step(&this, |app| app.forward()).await
+    }
+
     /// Answers the dialogs the app shows from now on (`AlertDialog.show`, action
     /// sheets): `handler` returns the text of the button to press, or
     /// `null` to close it without one. Without a handler, a dialog's cancel
@@ -1923,7 +2365,8 @@ impl App {
         *self.steps.dialog.borrow_mut() = Some(handler);
     }
 
-    /// Answers the picks the app asks for from now on (`Picker.pickImages`):
+    /// Answers the picks the app asks for from now on (`Picker.pickImages`,
+    /// `Picker.pickFiles`; the request's `kind` says which):
     /// `handler` gets what the pick asks and returns the files the user
     /// picks, given as they are (no scaling or conversion), or `null` to
     /// cancel. Without a handler, every pick is cancelled. Headless runs
@@ -1976,6 +2419,22 @@ impl App {
         step(&this, move |app| app.end_speech(error)).await
     }
 
+    /// What the app asked of the speaker (`Sound`, `AudioPlayer`), in
+    /// order. Headless apps play sound: sounds decode as WAV (their length
+    /// from the header; anything else fails with `decode`), players play a
+    /// minute of their source at once and end when `endAudio` says.
+    /// Headless runs only.
+    pub fn audio(&self) -> Result<Vec<AudioCall>, JsError> {
+        self.with(|app| Ok(app.audio_calls()?.iter().map(AudioCall::from).collect()))
+    }
+
+    /// The players playing reach their end: `end` (those that loop start
+    /// again). Then waits until the app is quiet. Rejects when none plays.
+    /// Headless runs only.
+    pub async fn end_audio(this: Instance<Self>) -> Result<(), JsError> {
+        step(&this, |app| app.end_audio()).await
+    }
+
     /// The dialogs the app showed, in order.
     pub fn dialogs(&self) -> Result<Vec<Dialog>, JsError> {
         self.with(|app| Ok(app.dialogs()?.iter().map(Dialog::from).collect()))
@@ -1997,6 +2456,16 @@ impl App {
                     .collect()
             }))
         })
+    }
+
+    /// The app's window `id` (`"main"`, or the id the app opened one
+    /// with), on a desktop: its state as the platform reports it, and its
+    /// close button. The window need not be open yet.
+    pub fn window(&self, id: String) -> AppWindow {
+        AppWindow {
+            steps: self.steps.clone(),
+            id,
+        }
     }
 
     /// The app's keyboard, whose keys the test presses.
@@ -2053,12 +2522,7 @@ impl App {
         let app = this.with(|a| a.steps.app.clone());
         let bytes = on_app(&app, |a| a.screenshot()).await?;
         if let Some(path) = path {
-            let saved = bytes.clone();
-            blocking(move || {
-                std::fs::write(&path, saved).map_err(|e| format!("screenshot({path:?}): {e}"))
-            })
-            .await
-            .map_err(|e| e.to_string())??;
+            save_screenshot(path, bytes.clone()).await?;
         }
         Ok(bytes)
     }
@@ -2082,6 +2546,57 @@ impl App {
         step(&this, move |app| app.set_color_scheme(scheme.into())).await
     }
 
+    /// The system hands the app `url`, a link that opens it, as when the
+    /// user opens one while the app runs: its `UrlScheme.on("open")`
+    /// listener gets it when the app claims its scheme (`nsh.json`
+    /// `schemes`; others are dropped, as on a device). Then waits
+    /// until the app is quiet. Headless only.
+    pub async fn open_with_url(this: Instance<Self>, url: String) -> Result<(), JsError> {
+        step(&this, move |app| app.open_with_url(&url)).await
+    }
+
+    /// The images whose source is `url` fail to load from now on, those
+    /// loading now included: each reports the failure as on a device
+    /// (`onError`), so a test checks what the app shows instead (an
+    /// avatar's initials, a placeholder). `url` is matched whole and `*`
+    /// in it matches anything (`"https://cdn.example.com/avatars/*"`), as
+    /// `open`'s `network` routes are; a bundled image's is
+    /// `asset:/<path>`. Then waits until the app is quiet. Headless only.
+    pub async fn fail_images(this: Instance<Self>, url: String) -> Result<(), JsError> {
+        step(&this, move |app| app.fail_images(&url)).await
+    }
+
+    /// The URLs the app opens that match `url` fail to open from now on:
+    /// `openUrl` resolves `{ opened: false }`, as on a device with no app
+    /// for the URL, so a test checks what the app shows then. `url` is
+    /// matched whole and `*` in it matches anything
+    /// (`"https://example.com/*"`), as `open`'s `network` routes are. They
+    /// are still listed by `openedUrls`. Then waits until the app is
+    /// quiet. Headless only.
+    pub async fn fail_open_urls(this: Instance<Self>, url: String) -> Result<(), JsError> {
+        step(&this, move |app| app.fail_open_urls(&url)).await
+    }
+
+    /// The platform shows a share sheet from now on (`Share.available()`
+    /// resolves `true`), and the user answers every one the app shows
+    /// (`Share.show`) as `answer` says: shared, to its `target` if it names
+    /// one, or dismissed. What the app shares is listed by `shares`. Then
+    /// waits until the app is quiet. Headless only: a real platform shows
+    /// its own sheet.
+    pub async fn on_share(this: Instance<Self>, answer: ShareAnswer) -> Result<(), JsError> {
+        let outcome = match answer.action {
+            ShareAnswerAction::Shared => nsh_core::share::ShareOutcome::shared(answer.target),
+            ShareAnswerAction::Dismissed => nsh_core::share::ShareOutcome::dismissed(),
+        };
+        step(&this, move |app| app.on_share(outcome)).await
+    }
+
+    /// What the app shared (`Share.show`), in order: recorded, never
+    /// shared, and answered as `onShare` says. Headless only.
+    pub fn shares(&self) -> Result<Vec<SharedContent>, JsError> {
+        self.with(|app| Ok(app.shares()?.iter().map(SharedContent::from).collect()))
+    }
+
     /// Moves the app to `state`, as the system does when the user leaves it
     /// (`"background"`), switches to another app or window (`"inactive"`)
     /// and comes back (`"active"`); `lifecycle()` follows. Headless only.
@@ -2089,9 +2604,36 @@ impl App {
         step(&this, move |app| app.set_lifecycle(state.into())).await
     }
 
+    /// Wakes the system from sleep, as when the user opens a laptop's lid:
+    /// `wakeCount()` counts one more, and `lifecycle()` stays as it was.
+    /// Headless only.
+    pub async fn wake(this: Instance<Self>) -> Result<(), JsError> {
+        step(&this, |app| app.wake()).await
+    }
+
+    /// Gives the user the locale settings `settings` names
+    /// (`{ hourCycle: "h23", timeZone: "Asia/Tokyo" }`), as the system does
+    /// when the user changes them or travels; `localeSettings()` follows,
+    /// with the others as they were. A time zone names the zone: local
+    /// times stay the machine's. Headless only.
+    pub async fn set_locale_settings(
+        this: Instance<Self>,
+        settings: LocaleSettingsOptions,
+    ) -> Result<(), JsError> {
+        settings.pins("setLocaleSettings").map_err(JsError::Range)?;
+        step(&this, move |app| app.set_locale_settings(settings)).await
+    }
+
     /// The text on the clipboard now, `null` when it holds none.
     pub fn clipboard(&self) -> Result<Option<String>, JsError> {
         self.with(|app| app.clipboard())
+    }
+
+    /// The item on the clipboard now, `{ text, html? }` (`Clipboard.write`;
+    /// text alone has no `html`), `null` when it holds none. Headless tests
+    /// only.
+    pub fn clipboard_item(&self) -> Result<Option<ClipboardItem>, JsError> {
+        self.with(|app| app.clipboard_item())
     }
 
     /// `f` with the app as it is now (the batches that came applied); a
@@ -2187,6 +2729,13 @@ impl Steps {
     }
 }
 
+/// Saves a screenshot's `bytes` at `path`, on a blocking thread.
+async fn save_screenshot(path: String, bytes: Vec<u8>) -> Result<(), String> {
+    blocking(move || std::fs::write(&path, bytes).map_err(|e| format!("screenshot({path:?}): {e}")))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
 /// `f` with the app `app`, on a blocking thread.
 async fn on_app<R: Send + 'static>(
     app: &OpenApp,
@@ -2214,6 +2763,14 @@ pub struct Expectation {
     /// `expect` was given a promise.
     promise: bool,
     not: bool,
+}
+
+/// What a matcher shows of the value it expected: the value as
+/// [`values::show`] writes it, and a note after it (why `toBe` failed when
+/// the values are equal but not the same).
+struct Want {
+    shown: String,
+    note: &'static str,
 }
 
 #[class]
@@ -2267,7 +2824,13 @@ impl Expectation {
                 Some(text) => pattern.matches(host, &text)?,
                 None => false,
             };
-            Ok((holds, Some(pattern.describe())))
+            Ok((
+                holds,
+                Some(Want {
+                    shown: pattern.describe(),
+                    note: "",
+                }),
+            ))
         })
     }
 
@@ -2283,7 +2846,13 @@ impl Expectation {
                 }
                 _ => None,
             };
-            Ok((len == Some(length), Some(values::number(length))))
+            Ok((
+                len == Some(length),
+                Some(Want {
+                    shown: values::number(length),
+                    note: "",
+                }),
+            ))
         })
     }
 
@@ -2372,7 +2941,13 @@ impl Expectation {
     fn compare(&self, n: f64, what: &'static str, holds: impl Fn(f64) -> bool + 'static) -> Check {
         self.verdict(what, move |_, value| {
             let holds = value.kind() == JsKind::Number && value.as_number().is_some_and(holds);
-            Ok((holds, Some(values::number(n))))
+            Ok((
+                holds,
+                Some(Want {
+                    shown: values::number(n),
+                    note: "",
+                }),
+            ))
         })
     }
 
@@ -2385,11 +2960,18 @@ impl Expectation {
             if value.same_value(expected) {
                 return Ok((true, None));
             }
-            let mut shown = values::show(expected);
-            if values::equals(value, expected).map_err(|e| e.0)? {
-                shown.push_str(" (an equal value, not the same one: `toEqual` compares members)");
-            }
-            Ok((false, Some(shown)))
+            let note = if values::equals(value, expected).map_err(|e| e.0)? {
+                " (an equal value, not the same one: `toEqual` compares members)"
+            } else {
+                ""
+            };
+            Ok((
+                false,
+                Some(Want {
+                    shown: values::show(expected),
+                    note,
+                }),
+            ))
         })
     }
 
@@ -2403,7 +2985,13 @@ impl Expectation {
         self.verdict("to equal", move |host, value| {
             let expected = expected.get(host)?;
             let holds = values::equals(value, expected.get()).map_err(|e| e.0)?;
-            Ok((holds, Some(values::show(expected.get()))))
+            Ok((
+                holds,
+                Some(Want {
+                    shown: values::show(expected.get()),
+                    note: "",
+                }),
+            ))
         })
     }
 
@@ -2417,7 +3005,13 @@ impl Expectation {
             let subset = subset.get(host)?;
             subset_of(subset.get())?;
             let holds = values::matches_object(value, subset.get()).map_err(|e| e.0)?;
-            Ok((holds, Some(values::show(subset.get()))))
+            Ok((
+                holds,
+                Some(Want {
+                    shown: values::show(subset.get()),
+                    note: "",
+                }),
+            ))
         })
     }
 
@@ -2434,7 +3028,13 @@ impl Expectation {
                     .iter()
                     .any(|i| values::strict_equal(i.get(), item.get())),
             };
-            Ok((holds, Some(values::show(item.get()))))
+            Ok((
+                holds,
+                Some(Want {
+                    shown: values::show(item.get()),
+                    note: "",
+                }),
+            ))
         })
     }
 
@@ -2451,7 +3051,13 @@ impl Expectation {
                     break;
                 }
             }
-            Ok((holds, Some(values::show(item.get()))))
+            Ok((
+                holds,
+                Some(Want {
+                    shown: values::show(item.get()),
+                    note: "",
+                }),
+            ))
         })
     }
 
@@ -2470,7 +3076,7 @@ impl Expectation {
     fn verdict(
         &self,
         what: &'static str,
-        holds: impl FnOnce(&dyn JsHost, JsIn<'_>) -> Result<(bool, Option<String>), String> + 'static,
+        holds: impl FnOnce(&dyn JsHost, JsIn<'_>) -> Result<(bool, Option<Want>), String> + 'static,
     ) -> Check {
         let (value, not) = (self.value.clone(), self.not);
         let hint = match (&self.run, self.promise) {
@@ -2484,15 +3090,25 @@ impl Expectation {
         };
         Check::new(move |host| {
             let value = value.get(host)?;
-            let (holds, expected) = holds(host, value.get())?;
+            let (holds, wanted) = holds(host, value.get())?;
             if holds != not {
                 return Ok(());
             }
             let not = if not { "not " } else { "" };
             let shown = values::show(value.get());
-            Err(match expected {
-                Some(expected) => format!("expected {shown} {not}{what} {expected}{hint}"),
-                None => format!("expected {shown} {not}{what}{hint}"),
+            let limit = crate::failure::SCREEN_TEXT_LIMIT;
+            Err(match wanted {
+                Some(Want {
+                    shown: expected,
+                    note,
+                }) => {
+                    let (shown, expected) = values::show_pair(&shown, &expected, limit);
+                    format!("expected {shown} {not}{what} {expected}{note}{hint}")
+                }
+                None => format!(
+                    "expected {} {not}{what}{hint}",
+                    values::shorten(&shown, limit)
+                ),
             })
         })
     }
@@ -2574,14 +3190,19 @@ impl Rejection {
             }
             let not_ = if not { "not " } else { "" };
             let subject = subject(promise);
+            let limit = crate::failure::SCREEN_TEXT_LIMIT;
             let subset = values::show(subset.get());
             Err(match error {
-                Some(error) => format!(
-                    "expected {subject} {not_}to reject with a value matching {subset}; it rejected with {}",
-                    values::show(error.get())
-                ),
+                Some(error) => {
+                    let rejected = values::show(error.get());
+                    let (subset, rejected) = values::show_pair(&subset, &rejected, limit);
+                    format!(
+                        "expected {subject} {not_}to reject with a value matching {subset}; it rejected with {rejected}"
+                    )
+                }
                 None => format!(
-                    "expected {subject} {not_}to reject with a value matching {subset}; it resolved"
+                    "expected {subject} {not_}to reject with a value matching {}; it resolved",
+                    values::shorten(&subset, limit)
                 ),
             })
         }))
@@ -2639,9 +3260,12 @@ async fn resolved(this: Instance<Resolution>) -> Result<Expectation, String> {
             not,
         }),
         Err(error) => Err(format!(
-            "expected {} to resolve; it rejected with {:?}",
+            "expected {} to resolve; it rejected with {}",
             subject(promise),
-            error.message
+            values::shorten(
+                &format!("{:?}", error.message),
+                crate::failure::SCREEN_TEXT_LIMIT
+            )
         )),
     }
 }
@@ -2661,7 +3285,7 @@ fn subset_of(subset: JsIn<'_>) -> Result<(), String> {
         Some(class) if class != JsClass::Function => Ok(()),
         _ => Err(format!(
             "`toMatchObject` takes an object of the properties to match, not {}",
-            values::show(subset)
+            values::shorten(&values::show(subset), crate::failure::SCREEN_TEXT_LIMIT)
         )),
     }
 }
@@ -2716,7 +3340,7 @@ fn describe_error(error: &Exception) -> String {
     if let Some(code) = field("code") {
         text.push_str(&format!(" (code {code:?})"));
     }
-    text
+    values::shorten(&text, crate::failure::SCREEN_TEXT_LIMIT)
 }
 
 /// What `expect` checks: a value, kept as JS made it; a function (for
@@ -2784,11 +3408,12 @@ impl ErrorMatch {
     }
 
     fn describe(&self) -> String {
-        match self {
+        let text = match self {
             ErrorMatch::Message(pattern) => pattern.describe(),
             ErrorMatch::Class(class) => class.clone(),
             ErrorMatch::Error(message) => format!("an error {}", JsonValue::from(message.as_str())),
-        }
+        };
+        values::shorten(&text, crate::failure::SCREEN_TEXT_LIMIT)
     }
 }
 
@@ -2859,6 +3484,7 @@ impl Pattern {
     }
 
     /// As failure messages show it: a string quoted, a `RegExp` as it reads.
+    /// The caller bounds it, keeping the whole pattern for comparisons.
     fn describe(&self) -> String {
         match self {
             Pattern::Contains(part) => JsonValue::String(part.clone()).to_string(),
@@ -2893,31 +3519,6 @@ impl JsValue for Pattern {
             Pattern::Contains(part) => Ok(JsOwned::new(host, host.new_string(part)?)),
             Pattern::RegExp(re, _) => re.to_js(host),
         }
-    }
-}
-
-/// Whether `a` and `b` are the same JSON value (numbers by value).
-fn same(a: &JsonValue, b: &JsonValue) -> bool {
-    match (a, b) {
-        (JsonValue::Number(a), JsonValue::Number(b)) => a.as_f64() == b.as_f64(),
-        (JsonValue::Array(a), JsonValue::Array(b)) => {
-            a.len() == b.len() && a.iter().zip(b).all(|(a, b)| same(a, b))
-        }
-        (JsonValue::Object(a), JsonValue::Object(b)) => {
-            a.len() == b.len() && a.iter().all(|(k, v)| b.get(k).is_some_and(|w| same(v, w)))
-        }
-        _ => a == b,
-    }
-}
-
-/// JS's truthiness of `value`.
-fn truthy(value: &JsonValue) -> bool {
-    match value {
-        JsonValue::Null => false,
-        JsonValue::Bool(b) => *b,
-        JsonValue::Number(n) => n.as_f64().is_some_and(|n| n != 0.0 && !n.is_nan()),
-        JsonValue::String(s) => !s.is_empty(),
-        JsonValue::Array(_) | JsonValue::Object(_) => true,
     }
 }
 
@@ -2975,6 +3576,39 @@ const fails = (f, message) => {{
                 () => expect(Promise.resolve(1)).toBe(1),
                 "expected Promise {} to be 1; `expect` was given a promise: check what it settles to with `resolves` or `rejects`",
             );
+        "#);
+    }
+
+    #[test]
+    fn a_long_value_is_cut_in_a_failure_message() {
+        run(r#"
+            const long = "x".repeat(200000);
+            let shown;
+            try { expect(long).toBe("y"); } catch (e) { shown = e.message; }
+            if (!shown || shown.length >= 6000 || !shown.includes("…"))
+                throw new Error("a long value was not cut: " + shown?.length);
+        "#);
+    }
+
+    #[test]
+    fn a_long_common_prefix_does_not_hide_the_difference() {
+        run(r#"
+            const prefix = "x".repeat(5000);
+            let shown;
+            try { expect(prefix + "A").toBe(prefix + "B"); } catch (e) { shown = e.message; }
+            if (!shown || shown.length >= 6000 || !shown.includes("A") || !shown.includes("B"))
+                throw new Error("the difference was hidden: " + shown);
+        "#);
+    }
+
+    #[test]
+    fn a_long_match_pattern_keeps_the_difference() {
+        run(r#"
+            const prefix = "x".repeat(5000);
+            let shown;
+            try { expect(prefix + "A").toMatch(prefix + "B"); } catch (e) { shown = e.message; }
+            if (!shown || shown.length >= 6000 || !shown.includes("A") || !shown.includes("B"))
+                throw new Error("the pattern's difference was hidden: " + shown);
         "#);
     }
 

@@ -304,3 +304,318 @@ fn handles_free_signals_and_reuse_slots_with_new_generations() {
     assert!(graph().live(b, graph().generation(b), u32::MAX));
     assert_ne!(graph().generation(b), generation);
 }
+
+/// The graph's links hold: every edge has its back edge, no edge names a
+/// freed slot, only computations have sources, and no slot is free twice.
+fn check_links() {
+    let g = graph();
+    for (id, n) in g.nodes.iter().enumerate() {
+        if n.kind == Kind::Free {
+            continue;
+        }
+        let id = id as u32;
+        assert!(
+            n.is_computation() || n.sources.is_empty(),
+            "{:?} {id} has sources",
+            n.kind
+        );
+        for (i, &(s, slot)) in n.sources.iter().enumerate() {
+            let back = g.nodes[s as usize].observers.get(slot as usize);
+            assert_eq!(back, Some(&(id, i as u32)), "{id} reads {s}");
+        }
+        for (i, &(o, slot)) in n.observers.iter().enumerate() {
+            assert_ne!(
+                g.nodes[o as usize].kind,
+                Kind::Free,
+                "{id} is read by freed {o}"
+            );
+            let back = g.nodes[o as usize].sources.get(slot as usize);
+            assert_eq!(back, Some(&(id, i as u32)), "{id} is read by {o}");
+        }
+    }
+    let mut free = g.free.clone();
+    free.sort_unstable();
+    free.dedup();
+    assert_eq!(free.len(), g.free.len(), "a slot freed twice: {:?}", g.free);
+}
+
+#[test]
+fn a_computation_disposed_while_it_runs_is_left_with_no_edges() {
+    let show = signal(1);
+    let (a, b, c) = (signal(0), signal(0), signal(0));
+    // Another reader of `c`, before the effect below in its list.
+    render_effect(move || {
+        get(c);
+    });
+    with_root(Test, || {
+        computed(move || {
+            if get(show) != 0 {
+                render_effect(move || {
+                    let _ = graph().on_cleanup(Box::new(move || {
+                        get(a);
+                        get(b);
+                        get(c);
+                    }));
+                    // Closes the branch it runs in: it is disposed, its
+                    // cleanup reads while it is still the listener.
+                    set(show, 0);
+                });
+            }
+            0
+        });
+    });
+    // Its slot is reused, and the first effect leaves `c`'s readers.
+    signal(0);
+    set(c, 1);
+    check_links();
+}
+
+#[test]
+fn a_memo_read_while_it_is_disposed_does_not_run_again() {
+    let s = signal(0);
+    let other = signal(0);
+    let runs = Rc::new(Cell::new(0));
+    let r = runs.clone();
+    with_root(Test, || {
+        computed(move || {
+            get(s);
+            let me = Rc::new(Cell::new(NONE));
+            let m = me.clone();
+            let r = r.clone();
+            let inner = memo(
+                Test,
+                func(move |_| {
+                    r.set(r.get() + 1);
+                    get(s);
+                    get(other);
+                    let m = m.clone();
+                    render_effect(move || {
+                        let m = m.clone();
+                        // Reads the memo that owns it when it goes.
+                        let _ = graph().on_cleanup(Box::new(move || {
+                            get(m.get());
+                        }));
+                    });
+                    0
+                }),
+                0,
+                Equals::Default,
+                false,
+            );
+            me.set(inner);
+            0
+        });
+    });
+    // The outer memo runs first and disposes the stale inner one.
+    set(s, 1);
+    assert_eq!(runs.get(), 2, "once at first, once made again");
+    check_links();
+}
+
+#[test]
+fn an_owner_disposed_again_by_its_cleanups_is_freed_once() {
+    let close = signal(0);
+    let root = Rc::new(Cell::new(NONE));
+    let r = root.clone();
+    render_effect(move || {
+        if get(close) != 0 {
+            dispose_owner(Test, r.get());
+        }
+    });
+    let (id, ()) = with_root(Test, || {
+        render_effect(move || {
+            let _ = graph().on_cleanup(Box::new(move || set(close, 1)));
+        });
+    });
+    root.set(id);
+    // Outside a round: the cleanup's write runs the effect above at once.
+    dispose_owner(Test, id);
+    check_links();
+}
+
+#[test]
+fn a_memo_whose_handle_goes_while_it_is_disposed_is_freed_once() {
+    let a = signal(0);
+    let me = Rc::new(Cell::new(NONE));
+    let m = me.clone();
+    let (root, ()) = with_root(Test, || {
+        let id = memo(
+            Test,
+            func(move |_| {
+                get(a);
+                let m = m.clone();
+                // A JS memo's object is finalized when a cleanup frees the
+                // last reference to it.
+                let _ = graph().on_cleanup(Box::new(move || {
+                    if let Some(held) = graph().drop_handle(m.get()) {
+                        held.free(Test);
+                    }
+                }));
+                0
+            }),
+            0,
+            Equals::Default,
+            true,
+        );
+        me.set(id);
+    });
+    dispose_owner(Test, root);
+    check_links();
+}
+
+#[test]
+fn a_computation_disposed_in_a_nested_run_tracks_nothing_after() {
+    let items = signal(1);
+    let other = signal(0);
+    let row = Rc::new(Cell::new(NONE));
+    with_root(Test, || {
+        // A list's memo: a row (a root) for its item, the last row goes.
+        computed(move || {
+            let n = get(items);
+            dispose_owner(Test, row.get());
+            // The row's item and index signals.
+            signal(n);
+            signal(0);
+            let row = row.clone();
+            with_root(Test, || {
+                row.set(graph().owner());
+                if n == 1 {
+                    render_effect(move || {
+                        // The list runs again in this write and disposes
+                        // the row; the effect is the listener again after,
+                        // and its slot holds the new row's index signal.
+                        set(items, 2);
+                        get(other);
+                    });
+                }
+            });
+            0
+        });
+    });
+    check_links();
+}
+
+#[test]
+fn compacting_gives_back_the_slots_of_a_tree_that_is_gone() {
+    let kept = signal(1);
+    let many: Vec<u32> = (0..5000).map(signal).collect();
+    let last = *many.last().unwrap();
+    let last_generation = graph().generation(last);
+    // One in the middle stays: the slots after it go, those before stay free.
+    let middle = many[100];
+    for &id in &many {
+        if id != middle
+            && let Some(held) = graph().drop_handle(id)
+        {
+            held.free(Test);
+        }
+    }
+    graph().compact();
+    assert_eq!(graph().slots(), (2, middle as usize + 1));
+    assert_eq!(get(kept), 1);
+    assert_eq!(get(middle), 100);
+    // A handle of a dropped slot never names the node made in its place.
+    assert!(!graph().live(last, last_generation, u32::MAX));
+    // Freed slots are reused lowest first.
+    let next = signal(7);
+    assert!(next < middle);
+    if let Some(held) = graph().drop_handle(middle) {
+        held.free(Test);
+    }
+    graph().compact();
+    let mut made: Vec<u32> = (0..(last as i64 + 1)).map(signal).collect();
+    made.sort_unstable();
+    let again = made.iter().copied().find(|&id| id == last).unwrap();
+    assert_ne!(graph().generation(again), last_generation);
+    assert!(!graph().live(last, last_generation, u32::MAX));
+    check_links();
+}
+
+/// A root made under an owner that is disposed before it keeps naming the
+/// owner's slot; once the slot is reused by a node made under the root, the
+/// root's `owner` link closes a loop. A write then must not hang `runTop`.
+#[test]
+fn a_root_whose_owner_went_does_not_loop_through_its_reused_slot() {
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let flag = done.clone();
+    std::thread::spawn(move || {
+        let tick = signal(0);
+        let mut root = NONE;
+        // The owner: a computation the root is made under (not owned by it).
+        let owner = render_effect(|| {});
+        with_owner(Test, owner, || {
+            root = with_root(Test, || ()).0;
+        });
+        // The owner goes; the root does not.
+        dispose(Test, owner);
+        // A computation made under the root takes the owner's freed slot.
+        let effect = with_owner(Test, root, || {
+            render_effect(move || {
+                get(tick);
+            })
+        });
+        assert_eq!(effect, owner, "the freed slot is reused");
+        assert_eq!(
+            graph().parent(effect),
+            root,
+            "the slot's new node is under the root"
+        );
+        set(tick, 1);
+        flag.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    for _ in 0..50 {
+        if done.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("runTop looped through the root's stale owner");
+}
+
+/// A memo whose function fails, as an effect's: what reads it hears of the
+/// next change of what it read, and keeps the last value meanwhile.
+#[test]
+fn a_memo_that_failed_once_still_tells_its_readers_of_changes() {
+    let a = signal(0);
+    let m = memo(
+        Test,
+        Rc::new(move |_| {
+            let v = get(a);
+            (v != 1).then_some(v * 10)
+        }),
+        0,
+        Equals::Default,
+        false,
+    );
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = seen.clone();
+    render_effect(move || log.borrow_mut().push(get(m)));
+    set(a, 1);
+    assert_eq!(get(m), 0, "a failed run keeps the last value");
+    set(a, 2);
+    set(a, 3);
+    assert_eq!(*seen.borrow(), vec![0, 20, 30]);
+}
+
+/// The same through a memo that reads the failed one.
+#[test]
+fn a_memo_that_failed_once_still_updates_the_memos_that_read_it() {
+    let a = signal(0);
+    let m = memo(
+        Test,
+        Rc::new(move |_| {
+            let v = get(a);
+            (v != 1).then_some(v)
+        }),
+        0,
+        Equals::Default,
+        false,
+    );
+    let n = computed(move || get(m) + 100);
+    let seen = Rc::new(RefCell::new(Vec::new()));
+    let log = seen.clone();
+    user_effect(move || log.borrow_mut().push(get(n)));
+    set(a, 1);
+    set(a, 2);
+    assert_eq!(*seen.borrow(), vec![100, 102]);
+}

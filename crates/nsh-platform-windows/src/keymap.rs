@@ -2,9 +2,12 @@
 //! mounts ([`MountItem::Keymap`](nsh_core::MountItem::Keymap)), matched on
 //! every key down the window gets ([`crate::input::key`]): after the dialogs
 //! the surface shows, before the focused field, selectable text, navigation
-//! and scroll views. A key that fires a binding is consumed (its `WM_CHAR`
-//! too) and reported to JS with the root's `KeyCommand` event; JS runs the
-//! handler afterwards.
+//! and scroll views. A key that fires a binding is consumed and reported to
+//! JS with the root's `KeyCommand` event; JS runs the handler afterwards.
+//! Only a key whose message `TranslateMessage` actually translated has
+//! characters to remove ([`KeyEvent::translated`]): an untranslated key (a
+//! captured private message, input synthesized inside the backend) made
+//! none, and none are taken for it.
 //!
 //! Keys are matched by virtual key code: letters and digits are the same
 //! on every layout (a Cyrillic layout's keys have the US layout's codes),
@@ -17,7 +20,10 @@ use nsh_core::{
     keymap::{Key, Keymap, Keystroke, Modifiers},
     platform::Os,
 };
-use windows::Win32::UI::WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_CHAR, WM_SYSCHAR};
+use windows::Win32::UI::{
+    Input::KeyboardAndMouse::GetFocus,
+    WindowsAndMessaging::{MSG, PM_REMOVE, PeekMessageW, WM_CHAR, WM_SYSCHAR},
+};
 
 use crate::{input::KeyEvent, surface::Surface};
 
@@ -52,7 +58,13 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
         return false;
     }
     let editing = crate::text_input::focused(surface).is_some();
-    let found = table.find(keystroke, editing, event.repeat);
+    // Only the bindings of the window the key is in (and JS's) take it.
+    let window = surface.input_root().id();
+    // Return and Space press a focused control: a binding of the focus
+    // takes them first, any other leaves them to the control
+    // (`crate::keyboard::activate`).
+    let control = crate::keyboard::focused_control(surface).is_some();
+    let found = table.find_at(window, keystroke, editing, control, event.repeat);
     if let Some(id) = found.fired() {
         surface.event(
             ROOT_ID,
@@ -60,20 +72,40 @@ pub(crate) fn key(surface: &Rc<Surface>, event: &KeyEvent) -> bool {
             EventPayload::Value(PayloadValue::Number(id as f64)),
         );
     }
-    if found.consumed() {
+    if found.consumed() && event.translated {
+        // Only characters this key's translation made may go: a key that
+        // was never translated (a captured private message, input
+        // synthesized in the backend) queued none, and anything found
+        // would be someone else's.
         drop_char(surface);
     }
     found.consumed()
 }
 
-/// Removes the character `TranslateMessage` queued for the consumed key.
+/// Removes the characters `TranslateMessage` queued for the consumed key:
+/// in the window that has the keyboard (the main one or a window of the
+/// app's own; every window's keys go through the app's keymap).
 fn drop_char(surface: &Surface) {
+    let hwnd = keyboard_window(surface);
     let mut msg = MSG::default();
     for kind in [WM_CHAR, WM_SYSCHAR] {
-        // SAFETY: a plain call with a local out value, for our own window.
+        // SAFETY: a plain call with a local out value, for a window of
+        // this thread.
         unsafe {
-            let _ = PeekMessageW(&mut msg, Some(surface.hwnd()), kind, kind, PM_REMOVE);
+            let _ = PeekMessageW(&mut msg, Some(hwnd), kind, kind, PM_REMOVE);
         }
+    }
+}
+
+/// The window whose queue `TranslateMessage` queued the character in: the
+/// window that has the keyboard, else the surface's.
+fn keyboard_window(surface: &Surface) -> windows::Win32::Foundation::HWND {
+    // SAFETY: a plain query of this thread's focus.
+    let focus = unsafe { GetFocus() };
+    if focus.is_invalid() {
+        surface.hwnd()
+    } else {
+        focus
     }
 }
 

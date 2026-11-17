@@ -33,15 +33,16 @@
 //! elements.
 //!
 //! Each element gets a role ([`role_for`]), its name (AccessKit reads a
-//! `Label`'s name from its value), its `accessibilityHint` (and a value text
-//! that is not a range's) as description, its `testID` as author id (UIA's
+//! `Label`'s name from its value), its `accessibilityDescription` and
+//! `accessibilityHint` (and a value text that is not a range's) as
+//! description, its `testID` as author id (UIA's
 //! `AutomationId`, `AXIdentifier`, AT-SPI's accessible id), its states
 //! (disabled, selected, checked as toggled, expanded, busy), a range's
 //! numeric value, a field's value ([`crate::text_input::accessible_value`]),
 //! a scroll view's offsets, the live region it is in, and the actions it
 //! takes: `Click` (its `activate` action, else a press), `Focus`,
 //! `Increment` / `Decrement`, `Expand` / `Collapse`, `ShowContextMenu`
-//! (`longpress`), `SetValue`, custom actions (the other
+//! (`onContextMenu` with no pointer, else `longpress`), `SetValue`, custom actions (the other
 //! `accessibilityActions`, by their labels), scrolling and
 //! `ScrollIntoView`. The listeners are registered as the surface paints
 //! ([`paint`]); each sends the action to the view's node by id, so a
@@ -59,6 +60,19 @@
 //! surface element registers its focus handle after it, so keys still go
 //! to the surface.
 //!
+//! **Native components.** The elements of native components are GPUI's
+//! own: those with an id and a role push their nodes under the surface's as
+//! the surface element prepaints them, after the focus proxy. The surface's
+//! node keeps them as children, after the views' ([`Built::adopt`]): a node
+//! of the frame that no node has as a child makes AccessKit's adapter
+//! panic, and the host with it (#1347).
+//!
+//! A frame GPUI Fast draws again from the last one runs none of this: it
+//! does again what building the tree did. From 0.1.14 on that keeps the
+//! children [`synthetic`] gave the surface's node; before, it hung every
+//! node pushed under the surface's off it again, the nested ones a second
+//! time.
+//!
 //! Announcements (`announce`, [`announce`]) are a polite
 //! live `Label` node added under the surface's: all three adapters read a
 //! live node that appears.
@@ -67,7 +81,7 @@
 //! assistive technology asked the window for its tree (on Windows any UI
 //! Automation client does, on Linux the AT-SPI bus being enabled does).
 //!
-//! **Limits** (AccessKit 0.24, as GPUI Fast 0.1.8 uses it). The adapters
+//! **Limits** (AccessKit 0.24, as GPUI Fast 0.1.14 uses it). The adapters
 //! pass on only some actions: `Click`, `Focus`, `SetValue` and
 //! `ScrollIntoView` everywhere, `Increment` / `Decrement` on macOS,
 //! `Expand` / `Collapse` on Windows. Custom actions, `ShowContextMenu` and
@@ -89,13 +103,14 @@ use gpui::{
     A11ySubtreeBuilder, AnyElement, App, AvailableSpace, FocusHandle, InteractiveElement,
     IntoElement, StatefulInteractiveElement, Styled, Window,
     accesskit::{
-        self, Action, ActionData, AriaCurrent, CustomAction, Live, Node, Role, ScrollUnit, Toggled,
+        self, Action, ActionData, AriaCurrent, CustomAction, Invalid, Live, Node, Role, ScrollUnit,
+        Toggled,
     },
     div, point, px, size,
 };
 use nsh_core::{
     Accessibility, AccessibilityCurrent, AccessibilityRole as AxRole, Checked, Command, EventKind,
-    EventMask, LiveRegion, MountBatch, NodeId, ViewKind, geometry::Points,
+    EventMask, LiveRegion, MountBatch, NodeId, ROOT_ID, ViewKind, geometry::Points,
 };
 use rustc_hash::FxHashMap;
 
@@ -251,6 +266,8 @@ pub(crate) fn role_for(a: &Accessibility, kind: ViewKind, pressable: bool) -> Op
         AxRole::TreeItem => Role::TreeItem,
         AxRole::MenuItemCheckbox => Role::MenuItemCheckBox,
         AxRole::MenuItemRadio => Role::MenuItemRadio,
+        AxRole::Dialog => Role::Dialog,
+        AxRole::AlertDialog => Role::AlertDialog,
     })
 }
 
@@ -330,7 +347,8 @@ fn own_name(view: &NshView, s: &ViewState, role: Option<Role>) -> Option<String>
         return Some(label.to_string());
     }
     if let Some(t) = &s.text {
-        return Some(t.text.text.clone());
+        // Hidden runs are not read.
+        return Some(t.text.visible_text().into_owned());
     }
     if !role.is_some_and(|r| groups(s, r)) {
         return None;
@@ -360,7 +378,8 @@ fn content_name(view: &NshView, out: &mut String) {
                     .accessibility
                     .label
                     .as_deref()
-                    .or(s.text.as_ref().map(|t| t.text.text.as_str())),
+                    .map(std::borrow::Cow::Borrowed)
+                    .or_else(|| s.text.as_ref().map(|t| t.text.visible_text())),
             };
             match own {
                 Some(text) => {
@@ -381,18 +400,15 @@ fn content_name(view: &NshView, out: &mut String) {
     });
 }
 
-/// The description: a value that is not a range's, and the hint.
+/// The description: a value that is not a range's, the description and
+/// the hint.
 pub(crate) fn help_of(a: &Accessibility, role: Role) -> Option<String> {
     let value_text = a
         .value
         .as_ref()
         .and_then(|v| v.text.as_deref())
         .filter(|_| !is_range(role));
-    match (value_text, a.hint.as_deref()) {
-        (Some(v), Some(h)) => Some(format!("{v}. {h}")),
-        (Some(t), None) | (None, Some(t)) => Some(t.to_owned()),
-        (None, None) => None,
-    }
+    a.help_text(value_text)
 }
 
 /// A range's minimum, maximum and current value, or `None` when the
@@ -517,6 +533,9 @@ fn describe(
     if state.busy {
         node.set_busy();
     }
+    if state.invalid {
+        node.set_invalid(Invalid::True);
+    }
     let range = range_of(a, role);
     if let Some((min, max, now)) = range {
         node.set_min_numeric_value(min);
@@ -573,7 +592,10 @@ fn describe(
         if state.expanded.is_some() && (pressable || declares(s, "collapse")) {
             actions.push(Action::Collapse);
         }
-        if declares(s, "longpress") || s.events.contains(EventKind::LongPress) {
+        if declares(s, "longpress")
+            || s.events.contains(EventKind::LongPress)
+            || s.events.contains(EventKind::ContextMenu)
+        {
             actions.push(Action::ShowContextMenu);
         }
         let stepped = range.is_some() && (declares(s, "increment") || declares(s, "decrement"));
@@ -637,6 +659,70 @@ impl Built {
         }
         Some((entry, below))
     }
+
+    /// Joins the nodes the surface element prepainted itself to the views'
+    /// tree. `prepainted` are the children of the surface's node so far: the
+    /// focus proxy first when it stands for the element `proxied`
+    /// ([`prepaint`] runs before the native components'), then the roots of
+    /// the native components' elements. The proxy takes its element's place
+    /// among the views' nodes, so it has that one parent; the native roots
+    /// stay children of the surface's node, after the views. Returns the
+    /// proxy's id.
+    fn adopt(
+        &mut self,
+        prepainted: &[accesskit::NodeId],
+        proxied: Option<accesskit::NodeId>,
+    ) -> Option<accesskit::NodeId> {
+        let (proxy, native) = match (proxied, prepainted.split_first()) {
+            (Some(stood_for), Some((&proxy, native))) => (Some((stood_for, proxy)), native),
+            _ => (None, prepainted),
+        };
+        if let Some((stood_for, proxy)) = proxy {
+            let swap = |ids: &[accesskit::NodeId]| -> Option<Vec<accesskit::NodeId>> {
+                ids.contains(&stood_for).then(|| {
+                    ids.iter()
+                        .map(|&id| if id == stood_for { proxy } else { id })
+                        .collect()
+                })
+            };
+            if let Some(top) = swap(&self.top) {
+                self.top = top;
+            } else if let Some((e, children)) = self
+                .entries
+                .iter_mut()
+                .find_map(|e| swap(e.node.children()).map(|children| (e, children)))
+            {
+                e.node.set_children(children);
+            } else {
+                // Nothing names the element: the proxy's node is in this
+                // frame's tree all the same, and needs a parent.
+                self.top.push(proxy);
+            }
+        }
+        self.top.extend_from_slice(native);
+        proxy.map(|(_, proxy)| proxy)
+    }
+}
+
+/// What this module does with an element's node as it adds the element's
+/// synthetic children: [`A11ySubtreeBuilder`], which only GPUI makes, and
+/// the tests' model of it.
+trait Subtree {
+    /// The element's own node, its children those pushed under it so far.
+    fn parent_node(&mut self) -> &mut Node;
+
+    /// Adds a leaf under the element's node. False when the id is taken.
+    fn push_child(&mut self, id: accesskit::NodeId, node: Node) -> bool;
+}
+
+impl Subtree for A11ySubtreeBuilder<'_> {
+    fn parent_node(&mut self) -> &mut Node {
+        A11ySubtreeBuilder::parent_node(self)
+    }
+
+    fn push_child(&mut self, id: accesskit::NodeId, node: Node) -> bool {
+        A11ySubtreeBuilder::push_child(self, id, node)
+    }
 }
 
 /// What the walk over the views needs.
@@ -688,17 +774,15 @@ fn walk(
     live: LiveRegion,
     kids: &mut Vec<accesskit::NodeId>,
 ) {
-    for child in &view.child_views() {
+    // A scroll view's content as it is on screen: a list's recycled cells
+    // are not in their rows' order.
+    for child in &view.with_children_in_reading_order(<[NshView]>::to_vec) {
         let Some(s) = child.try_state() else { continue };
         let part = part(&s);
         if part == Part::Hidden {
             continue;
         }
-        let (x, y) = view.state().child_origin(s.frame, s.shift);
-        let mut local = Mat4::new().translate(x, y);
-        if let Some(t) = s.transform() {
-            local = Mat4::mul(&t, &local);
-        }
+        let local = view.state().child_matrix(&s);
         let cm = Mat4::mul(&local, m);
         let live = match s.props.accessibility.live_region {
             LiveRegion::None => live,
@@ -829,16 +913,38 @@ struct State {
 }
 
 thread_local! {
-    static STATES: RefCell<FxHashMap<u64, State>> = RefCell::default();
+    /// Per surface and window (its root node): each window has a tree of
+    /// its own.
+    static STATES: RefCell<FxHashMap<(u64, NodeId), State>> = RefCell::default();
+}
+
+/// The window whose tree is built, drawn or acted in now: the window of the
+/// app's own whose input is entered ([`crate::window::enter`]), else the
+/// main window.
+fn current(surface: &Surface) -> NodeId {
+    crate::window::entered(surface).unwrap_or(ROOT_ID)
+}
+
+fn with_window_state<R>(surface: &Surface, window: NodeId, f: impl FnOnce(&mut State) -> R) -> R {
+    STATES.with_borrow_mut(|states| f(states.entry((surface.key(), window)).or_default()))
 }
 
 fn with_state<R>(surface: &Surface, f: impl FnOnce(&mut State) -> R) -> R {
-    STATES.with_borrow_mut(|states| f(states.entry(surface.key()).or_default()))
+    with_window_state(surface, current(surface), f)
 }
 
-/// True when a client was attached when the surface last drew.
+/// True when a client was attached when one of the surface's windows last
+/// drew.
 fn active(surface: &Surface) -> bool {
-    STATES.with_borrow(|s| s.get(&surface.key()).is_some_and(|s| s.active))
+    let key = surface.key();
+    STATES.with_borrow(|s| s.iter().any(|(k, s)| k.0 == key && s.active))
+}
+
+/// Window `window` of the app's own closed: its tree goes.
+pub(crate) fn window_closed(surface: &Surface, window: NodeId) {
+    STATES.with_borrow_mut(|s| {
+        s.remove(&(surface.key(), window));
+    });
 }
 
 /// A view was made.
@@ -871,6 +977,7 @@ pub(crate) fn prepare(_batch: &MountBatch) {}
 pub(crate) fn batch_applied(surface: &Surface) {
     if active(surface) {
         surface.invalidate();
+        crate::window::invalidate_all(surface);
     }
 }
 
@@ -879,23 +986,32 @@ pub(crate) fn focus(surface: &Rc<Surface>, view: &NshView) {
     let Ok(Some(element)) = exposed(view) else {
         return;
     };
-    with_state(surface, |s| s.focus = Some(element.id()));
+    let window = crate::window::root_of(surface, &element);
+    with_window_state(surface, window, |s| s.focus = Some(element.id()));
     surface.invalidate();
+    crate::window::invalidate_all(surface);
 }
 
 /// The keyboard focus moved to `view` (a text field): it takes the
 /// accessibility focus. Called by the modules that move it.
-pub(crate) fn focus_changed(surface: &Rc<Surface>, _view: &NshView) {
-    with_state(surface, |s| s.focus = None);
+pub(crate) fn focus_changed(surface: &Rc<Surface>, view: &NshView) {
+    let window = crate::window::root_of(surface, view);
+    with_window_state(surface, window, |s| s.focus = None);
     surface.invalidate();
+    crate::window::invalidate_all(surface);
 }
 
-/// The element with the accessibility focus.
+/// The element with the accessibility focus in the current window
+/// ([`current`]): the focused text field when it is in that window.
 pub(crate) fn focused(surface: &Surface) -> Option<NshView> {
-    if let Some(field) = crate::text_input::focused(surface) {
+    let window = current(surface);
+    if let Some(field) = crate::text_input::focused(surface)
+        && crate::window::root_of(surface, &field) == window
+    {
         return Some(field);
     }
-    let id = STATES.with_borrow(|s| s.get(&surface.key()).and_then(|s| s.focus))?;
+    let key = (surface.key(), window);
+    let id = STATES.with_borrow(|s| s.get(&key).and_then(|s| s.focus))?;
     let view = surface.view(id)?;
     match exposed(&view) {
         Ok(Some(e)) => Some(e),
@@ -908,16 +1024,20 @@ pub(crate) fn announce(surface: &Rc<Surface>, text: &str) {
     if text.is_empty() {
         return;
     }
-    with_state(surface, |s| {
+    // Read where the user is: the window with the keyboard focus.
+    let window = crate::window::focused_root(surface);
+    with_window_state(surface, window, |s| {
         let sequence = s.announcement.as_ref().map_or(0, |a| a.0 + 1);
         s.announcement = Some((sequence, text.to_owned()));
     });
     surface.invalidate();
+    crate::window::invalidate_all(surface);
 }
 
-/// The surface element prepaints (before it registers its focus handle):
-/// follows the client's attachment into the environment and, while one is
-/// attached, builds the nodes and prepaints the focus proxy.
+/// The surface element (or the element of a window of the app's own, its
+/// input entered) prepaints, before it registers its focus handle: follows
+/// the client's attachment into the environment and, while one is
+/// attached, builds the window's nodes and prepaints the focus proxy.
 pub(crate) fn prepaint(
     surface: &Rc<Surface>,
     focus_handle: &FocusHandle,
@@ -925,19 +1045,21 @@ pub(crate) fn prepaint(
     cx: &mut App,
 ) {
     let active = window.is_a11y_active();
+    let key = surface.key();
+    with_state(surface, |s| s.active = active);
+    // A client attached to any of its windows.
+    let any = self::active(surface);
     let mut env = surface.environment.get();
-    if env.screen_reader != active {
-        env.screen_reader = active;
+    if env.screen_reader != any {
+        env.screen_reader = any;
         surface.set_environment(env);
     }
-    let key = surface.key();
     STATES.with_borrow_mut(|states| {
         // Surfaces that are gone.
-        states.retain(|k, _| *k == key || Surface::by_key(*k).is_some());
+        states.retain(|k, _| k.0 == key || Surface::by_key(k.0).is_some());
     });
     if !active {
         with_state(surface, |s| {
-            s.active = false;
             s.built = None;
             s.proxied = None;
             s.proxy = None;
@@ -947,7 +1069,8 @@ pub(crate) fn prepaint(
     }
     let field = |v: &NshView| crate::text_input::accessible_value(v);
     let scale = window.scale_factor();
-    let mut built = build(key, &surface.root, surface.origin.get(), scale, &field);
+    let root = surface.input_root();
+    let mut built = build(key, &root, surface.origin.get(), scale, &field);
     let mut proxied = None;
     let mut proxy = None;
     if let Some(view) = focused(surface).map(|v| v.id())
@@ -965,12 +1088,7 @@ pub(crate) fn prepaint(
             .w(px(w))
             .h(px(h))
             .a11y_synthetic_children(move |builder: &mut A11ySubtreeBuilder| {
-                let children = node.children().to_vec();
-                *builder.parent_node() = node;
-                for e in below {
-                    builder.push_child(e.id, e.node);
-                }
-                builder.parent_node().set_children(children);
+                stand_in(node, below, builder)
             })
             .into_any_element();
         element.prepaint_as_root(
@@ -986,52 +1104,57 @@ pub(crate) fn prepaint(
         proxy = Some(element);
     }
     with_state(surface, |s| {
-        s.active = true;
         s.built = Some(built);
         s.proxied = proxied;
         s.proxy = proxy;
     });
 }
 
+/// The focus proxy's synthetic children: its node becomes the node of the
+/// element it stands for, the element's subtree below it.
+fn stand_in(node: Node, below: Vec<Entry>, builder: &mut impl Subtree) {
+    // Pushing the subtree's nodes adds each to the proxy's children.
+    let children = node.children().to_vec();
+    *builder.parent_node() = node;
+    for e in below {
+        builder.push_child(e.id, e.node);
+    }
+    builder.parent_node().set_children(children);
+}
+
 /// The surface element's synthetic children: the views' nodes, the focus
-/// proxy put where its element is, and the last announcement.
+/// proxy put where its element is, the native components' nodes and the
+/// last announcement.
 pub(crate) fn synthetic(surface: &Surface, builder: &mut A11ySubtreeBuilder) {
-    let key = surface.key();
     let (built, proxied, announcement) = with_state(surface, |s| {
         (s.built.take(), s.proxied.take(), s.announcement.clone())
     });
-    let Some(mut built) = built else { return };
-    // The proxy is the one node pushed under the surface's so far.
-    let proxy = proxied.and_then(|(view, actions)| {
-        let id = builder.parent_node().children().first().copied()?;
-        Some((id, view, actions))
-    });
-    if let Some((proxy_id, view, _)) = &proxy {
-        let stood_for = node_id(key, *view);
-        let swap = |ids: &[accesskit::NodeId]| -> Option<Vec<accesskit::NodeId>> {
-            ids.contains(&stood_for).then(|| {
-                ids.iter()
-                    .map(|&id| if id == stood_for { *proxy_id } else { id })
-                    .collect()
-            })
-        };
-        if let Some(top) = swap(&built.top) {
-            built.top = top;
-        } else {
-            for e in &mut built.entries {
-                if let Some(children) = swap(e.node.children()) {
-                    e.node.set_children(children);
-                    break;
-                }
-            }
-        }
-    }
+    let Some(built) = built else { return };
+    let listeners = attach(surface.key(), built, proxied, announcement, builder);
+    with_state(surface, |s| s.listeners = listeners);
+}
+
+/// Hangs the nodes of a surface (`key`) off its element's node, which has
+/// the nodes the element prepainted itself as children ([`Built::adopt`]).
+/// Returns the listeners to register as the surface paints.
+fn attach(
+    key: u64,
+    mut built: Built,
+    proxied: Option<(NodeId, Vec<Action>)>,
+    announcement: Option<(u64, String)>,
+    builder: &mut impl Subtree,
+) -> Vec<(accesskit::NodeId, NodeId, Vec<Action>)> {
+    let prepainted = builder.parent_node().children().to_vec();
+    let proxy = built.adopt(
+        &prepainted,
+        proxied.as_ref().map(|(view, _)| node_id(key, *view)),
+    );
     let mut listeners = Vec::with_capacity(built.entries.len() + 1);
     for e in built.entries {
         listeners.push((e.id, e.view, e.actions));
         builder.push_child(e.id, e.node);
     }
-    if let Some((id, view, actions)) = proxy {
+    if let (Some(id), Some((view, actions))) = (proxy, proxied) {
         listeners.push((id, view, actions));
     }
     let mut top = built.top;
@@ -1044,8 +1167,10 @@ pub(crate) fn synthetic(surface: &Surface, builder: &mut A11ySubtreeBuilder) {
             top.push(id);
         }
     }
+    // Pushing the views' nodes added every one to the surface's children:
+    // only those at the top are.
     builder.parent_node().set_children(top);
-    with_state(surface, |s| s.listeners = listeners);
+    listeners
 }
 
 /// The surface element paints: paints the focus proxy and registers the
@@ -1058,12 +1183,14 @@ pub(crate) fn paint(surface: &Surface, window: &mut Window, cx: &mut App) {
         proxy.paint(window, cx);
     }
     let key = surface.key();
+    let root = crate::window::entered(surface);
     for (node, view, actions) in listeners {
         for action in actions {
             window.on_a11y_action(node, action, move |data, window, cx| {
                 if let Some(surface) = Surface::by_key(key)
                     && let Some(view) = surface.view(view)
                 {
+                    let _in = crate::window::enter(&surface, root);
                     perform(&surface, &view, action, data, window.scale_factor());
                 }
                 crate::rt::flush(cx);
@@ -1157,7 +1284,11 @@ fn perform(
             }
         }
         Action::ShowContextMenu => {
-            if !action_or_press(surface, view, "longpress", false) {
+            // Its context menu (`onContextMenu`, no pointer), else its long
+            // press, as the mobile platforms map the action.
+            if crate::input::hears_show_menu(view) {
+                crate::input::show_context_menu(surface, view);
+            } else if !action_or_press(surface, view, "longpress", false) {
                 surface.event(
                     view.id(),
                     EventKind::LongPress,
@@ -1441,6 +1572,37 @@ mod tests {
             .node
     }
 
+    /// A list's recycled cells are read in the order they show, not in the
+    /// order they were made (bound to rows further down as the list
+    /// scrolled): a scroll view's content is read as it is on screen.
+    #[test]
+    fn a_scroll_views_content_is_read_in_screen_order() {
+        let root = view(0, ViewKind::View, Accessibility::default());
+        root.set_invalidate(Rc::new(|| {}));
+        let list = view(2, ViewKind::Scroll, Accessibility::default());
+        list.insert_before(&root, None);
+        for (id, y) in [(4, 160.0), (6, 200.0), (8, 80.0), (10, 120.0)] {
+            let cell = pressable(id, Accessibility::default());
+            cell.state_mut().frame = crate::geom::rect(0.0, y, 100.0, 40.0);
+            cell.insert_before(&list, None);
+        }
+        let b = built(&root);
+        assert_eq!(
+            node(&b, 2).children(),
+            [8, 10, 4, 6].map(|id| node_id(7, id))
+        );
+        // A list in its parent's viewport is a plain view, looked through:
+        // its cells are read in screen order too.
+        list.unparent();
+        let page = view(12, ViewKind::View, Accessibility::default());
+        page.state_mut().props.screen_order = Some(nsh_core::geometry::Axis::Vertical);
+        page.insert_before(&root, None);
+        for cell in list.child_views() {
+            cell.insert_before(&page, None);
+        }
+        assert_eq!(built(&root).top, [8, 10, 4, 6].map(|id| node_id(7, id)));
+    }
+
     #[test]
     fn hierarchy() {
         let (root, all) = tree();
@@ -1502,6 +1664,8 @@ mod tests {
             (AxRole::TreeItem, Role::TreeItem),
             (AxRole::MenuItemCheckbox, Role::MenuItemCheckBox),
             (AxRole::MenuItemRadio, Role::MenuItemRadio),
+            (AxRole::Dialog, Role::Dialog),
+            (AxRole::AlertDialog, Role::AlertDialog),
         ] {
             assert_eq!(
                 role_for(&with_role(role), ViewKind::View, false),
@@ -1600,7 +1764,17 @@ mod tests {
                 ..Default::default()
             },
         );
-        let field = view(6, ViewKind::Input, labelled("Password"));
+        let field = view(
+            6,
+            ViewKind::Input,
+            Accessibility {
+                state: AccessibilityState {
+                    invalid: true,
+                    ..Default::default()
+                },
+                ..labelled("Password")
+            },
+        );
         slider.insert_before(&root, None);
         off.insert_before(&root, None);
         field.insert_before(&root, None);
@@ -1618,6 +1792,7 @@ mod tests {
         assert_eq!(s.value(), Some("3 of 10"));
         assert_eq!(s.description(), Some("Volume"));
         assert!(s.is_busy());
+        assert_eq!(s.invalid(), None);
         assert_eq!(s.live(), Some(Live::Assertive));
         assert!(s.supports_action(Action::Increment));
         assert!(!s.supports_action(Action::Decrement));
@@ -1637,6 +1812,8 @@ mod tests {
         assert_eq!(f.label(), Some("Password"));
         assert_eq!(f.value(), None);
         assert!(f.supports_action(Action::SetValue));
+        // Its content rejected by the app (ARIA's `aria-invalid`).
+        assert_eq!(f.invalid(), Some(Invalid::True));
     }
 
     /// `visibility: hidden` takes the view and its subtree out of the tree,
@@ -1718,6 +1895,272 @@ mod tests {
         assert_eq!(left, [4, 22]);
     }
 
+    /// The window's node, the surface element's and the focus proxy's, as
+    /// GPUI would name them (from their elements' ids).
+    const WINDOW: accesskit::NodeId = accesskit::NodeId(0);
+    const SURFACE: accesskit::NodeId = accesskit::NodeId(1);
+    const PROXY: accesskit::NodeId = accesskit::NodeId(2);
+
+    /// GPUI's accessibility tree builder, as far as a surface element meets
+    /// it: an element's node hangs off the node open as it is pushed and is
+    /// finished with the children it has when its element is done.
+    #[derive(Default)]
+    struct Frame {
+        open: Vec<(accesskit::NodeId, Node)>,
+        finished: Vec<(accesskit::NodeId, Node)>,
+    }
+
+    impl Frame {
+        /// An element with an id and a role starts its prepaint.
+        fn push(&mut self, id: accesskit::NodeId, role: Role) {
+            if let Some((_, parent)) = self.open.last_mut() {
+                parent.push_child(id);
+            }
+            self.open.push((id, Node::new(role)));
+        }
+
+        /// The element is done, its synthetic children added.
+        fn pop(&mut self) {
+            let node = self.open.pop().unwrap();
+            self.finished.push(node);
+        }
+    }
+
+    impl Subtree for Frame {
+        fn parent_node(&mut self) -> &mut Node {
+            &mut self.open.last_mut().unwrap().1
+        }
+
+        fn push_child(&mut self, id: accesskit::NodeId, node: Node) -> bool {
+            let taken = |(other, _): &(accesskit::NodeId, Node)| *other == id;
+            if self.open.iter().any(taken) || self.finished.iter().any(taken) {
+                return false;
+            }
+            self.parent_node().push_child(id);
+            self.finished.push((id, node));
+            true
+        }
+    }
+
+    /// A native component's nodes: its root and a control inside it.
+    fn native(n: u64) -> (accesskit::NodeId, accesskit::NodeId) {
+        (accesskit::NodeId(100 + n), accesskit::NodeId(200 + n))
+    }
+
+    /// The tree GPUI hands AccessKit for a frame of a window with one
+    /// surface, built in a surface element's order: the focus proxy when
+    /// `focused` names the element with the accessibility focus
+    /// ([`prepaint`]), the elements of `components` native components, then
+    /// the surface's synthetic children ([`synthetic`]). With the listeners
+    /// the surface registers.
+    fn frame(
+        root: &NshView,
+        focused: Option<NodeId>,
+        components: u64,
+        announcement: Option<(u64, String)>,
+    ) -> (
+        accesskit::TreeUpdate,
+        Vec<(accesskit::NodeId, NodeId, Vec<Action>)>,
+    ) {
+        let mut f = Frame::default();
+        f.push(WINDOW, Role::Window);
+        f.push(SURFACE, ROLE);
+        let mut built = built(root);
+        let mut proxied = None;
+        if let Some(view) = focused {
+            let (entry, below) = built.take_subtree(node_id(7, view)).unwrap();
+            f.push(PROXY, entry.node.role());
+            stand_in(entry.node, below, &mut f);
+            f.pop();
+            proxied = Some((view, entry.actions));
+        }
+        for n in 0..components {
+            let (group, control) = native(n);
+            f.push(group, Role::Group);
+            f.push(control, Role::Switch);
+            f.pop();
+            f.pop();
+        }
+        let listeners = attach(7, built, proxied, announcement, &mut f);
+        f.pop();
+        f.pop();
+        assert!(f.open.is_empty());
+        let update = accesskit::TreeUpdate {
+            nodes: f.finished,
+            tree: Some(accesskit::Tree::new(WINDOW)),
+            tree_id: accesskit::TreeId::ROOT,
+            focus: focused.map_or(WINDOW, |_| PROXY),
+        };
+        (update, listeners)
+    }
+
+    /// The node `id` of a tree AccessKit took.
+    fn taken(
+        tree: &accesskit_consumer::Tree,
+        id: accesskit::NodeId,
+    ) -> accesskit_consumer::Node<'_> {
+        tree.state()
+            .node_by_tree_local_id(id, accesskit::TreeId::ROOT)
+            .unwrap_or_else(|| panic!("{id:?} is not in the tree"))
+    }
+
+    /// The children of node `id` of a tree AccessKit took.
+    fn children_of(
+        tree: &accesskit_consumer::Tree,
+        id: accesskit::NodeId,
+    ) -> Vec<accesskit::NodeId> {
+        taken(tree, id).children().map(|c| c.locate().0).collect()
+    }
+
+    /// What the surface's node has as children: the views' elements at the
+    /// top (the proxy in the place of the one `focused`), then the roots of
+    /// `components` native components.
+    fn surface_children(focused: Option<NodeId>, components: u64) -> Vec<accesskit::NodeId> {
+        [4, 6, 22]
+            .into_iter()
+            .map(|view| match focused {
+                Some(f) if f == view => PROXY,
+                _ => node_id(7, view),
+            })
+            .chain((0..components).map(|n| native(n).0))
+            .collect()
+    }
+
+    /// Native components push their own nodes under the surface's as it
+    /// prepaints. AccessKit's adapter panics on a tree with a node no node
+    /// has as a child, or one two nodes have (#1347): this is its check.
+    #[test]
+    fn native_components_keep_their_nodes() {
+        let (root, _all) = tree();
+        // No focus proxy, one at the top (a leaf, then an element with a
+        // subtree), one inside another element.
+        for focused in [None, Some(4), Some(6), Some(14)] {
+            for components in 0..3 {
+                let (update, listeners) = frame(&root, focused, components, None);
+                let tree = accesskit_consumer::Tree::new(update, true);
+                let case = format!("focus on {focused:?}, {components} components");
+                assert_eq!(
+                    children_of(&tree, SURFACE),
+                    surface_children(focused, components),
+                    "{case}"
+                );
+                for n in 0..components {
+                    let (group, control) = native(n);
+                    assert_eq!(children_of(&tree, group), [control], "{case}");
+                }
+                // The switch stays inside the button, whichever of them the
+                // proxy stands for.
+                let (button, switch) = match focused {
+                    Some(6) => (PROXY, node_id(7, 14)),
+                    Some(14) => (node_id(7, 6), PROXY),
+                    _ => (node_id(7, 6), node_id(7, 14)),
+                };
+                assert_eq!(children_of(&tree, button), [switch], "{case}");
+                let Some(view) = focused else {
+                    assert_eq!(tree.state().focus_id(), Some(tree.state().root_id()));
+                    continue;
+                };
+                let focus = tree.state().focus().unwrap();
+                assert_eq!(focus.locate().0, PROXY, "{case}");
+                // The proxy is the element: its role, and its actions go to
+                // the element's view.
+                let role = match view {
+                    4 => Role::Label,
+                    6 => Role::Button,
+                    _ => Role::Switch,
+                };
+                assert_eq!(focus.role(), role, "{case}");
+                assert_eq!(
+                    listeners
+                        .iter()
+                        .filter(|l| l.0 == PROXY)
+                        .map(|l| l.1)
+                        .collect::<Vec<_>>(),
+                    [view],
+                    "{case}"
+                );
+            }
+        }
+    }
+
+    /// The trees of frames that follow one another, as AccessKit's adapter
+    /// takes them: the focus moves, native components come and go, an
+    /// announcement is read.
+    #[test]
+    fn frames_follow_one_another() {
+        struct Changes;
+        impl accesskit_consumer::TreeChangeHandler for Changes {
+            fn node_added(&mut self, _: &accesskit_consumer::Node) {}
+            fn node_updated(&mut self, _: &accesskit_consumer::Node, _: &accesskit_consumer::Node) {
+            }
+            fn focus_moved(
+                &mut self,
+                _: Option<&accesskit_consumer::Node>,
+                _: Option<&accesskit_consumer::Node>,
+            ) {
+            }
+            fn node_removed(&mut self, _: &accesskit_consumer::Node) {}
+        }
+        let (root, _all) = tree();
+        let (first, _) = frame(&root, None, 2, None);
+        let mut tree = accesskit_consumer::Tree::new(first, true);
+        let said = || Some((0, String::from("Saved")));
+        for (focused, components, announcement) in [
+            // The same frame again, as a surface that changed nothing draws.
+            (None, 2, None),
+            (Some(14), 2, None),
+            (Some(4), 2, None),
+            (Some(4), 3, said()),
+            (Some(6), 1, said()),
+            (None, 0, said()),
+            (Some(14), 2, None),
+        ] {
+            let said = announcement.is_some();
+            let (update, _) = frame(&root, focused, components, announcement);
+            tree.update_and_process_changes(update, &mut Changes);
+            let case = format!("focus on {focused:?}, {components} components");
+            let mut children = surface_children(focused, components);
+            if said {
+                children.push(announcement_id(7, 0));
+            }
+            assert_eq!(children_of(&tree, SURFACE), children, "{case}");
+            for n in 0..3 {
+                let (group, control) = native(n);
+                let state = tree.state();
+                let there = |id| {
+                    state
+                        .node_by_tree_local_id(id, accesskit::TreeId::ROOT)
+                        .is_some()
+                };
+                assert_eq!(there(group), n < components, "{case}");
+                assert_eq!(there(control), n < components, "{case}");
+            }
+            assert_eq!(
+                tree.state().focus().unwrap().locate().0,
+                focused.map_or(WINDOW, |_| PROXY),
+                "{case}"
+            );
+        }
+    }
+
+    /// A proxy whose element nothing names is still a node of the frame:
+    /// it stays under the surface's, once.
+    #[test]
+    fn a_proxy_without_a_place_stays_under_the_surface() {
+        let (root, _all) = tree();
+        let mut b = built(&root);
+        let title = node_id(7, 4);
+        b.take_subtree(title).unwrap();
+        b.top.retain(|id| *id != title);
+        let (group, _) = native(0);
+        assert_eq!(b.adopt(&[PROXY, group], Some(title)), Some(PROXY));
+        assert_eq!(b.top, [node_id(7, 6), node_id(7, 22), PROXY, group]);
+        // Without an element to stand for, the first node is a component's.
+        let mut b = built(&root);
+        assert_eq!(b.adopt(&[group], None), None);
+        assert_eq!(b.top, [node_id(7, 4), node_id(7, 6), node_id(7, 22), group]);
+    }
+
     #[test]
     fn help_and_ranges() {
         let value = AccessibilityValue {
@@ -1736,6 +2179,15 @@ mod tests {
         assert_eq!(
             help_of(&button, Role::Button).as_deref(),
             Some("3 of 10. Plays")
+        );
+        // The app's description goes between the value and the hint.
+        let described = Accessibility {
+            description: Some("The whole album".into()),
+            ..button.clone()
+        };
+        assert_eq!(
+            help_of(&described, Role::Button).as_deref(),
+            Some("3 of 10. The whole album. Plays")
         );
         let progress = Accessibility {
             value: Some(AccessibilityValue {

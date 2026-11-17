@@ -1,11 +1,11 @@
 ---
-title: 终端
+title: TUI
 description: "在终端里运行 Rust 和 TSX 编写的 NSH 应用：Cell 布局、键盘与鼠标输入、终端的颜色、组件和弹出层在字符网格上的样子、在应用代码中识别终端、测试，以及在 ratatui 应用中嵌入 AppView。"
-order: 15.7
+order: 16.5
 group: platforms
 ---
 
-# 终端
+# TUI
 
 NSH 应用也能在终端里运行。终端后端用 [ratatui](https://ratatui.rs) 把应用绘制在终端的字符 Cell 网格上，使用终端自己的
 字体和颜色，并从键盘和鼠标接收输入。核心、响应式图、渲染器、组件和原生模块与其他平台完全相同，因此在窗口里运行的应用
@@ -27,7 +27,7 @@ nsh run --target tui                # Rust 应用，在它的目录里
 应用占满启动它的终端，保存时热更新；Rust 应用的根组件运行在用它的 crate 构建的终端开发宿主中，Rust 代码改动后会重新构建
 并重启。在源码仓库中，`nsh run` 会先构建开发宿主（`nsh-tui-host`）。
 
-终端只显示应用本身。诊断信息（CLI 的输出、宿主的日志、`console.log`）写入应用的 `.nsh/tui.log`，按 `C-h e`（先按
+启动时，CLI 显示构建进度，构建开发宿主时还显示正在编译的 crate；`-v` 实时显示工具的输出。应用打开后，终端只显示应用本身。诊断信息（CLI 的输出、宿主的日志、`console.log`）写入应用的 `.nsh/tui.log`，按 `C-h e`（先按
 Ctrl+H，再按 E）会在应用上方的面板里打开它们：方向键和 Page Up / Page Down 滚动，`r` 重新加载最新的构建，Escape、`C-g`
 或 `q` 关闭面板。应用出错时面板会自动打开，下一次更新时关闭。Ctrl+C 复制选中的文本，没有选中内容时退出；终端会恢复原样。
 
@@ -87,6 +87,21 @@ nsh run App.tsx --target tui --points-per-cell 10x20
 区分开，报告按键重复和松开，并把 Super 作为 Cmd 报告，因此 `cmd+` 快捷键在这些终端里可用；在不支持该协议的 macOS 终端里，
 没有绑定接收的 Ctrl 快捷键会再作为 Cmd 匹配一次，菜单和提示（`keymap.label`、`Command`）也把这些快捷键显示为 Ctrl，
 即在这里要按的键（`mod+o` 显示为 `⌃O`）。
+
+**原始按键事件。** 与桌面一致，获得焦点的自定义视图也能直接听到按键：`onKeyDown` / `onKeyUp`（Rust 视图的
+`on_key_down` / `on_key_up`）收到 `KeyEvent`，其中 `key` 是终端报告的逻辑按键（`a`、`A`、`ArrowLeft`、`Enter`），
+并带有终端报告的 `modifiers` 和 `repeat`。`code` 始终为空：终端不报告硬件按键身份，宿主也绝不根据按键输入的字符推断。
+`defaultPrevented` 是捕获规则（`capture_keys`）的决定，与应用 keymap 使用同一套规范快捷键匹配；被捕获的按键会被标记，
+不执行终端的默认行为，但监听者仍能听到。应用自己的快捷键保持优先，文本框和 Minibuffer 保留自己的按键。dialog（`Modal`）是
+键盘边界；sheet 是同一窗口内的浮层，其中的按键跟随声明它的视图，门户（overlay）同理，与桌面一致。
+
+终端能报告什么取决于协议；报告不出的一律不编造：
+
+| 终端 | `KeyEvent` 得到的信息 |
+|---|---|
+| 纯文本 / 传统终端 | 只有按下：每次按键一个 key down，没有松开，自动重复以新的按下到达；没有物理 code |
+| kitty 键盘协议 | 独立宿主会协商该协议：以转义序列发送的按键（方向键、功能键、带修饰键的按键）报告松开和自动重复；Enter、Tab、Backspace 和普通文本仍是按下；仍无物理 code |
+| Windows 控制台 | crossterm 读取控制台的按键松开记录，因此会收到松开；自动重复按控制台报告的形式到达；仍无物理 code |
 
 **搜索。** Ctrl+S 和 Ctrl+R 像 readline 和 Emacs 那样随输入搜索屏幕上的文本。查询显示在最底一行，前面是 `/`（向前）或
 `?`（向后），匹配处高亮，焦点移到匹配所属的控件。Ctrl+S / Ctrl+R 跳到下一个 / 上一个匹配，Backspace 或 Ctrl+H 撤回上一个

@@ -115,6 +115,68 @@ fn draw_decorations(cx: &CGContext, line: &LaidLine) {
     }
 }
 
+/// Clips `cx` to all but the hidden runs of `line` (y-up text space), if
+/// it has some, saving the state first; returns whether it did. CoreText
+/// draws a color emoji in its own colors whatever its run's color, so a
+/// hidden run's glyphs are clipped out, with their shadow and decorations.
+fn clip_hidden(cx: &CGContext, line: &LaidLine, text: &AttributedText) -> bool {
+    let mut hidden: Vec<(CGFloat, CGFloat)> = Vec::new();
+    // SAFETY: the line's own run array (of CTRuns); one position (the run
+    // has a glyph) into a one-point buffer; null out pointers are allowed.
+    unsafe {
+        let runs = line.line.glyph_runs();
+        for i in 0..runs.count() {
+            let run = &*runs.value_at_index(i).cast::<CTRun>();
+            let range = run.string_range();
+            if range.length <= 0 || run.glyph_count() <= 0 || !text.hidden_at(range.location as u32)
+            {
+                continue;
+            }
+            // The run's own left edge, whichever way it goes (a right to
+            // left run's first character is at its right).
+            let mut origin = CGPoint::new(0.0, 0.0);
+            run.positions(
+                CFRange {
+                    location: 0,
+                    length: 1,
+                },
+                std::ptr::NonNull::from(&mut origin),
+            );
+            let x = line.origin.x + origin.x;
+            let width = run.typographic_bounds(
+                CFRange {
+                    location: 0,
+                    length: 0,
+                },
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            );
+            hidden.push((x, x + width));
+        }
+    }
+    if hidden.is_empty() {
+        return false;
+    }
+    hidden.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let c = Some(cx);
+    CGContext::save_g_state(c);
+    // Far past the line's own extent: only the hidden runs' edges clip.
+    let (bottom, height) = (line.origin.y - 1.0e4, 2.0e4);
+    let mut from = line.origin.x - 1.0e4;
+    for (left, right) in hidden.into_iter().chain([(line.origin.x + 1.0e5, 0.0)]) {
+        if left > from {
+            CGContext::add_rect(
+                c,
+                CGRect::new(CGPoint::new(from, bottom), CGSize::new(left - from, height)),
+            );
+        }
+        from = from.max(right);
+    }
+    CGContext::clip(c);
+    true
+}
+
 /// One decoration line centered on `y` (y-up), `style` as encoded by the
 /// text engine: solid, double, dotted, dashed, wavy.
 fn stroke_decoration(
@@ -201,7 +263,7 @@ define_class!(
         fn is_accessibility_element(&self) -> bool {
             // SAFETY: calling the superclass implementation.
             let explicit: bool = unsafe { msg_send![super(self), isAccessibilityElement] };
-            explicit || (!self.hidden_from_accessibility() && self.has_text())
+            explicit || (!self.hidden_from_accessibility() && self.has_visible_text())
         }
 
         #[unsafe(method_id(accessibilityLabel))]
@@ -209,7 +271,8 @@ define_class!(
             // SAFETY: calling the superclass implementation (the explicit label).
             let explicit: Option<Retained<NSString>> = unsafe { msg_send![super(self), accessibilityLabel] };
             explicit.or_else(|| {
-                self.ivars().text.borrow().as_ref().map(|t| NSString::from_str(&t.text))
+                // Hidden runs are not read.
+                self.ivars().text.borrow().as_ref().map(|t| NSString::from_str(&t.visible_text()))
             })
         }
 
@@ -346,12 +409,19 @@ define_class!(
                 // SAFETY: no auxiliary info.
                 unsafe { CGContext::begin_transparency_layer(c, None) };
             }
+            let attributed = self.ivars().text.borrow();
+            let hidden = attributed.as_ref().filter(|t| t.has_hidden());
             for line in &text.lines {
+                // Nothing of a hidden run is drawn.
+                let clipped = hidden.is_some_and(|t| clip_hidden(&cx, line, t));
                 CGContext::set_text_position(c, line.origin.x, line.origin.y);
                 // SAFETY: a valid line and context.
                 unsafe { line.line.draw(&cx) };
                 if text.strikethrough {
                     draw_decorations(&cx, line);
+                }
+                if clipped {
+                    CGContext::restore_g_state(c);
                 }
             }
             if let Some(color) = color {
@@ -381,20 +451,25 @@ define_class!(
         }
 
         #[unsafe(method(insertText:))]
-        fn insert_text(&self, _text: &NSString) {}
+        fn insert_text(&self, _text: Option<&NSString>) {}
 
         #[unsafe(method(deleteBackward))]
         fn delete_backward(&self) {}
     }
 
+    // UIKit declares every position and range these methods take nonnull,
+    // yet passes nil at times (the edit menu of a secondary click on text
+    // with nothing selected moves a nil position): each takes an `Option`
+    // and answers nil with "nothing", as a message to nil would, rather
+    // than messaging it.
     unsafe impl UITextInput for TextView {
         #[unsafe(method_id(textInRange:))]
-        fn text_in_range(&self, range: &UITextRange) -> Option<Retained<NSString>> {
-            self.sel_text_in(range)
+        fn text_in_range(&self, range: Option<&UITextRange>) -> Option<Retained<NSString>> {
+            range.and_then(|range| self.sel_text_in(range))
         }
 
         #[unsafe(method(replaceRange:withText:))]
-        fn replace_range(&self, _range: &UITextRange, _text: &NSString) {}
+        fn replace_range(&self, _range: Option<&UITextRange>, _text: Option<&NSString>) {}
 
         #[unsafe(method_id(selectedTextRange))]
         fn selected_text_range(&self) -> Option<Retained<UITextRange>> {
@@ -436,27 +511,42 @@ define_class!(
         }
 
         #[unsafe(method_id(textRangeFromPosition:toPosition:))]
-        fn text_range(&self, from: &UITextPosition, to: &UITextPosition) -> Option<Retained<UITextRange>> {
-            Some(self.sel_range(from, to))
+        fn text_range(
+            &self,
+            from: Option<&UITextPosition>,
+            to: Option<&UITextPosition>,
+        ) -> Option<Retained<UITextRange>> {
+            from.zip(to).map(|(from, to)| self.sel_range(from, to))
         }
 
         #[unsafe(method_id(positionFromPosition:offset:))]
-        fn position_offset(&self, position: &UITextPosition, offset: NSInteger) -> Option<Retained<UITextPosition>> {
-            self.sel_moved(position, offset)
+        fn position_offset(
+            &self,
+            position: Option<&UITextPosition>,
+            offset: NSInteger,
+        ) -> Option<Retained<UITextPosition>> {
+            position.and_then(|position| self.sel_moved(position, offset))
         }
 
         #[unsafe(method_id(positionFromPosition:inDirection:offset:))]
         fn position_direction(
             &self,
-            position: &UITextPosition,
+            position: Option<&UITextPosition>,
             direction: UITextLayoutDirection,
             offset: NSInteger,
         ) -> Option<Retained<UITextPosition>> {
-            self.sel_moved_in(position, direction, offset)
+            position.and_then(|position| self.sel_moved_in(position, direction, offset))
         }
 
         #[unsafe(method(comparePosition:toPosition:))]
-        fn compare_position(&self, position: &UITextPosition, other: &UITextPosition) -> NSComparisonResult {
+        fn compare_position(
+            &self,
+            position: Option<&UITextPosition>,
+            other: Option<&UITextPosition>,
+        ) -> NSComparisonResult {
+            let (Some(position), Some(other)) = (position, other) else {
+                return NSComparisonResult::Same;
+            };
             match text_selection::offset(position).cmp(&text_selection::offset(other)) {
                 std::cmp::Ordering::Less => NSComparisonResult::Ascending,
                 std::cmp::Ordering::Equal => NSComparisonResult::Same,
@@ -465,7 +555,10 @@ define_class!(
         }
 
         #[unsafe(method(offsetFromPosition:toPosition:))]
-        fn offset_from(&self, from: &UITextPosition, to: &UITextPosition) -> NSInteger {
+        fn offset_from(&self, from: Option<&UITextPosition>, to: Option<&UITextPosition>) -> NSInteger {
+            let (Some(from), Some(to)) = (from, to) else {
+                return 0;
+            };
             text_selection::offset(to) as NSInteger - text_selection::offset(from) as NSInteger
         }
 
@@ -485,36 +578,48 @@ define_class!(
         }
 
         #[unsafe(method_id(positionWithinRange:farthestInDirection:))]
-        fn farthest(&self, range: &UITextRange, direction: UITextLayoutDirection) -> Option<Retained<UITextPosition>> {
-            Some(self.sel_farthest(range, direction))
+        fn farthest(
+            &self,
+            range: Option<&UITextRange>,
+            direction: UITextLayoutDirection,
+        ) -> Option<Retained<UITextPosition>> {
+            range.map(|range| self.sel_farthest(range, direction))
         }
 
         #[unsafe(method_id(characterRangeByExtendingPosition:inDirection:))]
-        fn extending(&self, position: &UITextPosition, direction: UITextLayoutDirection) -> Option<Retained<UITextRange>> {
-            Some(self.sel_extend(position, direction))
+        fn extending(
+            &self,
+            position: Option<&UITextPosition>,
+            direction: UITextLayoutDirection,
+        ) -> Option<Retained<UITextRange>> {
+            position.map(|position| self.sel_extend(position, direction))
         }
 
         #[unsafe(method(baseWritingDirectionForPosition:inDirection:))]
-        fn writing_direction(&self, _position: &UITextPosition, _direction: UITextStorageDirection) -> NSWritingDirection {
+        fn writing_direction(
+            &self,
+            _position: Option<&UITextPosition>,
+            _direction: UITextStorageDirection,
+        ) -> NSWritingDirection {
             self.sel_direction()
         }
 
         #[unsafe(method(setBaseWritingDirection:forRange:))]
-        fn set_writing_direction(&self, _direction: NSWritingDirection, _range: &UITextRange) {}
+        fn set_writing_direction(&self, _direction: NSWritingDirection, _range: Option<&UITextRange>) {}
 
         #[unsafe(method(firstRectForRange:))]
-        fn first_rect(&self, range: &UITextRange) -> CGRect {
-            self.sel_first_rect(range)
+        fn first_rect(&self, range: Option<&UITextRange>) -> CGRect {
+            range.map_or(CGRect::ZERO, |range| self.sel_first_rect(range))
         }
 
         #[unsafe(method(caretRectForPosition:))]
-        fn caret_rect(&self, position: &UITextPosition) -> CGRect {
-            self.sel_caret(position)
+        fn caret_rect(&self, position: Option<&UITextPosition>) -> CGRect {
+            position.map_or(CGRect::ZERO, |position| self.sel_caret(position))
         }
 
         #[unsafe(method_id(selectionRectsForRange:))]
-        fn selection_rects(&self, range: &UITextRange) -> Retained<NSArray<UITextSelectionRect>> {
-            self.sel_rects(range)
+        fn selection_rects(&self, range: Option<&UITextRange>) -> Retained<NSArray<UITextSelectionRect>> {
+            range.map_or_else(NSArray::new, |range| self.sel_rects(range))
         }
 
         #[unsafe(method_id(closestPositionToPoint:))]
@@ -523,8 +628,8 @@ define_class!(
         }
 
         #[unsafe(method_id(closestPositionToPoint:withinRange:))]
-        fn closest_within(&self, point: CGPoint, range: &UITextRange) -> Option<Retained<UITextPosition>> {
-            self.sel_closest(point, Some(range))
+        fn closest_within(&self, point: CGPoint, range: Option<&UITextRange>) -> Option<Retained<UITextPosition>> {
+            self.sel_closest(point, range)
         }
 
         #[unsafe(method_id(characterRangeAtPoint:))]
@@ -712,6 +817,15 @@ impl TextView {
             .borrow()
             .as_ref()
             .is_some_and(|t| !t.text.is_empty())
+    }
+
+    /// Whether some of the text is not hidden: what a screen reader reads.
+    fn has_visible_text(&self) -> bool {
+        self.ivars()
+            .text
+            .borrow()
+            .as_ref()
+            .is_some_and(|t| !t.visible_text().is_empty())
     }
 
     fn hidden_from_accessibility(&self) -> bool {

@@ -32,7 +32,8 @@ use std::sync::Arc;
 
 use crate::{
     AttributedText, Bounds, BoxShadow, Color, Corners, Edges, KeyframeAnimation, Keyframes,
-    LayoutCurve, LayoutProperty, LayoutTransition, Points, Transform, TransitionProps, ViewStyle,
+    LayoutCurve, LayoutProperty, LayoutTransition, Points, Transform, Transition, TransitionProps,
+    ViewStyle,
     geometry::{Percentage, Point, Radians, Size, deg},
 };
 
@@ -121,6 +122,45 @@ impl Live {
             && !self.color.running()
             && self.presence.is_none()
             && self.keyframes.is_none()
+    }
+
+    /// When what animates next ends (ms, the clock [`Live::step`] is
+    /// given), or `now` when a change has to be stepped to start: what a
+    /// surface that draws no frames (a hidden window) steps it at, so a
+    /// view animating out is removed on time without frames. `None` while
+    /// nothing animates, or only keyframes that repeat forever.
+    pub fn deadline(&self, now: f64) -> Option<f64> {
+        let keyframes = self.keyframes.as_ref().and_then(|run| {
+            let n = run.animation.iterations?;
+            let length = run.animation.delay.max(0.0) + n as f32 * run.animation.duration.max(0.0);
+            Some(run.start.map_or(now, |start| start + length as f64))
+        });
+        [
+            self.frame.as_ref().map(|t| t.timing.end(now)),
+            self.style.as_ref().map(|t| t.timing.end(now)),
+            self.color.0.as_ref().map(|t| t.timing.end(now)),
+            self.presence.as_ref().map(|p| p.timing.end(now)),
+            keyframes,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(f64::min)
+        // A millisecond past it: a step there finds it ended whatever the
+        // rounding of the time elapsed.
+        .map(|t| t + 1.0)
+    }
+
+    /// The highest frame rate its animations need, in Hz: a keyframe
+    /// animation's `animationFrameRate` while it is all that runs; `None`
+    /// (the screen's highest) while a transition, a layout animation or an
+    /// uncapped keyframe animation runs.
+    pub fn frame_rate(&self) -> Option<f32> {
+        let keyframes_alone = self.frame.is_none()
+            && self.style.is_none()
+            && !self.color.running()
+            && self.presence.is_none();
+        let run = self.keyframes.as_ref().filter(|_| keyframes_alone)?;
+        crate::style::frame_rate(run.animation.frame_rate)
     }
 
     /// True while a frame callback steps it.
@@ -343,7 +383,7 @@ pub fn restyle(
     let keyframes_changed = style.animation != old.animation;
     let transition = style.transition.filter(|t| {
         !reduce_motion
-            && t.duration + t.delay > 0.0
+            && t.run_ms() + t.delay > 0.0
             && differs(old, style, t.properties)
             // A view's first style does not transition from the defaults.
             && *old != ViewStyle::default()
@@ -359,7 +399,7 @@ pub fn restyle(
             from: Box::new(old.clone()),
             to,
             props: t.properties,
-            timing: Timing::new(t.delay, t.duration, Curve::Bezier(t.easing)),
+            timing: Timing::transition(&t),
         }
     });
     Some(Restyle { track, keyframes })
@@ -478,7 +518,7 @@ pub fn recolor(
     reduce_motion: bool,
 ) -> Recolor {
     let transition = style.transition.filter(|t| {
-        !reduce_motion && t.duration + t.delay > 0.0 && t.properties.has(TransitionProps::COLORS)
+        !reduce_motion && t.run_ms() + t.delay > 0.0 && t.properties.has(TransitionProps::COLORS)
     });
     // Most texts have no transition: their runs are not looked at.
     let Some((t, to)) = transition.and_then(|t| Some((t, text.uniform_color()?))) else {
@@ -489,7 +529,7 @@ pub fn recolor(
         Some(from) => Recoloring::Start {
             from,
             to,
-            timing: Timing::new(t.delay, t.duration, Curve::Bezier(t.easing)),
+            timing: Timing::transition(&t),
         },
         None => Recoloring::Stop,
     })
@@ -531,6 +571,8 @@ enum Curve {
     Bezier([f32; 4]),
     /// A spring with this damping ratio that settles within the duration.
     Spring(f32),
+    /// A spring's physics, over the time it settles in.
+    Physical(crate::element::Spring),
 }
 
 impl Curve {
@@ -543,7 +585,9 @@ impl Curve {
             LayoutCurve::EaseInEaseOut | LayoutCurve::Keyboard => {
                 Curve::Bezier([0.42, 0.0, 0.58, 1.0])
             }
-            LayoutCurve::Spring { damping } => Curve::Spring(damping),
+            LayoutCurve::FittedSpring { damping_ratio } => Curve::Spring(damping_ratio),
+            LayoutCurve::Spring(spring) => Curve::Physical(spring),
+            LayoutCurve::Bezier(points) => Curve::Bezier(points),
         }
     }
 
@@ -552,6 +596,7 @@ impl Curve {
             Curve::Linear => x,
             Curve::Bezier(b) => cubic_bezier(b, x),
             Curve::Spring(damping) => spring(damping, x),
+            Curve::Physical(spring) => spring.progress(x * spring.settle_ms()),
         }
     }
 }
@@ -650,7 +695,21 @@ impl Timing {
     }
 
     fn layout(t: &LayoutTransition) -> Self {
-        Timing::new(t.delay_ms, t.duration_ms, Curve::of(t.curve))
+        Timing::new(t.delay_ms, t.run_ms(), Curve::of(t.curve))
+    }
+
+    fn transition(t: &Transition) -> Self {
+        let curve = match t.spring {
+            Some(spring) => Curve::Physical(spring),
+            None => Curve::Bezier(t.easing),
+        };
+        Timing::new(t.delay, t.run_ms(), curve)
+    }
+
+    /// When it ends (ms), `now` before its first step.
+    fn end(&self, now: f64) -> f64 {
+        self.start
+            .map_or(now, |start| start + (self.delay + self.duration) as f64)
     }
 
     /// Eased progress at `now` (ms): `None` while delayed, then the value
@@ -965,7 +1024,7 @@ fn lerp_rect(a: Bounds<Points>, b: Bounds<Points>, t: f32) -> Bounds<Points> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{LayoutAnimation, TransformKind};
+    use crate::{LayoutAnimation, TransformKind, element::Spring};
 
     fn close(a: f32, b: f32) -> bool {
         (a - b).abs() < 1e-3
@@ -1014,6 +1073,195 @@ mod tests {
         assert!((spring(1.0, 0.98) - 1.0).abs() < 0.01);
     }
 
+    /// `spring` released at rest at 0 toward 1, stepped by semi-implicit
+    /// Euler at 10 µs: where it is after each of `steps` milliseconds.
+    fn integrate(spring: Spring, steps: usize) -> Vec<f64> {
+        let (k, c, m) = (
+            f64::from(spring.stiffness),
+            f64::from(spring.damping),
+            f64::from(spring.mass),
+        );
+        let (mut x, mut v) = (0.0_f64, 0.0_f64);
+        let mut out = Vec::new();
+        for _ in 0..steps {
+            for _ in 0..100 {
+                v += (-k * (x - 1.0) - c * v) / m * 1e-5;
+                x += v * 1e-5;
+            }
+            out.push(x);
+        }
+        out
+    }
+
+    /// A spring of these physics: stiffness, damping coefficient, mass.
+    fn physics(stiffness: f32, damping: f32, mass: f32) -> Spring {
+        Spring {
+            stiffness,
+            damping,
+            mass,
+            ..Spring::default()
+        }
+    }
+
+    /// M3 Expressive's fast spatial spring (stiffness 800, damping ratio
+    /// 0.6, mass 1), its damping as a coefficient: 2 · 0.6 · √800.
+    const FAST_SPATIAL: Spring = Spring {
+        stiffness: 800.0,
+        damping: 33.941_124,
+        mass: 1.0,
+        velocity: None,
+        frame_rate: None,
+    };
+
+    #[test]
+    fn a_physical_spring_follows_its_physics() {
+        let critical = physics(400.0, 40.0, 1.0);
+        let overdamped = physics(100.0, 40.0, 2.0);
+        for spring in [FAST_SPATIAL, critical, overdamped] {
+            assert_eq!(spring.progress(0.0), 0.0, "{spring:?}");
+            for (ms, expected) in integrate(spring, 600).into_iter().enumerate() {
+                let found = f64::from(spring.progress((ms + 1) as f32));
+                assert!(
+                    (found - expected).abs() < 1e-3,
+                    "{spring:?} at {ms} ms: {found} vs {expected}"
+                );
+            }
+        }
+        // Underdamped, it overshoots; critically damped or overdamped, it does not.
+        assert!((1..400).any(|ms| FAST_SPATIAL.progress(ms as f32) > 1.0));
+        for spring in [critical, overdamped] {
+            assert!(
+                (1..2000).all(|ms| spring.progress(ms as f32) <= 1.0),
+                "{spring:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_physical_spring_settles_within_a_thousandth_by_its_settling_time() {
+        // ln(1000) / (0.6 · √800) s.
+        assert!(
+            (FAST_SPATIAL.settle_ms() - 407.03).abs() < 0.1,
+            "{}",
+            FAST_SPATIAL.settle_ms()
+        );
+        let springs = [
+            FAST_SPATIAL,
+            physics(400.0, 40.0, 1.0),
+            physics(100.0, 40.0, 2.0),
+            physics(1400.0, 67.35, 1.0),
+        ];
+        for spring in springs {
+            let settle = spring.settle_ms();
+            let zeta = spring.damping / (2.0 * (spring.stiffness * spring.mass).sqrt());
+            // Underdamped, its decay is 1/1000 there: the swing is within 1/1000 of 1/√(1-ζ²).
+            let bound = if zeta < 0.999 {
+                1e-3 / (1.0 - zeta * zeta).sqrt()
+            } else {
+                1e-3
+            };
+            for ms in [settle, settle + 50.0, settle * 2.0] {
+                let off = (spring.progress(ms) - 1.0).abs();
+                assert!(off <= bound * 1.01, "{spring:?} at {ms} ms: {off}");
+            }
+            // Not long before: it is still more than a thousandth away somewhere.
+            let earlier =
+                (0..100).any(|i| (spring.progress(settle * 0.7 + i as f32) - 1.0).abs() > 1e-3);
+            assert!(earlier, "{spring:?} settled long before {settle} ms");
+        }
+    }
+
+    #[test]
+    fn a_spring_that_never_settles_is_there_at_once() {
+        for spring in [
+            physics(800.0, 0.0, 1.0),
+            physics(0.0, 30.0, 1.0),
+            physics(800.0, 30.0, 0.0),
+            physics(f32::NAN, 30.0, 1.0),
+            physics(f32::INFINITY, 30.0, 1.0),
+        ] {
+            assert_eq!(spring.progress(10.0), 1.0, "{spring:?}");
+            assert_eq!(spring.settle_ms(), 0.0, "{spring:?}");
+            let mut t = Timing::layout(&LayoutTransition::spring(spring));
+            assert_eq!(t.at(0.0), Some((1.0, true)), "{spring:?}");
+        }
+    }
+
+    #[test]
+    fn a_layout_spring_moves_by_its_physics_and_ends_when_it_settles() {
+        let transition = LayoutTransition::spring(FAST_SPATIAL);
+        assert_eq!(transition.curve, LayoutCurve::Spring(FAST_SPATIAL));
+        assert_eq!(transition.duration_ms, FAST_SPATIAL.settle_ms());
+        assert_eq!(transition.delay_ms, 0.0);
+        let mut t = Timing::layout(&transition);
+        assert_eq!(t.at(1000.0), Some((0.0, false)));
+        for ms in [16.0_f32, 100.0, 250.0, 400.0] {
+            let (value, done) = t.at(1000.0 + f64::from(ms)).unwrap();
+            assert!(
+                close(value, FAST_SPATIAL.progress(ms)) && !done,
+                "{ms} ms: {value}"
+            );
+        }
+        assert_eq!(
+            t.at(1000.0 + f64::from(transition.duration_ms)),
+            Some((1.0, true))
+        );
+    }
+
+    #[test]
+    fn a_layout_spring_times_itself_whatever_its_duration() {
+        let settle = FAST_SPATIAL.settle_ms();
+        for duration in [100.0, 2000.0] {
+            let transition = LayoutTransition::new(LayoutCurve::Spring(FAST_SPATIAL), duration);
+            assert_eq!(transition.run_ms(), settle);
+            let mut t = Timing::layout(&transition);
+            t.at(0.0);
+            assert!(
+                close(t.at(100.0).unwrap().0, FAST_SPATIAL.progress(100.0)),
+                "{duration}"
+            );
+            assert_eq!(t.at(f64::from(settle)), Some((1.0, true)), "{duration}");
+        }
+        // Other curves keep their duration.
+        assert_eq!(
+            LayoutTransition::new(LayoutCurve::Linear, 100.0).run_ms(),
+            100.0
+        );
+    }
+
+    #[test]
+    fn a_spring_is_made_as_gpui_base_makes_one() {
+        // `Spring::new(response)`: one undamped swing in `response`, critically damped.
+        let spring = Spring::new(280.0);
+        let omega = std::f32::consts::TAU / 0.28;
+        assert!(close(spring.stiffness, omega * omega) && close(spring.mass, 1.0));
+        assert!(close(spring.damping, 2.0 * omega));
+        assert!((1..2000).all(|ms| spring.progress(ms as f32) <= 1.0));
+        // `with_damping(0.85)`: ln 1000 / (0.85 · 2π / 0.28 s), what `Tabs` waited by hand.
+        let move_ = spring.damping_ratio(0.85);
+        assert!(
+            (move_.settle_ms() - 362.2).abs() < 0.1,
+            "{}",
+            move_.settle_ms()
+        );
+        assert!((1..400).any(|ms| move_.progress(ms as f32) > 1.0));
+        // From a stiffness token, at another mass: the ratio holds.
+        let mut heavy = Spring::from_stiffness(800.0);
+        heavy.mass = 2.0;
+        let heavy = heavy.damping_ratio(0.6);
+        assert!(close(heavy.damping / (2.0 * (800.0_f32 * 2.0).sqrt()), 0.6));
+        assert!(close(
+            Spring::from_stiffness(800.0).damping_ratio(0.6).damping,
+            FAST_SPATIAL.damping
+        ));
+        // A critically damped 180 ms response settles where `Collapsible` waited by hand.
+        assert!(
+            (Spring::new(180.0).settle_ms() - 264.5).abs() < 0.5,
+            "{}",
+            Spring::new(180.0).settle_ms()
+        );
+    }
+
     #[test]
     fn progress_waits_for_delay() {
         assert_eq!(progress(Curve::Linear, 100.0, 200.0, 50.0), None);
@@ -1026,6 +1274,80 @@ mod tests {
             Some((1.0, true))
         );
         assert_eq!(progress(Curve::Linear, 0.0, 0.0, 0.0), Some((1.0, true)));
+    }
+
+    /// A view scaled from `from` to `to` with `easing` on its transforms:
+    /// the scales it shows every 10 ms until the transition ends.
+    fn scales(
+        easing: [f32; 4],
+        spring: Option<crate::element::Spring>,
+        from: f32,
+        to: f32,
+    ) -> Vec<f32> {
+        let styled = |scale: f32| {
+            let mut transform = Transform::IDENTITY;
+            let _ = transform.push(crate::transform::TransformKind::Scale, scale);
+            ViewStyle {
+                transform,
+                transition: Some(Transition {
+                    properties: TransitionProps(TransitionProps::TRANSFORM),
+                    duration: 200.0,
+                    delay: 0.0,
+                    easing,
+                    spring,
+                }),
+                ..ViewStyle::default()
+            }
+        };
+        let old = styled(from);
+        let mut style = Box::new(styled(to));
+        let mut live = Live::default();
+        live.restyle(restyle(&old, &mut style, false).expect("it transitions"));
+        let mut frame = Bounds::default();
+        let mut out = Vec::new();
+        for i in 0..200 {
+            let step = live.step(f64::from(i) * 10.0, &mut frame, &mut style);
+            out.push(style.transform.ops()[0].value);
+            if step.finished {
+                break;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn a_style_transition_runs_on_a_spring() {
+        let spring = crate::element::Spring {
+            stiffness: 620.0,
+            damping: 36.0,
+            ..crate::element::Spring::default()
+        };
+        let shown = scales(Transition::EASE, Some(spring), 0.95, 1.0);
+        // It passes its target (by 3.7% of the travel) and settles on it, in
+        // the time the spring takes, not the transition's 200 ms.
+        let peak = shown.iter().copied().fold(f32::MIN, f32::max);
+        assert!(peak > 1.001 && peak < 1.003, "{peak}");
+        assert_eq!(*shown.last().unwrap(), 1.0);
+        let ms = (shown.len() - 1) * 10;
+        assert!((380..=390).contains(&ms), "{ms}");
+        // Its exit waits as long.
+        let t = Transition {
+            properties: TransitionProps(TransitionProps::ALL),
+            duration: 200.0,
+            delay: 20.0,
+            easing: Transition::EASE,
+            spring: Some(spring),
+        };
+        assert!((t.run_ms() - spring.settle_ms()).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn a_bezier_past_one_overshoots() {
+        let shown = scales([0.3, 1.25, 0.6, 1.0], None, 0.95, 1.0);
+        let peak = shown.iter().copied().fold(f32::MIN, f32::max);
+        assert!(peak > 1.0, "{peak}");
+        assert_eq!(*shown.last().unwrap(), 1.0);
+        assert_eq!(shown.len(), 21);
     }
 
     #[test]
@@ -1191,6 +1513,7 @@ mod tests {
             delay: 0.0,
             easing: [0.0, 0.0, 1.0, 1.0],
             iterations,
+            frame_rate: None,
         };
         let spin = anim(Keyframes::Spin, None);
         assert!(close(
@@ -1227,6 +1550,24 @@ mod tests {
     }
 
     #[test]
+    fn keyframes_alone_ask_for_their_frame_rate() {
+        let spin = KeyframeAnimation::new(Keyframes::Spin);
+        let restyle = |animation| Restyle {
+            track: None,
+            keyframes: Some(animation),
+        };
+        let mut live = Live::default();
+        assert_eq!(live.frame_rate(), None);
+        live.restyle(restyle(Some(spin)));
+        assert_eq!(live.frame_rate(), None);
+        live.restyle(restyle(Some(spin.frame_rate(30.0))));
+        assert_eq!(live.frame_rate(), Some(30.0));
+        // With a layout animation running beside it: the screen's highest.
+        live.appear(LayoutTransition::new(LayoutCurve::Linear, 300.0));
+        assert_eq!(live.frame_rate(), None);
+    }
+
+    #[test]
     fn a_view_appears_and_disappears() {
         let t = LayoutAnimation::LINEAR.create.unwrap();
         let mut live = Live::default();
@@ -1242,6 +1583,48 @@ mod tests {
         assert!(close(live.opacity(), 0.5));
         let step = live.step(2000.0, &mut frame, &mut style);
         assert!(step.removed && step.finished && !live.ticking());
+    }
+
+    #[test]
+    fn a_view_animating_out_is_removed_at_its_deadline() {
+        let t = LayoutAnimation::LINEAR.create.unwrap();
+        let mut live = Live::default();
+        let (mut frame, mut style) = (Bounds::default(), Box::default());
+        assert_eq!(live.deadline(0.0), None);
+        live.appear(t);
+        live.step(0.0, &mut frame, &mut style);
+        live.disappear(t);
+        // Not started: step now, which starts it.
+        assert_eq!(live.deadline(100.0), Some(101.0));
+        live.step(100.0, &mut frame, &mut style);
+        let end = live.deadline(100.0).expect("it animates out");
+        assert!(close(end as f32, 100.0 + t.duration_ms + 1.0), "{end}");
+        let step = live.step(end, &mut frame, &mut style);
+        assert!(step.removed && step.finished);
+        assert_eq!(live.deadline(end), None);
+    }
+
+    #[test]
+    fn keyframes_that_repeat_forever_give_no_deadline() {
+        let mut live = Live::default();
+        let spin = |iterations| KeyframeAnimation {
+            keyframes: Keyframes::Spin,
+            duration: 1000.0,
+            delay: 0.0,
+            easing: [0.0, 0.0, 1.0, 1.0],
+            iterations,
+            frame_rate: None,
+        };
+        live.keyframes = Some(KeyframeRun {
+            animation: spin(None),
+            start: Some(0.0),
+        });
+        assert_eq!(live.deadline(10.0), None);
+        live.keyframes = Some(KeyframeRun {
+            animation: spin(Some(2)),
+            start: Some(0.0),
+        });
+        assert_eq!(live.deadline(10.0), Some(2001.0));
     }
 
     fn text(colors: &[Color]) -> AttributedText {
@@ -1263,6 +1646,7 @@ mod tests {
                 duration: 150.0,
                 delay: 0.0,
                 easing: [0.0, 0.0, 1.0, 1.0],
+                spring: None,
             }),
             ..ViewStyle::default()
         }

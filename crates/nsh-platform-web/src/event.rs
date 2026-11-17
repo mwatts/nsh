@@ -11,7 +11,10 @@ use nsh_core::{
 };
 
 /// `value`, the JSON payload of a `kind` event, as the core takes it.
-pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> EventPayload {
+/// `None` when the payload names something this build does not know, such as
+/// a mouse button's name it cannot report: the event is dropped rather than
+/// reported as another one.
+pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> Option<EventPayload> {
     let num = |k: &str| value.get(k).and_then(|v| v.as_f64()).unwrap_or(0.0) as f32;
     let text = |k: &str| {
         value
@@ -20,7 +23,7 @@ pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> EventPayload
             .unwrap_or_default()
             .to_owned()
     };
-    match kind {
+    let payload = match kind {
         EventKind::ScrollEnd
         | EventKind::ScrollDragStart
         | EventKind::ScrollDragEnd
@@ -45,11 +48,67 @@ pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> EventPayload
                 .get("pressedButton")
                 .and_then(|v| v.as_str())
                 .and_then(mouse_button);
-            EventPayload::Mouse(nsh_core::MouseEvent::new(
+            EventPayload::Mouse(with_pointer(
+                nsh_core::MouseEvent::new(position, page_position, modifiers, pressed_button),
+                &value,
+            ))
+        }
+        // `{ position, pagePosition, delta, phase, modifiers }`, as
+        // handlers get it.
+        EventKind::Pinch => {
+            let (position, page_position, modifiers) = pointer_at(&value);
+            EventPayload::Pinch(nsh_core::PinchEvent::new(
                 position,
                 page_position,
+                nsh_core::geometry::Percentage(num("delta")),
+                nsh_core::PinchPhase::from_name(&text("phase")).unwrap_or_default(),
                 modifiers,
-                pressed_button,
+            ))
+        }
+        // `{ position, pagePosition, delta, deltaMode, modifiers }`, as
+        // handlers get it.
+        EventKind::Wheel => {
+            let (position, page_position, modifiers) = pointer_at(&value);
+            let d = |c: &str| {
+                value
+                    .get("delta")
+                    .and_then(|p| p.get(c))
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0) as f32
+            };
+            let (dx, dy) = (d("x"), d("y"));
+            let delta = if value.get("deltaMode").and_then(|v| v.as_str()) == Some("lines") {
+                nsh_core::WheelDelta::Lines(point(dx, dy))
+            } else {
+                nsh_core::WheelDelta::Points(point(Points(dx), Points(dy)))
+            };
+            EventPayload::Wheel(nsh_core::WheelEvent::new(
+                position,
+                page_position,
+                delta,
+                modifiers,
+            ))
+        }
+        // `{ position, pagePosition, modifiers, button }`, as handlers get
+        // it.
+        EventKind::MouseUp => {
+            let (position, page_position, modifiers) = pointer_at(&value);
+            EventPayload::Mouse(with_pointer(
+                nsh_core::MouseEvent::released(
+                    position,
+                    page_position,
+                    modifiers,
+                    // A keyboard or scripted release names no button; the
+                    // primary one is the release that `onPressUp` pairs with. A
+                    // name this build does not know is no release to report: the
+                    // `?` drops the event instead of reading it as the primary
+                    // button.
+                    match value.get("button").and_then(|v| v.as_str()) {
+                        None => nsh_core::MouseButton::Left,
+                        Some(name) => mouse_button(name)?,
+                    },
+                ),
+                &value,
             ))
         }
         EventKind::ContextMenu
@@ -60,7 +119,8 @@ pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> EventPayload
             if kind == EventKind::ContextMenu || value.get("pagePosition").is_some() =>
         {
             // `{ position, pagePosition, modifiers }` (presses: and
-            // `clicks`), as handlers get it.
+            // `clicks`; a context menu: and `pointerType`), as handlers get
+            // it.
             let (position, page_position, modifiers) = pointer_at(&value);
             if kind != EventKind::ContextMenu {
                 EventPayload::Press(nsh_core::PressEvent {
@@ -70,11 +130,16 @@ pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> EventPayload
                     clicks: (num("clicks") as u32).max(1),
                 })
             } else {
-                EventPayload::ContextMenu(nsh_core::ContextMenuEvent {
+                EventPayload::ContextMenu(nsh_core::ContextMenuEvent::new(
                     position,
                     page_position,
                     modifiers,
-                })
+                    // `null`: the keyboard or an assistive technology.
+                    value
+                        .get("pointerType")
+                        .and_then(|v| v.as_str())
+                        .and_then(nsh_core::PointerType::from_name),
+                ))
             }
         }
         EventKind::ChangeText | EventKind::SubmitEditing => EventPayload::Text {
@@ -96,6 +161,9 @@ pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> EventPayload
                 size: size(Points(n("size", "width")), Points(n("size", "height"))),
             })
         }
+        // `{ id, event, ... }`: what a sound or a player reported
+        // (`nsh.js`'s `audioEvent`; durations and positions in seconds).
+        EventKind::Audio => audio_payload(&value),
         EventKind::Host => EventPayload::Json(value),
         _ => match &value {
             // Every field goes through: a key the page sends is one the
@@ -119,7 +187,8 @@ pub(crate) fn payload(kind: EventKind, value: serde_json::Value) -> EventPayload
             ),
             _ => EventPayload::None,
         },
-    }
+    };
+    Some(payload)
 }
 
 /// `name` as the static payload key the core takes: each distinct key is
@@ -184,4 +253,82 @@ fn mouse_button(name: &str) -> Option<nsh_core::MouseButton> {
         "forward" => nsh_core::MouseButton::Forward,
         _ => return None,
     })
+}
+
+/// The payload of an `onAudio` event: `{ id, event, duration?, position?,
+/// bytes?, truncated?, buffering?, error?, message? }`.
+fn audio_payload(value: &serde_json::Value) -> EventPayload {
+    use std::time::Duration;
+
+    use nsh_core::audio::{AudioError, AudioEvent as E};
+    let seconds = |k: &str| {
+        value
+            .get(k)
+            .and_then(|v| v.as_f64())
+            // `try_`: a time too large for a `Duration` is no time, not a
+            // panic.
+            .and_then(|s| Duration::try_from_secs_f64(s).ok())
+    };
+    let id = value.get("id").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    let name = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
+    let event = match name {
+        "loaded" => E::Loaded {
+            duration: seconds("duration").unwrap_or_default(),
+            bytes: value.get("bytes").and_then(|v| v.as_u64()).unwrap_or(0),
+            truncated: value
+                .get("truncated")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        },
+        // `duration` is absent for a live stream (Infinity).
+        "load" => E::Load {
+            duration: seconds("duration"),
+        },
+        "playing" => E::Playing,
+        "paused" => E::Paused,
+        "progress" => E::Progress {
+            position: seconds("position").unwrap_or_default(),
+            duration: seconds("duration"),
+        },
+        "buffer" => E::Buffer {
+            buffering: value
+                .get("buffering")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        },
+        "ended" => E::Ended,
+        "failed" => E::Failed {
+            error: value
+                .get("error")
+                .and_then(|v| v.as_str())
+                .and_then(AudioError::from_name)
+                .unwrap_or(AudioError::Failed),
+            message: value
+                .get("message")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_owned(),
+        },
+        _ => return EventPayload::None,
+    };
+    EventPayload::Audio { id, event }
+}
+
+/// `event` with the pen fields of `value` (`pointerType`, `pressure`,
+/// `tiltX`, `tiltY`), when it has them.
+fn with_pointer(event: nsh_core::MouseEvent, value: &serde_json::Value) -> nsh_core::MouseEvent {
+    let Some(kind) = value
+        .get("pointerType")
+        .and_then(|v| v.as_str())
+        .and_then(nsh_core::PointerType::from_name)
+    else {
+        return event;
+    };
+    let num = |k: &str| value.get(k).and_then(|v| v.as_f64()).map(|v| v as f32);
+    event.with_pointer(
+        kind,
+        num("pressure").unwrap_or(event.pressure),
+        num("tiltX").unwrap_or(0.0),
+        num("tiltY").unwrap_or(0.0),
+    )
 }

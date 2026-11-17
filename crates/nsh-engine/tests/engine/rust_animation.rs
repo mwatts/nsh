@@ -97,6 +97,7 @@ impl Platform {
             app: App::Rust(Root::of::<Jumper>()),
             viewport: Size::new(px(390.0), px(844.0)),
             trace: false,
+            content_culling: false,
             network: None,
             websocket: None,
             refuse_connections: None,
@@ -107,7 +108,7 @@ impl Platform {
             limits: nsh_engine::Limits::default(),
             ui_sets: Vec::new(),
             runtime: None,
-            data_dir: None,
+            support_dir: None,
             cache: nsh_engine::CacheOptions::off(),
             storage: None,
             clock: Default::default(),
@@ -117,6 +118,10 @@ impl Platform {
             host: Default::default(),
             picker: None,
             speech: None,
+            audio: None,
+            windows: None,
+            login_item: None,
+            data_dir: None,
         };
         let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
         let mut platform = Self {
@@ -354,6 +359,7 @@ fn a_release_moves_on_with_the_drags_velocity() {
             damping,
             mass,
             velocity: Some(velocity),
+            frame_rate: None,
         }
     };
     assert_eq!(started(&rx).0, [spring(300.0), spring(-400.0)]);
@@ -363,6 +369,7 @@ fn a_release_moves_on_with_the_drags_velocity() {
         deceleration: 0.998,
         clamp: None,
         bounce: 0.0,
+        frame_rate: None,
     };
     assert_eq!(started(&rx).0, [decay(300.0), decay(-400.0)]);
 }

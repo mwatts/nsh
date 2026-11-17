@@ -133,6 +133,8 @@ pub(crate) fn draw(
     let mut text_cells = std::mem::take(&mut tree.text_cells);
     text_cells.clear();
     text_cells.resize(buffer.content.len(), false);
+    let mut links = std::mem::take(&mut tree.links);
+    links.clear();
     let mut painter = Painter {
         buffer,
         tree,
@@ -144,6 +146,8 @@ pub(crate) fn draw(
         bands,
         screen: clip,
         text_cells,
+        links,
+        link: None,
         focus: Focus::None,
         popup: false,
         pane: None,
@@ -176,6 +180,7 @@ pub(crate) fn draw(
                 pane: false,
                 right_line: None,
                 field_group: false,
+                lined_group: false,
                 handle: false,
                 rule: false,
                 track: false,
@@ -190,6 +195,7 @@ pub(crate) fn draw(
     }
     painter.tree.scroll_bars = painter.bars;
     painter.tree.text_cells = std::mem::take(&mut painter.text_cells);
+    painter.tree.links = std::mem::take(&mut painter.links);
     painter.tree.spans = std::mem::take(&mut painter.spans);
     if painter.tree.menus.is_open() {
         painter.hits.clear();
@@ -236,6 +242,9 @@ struct Layer {
     /// Inside an input group's band ([`input_group`]): its field is
     /// raised with it, not a step of its own.
     field_group: bool,
+    /// Inside an input group that draws its line (a box three rows tall):
+    /// its field shows its extent by that box, with no underline of its own.
+    lined_group: bool,
     /// Inside an adjustable view (a resize handle): a column of `│` in
     /// it is a divider's line ([`rule_axis`]).
     handle: bool,
@@ -268,6 +277,11 @@ struct Painter<'a> {
     screen: Rect,
     /// Which Cells of the buffer hold text drawn this frame.
     text_cells: Vec<bool>,
+    /// The Cells drawn this frame that hold a linked glyph.
+    links: crate::link::Painted,
+    /// The opening sequence of the hyperlink of the innermost view with an
+    /// `href` around the view being drawn (`crate::link`).
+    link: Option<std::sync::Arc<str>>,
     /// Where the focus is in the subtree being marked.
     focus: Focus,
     /// A popup (an anchored overlay's box) is drawn: only boxes inside an
@@ -311,9 +325,36 @@ impl Edges {
 
 impl Painter<'_> {
     /// Draws view `id`, whose parent's content starts at `origin` (points
-    /// from the area's top left), inside the `clip` Cells.
+    /// from the area's top left), inside the `clip` Cells; the text inside
+    /// a view with an `href` (a `Link`'s) is linked to it.
     #[allow(clippy::too_many_arguments)]
     fn view(
+        &mut self,
+        id: NodeId,
+        origin: Point<Points>,
+        clip: Rect,
+        opacity: f32,
+        ground: Ground,
+        layer: Layer,
+        pointer: bool,
+        press: Option<(NodeId, Point<Points>)>,
+    ) {
+        let open = self
+            .tree
+            .get(id)
+            .and_then(|view| view.props.href.as_deref())
+            .and_then(|href| crate::link::open(id, href));
+        let outer = match open {
+            Some(open) => self.link.replace(open),
+            None => self.link.clone(),
+        };
+        self.view_content(id, origin, clip, opacity, ground, layer, pointer, press);
+        self.link = outer;
+    }
+
+    /// Draws view `id` as [`Self::view`] does, within the link around it.
+    #[allow(clippy::too_many_arguments)]
+    fn view_content(
         &mut self,
         id: NodeId,
         origin: Point<Points>,
@@ -367,6 +408,8 @@ impl Painter<'_> {
                     && view.frame.size.height <= self.cells.height()
             })
             && input_group(self.tree, id);
+        // Any input group, which a line of its own may frame.
+        let field_box = input_group(self.tree, id);
         // Such a group whose field has the keys shows it on its band.
         let group_focused = holds_field && focused_field_in(self.tree, id, 3);
         let rule_box = holds_rule(self.tree, id, 3);
@@ -430,7 +473,10 @@ impl Painter<'_> {
         let press = if pointer
             && view.props.pointer_events != PointerEvents::BoxNone
             && !view.props.accessibility.state.disabled
-            && nsh_core::input::has_press(view.events)
+            // The terminal's mouse holds no long press: a view that
+            // listens only to `onLongPress` leaves the clicks to the one
+            // around it.
+            && nsh_core::input::has_tap(view.events)
         {
             Some((id, cell_origin))
         } else {
@@ -1007,7 +1053,12 @@ impl Painter<'_> {
                 };
                 let rule = rule_axis(layout, view, ground, layer.handle || layer.rule)
                     .filter(|_| !layer.track);
-                text(self.buffer, &mut self.text_cells, place, view, ground);
+                let cells = TextCells {
+                    text: &mut self.text_cells,
+                    links: &mut self.links,
+                    link: self.link.as_ref(),
+                };
+                text(self.buffer, cells, place, view, ground);
                 if let Some(down) = rule {
                     let drawn = text_bounds.clipped(visible);
                     let glyph = if down { "│" } else { "─" };
@@ -1160,6 +1211,7 @@ impl Painter<'_> {
                 .filter(|&(right, _)| (0..=LINE_GAP).contains(&(right - bounds.right)))
         };
         child_layer.field_group |= group;
+        child_layer.lined_group |= edges.any() && bounds.bottom - bounds.top >= 3 && field_box;
         child_layer.handle |= view.props.accessibility.role == AccessibilityRole::Adjustable;
         child_layer.rule |= rule_box;
         child_layer.track = track;
@@ -1340,6 +1392,7 @@ impl Painter<'_> {
                     crate::ColorDepth::Ansi16 | crate::ColorDepth::Monochrome
                 ),
                 popup: popup_item,
+                lined_group: layer.lined_group,
             };
             match ground.ramp {
                 Some(ramp) => mark_surface(
@@ -1804,15 +1857,30 @@ struct TextPlace<'a> {
     focused: Option<std::ops::Range<u32>>,
 }
 
+/// What the text painter records of the Cells it draws.
+struct TextCells<'a> {
+    /// Which Cells hold text.
+    text: &'a mut [bool],
+    /// Which hold a linked glyph.
+    links: &'a mut crate::link::Painted,
+    /// The opening sequence of the link around the text, if any.
+    link: Option<&'a std::sync::Arc<str>>,
+}
+
 /// Draws a text view's rows, as laid out, inside the place's `visible`,
 /// colors read on `ground`.
 fn text(
     buffer: &mut Buffer,
-    text_cells: &mut [bool],
+    cells: TextCells<'_>,
     place: TextPlace<'_>,
     view: &NshView,
     ground: Ground,
 ) {
+    let TextCells {
+        text: text_cells,
+        links,
+        link,
+    } = cells;
     let TextPlace {
         layout,
         bounds,
@@ -1959,7 +2027,18 @@ fn text(
                 }
             }
             for (offset, cx) in (start..end).enumerate() {
-                text_cells[buffer.index_of(cx as u16, y)] = true;
+                let at = buffer.index_of(cx as u16, y);
+                text_cells[at] = true;
+                // The Cell that holds the glyph carries its link; text
+                // drawn over a linked Cell takes it away.
+                match link {
+                    Some(open) if offset == 0 => {
+                        links.insert(at, (open.clone(), glyph.text.clone()));
+                    }
+                    _ => {
+                        links.remove(&at);
+                    }
+                }
                 let cell = &mut buffer[(cx as u16, y)];
                 cell.set_symbol(if offset == 0 { &glyph.text } else { " " });
                 // A glyph in the color of the band it lands on (a trigger's
@@ -2479,6 +2558,9 @@ struct Marks {
     /// The view is an item of a popup (a list's option, a menu's item):
     /// its focus spans its row, as a selected item's reverse does.
     popup: bool,
+    /// The view is inside an input group that draws its line
+    /// ([`Layer::lined_group`]).
+    lined_group: bool,
 }
 
 /// Draws the view's state over its drawn Cells (its subtree's included):
@@ -2563,7 +2645,7 @@ fn mark_state(
     // A field shows its extent with no fill to show it (its fill is a
     // ramp's step, which a bandless terminal has not): an underline along
     // its last row, unless its line is drawn (a box three rows tall).
-    let lined = edges.any() && bounds.bottom - bounds.top >= 3;
+    let lined = edges.any() && bounds.bottom - bounds.top >= 3 || marks.lined_group;
     let row = (!inner.is_empty())
         .then(|| Rect::new(inner.x, inner.bottom() - 1, inner.width, 1).intersection(visible))
         .filter(|row| !row.is_empty());

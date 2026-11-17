@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use crate::{
+    color::Hsla,
     geometry::{DefiniteLength, Percentage, Points, REM_SIZE, Radians, Size, deg},
     style::{BorderStyle, Color},
 };
@@ -140,7 +141,7 @@ pub struct ColorStop {
     pub position: Option<DefiniteLength>,
 }
 
-/// A gradient image (`backgroundImage`).
+/// A gradient image (`backgroundImage`, `maskImage`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Gradient {
     /// Geometry.
@@ -149,6 +150,39 @@ pub struct Gradient {
     pub stops: Vec<ColorStop>,
     /// Repeats past the last stop.
     pub repeating: bool,
+}
+
+/// A stop at no position of its own: spread evenly between its neighbors.
+impl From<Hsla> for ColorStop {
+    fn from(color: Hsla) -> Self {
+        ColorStop {
+            color: color.into(),
+            position: None,
+        }
+    }
+}
+
+/// A stop at a fraction of the gradient line (`percentage(0.2)`) or a
+/// length from its start (`px(12.0)`).
+impl<P: Into<DefiniteLength>> From<(Hsla, P)> for ColorStop {
+    fn from((color, position): (Hsla, P)) -> Self {
+        ColorStop {
+            color: color.into(),
+            position: Some(position.into()),
+        }
+    }
+}
+
+impl<T: Into<ColorStop>, const N: usize> crate::element::IntoReactive<Vec<ColorStop>> for [T; N] {
+    fn into_reactive(self) -> crate::element::Reactive<Vec<ColorStop>> {
+        crate::element::Reactive::Static(self.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<T: Into<ColorStop>> crate::element::IntoReactive<Vec<ColorStop>> for Vec<T> {
+    fn into_reactive(self) -> crate::element::Reactive<Vec<ColorStop>> {
+        crate::element::Reactive::Static(self.into_iter().map(Into::into).collect())
+    }
 }
 
 impl Gradient {
@@ -591,6 +625,95 @@ impl BackdropMaterial {
     }
 }
 
+/// `macos={{ backdrop }}`: the `NSVisualEffectView` material a view draws with
+/// on macOS.
+///
+/// Unlike iOS's [`BackdropMaterial`], which always blurs a `backdropFilter`,
+/// this is a material of its own: an explicit backdrop draws its native
+/// view whether or not the style has a blur, and it wins over
+/// [`GlassEffect`] and `backdropFilter` on macOS. Its fields default to
+/// `popover`, `withinWindow` and `active`, the blur macOS has always drawn.
+///
+/// There is no CSS for this -- `backdrop-filter` only describes filters --
+/// so the names follow AppKit's `NSVisualEffectMaterial`,
+/// `NSVisualEffectBlendingMode` and `NSVisualEffectState` in camel case.
+///
+/// Fields may be added: start with [`Self::default`] and set what it
+/// needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct MacOsBackdrop {
+    /// The material: what is blurred and how it is tinted.
+    pub material: MacOsBackdropMaterial,
+    /// What it blurs: the view's window, or what is behind the window.
+    pub blending: MacOsBackdropBlending,
+    /// Whether it follows the window's active state, or is always active
+    /// or inactive.
+    pub state: MacOsBackdropState,
+}
+
+/// `NSVisualEffectMaterial`: the material of a [`MacOsBackdrop`].
+///
+/// The roles AppKit still documents: the newer content and under-window
+/// roles, and the older named roles apps still use (which AppKit marks
+/// deprecated in favor of the newer ones).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, crate::element::PropEnum)]
+pub enum MacOsBackdropMaterial {
+    /// The title bar's material.
+    Titlebar,
+    /// The selected content's material.
+    Selection,
+    /// A menu's material.
+    Menu,
+    /// A popover's material.
+    #[default]
+    Popover,
+    /// A source list's (sidebar's) material.
+    Sidebar,
+    /// A table header's material.
+    HeaderView,
+    /// A sheet's material.
+    Sheet,
+    /// The window's background material.
+    WindowBackground,
+    /// A heads-up display's material.
+    HudWindow,
+    /// A full-screen UI's material.
+    FullScreenUI,
+    /// A tooltip's material.
+    ToolTip,
+    /// The content's background material.
+    ContentBackground,
+    /// The material under the window's background.
+    UnderWindowBackground,
+    /// The material under a page's background.
+    UnderPageBackground,
+}
+
+/// `NSVisualEffectBlendingMode`: what a [`MacOsBackdrop`] blurs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, crate::element::PropEnum)]
+pub enum MacOsBackdropBlending {
+    /// What is in the view's window behind it.
+    #[default]
+    WithinWindow,
+    /// What is behind the window, so the window must be transparent for
+    /// it to show.
+    BehindWindow,
+}
+
+/// `NSVisualEffectState`: whether a [`MacOsBackdrop`] follows the window's
+/// active state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, crate::element::PropEnum)]
+pub enum MacOsBackdropState {
+    /// Active while the window is, inactive otherwise.
+    FollowsWindowActiveState,
+    /// Always active.
+    #[default]
+    Active,
+    /// Always inactive.
+    Inactive,
+}
+
 /// `glassEffect`: a glass material drawn behind the view's content.
 ///
 /// Apple's "Liquid Glass", new in iOS 26. No CSS property describes it --
@@ -852,6 +975,7 @@ impl TransitionProps {
 
 /// `transition*`: style changes animate natively instead of jumping.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[non_exhaustive]
 pub struct Transition {
     /// Properties that animate.
     pub properties: TransitionProps,
@@ -859,13 +983,43 @@ pub struct Transition {
     pub duration: f32,
     /// Milliseconds before it starts.
     pub delay: f32,
-    /// Cubic Bézier `x1, y1, x2, y2`.
+    /// Cubic Bézier `x1, y1, x2, y2` (a `y` outside 0..1 overshoots).
     pub easing: [f32; 4],
+    /// A spring's physics it runs on instead of `easing`
+    /// (`transitionTimingFunction: "spring(stiffness, damping, mass)"`),
+    /// released at rest: it times itself, lasting until it settles
+    /// ([`Spring::settle_ms`](crate::element::Spring::settle_ms)), so
+    /// `duration` is not used, nor the spring's `velocity` and
+    /// `frame_rate`. A change that arrives mid-way starts again from what
+    /// is on screen, at rest.
+    pub spring: Option<crate::element::Spring>,
+}
+
+impl Default for Transition {
+    /// CSS's initial values: every property, no time, `ease`.
+    fn default() -> Self {
+        Self {
+            properties: TransitionProps(TransitionProps::ALL),
+            duration: 0.0,
+            delay: 0.0,
+            easing: Self::EASE,
+            spring: None,
+        }
+    }
 }
 
 impl Transition {
     /// CSS's default curve (`ease`).
     pub const EASE: [f32; 4] = [0.25, 0.1, 0.25, 1.0];
+
+    /// How long it runs once started, in milliseconds: the duration, or
+    /// the time its spring takes to settle (its delay not included).
+    pub fn run_ms(&self) -> f32 {
+        match self.spring {
+            Some(spring) => spring.settle_ms(),
+            None => self.duration.max(0.0),
+        }
+    }
 }
 
 /// A built-in keyframe animation (Tailwind's `animate-*`).
@@ -894,6 +1048,10 @@ pub struct KeyframeAnimation {
     pub easing: [f32; 4],
     /// `None` repeats forever.
     pub iterations: Option<u32>,
+    /// The highest frame rate it needs, in Hz (`animationFrameRate`);
+    /// `None`: the screen's highest. Platforms that can lower their frame
+    /// rate honor it.
+    pub frame_rate: Option<f32>,
 }
 
 impl KeyframeAnimation {
@@ -906,6 +1064,7 @@ impl KeyframeAnimation {
             delay: 0.0,
             easing: [0.0, 0.0, 1.0, 1.0],
             iterations: None,
+            frame_rate: None,
         }
     }
 
@@ -930,6 +1089,13 @@ impl KeyframeAnimation {
     /// `count` iterations, then it stops.
     pub const fn iterations(mut self, count: u32) -> Self {
         self.iterations = Some(count);
+        self
+    }
+
+    /// Needs at most `hz` frames per second (a slow spinner: 30), so the
+    /// screen may refresh less often while it is all that moves.
+    pub const fn frame_rate(mut self, hz: f32) -> Self {
+        self.frame_rate = Some(hz);
         self
     }
 }

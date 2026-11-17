@@ -64,6 +64,7 @@ mount(() => <Text>{{shown()}}</Text>);
             minify: false,
             split: false,
             ui_sets: Vec::new(),
+            ..Default::default()
         })
         .unwrap();
         let bundle = Bundle::source(bundled.code)
@@ -76,10 +77,13 @@ mount(() => <Text>{{shown()}}</Text>);
             app: nsh_engine::App::Js(bundle),
             viewport: Size::new(nsh_core::geometry::px(400.0), nsh_core::geometry::px(300.0)),
             trace: false,
+            content_culling: false,
             network: None,
             websocket: None,
             refuse_connections: None,
             filesystem: None,
+            windows: None,
+            login_item: None,
             assets: None,
             environment: Environment {
                 os: Os::Linux,
@@ -89,7 +93,7 @@ mount(() => <Text>{{shown()}}</Text>);
             limits: nsh_engine::Limits::default(),
             ui_sets: Vec::new(),
             runtime: None,
-            data_dir: Some(root.join("data")),
+            support_dir: Some(root.join("data")),
             cache: nsh_engine::CacheOptions::off(),
             storage: None,
             clock: Default::default(),
@@ -99,6 +103,8 @@ mount(() => <Text>{{shown()}}</Text>);
             host: Default::default(),
             picker: None,
             speech: None,
+            audio: None,
+            data_dir: None,
         };
         let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
         let data = root.join("data/com.example.process");

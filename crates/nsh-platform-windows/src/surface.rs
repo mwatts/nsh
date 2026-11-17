@@ -6,9 +6,11 @@
 //! the main thread drains the queue and applies every batch in order
 //! ([`Surface::drain`]). Native animations and JS frame requests run on the
 //! window's frame ticker ([`crate::window::Ticker`], paced by the
-//! compositor) while there is something to do. Drawing is coalesced:
-//! changes invalidate the window and `WM_PAINT` draws the tree once
-//! ([`crate::render::frame`]).
+//! compositor) while there is something to do; while nothing composes (a
+//! locked or remote session) no frames are ticked, and the times animations
+//! end are kept with a timer instead ([`Surface::keep_deadline`]). Drawing
+//! is coalesced: changes invalidate the window and `WM_PAINT` draws the
+//! tree once ([`crate::render::frame`]).
 
 use std::{
     cell::{Cell, RefCell},
@@ -20,8 +22,10 @@ use std::{
 };
 
 use crossbeam_channel::{Receiver, Sender};
-use nsh_core::{EventKind, EventPayload, MountBatch, MountItem, NodeId, Points, ROOT_ID, Size};
-use nsh_engine::{Engine, EngineConfig, EngineControl, Environment, MountSink};
+use nsh_core::{
+    Bounds, Command, EventKind, EventPayload, MountBatch, MountItem, NodeId, Points, ROOT_ID, Size,
+};
+use nsh_engine::{Engine, EngineConfig, EngineControl, Environment, MainThreadTask, MountSink};
 use rustc_hash::FxHashMap;
 use windows::Win32::Foundation::{HWND, RECT};
 
@@ -40,14 +44,26 @@ enum Message {
     HotUpdateFailed,
     /// The engine laid the app out at this size ([`MountSink::resized`]).
     Resized(Size<Points>),
+    /// A function the app runs on the main thread
+    /// ([`MountSink::run_on_main_thread`]), after the batches before it.
+    Run(MainThreadTask),
 }
 
 /// How long the main thread waits for the layout at a new window size
 /// (a frame at 60 Hz): see [`Surface::resized`].
 const RESIZE_WAIT: std::time::Duration = std::time::Duration::from_millis(16);
 
+/// How long after a deadline the timer that keeps it fires
+/// ([`Surface::keep_deadline`]): more than a frame, so while the compositor
+/// paces frames the ticker's always comes first.
+const LATE: f64 = 0.05;
+
+/// How long a test's app waits for the ticker's frame before one runs
+/// without it ([`Surface::keep_deadline`]): a frame at 60 Hz.
+const TEST_FRAME: f64 = 1.0 / 60.0;
+
 thread_local! {
-    /// The surfaces of this (main) thread, by key.
+    /// The surfaces of this thread, by key.
     static SURFACES: RefCell<FxHashMap<u64, Weak<Surface>>> = RefCell::default();
 }
 
@@ -92,11 +108,36 @@ impl MountSink for Sink {
     fn resized(&self, size: Size<Points>) {
         self.send(Message::Resized(size));
     }
+
+    fn run_on_main_thread(&self, task: MainThreadTask) {
+        self.send(Message::Run(task));
+    }
 }
 
-/// Called on every frame with the frame's time until it returns false
-/// ([`Surface::on_frame`]).
-pub(crate) type FrameClient = Box<dyn FnMut(&Rc<Surface>, f64) -> bool>;
+/// Called on every frame with the frame's time (seconds) until it is done
+/// ([`Surface::on_frame`]): returns what it has left.
+pub(crate) type FrameClient = Box<dyn FnMut(&Rc<Surface>, f64) -> Next>;
+
+/// What a frame client has left after a frame.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum Next {
+    /// Nothing: it is not called again.
+    Done,
+    /// Drawing only (a shader, a fade): the next frame, when there is one.
+    Frame,
+    /// Something that changes the app's state ends at this time (seconds,
+    /// the frames' clock: a view detached, an event sent): it is called by
+    /// then even while no frames are ticked ([`Surface::keep_deadline`]),
+    /// and on every frame until then.
+    At(f64),
+}
+
+impl From<bool> for Next {
+    /// Whether it wants the next frame, for drawing only.
+    fn from(more: bool) -> Self {
+        if more { Next::Frame } else { Next::Done }
+    }
+}
 
 /// Called with the new size (points) when the surface is resized.
 pub(crate) type ResizeHandler = Box<dyn Fn(f32, f32)>;
@@ -110,6 +151,9 @@ pub(crate) type ErrorHandler = Box<dyn Fn(&str)>;
 /// One engine and its views.
 pub(crate) struct Surface {
     key: u64,
+    /// The UI thread the surface was made on: where work that finishes
+    /// elsewhere returns to.
+    ui_thread: crate::window::UiThread,
     /// The root view (node [`ROOT_ID`]): fills the window.
     pub(crate) root: NshView,
     /// Views by node id, and what mounting needs between items.
@@ -123,10 +167,16 @@ pub(crate) struct Surface {
     pub(crate) nav: RefCell<crate::navigation::Nav>,
     /// Pointer input state ([`crate::input`]).
     pub(crate) input: crate::input::Input,
+    /// Keyboard focus of custom views, and their raw key events
+    /// ([`crate::keyboard`]).
+    pub(crate) keyboard: crate::keyboard::Keyboard,
     /// Native file-drop destinations.
     pub(crate) file_drop: crate::file_drop::State,
     engine: RefCell<Option<Engine>>,
     control: RefCell<Option<EngineControl>>,
+    /// The URLs the app was launched with, for the next engine to start
+    /// ([`Surface::set_launch_links`]).
+    launch_links: RefCell<Vec<String>>,
     rx: RefCell<Option<Receiver<Message>>>,
     pending: RefCell<Arc<AtomicBool>>,
     /// The window drawn into (shared with the engine's sink).
@@ -141,6 +191,12 @@ pub(crate) struct Surface {
     pub(crate) target_scale: Cell<f32>,
     /// A paint is requested.
     invalid: Cell<bool>,
+    /// A frame is being drawn ([`Surface::paint`]).
+    painting: Cell<bool>,
+    /// A paint was requested while a frame was drawn: asked for again
+    /// once it is done (the request made inside `WM_PAINT` does not come
+    /// back as another `WM_PAINT`).
+    repaint: Cell<bool>,
     /// The next frame draws the whole window ([`Surface::invalidate`]).
     full_damage: Cell<bool>,
     /// The change stamp of the last request to draw the whole window
@@ -149,6 +205,10 @@ pub(crate) struct Surface {
     /// Views that changed since the last frame
     /// ([`Surface::invalidate_view`]).
     dirty: RefCell<Vec<NshView>>,
+    /// Parts of views that changed since the last frame, in the view's own
+    /// coordinates ([`Surface::invalidate_view_rect`]): a canvas's animated
+    /// values, drawn again only there.
+    partial: RefCell<Vec<(NshView, Bounds<Points>)>>,
     /// The environment the engine was last told about.
     pub(crate) environment: Cell<Environment>,
     /// The app's appearance (`nsh.json`, `setColorScheme`): the color
@@ -168,12 +228,17 @@ pub(crate) struct Surface {
     /// Paces animation frames while something animates.
     ticker: RefCell<Option<crate::window::Ticker>>,
     /// Extra frame clients (transitions, glides, spinners): called on every
-    /// frame until they return false ([`Surface::on_frame`]).
-    frame_clients: RefCell<Vec<FrameClient>>,
+    /// frame until they are done, each with its deadline ([`Next::At`]; a
+    /// new one's is when it was added).
+    frame_clients: RefCell<Vec<(FrameClient, Option<f64>)>>,
+    /// The deadline the scheduled timer waits for
+    /// ([`Surface::keep_deadline`]).
+    keeper: Cell<Option<f64>>,
     /// The model of a test session's app (`nsh test --target windows`).
     #[cfg(feature = "dev")]
     test_model: RefCell<Option<std::sync::Arc<nsh_testing::agent::Model>>>,
-    /// The time of the current frame (seconds since the surface was made).
+    /// The time of the current (last) frame (seconds since the surface was
+    /// made).
     now: Cell<f64>,
     epoch: std::time::Instant,
     on_error: RefCell<Option<ErrorHandler>>,
@@ -186,8 +251,13 @@ pub(crate) struct Surface {
     pub(crate) backdrop_readers: RefCell<Vec<NodeId>>,
     /// Where `asset:/` image URIs resolve ([`crate::image::set_asset_base`]).
     pub(crate) asset_base: RefCell<Option<crate::image::AssetBase>>,
+    /// The engine's sounds and players ([`crate::audio`]).
+    pub(crate) audio: crate::audio::Speaker,
     /// The disk cache of downloaded images ([`crate::image::set_disk_cache`]).
     pub(crate) image_cache: RefCell<Option<nsh_core::image::DiskCache>>,
+    /// The roots the app's `<Image>` files are read under
+    /// ([`nsh_engine::Engine::media_files`]).
+    pub(crate) media_files: RefCell<Arc<nsh_core::access::MediaFiles>>,
     /// Videos, web views and registered native components.
     pub(crate) native: crate::native::NativeState,
     /// The app's keyboard shortcuts ([`crate::keymap`]).
@@ -196,10 +266,20 @@ pub(crate) struct Surface {
     placed: RefCell<Vec<(Rc<dyn Hosted>, RECT)>>,
     /// The window's composition while it has web views (each holds it).
     composition: RefCell<Weak<crate::compose::Composition>>,
+    /// A transparent window's composition, made with the window and kept
+    /// with it: its swap chain is a visual at the bottom of the tree
+    /// ([`AppOptions::transparent`](crate::AppOptions::transparent)).
+    pub(crate) base: RefCell<Option<Rc<crate::compose::Composition>>>,
     /// Composed items (web views) drawn by the last frame.
     composed: RefCell<Vec<Rc<dyn Hosted>>>,
     /// The window's chrome: title bar, menus ([`crate::chrome`]).
     pub(crate) chrome: crate::chrome::Chrome,
+    /// A top-level window that has not shown yet: its first show paints it
+    /// before DWM composites it ([`crate::app::show_main`]).
+    pub(crate) main_unshown: Cell<bool>,
+    /// The mode the top-level window takes when it first shows (nsh.json
+    /// `window`, [`AppView::place_main_window`](crate::AppView)).
+    pub(crate) main_opening_mode: Cell<Option<nsh_core::desktop::WindowMode>>,
     /// Called after the surface is resized (development overlays).
     pub(crate) on_resized: RefCell<Vec<ResizeHandler>>,
     /// The engine missed the deadline of a resize ([`RESIZE_WAIT`]): later
@@ -208,6 +288,11 @@ pub(crate) struct Surface {
     /// Keys the window takes before anything focused sees them (the
     /// standalone app's full screen, the dev host's reload).
     pub(crate) shortcuts: RefCell<Vec<ShortcutHandler>>,
+    /// The app's own windows besides this one (`Window.open`).
+    pub(crate) windows: RefCell<Vec<Rc<crate::app_window::AppWindow>>>,
+    /// The root view the input being handled is in: a window of the app's
+    /// own's ([`crate::app_window::enter`]), or [`Surface::root`].
+    pub(crate) input_root: RefCell<Option<NshView>>,
 }
 
 impl Surface {
@@ -218,15 +303,18 @@ impl Surface {
         let mounter = Mounter::new(root.clone());
         let surface = Rc::new(Surface {
             key,
+            ui_thread: crate::window::UiThread::current(),
             root: root.clone(),
             views: mounter.views.clone(),
             mounter: RefCell::new(mounter),
             anim: RefCell::new(UiAnimation::default()),
             nav: RefCell::default(),
             input: Default::default(),
+            keyboard: Default::default(),
             file_drop: Default::default(),
             engine: RefCell::new(None),
             control: RefCell::new(None),
+            launch_links: RefCell::new(Vec::new()),
             rx: RefCell::new(None),
             pending: RefCell::new(Arc::new(AtomicBool::new(false))),
             hwnd: Arc::new(std::sync::atomic::AtomicIsize::new(0)),
@@ -236,10 +324,13 @@ impl Surface {
             fps: RefCell::new(None),
             target_scale: Cell::new(0.0),
             invalid: Cell::new(false),
+            painting: Cell::new(false),
+            repaint: Cell::new(false),
             // The first frame draws everything.
             full_damage: Cell::new(true),
             whole_change: Cell::new(0),
             dirty: RefCell::default(),
+            partial: RefCell::default(),
             environment: Cell::new(environment),
             appearance: Cell::default(),
             host_environment: Cell::default(),
@@ -247,6 +338,7 @@ impl Surface {
             js_frame: Cell::new(false),
             ticker: RefCell::new(None),
             frame_clients: RefCell::default(),
+            keeper: Cell::new(None),
             #[cfg(feature = "dev")]
             test_model: RefCell::default(),
             now: Cell::new(0.0),
@@ -256,34 +348,49 @@ impl Surface {
             shader_renderer: std::cell::OnceCell::new(),
             backdrop_readers: RefCell::default(),
             asset_base: RefCell::new(None),
+            audio: Default::default(),
             image_cache: RefCell::new(None),
+            media_files: RefCell::default(),
             native: Default::default(),
             keymap: Default::default(),
             placed: RefCell::default(),
             composition: RefCell::default(),
+            base: RefCell::default(),
             composed: RefCell::default(),
             on_resized: RefCell::default(),
             resize_late: Cell::new(false),
             shortcuts: RefCell::default(),
+            windows: RefCell::default(),
+            input_root: RefCell::default(),
             chrome: Default::default(),
+            main_unshown: Cell::new(true),
+            main_opening_mode: Cell::new(None),
         });
         SURFACES.with(|s| s.borrow_mut().insert(key, Rc::downgrade(&surface)));
         let weak = Rc::downgrade(&surface);
-        root.set_invalidate(Rc::new(move |view| {
+        root.set_invalidate(Rc::new(move |view, rect| {
             if let Some(surface) = weak.upgrade() {
-                surface.invalidate_view(view);
+                match rect {
+                    Some(rect) => surface.invalidate_view_rect(view, rect),
+                    None => surface.invalidate_view(view),
+                }
             }
         }));
         surface
     }
 
     /// The GPU device shader views render with ([`crate::shader`]), opened
-    /// the first time one asks.
+    /// the first time one asks; without one the app hears that shader views
+    /// draw nothing (`shadersAvailable()`).
     pub(crate) fn shader_renderer(&self) -> Option<Rc<nsh_engine::shader::Renderer>> {
         self.shader_renderer
             .get_or_init(|| {
-                nsh_engine::shader::Renderer::new(nsh_engine::shader::PixelFormat::Bgra)
-                    .map(Rc::new)
+                let renderer =
+                    nsh_engine::shader::Renderer::new(nsh_engine::shader::PixelFormat::Bgra);
+                if renderer.is_none() {
+                    self.control(EngineControl::shaders_unavailable);
+                }
+                renderer.map(Rc::new)
             })
             .clone()
     }
@@ -298,6 +405,16 @@ impl Surface {
     /// The surface with `key`, if it is alive.
     pub(crate) fn by_key(key: u64) -> Option<Rc<Surface>> {
         SURFACES.with(|s| s.borrow().get(&key).and_then(Weak::upgrade))
+    }
+
+    /// The live surfaces of this thread.
+    pub(crate) fn all() -> Vec<Rc<Surface>> {
+        SURFACES.with(|s| s.borrow().values().filter_map(Weak::upgrade).collect())
+    }
+
+    /// The UI thread it lives on ([`crate::window::UiThread::invoke`] runs closures there).
+    pub(crate) fn ui_thread(&self) -> crate::window::UiThread {
+        self.ui_thread
     }
 
     /// Its key ([`Surface::by_key`]).
@@ -343,7 +460,7 @@ impl Surface {
     }
 
     /// Measures the surface's frames and commits from now on; one
-    /// `nsh::perf` line a second ([`crate::fps`]). The ticker then runs on
+    /// `nsh::fps` line a second ([`crate::fps`]). The ticker then runs on
     /// every refresh.
     pub(crate) fn enable_fps(self: &Rc<Self>) {
         if self.fps.borrow().is_some() {
@@ -355,6 +472,13 @@ impl Surface {
         self.ensure_ticking();
     }
 
+    /// Stops measuring ([`Surface::enable_fps`]).
+    pub(crate) fn disable_fps(&self) {
+        if self.fps.take().is_some() {
+            self.control(|c| c.set_perf_monitor(None));
+        }
+    }
+
     /// The performance monitor, while one measures.
     pub(crate) fn fps(&self) -> Option<Rc<crate::fps::Fps>> {
         self.fps.borrow().clone()
@@ -363,6 +487,13 @@ impl Surface {
     /// Starts `config`'s app, replacing what ran.
     pub(crate) fn start(self: &Rc<Self>, mut config: EngineConfig) {
         self.stop();
+        // The main window's state and the displays are known from the
+        // first frame on (an embedded surface's window is the host's).
+        let top_level = crate::window_state::top_level(self.hwnd());
+        if top_level {
+            crate::window_state::report_main(self);
+        }
+        let displays = top_level.then(crate::window_state::displays);
         let env = self.environment.get();
         config.viewport = env.window;
         config.environment = env;
@@ -381,17 +512,27 @@ impl Surface {
         *self.rx.borrow_mut() = Some(rx);
         *self.pending.borrow_mut() = pending;
         let family = crate::text::ui_family();
-        // The embedding app's theme overrides are in the first frame.
+        // The embedding app's theme overrides are in the first frame, and
+        // the launch URL is the app's address when its code first runs
+        // (`UrlScheme.url()`).
         let tokens = self.host_tokens.borrow().clone();
+        let launch = self.launch_links.take();
         let setup = |control: &EngineControl| {
             if tokens.is_some() {
                 control.set_tokens(tokens);
+            }
+            if let Some(displays) = displays {
+                control.set_displays(displays);
+            }
+            for url in launch {
+                crate::linking::dispatch(control, url);
             }
         };
         match Engine::start_with(config, move || DWriteTextEngine::new(family), sink, setup) {
             Ok(engine) => {
                 // The app's downloaded images go through its disk cache.
                 crate::image::set_disk_cache(self, engine.image_cache());
+                *self.media_files.borrow_mut() = engine.media_files();
                 // The test moves its clock through the engine.
                 #[cfg(feature = "dev")]
                 if let Some(model) = &*self.test_model.borrow() {
@@ -419,10 +560,12 @@ impl Surface {
         *self.anim.borrow_mut() = UiAnimation::default();
         self.nav.borrow_mut().reset();
         crate::input::reset(self);
+        crate::text_input::stopped(self);
         crate::keymap::clear(self);
         self.js_frame.set(false);
         self.resize_late.set(false);
         self.frame_clients.borrow_mut().clear();
+        crate::app_window::close_all(self);
         self.invalidate();
     }
 
@@ -433,8 +576,23 @@ impl Surface {
         }
     }
 
+    /// Sets the URLs the app was launched with (`EventKind::UrlScheme`: links
+    /// and files), which the next engine to start applies before the app's
+    /// code first runs.
+    pub(crate) fn set_launch_links(&self, urls: Vec<String>) {
+        *self.launch_links.borrow_mut() = urls;
+    }
+
     /// Sends an event to JS.
     pub(crate) fn event(&self, id: NodeId, kind: EventKind, payload: EventPayload) {
+        // A new activation cannot open a popup for an unanswered context
+        // request. Menu events include bar items, tray clicks and hotkeys.
+        if matches!(
+            kind,
+            EventKind::Menu | EventKind::Press | EventKind::AccessibilityAction
+        ) {
+            self.chrome.context_area.take();
+        }
         self.control(|c| c.dispatch_event(id, kind, payload));
     }
 
@@ -539,6 +697,7 @@ impl Surface {
         self.full_damage.set(true);
         self.whole_change.set(crate::view::next_change_stamp());
         self.request_paint();
+        crate::app_window::invalidate_all(self);
     }
 
     /// The change stamp of the last request to draw the whole window
@@ -560,10 +719,32 @@ impl Surface {
         self.request_paint();
     }
 
+    /// Asks for `rect` of `view` (in its own coordinates) to be drawn again:
+    /// a canvas whose animated values changed paints only there.
+    pub(crate) fn invalidate_view_rect(&self, view: &NshView, rect: Bounds<Points>) {
+        // A whole redraw of the view already on its way covers it.
+        if !self.full_damage.get() && !view.is_queued() {
+            self.partial.borrow_mut().push((view.clone(), rect));
+        }
+        self.request_paint();
+    }
+
     fn request_paint(&self) {
+        if self.painting.get() {
+            self.repaint.set(true);
+            return;
+        }
         if !self.invalid.replace(true) {
             crate::window::invalidate(self.hwnd());
         }
+    }
+
+    /// The root view the input being handled is in.
+    pub(crate) fn input_root(&self) -> NshView {
+        self.input_root
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| self.root.clone())
     }
 
     /// What changed since the last frame, in the window's DIPs: where the
@@ -571,13 +752,14 @@ impl Surface {
     /// whole window (asked for, or a change whose area is not known).
     pub(crate) fn take_damage(&self) -> Option<Vec<crate::view::WindowRect>> {
         let dirty = std::mem::take(&mut *self.dirty.borrow_mut());
+        let partial = std::mem::take(&mut *self.partial.borrow_mut());
         for view in &dirty {
             view.set_queued(false);
         }
         if self.full_damage.replace(false) {
             return None;
         }
-        let mut rects = Vec::with_capacity(dirty.len() * 2);
+        let mut rects = Vec::with_capacity(dirty.len() * 2 + partial.len());
         for view in &dirty {
             if let Some(old) = view.painted_subtree() {
                 rects.push(old);
@@ -595,6 +777,23 @@ impl Surface {
                     .map(|area| crate::compose::map_bounds(&world.to_3x2(), &area))?,
             );
         }
+        // What changed in part of a view: where that part is now (a view
+        // that moved is in `dirty` whole, which covers it).
+        for (view, rect) in &partial {
+            let Some(world) = view.to_root() else {
+                continue;
+            };
+            if !world.is_affine() {
+                return None;
+            }
+            let area = crate::render::rect_f(
+                rect.origin.x.0,
+                rect.origin.y.0,
+                rect.size.width.0,
+                rect.size.height.0,
+            );
+            rects.push(crate::compose::map_bounds(&world.to_3x2(), &area));
+        }
         // Asked to draw with nothing changed (the system's `WM_PAINT`).
         (!rects.is_empty()).then_some(rects)
     }
@@ -602,7 +801,30 @@ impl Surface {
     /// Draws the window (`WM_PAINT`).
     pub(crate) fn paint(self: &Rc<Self>) {
         self.invalid.set(false);
-        crate::render::frame(self);
+        self.painting.set(true);
+        // Deferred: the swap chain posts `WM_NSH_PAINT` when it has room, so
+        // `invalid` stays set (no second `WM_PAINT` meanwhile).
+        let deferred = crate::render::frame(self);
+        self.painting.set(false);
+        if deferred {
+            self.invalid.set(true);
+        } else if self.repaint.replace(false) {
+            // What changed while the frame was drawn (a text field's text
+            // services laying out as they draw) is drawn by the next one.
+            self.invalid.set(true);
+            let hwnd = self.hwnd();
+            if !hwnd.is_invalid() {
+                // SAFETY: a plain call on a window of this thread.
+                let _ = unsafe {
+                    windows::Win32::UI::WindowsAndMessaging::PostMessageW(
+                        Some(hwnd),
+                        crate::window::WM_NSH_PAINT,
+                        windows::Win32::Foundation::WPARAM(0),
+                        windows::Win32::Foundation::LPARAM(0),
+                    )
+                };
+            }
+        }
     }
 
     /// Hosted items drawn by the frame just shown, with their window
@@ -614,40 +836,37 @@ impl Surface {
         drawn: Vec<(Rc<dyn Hosted>, RECT)>,
         redrawn: Option<&[RECT]>,
     ) {
-        let mut placed = self.placed.borrow_mut();
-        let mut next: Vec<(Rc<dyn Hosted>, RECT)> = Vec::with_capacity(drawn.len());
-        for (item, rect) in drawn {
-            // A partial frame draws its areas one by one.
-            if !next.iter().any(|(i, _)| Rc::ptr_eq(i, &item)) {
-                next.push((item, rect));
-            }
-        }
-        for (old, rect) in placed.iter() {
-            if next.iter().any(|(item, _)| Rc::ptr_eq(item, old)) {
-                continue;
-            }
-            let untouched =
-                redrawn.is_some_and(|areas| !areas.iter().any(|a| crate::render::overlap(a, rect)));
-            if untouched {
-                next.push((old.clone(), *rect));
-            } else {
-                old.placed(None);
-            }
-        }
-        for (item, rect) in &next {
-            item.placed(Some(*rect));
-        }
-        *placed = next;
+        items_placed(&self.placed, drawn, redrawn);
     }
 
-    /// The window's composition, if it has web views.
+    /// The window is see-through where the app draws nothing: it is shown
+    /// by a composition of its own and is `transparent` or has a system
+    /// backdrop now. A composed window without either (a development
+    /// host's before its app's `window` options came, or after they
+    /// dropped the backdrop) draws on its opaque background.
+    pub(crate) fn transparent(&self) -> bool {
+        self.base.borrow().is_some()
+            && crate::window::shell(self.hwnd()).is_none_or(|shell| {
+                let attrs = shell.attrs();
+                attrs.transparent || attrs.backdrop != nsh_core::desktop::Backdrop::None
+            })
+    }
+
+    /// The window's composition, if it has web views or composed components.
     pub(crate) fn composition(&self) -> Option<Rc<crate::compose::Composition>> {
         self.composition.borrow().upgrade()
     }
 
-    /// The window's composition, made for a web view if there is none.
+    /// The window's composition, made for a web view or a composed component
+    /// if there is none.
+    #[cfg_attr(not(feature = "webview"), allow(dead_code))]
     pub(crate) fn compose(&self) -> windows::core::Result<Rc<crate::compose::Composition>> {
         if let Some(c) = self.composition() {
+            return Ok(c);
+        }
+        // A transparent window's own: its swap chain is already a visual.
+        if let Some(c) = self.base.borrow().clone() {
+            *self.composition.borrow_mut() = Rc::downgrade(&c);
             return Ok(c);
         }
         let hwnd = self.hwnd();
@@ -670,28 +889,7 @@ impl Surface {
         composed: Vec<crate::render::Composed>,
         layers: &[usize],
     ) {
-        let old = std::mem::replace(
-            &mut *self.composed.borrow_mut(),
-            composed.iter().map(|c| c.item.clone()).collect(),
-        );
-        if old.is_empty() && composed.is_empty() {
-            return;
-        }
-        for item in &old {
-            if !composed.iter().any(|c| Rc::ptr_eq(&c.item, item)) {
-                item.compose_at(None);
-            }
-        }
-        let mut visuals = Vec::with_capacity(composed.len());
-        for c in &composed {
-            c.item.compose_at(Some(&c.at));
-            if let Some(v) = c.item.visual() {
-                visuals.push(v);
-            }
-        }
-        if let Some(composition) = composition {
-            composition.arrange(&visuals, layers);
-        }
+        composed_placed(&self.composed, composition, composed, layers);
     }
 
     /// Applies what the engine sent (`WM_NSH_WAKE`).
@@ -743,6 +941,7 @@ impl Surface {
                 }
             }
             Message::Resized(_) => self.resize_late.set(false),
+            Message::Run(task) => task.run(),
         }
         false
     }
@@ -755,6 +954,20 @@ impl Surface {
                 item,
                 MountItem::Animation(_) | MountItem::AnimationBindings { .. }
             ) {
+                // A window command can paint before the batch ends (sizing
+                // a window sends `WM_SIZE`, where it draws at once; showing
+                // one can paint it): the views take the animated values set
+                // so far first, or one entering with a motion is drawn as
+                // its style is, then at the motion's start, and flashes.
+                if matches!(
+                    item,
+                    MountItem::Command {
+                        command: Command::Desktop(_),
+                        ..
+                    }
+                ) {
+                    self.anim.borrow_mut().write(&self.mounter.borrow());
+                }
                 self.mounter.borrow_mut().apply(self, item);
             }
         }
@@ -791,11 +1004,25 @@ impl Surface {
         }
     }
 
-    /// Calls `f` on every frame (with the frame's time) until it returns
-    /// false: transitions, scroll glides, spinners.
-    pub(crate) fn on_frame(self: &Rc<Self>, f: impl FnMut(&Rc<Surface>, f64) -> bool + 'static) {
-        self.frame_clients.borrow_mut().push(Box::new(f));
+    /// Calls `f` on every frame (with the frame's time) until it is done
+    /// ([`Next`]): transitions, scroll glides, navigation; the first time
+    /// by now even while no frames are ticked.
+    pub(crate) fn on_frame(self: &Rc<Self>, f: impl FnMut(&Rc<Surface>, f64) -> Next + 'static) {
+        let now = self.clock();
+        self.frame_clients
+            .borrow_mut()
+            .push((Box::new(f), Some(now)));
         self.ensure_ticking();
+    }
+
+    /// Calls `f` on every frame while it returns true, for what only draws
+    /// (a shader, a fade, a video's frames): nothing it does comes due
+    /// without frames ([`Next::Frame`]).
+    pub(crate) fn on_draw_frame(
+        self: &Rc<Self>,
+        mut f: impl FnMut(&Rc<Surface>, f64) -> bool + 'static,
+    ) {
+        self.on_frame(move |surface, now| f(surface, now).into());
     }
 
     /// Whether a native animation runs: the graph's (not one looping
@@ -821,11 +1048,13 @@ impl Surface {
             || !self.frame_clients.borrow().is_empty()
     }
 
-    /// Runs the frame ticker while animations run or JS wants a frame.
+    /// Runs the frame ticker while animations run or JS wants a frame, and
+    /// keeps their deadlines ([`Surface::keep_deadline`]).
     pub(crate) fn ensure_ticking(self: &Rc<Self>) {
         if !self.wants_frames() {
             return;
         }
+        self.keep_deadline();
         let mut ticker = self.ticker.borrow_mut();
         match &*ticker {
             Some(t) => t.resume(),
@@ -833,8 +1062,107 @@ impl Surface {
         }
     }
 
+    /// When the next thing that changes the app's state comes due without
+    /// a frame: an animation of the graph or a frame client ending. `None`
+    /// when only drawing is left: an animation looping forever, a JS frame
+    /// request. Batches never wait for a frame here: [`Surface::drain`]
+    /// applies them as they arrive.
+    fn deadline(&self, now: f64) -> Option<f64> {
+        let clients = self
+            .frame_clients
+            .borrow()
+            .iter()
+            .filter_map(|(_, at)| *at)
+            .reduce(f64::min);
+        [self.anim.borrow().deadline(now), clients]
+            .into_iter()
+            .flatten()
+            .reduce(f64::min)
+    }
+
+    /// Whether `nsh test --target windows` drives the app.
+    pub(crate) fn testing(&self) -> bool {
+        #[cfg(feature = "dev")]
+        return self.test_model.borrow().is_some();
+        #[cfg(not(feature = "dev"))]
+        false
+    }
+
+    /// Makes what comes due happen on time while no frames are ticked: the
+    /// ticker posts none while nothing composes (`DwmFlush` fails in a
+    /// locked or remote session), and animations must still end (a
+    /// transition detaches its views when it does, a modal reports its
+    /// dismissal, an animation its end to JS). A one-shot thread timer
+    /// waits for the next deadline ([`Surface::deadline`]) and a little
+    /// more ([`LATE`]); if no frame ran since it came due, it runs one,
+    /// which steps everything to its time, ends what ended and gives the
+    /// next deadline. While the compositor paces frames, they always come
+    /// first and the timer does nothing: frames are the ticker's only.
+    /// Nothing is scheduled for what only draws (a spinner, a JS frame
+    /// request), so a session without composition and an endless animation
+    /// does no work.
+    fn keep_deadline(self: &Rc<Self>) {
+        let now = self.clock();
+        // A test's app runs as on screen whatever the session shows (a
+        // locked one composes nothing): what wants a frame gets one a frame
+        // later when the ticker gives none, drawing too (a JS frame
+        // request, a list binding its rows over frames).
+        let testing = self.testing() && self.wants_frames();
+        let deadline = if testing {
+            Some(now)
+        } else {
+            self.deadline(now)
+        };
+        let Some(at) = deadline else {
+            return;
+        };
+        // One timer at a time: the one waiting for an earlier deadline
+        // schedules the next when it fires.
+        if self.keeper.get().is_some_and(|pending| pending <= at) {
+            return;
+        }
+        self.keeper.set(Some(at));
+        let key = self.key;
+        let late = if testing { TEST_FRAME } else { LATE };
+        let ms = ((at + late - now).max(0.0) * 1000.0).ceil() as u64;
+        crate::input::after_ms(ms, move || {
+            let Some(surface) = Surface::by_key(key) else {
+                return;
+            };
+            // An earlier deadline took its place and schedules on.
+            if surface.keeper.get() != Some(at) {
+                return;
+            }
+            surface.keeper.set(None);
+            if surface.now.get() < at {
+                surface.frame();
+                // Nothing composes, so no tick of the ticker's would pause
+                // it: this frame does when it leaves nothing to do.
+                if !surface.wants_frames()
+                    && let Some(t) = &*surface.ticker.borrow()
+                {
+                    t.pause();
+                }
+            }
+            surface.keep_deadline();
+        });
+    }
+
     /// One frame of the ticker (`WM_NSH_TICK`).
     pub(crate) fn tick(self: &Rc<Self>) {
+        self.frame();
+        if let Some(t) = &*self.ticker.borrow() {
+            if self.wants_frames() {
+                t.ticked();
+            } else {
+                t.pause();
+            }
+        }
+    }
+
+    /// One frame at the clock's time: the ticker's, or one a deadline ran
+    /// without a tick ([`Surface::keep_deadline`]).
+    fn frame(self: &Rc<Self>) {
         let started = self
             .fps
             .borrow()
@@ -853,18 +1181,18 @@ impl Surface {
             self.control(|c| c.frame());
         }
         let mut clients = std::mem::take(&mut *self.frame_clients.borrow_mut());
-        clients.retain_mut(|f| f(self, now));
+        clients.retain_mut(|(f, deadline)| {
+            *deadline = match f(self, now) {
+                Next::Done => return false,
+                Next::Frame => None,
+                Next::At(at) => Some(at),
+            };
+            true
+        });
         // Clients added while running stay after the ones kept.
         let mut added = std::mem::take(&mut *self.frame_clients.borrow_mut());
         clients.append(&mut added);
         *self.frame_clients.borrow_mut() = clients;
-        if let Some(t) = &*self.ticker.borrow() {
-            if self.wants_frames() {
-                t.ticked();
-            } else {
-                t.pause();
-            }
-        }
         if let (Some(started), Some(fps)) = (started, self.fps()) {
             fps.ticked(started.elapsed(), moved);
         }
@@ -878,13 +1206,82 @@ impl Drop for Surface {
     }
 }
 
+/// Hosted items a window's frame drew, with their window rectangles
+/// (`placed`: what its last frame drew): tells them, and the ones no longer
+/// drawn ([`Surface::items_placed`]; each window of the app's own keeps
+/// its own list).
+pub(crate) fn items_placed(
+    placed: &RefCell<Vec<(Rc<dyn Hosted>, RECT)>>,
+    drawn: Vec<(Rc<dyn Hosted>, RECT)>,
+    redrawn: Option<&[RECT]>,
+) {
+    let mut placed = placed.borrow_mut();
+    let mut next: Vec<(Rc<dyn Hosted>, RECT)> = Vec::with_capacity(drawn.len());
+    for (item, rect) in drawn {
+        // A partial frame draws its areas one by one.
+        if !next.iter().any(|(i, _)| Rc::ptr_eq(i, &item)) {
+            next.push((item, rect));
+        }
+    }
+    for (old, rect) in placed.iter() {
+        if next.iter().any(|(item, _)| Rc::ptr_eq(item, old)) {
+            continue;
+        }
+        let untouched =
+            redrawn.is_some_and(|areas| !areas.iter().any(|a| crate::render::overlap(a, rect)));
+        if untouched {
+            next.push((old.clone(), *rect));
+        } else {
+            old.placed(None);
+        }
+    }
+    for (item, rect) in &next {
+        item.placed(Some(*rect));
+    }
+    *placed = next;
+}
+
+/// The composed items a window's frame drew (`last`: what its last frame
+/// drew), where they go, and its layers: tells them, and the ones no
+/// longer drawn, and stacks them in `composition`
+/// ([`Surface::composed_placed`]).
+pub(crate) fn composed_placed(
+    last: &RefCell<Vec<Rc<dyn Hosted>>>,
+    composition: Option<&crate::compose::Composition>,
+    composed: Vec<crate::render::Composed>,
+    layers: &[usize],
+) {
+    let old = std::mem::replace(
+        &mut *last.borrow_mut(),
+        composed.iter().map(|c| c.item.clone()).collect(),
+    );
+    if old.is_empty() && composed.is_empty() {
+        return;
+    }
+    for item in &old {
+        if !composed.iter().any(|c| Rc::ptr_eq(&c.item, item)) {
+            item.compose_at(None);
+        }
+    }
+    let mut visuals = Vec::with_capacity(composed.len());
+    for c in &composed {
+        c.item.compose_at(Some(&c.at));
+        if let Some(v) = c.item.visual() {
+            visuals.push(v);
+        }
+    }
+    if let Some(composition) = composition {
+        composition.arrange(&visuals, layers);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, Instant};
 
     use nsh_core::Cursor;
     use windows::Win32::{
-        Foundation::{LPARAM, POINT, WPARAM},
+        Foundation::{LPARAM, LRESULT, POINT, WPARAM},
         Graphics::Gdi::ClientToScreen,
         UI::{
             Input::KeyboardAndMouse::{GetCapture, ReleaseCapture, SetCapture},
@@ -968,7 +1365,8 @@ mod tests {
         let saved = cursor_info();
         let surface = Surface::new(Environment::default());
         let hwnd =
-            crate::window::create(&surface, "NSH cursor regression", (320, 240), None).unwrap();
+            crate::window::create(&surface, "NSH cursor regression", (320, 240), None, false)
+                .unwrap();
         let mut desktop = Desktop {
             hwnd,
             saved,
@@ -1062,5 +1460,172 @@ mod tests {
                 None => assert_eq!(info.flags.0 & CURSOR_SHOWING.0, 0, "cursor stayed visible"),
             }
         }
+    }
+
+    /// The opacity the animator has written into view `id`.
+    fn animated_opacity(surface: &Surface, id: NodeId) -> Option<f32> {
+        let view = surface.mounter.borrow().views.get(id).expect("the view");
+        view.state().anim.opacity
+    }
+
+    #[test]
+    fn window_commands_see_the_animated_values_set_before_them() {
+        use nsh_core::{
+            ViewKind,
+            animation::{AnimationOp, AnimationProp},
+            desktop::{DesktopCommand, WindowRequest},
+        };
+
+        let surface = Surface::new(Environment::default());
+        // What the core sends for a window that fits its content (with no
+        // window here, nothing is sized).
+        let fit = || MountItem::Command {
+            id: ROOT_ID,
+            command: Command::Desktop(Box::new(DesktopCommand::Request(
+                WindowRequest::SetContentSize {
+                    width: None,
+                    height: Some(Points(250.0)),
+                },
+            ))),
+        };
+        let set = |value| MountItem::Animation(AnimationOp::Set { node: 2, value });
+        // A view entering with a fade, a window command, then more of the
+        // batch: the command sees the value set before it.
+        surface.apply(&MountBatch {
+            items: vec![
+                MountItem::Animation(AnimationOp::CreateValue {
+                    node: 2,
+                    value: 0.25,
+                }),
+                MountItem::Create {
+                    id: 2,
+                    kind: ViewKind::View,
+                },
+                MountItem::Insert {
+                    parent: ROOT_ID,
+                    child: 2,
+                    before: None,
+                },
+                MountItem::AnimationBindings {
+                    id: 2,
+                    bindings: vec![(AnimationProp::Opacity, 2)],
+                },
+                fit(),
+                set(0.75),
+            ],
+        });
+        assert_eq!(animated_opacity(&surface, 2), Some(0.25));
+        // A value bound before moves with no bindings sent again.
+        surface.apply(&MountBatch {
+            items: vec![set(0.5), fit()],
+        });
+        assert_eq!(animated_opacity(&surface, 2), Some(0.5));
+        // Without a window command, the values are written once the
+        // batches are applied, as before.
+        surface.apply(&MountBatch {
+            items: vec![set(1.0)],
+        });
+        assert_eq!(animated_opacity(&surface, 2), Some(0.5));
+        surface.write_animations();
+        assert_eq!(animated_opacity(&surface, 2), Some(1.0));
+    }
+
+    thread_local! {
+        /// The root a test window's `WM_SIZE` looks under, and the opacity
+        /// its view 2 had at each one ([`observe_sizes`]).
+        static SIZED: RefCell<(Option<NshView>, Vec<Option<f32>>)> =
+            const { RefCell::new((None, Vec::new())) };
+        /// The window procedure [`observe_sizes`] wraps.
+        static WRAPPED: Cell<isize> = const { Cell::new(0) };
+    }
+
+    /// Notes the opacity view 2 has when the window is sized, which the
+    /// window draws it with in `WM_SIZE`, then hands the message on.
+    unsafe extern "system" fn observe_sizes(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        if msg == WM_SIZE {
+            SIZED.with_borrow_mut(|(root, seen)| {
+                let view = root
+                    .as_ref()
+                    .and_then(|root| root.child_views().into_iter().find(|v| v.id() == 2));
+                seen.push(view.and_then(|v| v.state().anim.opacity));
+            });
+        }
+        // SAFETY: the window's own procedure, read from it before it was
+        // wrapped.
+        unsafe {
+            let wrapped = std::mem::transmute::<isize, WNDPROC>(WRAPPED.get());
+            CallWindowProcW(wrapped, hwnd, msg, wparam, lparam)
+        }
+    }
+
+    #[test]
+    fn a_window_command_draws_the_animated_values_set_before_it() {
+        use nsh_core::{
+            ViewKind,
+            animation::{AnimationOp, AnimationProp},
+            desktop::{DesktopCommand, WindowRequest},
+        };
+
+        let surface = Surface::new(Environment::default());
+        let hwnd =
+            crate::window::create(&surface, "NSH window command", (320, 240), None, false).unwrap();
+        SIZED.with_borrow_mut(|sized| *sized = (Some(surface.root.clone()), Vec::new()));
+        let observe: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT =
+            observe_sizes;
+        // SAFETY: the test's own window, wrapped until it is destroyed.
+        unsafe {
+            WRAPPED.set(GetWindowLongPtrW(hwnd, GWLP_WNDPROC));
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, observe as usize as isize);
+        }
+        let fit = |height| MountItem::Command {
+            id: ROOT_ID,
+            command: Command::Desktop(Box::new(DesktopCommand::Request(
+                WindowRequest::SetContentSize {
+                    width: None,
+                    height: Some(Points(height)),
+                },
+            ))),
+        };
+        // Two commands that size the (hidden) window, which draws at once,
+        // with the value moved between them.
+        surface.apply(&MountBatch {
+            items: vec![
+                MountItem::Animation(AnimationOp::CreateValue {
+                    node: 2,
+                    value: 0.25,
+                }),
+                MountItem::Create {
+                    id: 2,
+                    kind: ViewKind::View,
+                },
+                MountItem::Insert {
+                    parent: ROOT_ID,
+                    child: 2,
+                    before: None,
+                },
+                MountItem::AnimationBindings {
+                    id: 2,
+                    bindings: vec![(AnimationProp::Opacity, 2)],
+                },
+                fit(250.0),
+                MountItem::Animation(AnimationOp::Set {
+                    node: 2,
+                    value: 0.75,
+                }),
+                fit(300.0),
+            ],
+        });
+        let seen = SIZED.with_borrow_mut(|(root, seen)| {
+            *root = None;
+            std::mem::take(seen)
+        });
+        // SAFETY: the test's own window.
+        let _ = unsafe { DestroyWindow(hwnd) };
+        assert_eq!(seen, [Some(0.25), Some(0.75)]);
     }
 }

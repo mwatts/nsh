@@ -51,6 +51,12 @@ final class SelectableView implements SelectionHandle.Owner {
     private final Mounter mounter;
     /** The area's view. */
     final View view;
+    /** The area's node id. */
+    private final int id;
+    /** The selected text last reported to the area's {@code onSelectionChange}. */
+    private String reported = "";
+    /** The area's view is gone: clearing reports nothing. */
+    private boolean removed;
     /** The native model while there is a selection, else 0. */
     private long handle;
     /** The texts taking part, in document order (while there is a selection). */
@@ -63,6 +69,24 @@ final class SelectableView implements SelectionHandle.Owner {
     /** A dragged handle passed the other: each marks the other end until the finger lifts. */
     private boolean swapped;
     private android.view.ActionMode mode;
+    /** The app's items of the menu (`selectionMenu`), after the system's. */
+    MenuEntry[] menu = new MenuEntry[0];
+
+    /** An item of the app's (`id` -1: a separator, which starts a new group). */
+    static final class MenuEntry {
+        final int id;
+        final boolean enabled;
+        final String label;
+
+        MenuEntry(int id, boolean enabled, String label) {
+            this.id = id;
+            this.enabled = enabled;
+            this.label = label;
+        }
+    }
+
+    /** The first menu item id of the app's items (above the system's ids). */
+    private static final int APP_ITEM = 0x10000;
     /** The text the touch went down on, and where (screen). */
     private TextBox touched;
     private float downX, downY;
@@ -79,9 +103,23 @@ final class SelectableView implements SelectionHandle.Owner {
         return true;
     };
 
-    SelectableView(Mounter mounter, View view) {
+    SelectableView(Mounter mounter, View view, int id) {
         this.mounter = mounter;
         this.view = view;
+        this.id = id;
+    }
+
+    /** The area's view is gone: ends the selection without reporting it. */
+    void remove() {
+        removed = true;
+        clear();
+    }
+
+    /** Reports {@code text}, the selected text, to {@code onSelectionChange} when it changed and JS listens. */
+    private void report(String text) {
+        if (text.equals(reported) || !mounter.wants(id, Native.SELECTION_CHANGE)) return;
+        reported = text;
+        mounter.eventMap(id, Native.SELECTION_CHANGE, new String[] {"text"}, new Object[] {text});
     }
 
     /** Whether the long press selected and the gesture goes on (presses are cancelled). */
@@ -178,6 +216,8 @@ final class SelectableView implements SelectionHandle.Owner {
         mode = null;
         if (m != null) m.finish();
         nativeDestroy(h);
+        if (removed) reported = "";
+        else report("");
     }
 
     /** Whether the screen point is on one of the handles (a touch there keeps the selection). */
@@ -318,6 +358,17 @@ final class SelectableView implements SelectionHandle.Owner {
     }
 
     /**
+     * The UTF-16 range {@code start..end} of text {@code i} as a copy gives
+     * it (called from Rust within a native call): without attachments and
+     * hidden runs.
+     */
+    String copiedText(int i, int start, int end) {
+        if (i < 0 || i >= texts.size()) return "";
+        Layout layout = texts.get(i).layout();
+        return layout == null ? "" : TextLayouts.shown(layout.getText(), start, end);
+    }
+
+    /**
      * The model's hit test (called from Rust within a native call): the
      * UTF-16 offset of text {@code i} nearest the area point ({@code x},
      * {@code y}) in dp.
@@ -356,6 +407,10 @@ final class SelectableView implements SelectionHandle.Owner {
         // Scrolled away, the ends' rows must not be recycled.
         int[] kept = nativeKept(handle);
         if (kept != null) Native.keepRendered(mounter.handle(), kept);
+        if (mounter.wants(id, Native.SELECTION_CHANGE)) {
+            String text = empty() ? "" : nativeText(handle, this);
+            report(text != null ? text : "");
+        }
         int[] ranges = nativeRanges(handle, this);
         java.util.ArrayList<TextBox> now = new java.util.ArrayList<>();
         if (ranges != null) {
@@ -465,6 +520,22 @@ final class SelectableView implements SelectionHandle.Owner {
         return b[0] == 0 && b[1] == 0 && b[2] == last && layout != null && b[3] >= layout.getText().length();
     }
 
+    /**
+     * The app's items (`selectionMenu`) after the system's and the text
+     * actions, in their order; a separator starts a new group.
+     */
+    private void addAppItems(android.view.Menu m) {
+        int group = 1;
+        for (int i = 0; i < menu.length; i++) {
+            MenuEntry entry = menu[i];
+            if (entry.id == -1) {
+                group++;
+                continue;
+            }
+            m.add(group, APP_ITEM + i, 200 + i, entry.label).setEnabled(entry.enabled);
+        }
+    }
+
     private void showToolbar() {
         if (handle == 0 || empty()) return;
         if (mode != null) {
@@ -483,6 +554,8 @@ final class SelectableView implements SelectionHandle.Owner {
                 android.content.res.Resources system = android.content.res.Resources.getSystem();
                 int share = system.getIdentifier("share", "string", "android");
                 if (share != 0) menu.add(android.view.Menu.NONE, android.R.id.shareText, 2, system.getString(share));
+                addTextActions(menu);
+                addAppItems(menu);
                 return true;
             }
 
@@ -496,8 +569,19 @@ final class SelectableView implements SelectionHandle.Owner {
             public boolean onActionItemClicked(android.view.ActionMode m, android.view.MenuItem item) {
                 if (handle == 0) return false;
                 int itemId = item.getItemId();
+                if (itemId >= APP_ITEM && itemId - APP_ITEM < menu.length) {
+                    int chosen = menu[itemId - APP_ITEM].id;
+                    // The root's `Menu` event, as a menu's item.
+                    if (chosen > 0 || chosen < -1) {
+                        mounter.eventMap(1, Native.MENU, new String[] {"id"},
+                                new Object[] {(double) (chosen & 0xffffffffL)});
+                    }
+                    clear();
+                    return true;
+                }
                 if (itemId == android.R.id.copy) {
-                    SystemUi.setClipboard(view.getContext(), nativeText(handle, SelectableView.this));
+                    String copied = nativeText(handle, SelectableView.this);
+                    if (copied != null && !copied.isEmpty()) SystemUi.setClipboard(view.getContext(), copied);
                     clear();
                     return true;
                 }
@@ -519,6 +603,23 @@ final class SelectableView implements SelectionHandle.Owner {
                         context.startActivity(chooser);
                     } catch (android.content.ActivityNotFoundException ignored) {
                         // Nothing can share text.
+                    }
+                    clear();
+                    return true;
+                }
+                android.content.Intent process = item.getIntent();
+                if (process != null && android.content.Intent.ACTION_PROCESS_TEXT.equals(process.getAction())) {
+                    android.content.Context context = view.getContext();
+                    android.content.Intent send = new android.content.Intent(process)
+                            .putExtra(android.content.Intent.EXTRA_PROCESS_TEXT, nativeText(handle, SelectableView.this))
+                            .putExtra(android.content.Intent.EXTRA_PROCESS_TEXT_READONLY, true);
+                    if (!(context instanceof android.app.Activity)) {
+                        send.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK);
+                    }
+                    try {
+                        context.startActivity(send);
+                    } catch (RuntimeException ignored) {
+                        // The app went away, or does not take the text.
                     }
                     clear();
                     return true;
@@ -561,5 +662,33 @@ final class SelectableView implements SelectionHandle.Owner {
                 else out.set(Math.round(all.left), Math.round(all.top), Math.round(all.right), Math.round(all.bottom));
             }
         }, android.view.ActionMode.TYPE_FLOATING);
+    }
+
+    /**
+     * The installed apps' text actions (Translate and the like) after the
+     * built-in items, as TextView's. The text is passed read-only.
+     */
+    private void addTextActions(android.view.Menu menu) {
+        android.content.Context context = view.getContext();
+        android.content.pm.PackageManager pm = context.getPackageManager();
+        android.content.Intent query = new android.content.Intent(android.content.Intent.ACTION_PROCESS_TEXT)
+                .setType("text/plain");
+        java.util.List<android.content.pm.ResolveInfo> found;
+        try {
+            found = pm.queryIntentActivities(query, 0);
+        } catch (RuntimeException e) {
+            return;
+        }
+        int order = 100;
+        for (android.content.pm.ResolveInfo info : found) {
+            android.content.pm.ActivityInfo activity = info.activityInfo;
+            if (activity == null || !activity.exported) continue;
+            if (activity.packageName.equals(context.getPackageName())) continue;
+            android.content.Intent intent = new android.content.Intent(query)
+                    .setClassName(activity.packageName, activity.name);
+            menu.add(android.view.Menu.NONE, android.view.Menu.NONE, order++, info.loadLabel(pm))
+                    .setIntent(intent)
+                    .setShowAsAction(android.view.MenuItem.SHOW_AS_ACTION_IF_ROOM);
+        }
     }
 }

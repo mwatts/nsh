@@ -1,6 +1,6 @@
 // Internal design tokens and finishes shared by gallery and website demos.
-import type { Tokens, ViewStyle } from "nsh";
-import { token } from "nsh";
+import type { AnimatedValue, Tokens, ViewStyle } from "nsh";
+import { createAnimatedValue, effect, reduceMotion, token } from "nsh";
 import { Easing } from "nsh";
 import { colorScheme } from "nsh";
 import { platform } from "nsh";
@@ -71,7 +71,7 @@ export interface Palette {
   accentFill: string;
   /** Text on the accent fill. */
   onAccent: string;
-  /** The main action's button: light on the dark page, dark on the light one. */
+  /** The main action's fill (the theme's `primary`): the citrus, in both appearances. */
   light: string;
   /** Text on `light`. */
   onLight: string;
@@ -141,6 +141,21 @@ export const colors: Palette = tokens<keyof Palette>({
   down: "down",
 });
 
+/**
+ * The window buttons an app draws for a frameless window on macOS (the
+ * traffic lights): close, minimize and zoom in the system's hues, the
+ * glyphs' ink over them, their hairline edge, and `off`, all three while
+ * the window is in the background.
+ */
+export const windowControls = tokens<"close" | "minimize" | "zoom" | "ink" | "edge" | "off">({
+  close: "window-close",
+  minimize: "window-minimize",
+  zoom: "window-zoom",
+  ink: "window-control-ink",
+  edge: "window-control-edge",
+  off: "window-control-off",
+});
+
 /** `color` at opacity `a`. */
 export function alpha(color: string, a: number) {
   return `color-mix(in srgb, ${color} ${a * 100}%, transparent)`;
@@ -181,10 +196,21 @@ export interface Finish {
  * hard 1-point drop under what stands up and a 1-point inner shade in what
  * is sunk; only floating surfaces (menus, glass) cast a soft
  * shadow. `hover` and `pressed` are a raised control's states, `fill` a
- * slider's or a meter's run of the accent.
+ * slider's or a meter's run of the accent; `knob` a switch's knob on its
+ * sunk track, `knobOn` the white one with an olive edge on the citrus.
+ * `thumb` is a segmented control's or a tab strip's selected segment on
+ * its sunk track: the raised fill dark; white with a soft drop light, where
+ * the raised fill is all but the track's color.
+ * `on` is what stays on (a toggle, a chosen tool, a selected button): a
+ * fill that stands off every surface it sits on, and off a raised control
+ * at rest, further than a hover does, so on and off read apart at a
+ * glance. Dark, a step lighter than the raised fill; light, where a raised
+ * fill is all but the color of the card and the inset under it, a deeper
+ * neutral with an edge. `groove` is a hairline's lip of light under it, a
+ * menu's separator cut into the surface.
  */
 export const finish = themed<
-  Record<"card" | "inset" | "field" | "raised" | "hover" | "pressed" | "light" | "accent" | "track" | "fill" | "knob" | "pill" | "chip" | "glass" | "menu", Finish>
+  Record<"card" | "inset" | "field" | "raised" | "hover" | "pressed" | "light" | "accent" | "track" | "fill" | "knob" | "knobOn" | "pill" | "thumb" | "on" | "chip" | "glass" | "menu" | "groove", Finish>
 >(finishes.dark, finishes.light);
 
 export type Tone = "neutral" | "accent" | "info" | "warn" | "danger" | "up" | "down";
@@ -193,6 +219,12 @@ export type Tone = "neutral" | "accent" | "info" | "warn" | "danger" | "up" | "d
 export const toneColor = (tone: Tone) => (tone === "neutral" ? colors.muted : colors[tone]);
 /** The tint of a tone. */
 export const toneTint = (tone: Tone) => (tone === "neutral" ? colors.raised : tints[tone]);
+
+/** A tone's tint as `toneTint` shows it on `base` (default the card), but
+ * opaque: for what overlaps, such as stacked avatars, where a translucent
+ * tint would let what is under it show through. */
+export const solidTint = (tone: Tone, base: string = colors.surface) =>
+  tone === "neutral" ? colors.raised : `color-mix(in srgb, ${toneColor(tone)} ${isDark() ? 16 : 10}%, ${base})`;
 
 /** The monospaced family, for code (API names, identifiers). Figures use
  * the system font with tabular numbers instead. */
@@ -234,6 +266,27 @@ export const motion = {
 } as const;
 
 /**
+ * An animated value that springs to `target` each time it changes (a
+ * control's state: 1 while on, 0 while off), natively: JS only starts each
+ * spring. A change mid-way turns it from where it is, with its velocity;
+ * with reduced motion it lands at once. For discrete changes only: what
+ * the pointer drives (a dragged thumb, a hover's place) is set in the same
+ * frame, never sprung toward the pointer.
+ */
+export function follow(target: () => number, spring: { stiffness: number; damping: number } = motion.control): AnimatedValue {
+  const v = createAnimatedValue(target());
+  let shown = target();
+  effect(() => {
+    const next = target();
+    if (next === shown) return;
+    shown = next;
+    if (reduceMotion()) v.set(next);
+    else v.spring(next, spring);
+  });
+  return v;
+}
+
+/**
  * A pressable under the pointer (`hoverStyle`): a whisper of the text color
  * over its surface, quieter than pressed and than selected. Leave it off a
  * disabled control and off a selected one, whose own fill shows.
@@ -249,15 +302,15 @@ export const hovered = (): ViewStyle => ({ backgroundColor: alpha(colors.text, 0
 export const ghostFill = () => (terminal ? token("secondary") : "transparent");
 
 /**
- * The keyboard focus (`focusStyle`): the edge turns the theme's muted olive
- * `ring` and a 3-point halo of it lies around the view (`offset` moves the
- * halo out from the edge).
+ * The keyboard focus (`focusVisibleStyle`: not after a click or a tap): the
+ * edge turns the theme's muted olive `ring` and a 3-point halo of it lies
+ * around the view (`offset` moves the halo out from the edge).
  */
 export const focusRing = (offset = 0): ViewStyle => ({
   borderColor: token("ring"),
   outlineStyle: "solid",
   outlineWidth: 3,
-  outlineColor: isDark() ? "rgba(170,210,90,0.10)" : "rgba(150,190,70,0.15)",
+  outlineColor: isDark() ? "rgba(160,170,190,0.14)" : "rgba(100,110,130,0.14)",
   outlineOffset: offset,
 });
 

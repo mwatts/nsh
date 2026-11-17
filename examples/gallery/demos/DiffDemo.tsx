@@ -1,6 +1,6 @@
-import { signal, Text, View } from "nsh";
-import { Button, DiffView, type DiffStats, type DiffViewRef } from "nsh/base";
-import { colors, finish, hovered, Segmented } from "../ui";
+import { fontScale, signal, Text, View } from "nsh";
+import { DiffView, type DiffStats, type DiffViewRef } from "nsh/base";
+import { Button as GalleryButton, colors, desktop, DiffHunkActions, diffHunkTone, diffViewStyles, Segmented, terminal } from "../ui";
 
 // `nsh/base`'s `DiffView` lays the two texts out, highlights what changed
 // within lines and collapses what did not; the texts are the app's: a
@@ -57,6 +57,14 @@ export default Counter;
 `;
 
 /** `git diff` of one file: shown as its hunks, each under its header. */
+/** How many lines `text` has. */
+const lineCount = (text: string) => text.split("\n").length;
+
+// Long, unwrapped lines: at a larger system text size (`fontScale`) each must
+// stay on its own row, never wrap over the next (#1803).
+const LONG_OLD = Array.from({ length: 24 }, (_, i) => `export const value${i} = ${i}; // a long unwrapped filler line number ${i}`).join("\n");
+const LONG_NEW = LONG_OLD.replace("value9 = 9;", "value9 = 9090;");
+
 const PATCH = `diff --git a/src/layout.rs b/src/layout.rs
 --- a/src/layout.rs
 +++ b/src/layout.rs
@@ -78,20 +86,9 @@ const PATCH = `diff --git a/src/layout.rs b/src/layout.rs
          }
 `;
 
-/** A small button in the gallery's look. */
+/** A small secondary button (the gallery's `Button`, `buttonLook`). */
 function Tool(props: { label: string; name: string; onPress: () => void; disabled?: boolean }) {
-  return (
-    <Button
-      onPress={props.onPress}
-      disabled={props.disabled}
-      accessibilityLabel={props.label}
-      hoverStyle={props.disabled ? undefined : finish.hover}
-      class="h-8 items-center justify-center rounded-md border border-border px-3 active:opacity-70 disabled:opacity-40"
-      style={{ backgroundColor: colors.raised, ...finish.raised }}
-    >
-      <Text class="text-[13px] font-semibold text-foreground">{props.name}</Text>
-    </Button>
-  );
+  return <GalleryButton label={props.name} accessibilityLabel={props.label} variant="secondary" size="small" disabled={props.disabled} onPress={props.onPress} />;
 }
 
 /**
@@ -100,13 +97,15 @@ function Tool(props: { label: string; name: string; onPress: () => void; disable
  * change, and a `git diff` patch shown as its hunks.
  */
 export function DiffDemo() {
-  const source = signal<"texts" | "patch">("texts");
-  const layout = signal<"split" | "unified">("split");
+  const source = signal<"texts" | "long" | "patch">("texts");
+  // Split while both sides have room; a narrow window starts unified, its
+  // lines as wide as the view, so a change's actions cover less of them.
+  const layout = signal<"split" | "unified">(desktop() ? "split" : "unified");
   const oldValue = signal(OLD);
   const newValue = signal(NEW);
   const stats = signal<DiffStats>({ added: 0, deleted: 0, hunks: 0 });
   const current = signal(0);
-  const last = signal("—");
+  const last = signal("");
   let diff: DiffViewRef | undefined;
 
   // The counts follow the texts: the view reports them as it diffs.
@@ -123,10 +122,11 @@ export function DiffDemo() {
   return (
     <View class="flex-1 gap-3 bg-background p-4">
       <View class="flex-row flex-wrap items-center gap-3">
-        <View class="w-[200px]">
+        <View>
           <Segmented
             options={[
               { value: "texts", label: "Texts" },
+              { value: "long", label: "Long lines" },
               { value: "patch", label: "Patch" },
             ]}
             value={source()}
@@ -134,7 +134,7 @@ export function DiffDemo() {
             size="small"
           />
         </View>
-        <View class="w-[200px]">
+        <View>
           <Segmented
             options={[
               { value: "split", label: "Split" },
@@ -149,8 +149,11 @@ export function DiffDemo() {
 
       <If when={source() === "texts"}>
         <View class="flex-row flex-wrap items-center gap-2">
-          <Text class="font-mono text-[12px] tabular-nums text-foreground">
-            {`+${stats().added} −${stats().deleted} · ${stats().hunks === 0 ? "No changes" : `Change ${current() + 1} of ${stats().hunks}`}`}
+          <Text class="text-xs tabular-nums text-muted-foreground">
+            <Text style={{ color: colors.up }}>{`+${stats().added}`}</Text>
+            {" "}
+            <Text style={{ color: colors.down }}>{`−${stats().deleted}`}</Text>
+            {` · ${stats().hunks === 0 ? "No changes" : `Change ${current() + 1} of ${stats().hunks}`}`}
           </Text>
           <View class="flex-1" />
           <Tool label="Previous change" name="↑" disabled={current() <= 0} onPress={() => go(current() - 1)} />
@@ -169,9 +172,18 @@ export function DiffDemo() {
         </View>
       </If>
 
-      <View class="flex-1 overflow-hidden rounded-lg border border-border bg-card">
+      {/* As tall as the room, but no taller than the diff's rows (20 points each, and its border), so a short diff
+          leaves no empty frame under its last line: a texts' diff split pairs its deleted lines with its added ones
+          (as many rows as the longer text), unified lists both (its new lines and the deleted ones); a patch at most
+          its own lines. */}
+      <View
+        class="flex-1 overflow-hidden rounded-lg border border-border bg-card"
+        style={terminal ? undefined : { maxHeight: 2 + 20 * fontScale() * (source() === "long" ? lineCount(LONG_NEW) : source() === "patch" ? lineCount(PATCH) : layout() === "split" ? Math.max(lineCount(oldValue()), lineCount(newValue())) : lineCount(newValue()) + stats().deleted) }}
+      >
         {() =>
-          source() === "texts" ? (
+          source() === "long" ? (
+            <DiffView oldValue={LONG_OLD} newValue={LONG_NEW} language="util.ts" layout={layout()} styles={diffViewStyles()} onStatsChange={counted} expandAll class="flex-1" />
+          ) : source() === "texts" ? (
             <DiffView
               ref={(r) => (diff = r)}
               onStatsChange={counted}
@@ -179,25 +191,15 @@ export function DiffDemo() {
               newValue={newValue()}
               language="tsx"
               layout={layout()}
+              styles={diffViewStyles()}
               renderHunkActions={(hunk) => (
-                <View class="flex-row gap-1">
-                  <Button
-                    onPress={() => diff?.revertHunk(hunk.index)}
-                    accessibilityLabel={`Revert change ${hunk.index + 1}`}
-                    hoverStyle={hovered()}
-                    class="rounded border border-border bg-background px-2 py-0.5 active:opacity-70"
-                  >
-                    <Text class="text-[11px] font-medium text-foreground">Revert</Text>
-                  </Button>
-                  <Button
-                    onPress={() => diff?.acceptHunk(hunk.index)}
-                    accessibilityLabel={`Keep change ${hunk.index + 1}`}
-                    hoverStyle={{ opacity: 0.88 }}
-                    class="rounded bg-primary px-2 py-0.5 active:opacity-70"
-                  >
-                    <Text class="text-[11px] font-medium text-primary-foreground">Keep</Text>
-                  </Button>
-                </View>
+                <DiffHunkActions
+                  index={hunk.index}
+                  iconOnly={!desktop()}
+                  tone={diffHunkTone(hunk, layout())}
+                  onRevert={() => diff?.revertHunk(hunk.index)}
+                  onKeep={() => diff?.acceptHunk(hunk.index)}
+                />
               )}
               onChange={({ change }) => {
                 oldValue.set(change.oldValue);
@@ -212,6 +214,7 @@ export function DiffDemo() {
               patch={PATCH}
               onStatsChange={counted}
               layout={layout()}
+              styles={diffViewStyles()}
               indicators="classic"
               renderSeparator={(sep) => (
                 <View class="flex-1 flex-row items-center gap-2 bg-muted px-3">
@@ -225,7 +228,14 @@ export function DiffDemo() {
         }
       </View>
 
-      <Text class="font-mono text-[11px] text-muted-foreground">{last()}</Text>
+      <If when={source() === "long"}>
+        <Text class="text-xs text-muted-foreground">{`Text size ${fontScale().toFixed(2)}× · raise the system text size: every line stays on its own row`}</Text>
+      </If>
+
+      {/* What the last action did; nothing until there is one. */}
+      <If when={last()}>
+        <Text class="text-xs text-muted-foreground">{last()}</Text>
+      </If>
     </View>
   );
 }

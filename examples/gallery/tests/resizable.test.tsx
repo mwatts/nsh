@@ -6,10 +6,13 @@
 import { beforeEach, expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 
+/** How the demo shows each panel's size: the sidebar's width, the console's height. */
+const unit: Record<string, string> = { Sidebar: " pt wide", Console: " pt tall" };
+
 /** The size the demo shows for `panel` (`"Sidebar"`, `"Console"`). */
 const size = (app: App, panel: string) => {
-  const line = app.texts().find((t) => t.startsWith(`${panel} `) && t.endsWith(" pt"));
-  return line === undefined ? NaN : parseFloat(line.slice(panel.length + 1));
+  const line = app.texts().find((t) => /^\d/.test(t) && t.endsWith(unit[panel]));
+  return line === undefined ? NaN : parseFloat(line);
 };
 
 /** Waits for a size within 2 points of `want` (real platforms' pointers may round). */
@@ -19,17 +22,17 @@ let app: App;
 beforeEach(async () => {
   app = await open("../App.tsx", { platform: "macos", width: 1200, height: 800, clock: {} });
   await app.press("role:button[Resizable]");
-  await app.waitFor("Sidebar 220 pt");
+  await app.waitFor("220 pt wide");
 });
 
 test("dragging a handle resizes the panels beside it, and the group reports the sizes", async () => {
   expect(app.count("role:adjustable")).toBe(2);
   await app.drag("label:Resize the sidebar", { x: 60, y: 0 });
   await waitForSize(app, "Sidebar", 280);
-  expect(app.texts().some((t) => t.startsWith("Last resize: Row: "))).toBe(true);
+  expect(app.texts().some((t) => t.startsWith("Last resize: sidebar "))).toBe(true);
   await app.drag("label:Resize the console", { x: 0, y: -40 });
   await waitForSize(app, "Console", 180);
-  expect(app.texts().some((t) => t.startsWith("Last resize: Column: "))).toBe(true);
+  expect(app.texts().some((t) => t.startsWith("Last resize: editor "))).toBe(true);
 });
 
 test("a panel stops at its minimum and its maximum", async () => {
@@ -44,7 +47,7 @@ test("a hidden panel gives its room back and returns at its size", async () => {
   await waitForSize(app, "Console", 180);
   await app.press("label:Hide the console");
   await app.waitFor("label:Resize the console", { state: "gone" });
-  expect(app.shows("Hidden, it keeps its size")).toBe(false);
+  expect(app.shows("Keeps its size while hidden")).toBe(false);
   await app.press("label:Show the console");
   await app.waitFor("label:Resize the console");
   await waitForSize(app, "Console", 180);

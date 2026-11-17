@@ -8,7 +8,7 @@ demo: guide-lists
 
 # Lists
 
-A list (`virtual_list(..)` in Rust, `List` from `nsh` in TSX) renders long data on a native scroll view while only creating the rows near the screen. Which rows exist, where they go, the columns, sticky headers and which items are visible are all computed natively; your code only fills cells with content when the native side asks for one. A list of a million items costs about as much as a list of thirty.
+For collections that can grow, including chat timelines, feeds and history, prefer a virtualized list from the start. Use a scroll view with ordinary children for small, bounded content. A list (`virtual_list(..)` in Rust, `List` from `nsh` in TSX) renders long data on a native scroll view while only creating the rows near the screen. Which rows exist, where they go, the columns, sticky headers and which items are visible are all computed natively; your code only fills cells with content when the native side asks for one. A list of a million items costs about as much as a list of thirty.
 
 ```rust tabs
 use std::rc::Rc;
@@ -137,17 +137,17 @@ Rows can have different heights. Until a row has been measured, the list assumes
 
 ## Changing the data
 
-In Rust, give the count as a signal or a closure (`move || posts.with(Vec::len)`): the list grows and shrinks in place. Rows added or removed at the end need nothing more; when rows come and go elsewhere, give their identities with `.keys(move || posts.with(|p| p.iter().map(|p| p.id).collect::<Vec<_>>()))`, and the list keeps the common start and end and treats what is between as removed and inserted.
+In Rust, give the count as a signal or a closure (`move || posts.with(Vec::len)`): the list grows and shrinks in place. Rows added or removed at the end need nothing more; when rows come and go elsewhere, give their identities with `.keys(move || posts.with(|p| p.iter().map(|p| p.id).collect::<Vec<_>>()))`, and the list matches the rows by key.
 
-In TSX, pass a new array to change the items: `posts.set([...posts(), ...more])`. The list compares the old and the new array **by item identity** (`===`), keeps the common start and end, and treats what is between as removed and inserted.
+In TSX, pass a new array to change the items: `posts.set([...posts(), ...more])`. The list compares the old and the new array **by item identity** (`===`), or by the keys `keyExtractor` returns.
 
-In both, measurements stay with their rows, and when rows are inserted above the rows on screen, the visible rows stay where they are instead of jumping.
+In both, a row that stays keeps its cell, its content and its measured size wherever it moves (an item sorted to the top once it changes), and so do the rows it passes: a focused field or an open menu in them stays open. Only new items get new rows. When rows are inserted above the rows on screen, the visible rows stay where they are instead of jumping.
 
 - In TSX, update immutably: a new array, with the unchanged item objects reused. Mutating the array in place (`push`) is not seen.
 - A changed item should be a new object (`{ ...post, title }`), so its row shows the change.
 - Prepending (new messages, a refreshed feed) keeps the user's place.
 
-`keyExtractor` names items in viewability tokens (below); by default the key is `item.key`, then `item.id`, then the index. It does not affect how changes are matched in TSX, which is always by identity.
+`keyExtractor` gives the key changes are matched by, so rows rebuilt as new objects keep their rows, and names items in viewability tokens (below). Without it, changes are matched by identity, and tokens name items by `item.key`, then `item.id`, then the index.
 
 ## Props
 
@@ -163,6 +163,7 @@ A list takes every scrolling prop of the scroll view that makes sense for a list
 | `numColumns` | `.columns(n)` | `number` | `1` | Items per row (vertical lists). |
 | `inverted` | `.inverted()` | `boolean` | `false` | Item 0 at the bottom (chat); starts at the end and keeps its distance from the end. |
 | `maintainVisibleContentPosition` | `.follow_end(px(..))` | `{ autoscrollToBottomThreshold?: number }` | | A list that is not inverted stays at the end while it is within that many points of it, as content grows (see below). |
+| `alignment` | `.alignment(ListAlignment::..)` | `"top" \| "bottom"` | `"top"` | Where the list rests. `"bottom"`: it opens at the end and stays there as content grows, with rows in reading order (see below). |
 | `stickyHeaderIndices` | `.sticky_header_indices(..)` | `number[]` | | Items that stick to the top while scrolled past (one column, not inverted). |
 | `stickyHeaderOffset` | `.sticky_header_offset(px(..))`, `.bind_sticky_header_offset(&node)` | `number \| AnimatedNode` | `0` | How far below the top the sticky items stick, as CSS `position: sticky`'s `top`; the content scrolls on under the space above them. An animated value moves them every frame. |
 | `contentStyle` | `.content_padding(..)`, `.content_padding_x(..)`, ..., `.row_gap(..)`, `.column_gap(..)` | `{ padding*, gap, rowGap, columnGap }` | | Padding and gaps of the content, numbers only. |
@@ -172,19 +173,20 @@ A list takes every scrolling prop of the scroll view that makes sense for a list
 | `empty` | `.empty(..)` | component or element | | Shown instead of the items while there are none. |
 | `separator` | `.separator(\|\| ..)` | component or element | | Between items (one column). |
 | `initialScrollIndex` | `.initial_scroll_index(i)` | `number` | | Scrolls to this item before the first frame. |
+| `initialScrollAtEnd` | `.initial_scroll_at_end()` | `boolean` | `false` | Opens at the end before the first frame and follows it while rows measure. Short content stays at the top. In TSX this takes precedence over `initialScrollIndex`; in Rust the last initial-scroll builder wins. |
 | `onLoadMore` | `.on_load_more(..)` | `() => void` | | The end is near (see below). |
 | `loadMoreThreshold` | `.load_more_threshold(..)` | `number` | `1` | How close to the end, in viewports, `onLoadMore` fires. |
 | `onLoadMoreAtStart` | `.on_load_more_at_start(..)` | `() => void` | | The start is near, after a scroll (see below). |
 | `loadMoreAtStartThreshold` | `.load_more_at_start_threshold(..)` | `number` | `1` | How close to the start, in viewports, `onLoadMoreAtStart` fires. |
 | `onViewableItemsChange` | `.on_viewable_items_change(..)` | `(info) => void` | | Items became or stopped being viewable. |
 | `viewabilityConfig` | `.viewability(..)`, `.minimum_view_time(..)` | `ViewabilityConfig` | | When items count as viewable. |
-| `keyExtractor` | `.keys(..)` | `(item, index) => string` | | The key in viewability tokens; in Rust, the rows' identities. |
+| `keyExtractor` | `.keys(..)` | `(item, index) => string` | | The rows' identities, which changes are matched by; also the key in viewability tokens. |
 | `refreshing` / `onRefresh` | `.refreshing(..)` / `.on_refresh(..)` | `boolean` / `() => void` | | Pull to refresh. |
 | `refreshIndicator` | `.refresh_indicator(..)` | `{ height: number }` | | The app's own pull-to-refresh indicator, in place of the platform's spinner (see [Scrolling](./scrolling.md#an-indicator-of-your-own)). |
-| `scrollbar` | `.scrollbar(..)` | `boolean \| ScrollbarTheme` | `true` | The scroll indicator shows: the platform's, or the app's [built-in bar](../elements/scrollbar.md#built-in-bars) once it set a theme; an object is a theme of the view's own. On the desktop and in desktop browsers a horizontal view keeps it: it is the mouse's scroll bar. |
-| `ref` | `.element_ref(&list)` | `ListRef` | | `scrollToIndex`, `scrollToOffset`, `scrollToEnd`, `scrollTo`. |
+| `scrollbar` | `.scrollbar(..)` | `boolean \| ScrollbarTheme` | `true` | The scroll indicator shows: the platform's, or the app's [built-in bar](../elements/scrollbar.md#built-in-bars) once it set a theme; an object is a theme of the view's own. |
+| `ref` | `.element_ref(&list)` | `ListRef` | | `scrollToIndex`, `scrollToOffset`, `scrollToEnd`, `scrollTo`, `measureScrollPosition`. |
 
-The header, footer and empty slots take an element (in TSX also a component: `header={Header}`). They are cells of their own, never recycled, and they are reactive like any other element.
+The header, footer and empty slots take an element (in TSX also a component: `header={Header}`). They are cells of their own, never recycled, and they are reactive like any other element: a slot that is one `<If>` or `<Each>` follows its condition or its items, and a component is called once.
 
 ## Columns and grids
 
@@ -465,6 +467,25 @@ mount(Chat);
 ```
 
 `scroll_to_end(..)` / `scrollToEnd()` on an inverted list scrolls to its start: the newest message.
+
+### Bottom alignment
+
+`alignment="bottom"` (`.alignment(ListAlignment::Bottom)` in Rust) is the simplest way to build a chat: messages stay in reading order, oldest first, and the list opens at the newest. It stays at the end as a reply streams in, a message is appended or the keyboard shows; when the user scrolls up, the visible content stays where it is, and scrolling back to the end resumes following. Messages shorter than the viewport lie at its bottom.
+
+Rows keep their positions in the content while the list grows, so an appended message moves no other row: the list places the new row and scrolls once. Older messages prepended with `onLoadMoreAtStart` keep the visible rows in place.
+
+```rust tabs
+virtual_list(move || messages.with(Vec::len), move |at| bubble(messages, at))
+    .keys(move || messages.with(|m| m.iter().map(|m| m.id).collect::<Vec<_>>()))
+    .alignment(ListAlignment::Bottom)
+    .flex_1()
+```
+
+```tsx tabs
+<List each={messages()} keyExtractor={(m) => m.id} alignment="bottom" style={{ flex: 1 }}>
+  {(m) => <Bubble message={m()} />}
+</List>
+```
 
 ### Following the end of a list that is not inverted
 
@@ -759,7 +780,46 @@ let list!: ListRef;
 list.scrollToIndex({ index: 120, viewPosition: 0.5 });
 ```
 
-Scrolling to an index (and to the end) is resolved natively with the sizes known at that moment: measured rows where they have been measured, the estimated size elsewhere. The list then follows its target while the rows around it are measured, so it lands exactly, until the user scrolls or the items change. To open a list at an item, use `initialScrollIndex` (`.initial_scroll_index(..)`) rather than scrolling after the first frame.
+Scrolling to an index (and to the end) is resolved natively with the sizes known at that moment: measured rows where they have been measured, the estimated size elsewhere. The list then follows its target while the rows around it are measured, so it lands exactly, until the user scrolls or the items change. To open a list at an item, use `initialScrollIndex` (`.initial_scroll_index(..)`), and at its end `initialScrollAtEnd` (`.initial_scroll_at_end()`), rather than scrolling after the first frame.
+
+### Keeping a reading position
+
+`measureScrollPosition()` (`measure_scroll_position()`) tells where the viewport starts among the rows once this turn's changes are laid out: `{ index, offset }`, the row there and how far into it, in the positions the list itself lays its rows out at (measured rows at their sizes, the others at their estimates). Read it as the list scrolls and keep it; `scrollToIndex({ index, viewOffset: -offset })` puts the viewport's start back there, in the same list or in one made anew, which follows the row as it is measured. A list without items answers `null`. It counts along the list's axis from the side item 0 is on (the bottom of an inverted list); in a header before the first row, `index` is 0 and `offset` negative.
+
+```rust tabs
+let list = element_ref();
+let reading = signal(None::<ListScrollPosition>);
+
+virtual_list(count, row)
+    .estimated_item_size(px(48.0))
+    .on_scroll(move |_| {
+        spawn(async move { reading.set(list.measure_scroll_position().await) });
+    })
+    .element_ref(&list)
+
+// Later, in a list made anew:
+if let Some(at) = reading.get() {
+    list.scroll_to_index(at.index, percentage(0.0), -at.offset, false);
+}
+```
+
+```tsx tabs
+let list!: ListRef;
+let reading: { index: number; offset: number } | null = null;
+
+<List
+  ref={list}
+  each={items}
+  estimatedItemSize={48}
+  onScroll={async () => (reading = await list.measureScrollPosition())}
+  style={{ flex: 1 }}
+>
+  …
+</List>;
+
+// Later, in a list made anew:
+if (reading) list.scrollToIndex({ index: reading.index, viewOffset: -reading.offset, animated: false });
+```
 
 ## A settings-style list
 

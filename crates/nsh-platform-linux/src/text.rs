@@ -9,9 +9,10 @@
 //! is what is drawn. Hinted metrics and rounded glyph positions are off on
 //! both sides, so measuring is resolution-independent.
 //!
-//! Colors and decorations are not part of a layout: the core reuses a
-//! layout for a text that only differs in them (`AttributedText::layout_eq`),
-//! so they are read from the drawn text's spans, per glyph cluster.
+//! Colors and decorations are not part of a layout: they are read from the
+//! drawn text's spans, per glyph cluster, so the core keeps a layout for a
+//! text that only differs in its colors
+//! (`TextEngine::draws_colors_from_text`).
 
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -21,11 +22,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use gtk4::{self as gtk, glib, glib::translate::ToGlibPtr, graphene, gsk, prelude::*};
+use gtk4::{self as gtk, gio, glib, glib::translate::ToGlibPtr, graphene, gsk, prelude::*};
 use nsh_core::{
-    ATTACHMENT_CHAR, Affinity, AttributedText, Bounds, Color, DecorationStyle, EllipsizeMode,
-    EventKind, Points, ResolvedTextStyle, Size, TextAlign, TextEngine, TextLayout, TextLine,
-    TextPosition, TextSpan,
+    Affinity, AttributedText, Bounds, Color, DecorationStyle, EllipsizeMode, EventKind, Points,
+    ResolvedTextStyle, Size, TextAlign, TextEngine, TextLayout, TextLine, TextPosition, TextSpan,
 };
 use rustc_hash::FxHashMap;
 
@@ -154,13 +154,13 @@ pub(crate) fn main_font_description(style: &ResolvedTextStyle) -> pango::FontDes
 fn resolve_family(name: &str, ui: &str) -> String {
     let mut out = String::with_capacity(name.len());
     use nsh_core::FamilyName;
-    for family in nsh_core::font_families(name) {
+    nsh_core::for_each_font_family(name, |family| {
         let family = match family {
             FamilyName::Monospace => "monospace",
             FamilyName::Serif => "serif",
             // Pango's list is comma-separated: a quoted name with a comma
             // in it can't be one of its families.
-            FamilyName::Named(f) if f.contains(',') => continue,
+            FamilyName::Named(f) if f.contains(',') => return,
             FamilyName::Named(f) => f,
             _ => ui,
         };
@@ -168,7 +168,7 @@ fn resolve_family(name: &str, ui: &str) -> String {
             out.push(',');
         }
         out.push_str(family);
-    }
+    });
     if out.is_empty() {
         out.push_str(ui);
     }
@@ -295,6 +295,9 @@ struct Line {
     info: TextLine,
     /// Its runs in [`LinuxLayout::runs`].
     runs: std::ops::Range<usize>,
+    /// Its baseline: where its runs are drawn (`info.ascender` is from its
+    /// logical top, which a `lineHeight` moves off the line's top).
+    baseline: f32,
 }
 
 /// A final layout: plain data, drawn on the main thread.
@@ -779,8 +782,9 @@ impl TextEngine for PangoTextEngine {
             } else {
                 self.attachment_font(context, text, a)
             };
-            let top = a.ascent(font, alignments.get(a.index));
-            let (up, down) = a.extent(font, alignments.get(a.index));
+            // By the baseline of its own text where it has one.
+            let top = alignments.ascent(a, font);
+            let (up, down) = alignments.extent(a, font);
             let (mut up, mut down) = (to_pango(up.0), to_pango(down.0));
             // With a fixed `lineHeight`, at least the box the text's runs
             // take (their font with the line height spread evenly above and
@@ -869,6 +873,24 @@ impl TextEngine for PangoTextEngine {
             width = width.min(max.max(0.0));
         }
         Size::new(Points(width), Points(from_pango(bottom).ceil()))
+    }
+
+    fn draws_colors_from_text(&self) -> bool {
+        // Colors and decorations are read from the drawn text's spans.
+        true
+    }
+
+    fn breaks_lines_greedily(&self) -> bool {
+        true
+    }
+
+    fn first_baseline(&self, prepared: &Prepared, width: Points) -> Option<Points> {
+        // Typeset at the size it measures `width` wide, as the text is laid
+        // out: the baseline of its first line (the line's, as a line of
+        // only a break or an inline view has no runs).
+        let layout = self.layout(prepared, self.measure(prepared, Some(width)));
+        let layout = layout.downcast::<LinuxLayout>()?;
+        Some(Points(layout.lines.first()?.baseline))
     }
 
     fn layout(&self, prepared: &Prepared, size: Size<Points>) -> TextLayout {
@@ -1001,6 +1023,7 @@ impl TextEngine for PangoTextEngine {
                     x_height: Points(x_height),
                 },
                 runs: first..out.runs.len(),
+                baseline,
             });
         }
         TextLayout(Arc::new(out))
@@ -1299,7 +1322,10 @@ pub(crate) fn draw(snapshot: &gtk::Snapshot, state: &ViewState) {
         let (cx, cy) = (drawn.content.origin.x.0, drawn.content.origin.y.0);
         let mut rects = drawn.selection_rects.borrow_mut();
         rects.clear();
-        layout.range_rects(range.0..range.1, &mut rects);
+        // Hidden characters show no highlight, as nothing of them shows.
+        for shown in drawn.text.visible_ranges(range.0..range.1) {
+            layout.range_rects(shown, &mut rects);
+        }
         for r in rects.iter() {
             let (x, y) = (cx + r.origin.x.0, cy + r.origin.y.0);
             snapshot.append_color(
@@ -1386,6 +1412,13 @@ fn build(
             }
             let glyphs = &run.glyphs[i..j];
             let style = text.spans.get(span).map_or(&default, |s| &s.style);
+            if style.hidden {
+                // Nothing of a hidden run is drawn: not its color emoji,
+                // which keep their own colors, nor its shadow.
+                x += from_pango(glyphs.iter().map(|g| g.width).sum::<i32>());
+                i = j;
+                continue;
+            }
             let mut string = pango::GlyphString::new();
             string.set_size(glyphs.len() as i32);
             let mut width = 0;
@@ -1678,10 +1711,7 @@ impl Selection {
             let ctrl = modifiers.contains(ModifierType::CONTROL_MASK);
             match key {
                 Key::c | Key::C | Key::Insert if ctrl => copy(&view),
-                Key::a | Key::A if ctrl => {
-                    let len = view.state().text.as_ref().map_or(0, |t| t.text.len_utf16());
-                    select(&view, Some((0, len)));
-                }
+                Key::a | Key::A if ctrl => select_all(&view),
                 // Without a selection Escape goes on (to going back).
                 Key::Escape if view_selection(&view).is_some_and(|s| s.range.get().is_some()) => {
                     select(&view, None)
@@ -1695,14 +1725,34 @@ impl Selection {
             // The window going to the background keeps its focus widget,
             // and so the selection.
             if let Some(view) = weak.upgrade()
-                && view.root().and_then(|r| r.focus()).as_ref() != Some(view.upcast_ref())
+                && !view
+                    .root()
+                    .and_then(|r| r.focus())
+                    .is_none_or(|f| &f == view.upcast_ref::<gtk::Widget>() || f.is_ancestor(&view))
             {
+                // Its edit menu (a popover, which leaves the window with no
+                // focus widget) keeps it too.
                 select(&view, None);
             }
         });
         for c in &selection.controllers {
             view.add_controller(c.clone());
         }
+        // The window menu's and the context menu's Copy and Select All.
+        let action = |name: &str, f: fn(&NshView)| {
+            let action = gio::SimpleAction::new(name, None);
+            let weak = view.downgrade();
+            action.connect_activate(move |_, _| {
+                if let Some(view) = weak.upgrade() {
+                    f(&view);
+                }
+            });
+            let group = gio::SimpleActionGroup::new();
+            group.add_action(&action);
+            group
+        };
+        view.insert_action_group("clipboard", Some(&action("copy", copy)));
+        view.insert_action_group("selection", Some(&action("select-all", select_all)));
         selection
     }
 
@@ -1714,6 +1764,8 @@ impl Selection {
         for c in &self.controllers {
             view.remove_controller(c);
         }
+        view.insert_action_group("clipboard", None::<&gio::ActionGroup>);
+        view.insert_action_group("selection", None::<&gio::ActionGroup>);
         view.set_focusable(false);
     }
 
@@ -1891,6 +1943,17 @@ fn dragged(view: &NshView, dx: f32, dy: f32, x: f32, y: f32) {
     select(view, Some(range));
 }
 
+/// Selects all of `view`'s text.
+fn select_all(view: &NshView) {
+    let len = view.state().text.as_ref().map_or(0, |t| t.text.len_utf16());
+    select(view, Some((0, len)));
+}
+
+/// Whether `view` (selectable text) has a selection to copy.
+pub(crate) fn has_selection(view: &NshView) -> bool {
+    selected_text(view).is_some()
+}
+
 /// Copies the selection to the clipboard.
 fn copy(view: &NshView) {
     if let Some(text) = selected_text(view) {
@@ -1898,14 +1961,11 @@ fn copy(view: &NshView) {
     }
 }
 
-/// The selected text, without attachments' placeholders.
+/// The selected text, without attachments' placeholders and hidden runs.
 fn selected_text(view: &NshView) -> Option<String> {
     let (a, b) = view_selection(view)?.range.get()?;
     let state = view.state();
-    let s = state.text.as_ref()?.text.text.as_str();
-    let start = utf16_to_byte(s, (0, 0), a);
-    let end = utf16_to_byte(s, (start, a), b);
-    Some(s[start..end].replace(ATTACHMENT_CHAR, ""))
+    Some(state.text.as_ref()?.text.copied_text(a..b)).filter(|t| !t.is_empty())
 }
 
 /// The selection from `anchor` (a range) to `caret`, by `unit`.
@@ -2156,22 +2216,43 @@ impl LinuxLayout {
             let Some(baseline) = runs.first().map(|r| r.baseline) else {
                 continue;
             };
-            let pieces = runs.iter().flat_map(|run| {
-                let mut gx = run.x;
-                let (ascent, descent) = run.font.extents;
-                run.glyphs.iter().map(move |g| {
-                    let x = gx;
-                    let width = from_pango(g.width);
-                    gx += width;
-                    nsh_core::LinePiece {
-                        x: Points(x),
-                        width: Points(width),
-                        background: text.background_at(g.index),
-                        ascent: Points(ascent),
-                        descent: Points(descent),
-                    }
+            let mut pieces: Vec<_> = runs
+                .iter()
+                .flat_map(|run| {
+                    let mut gx = run.x;
+                    let (ascent, descent) = run.font.extents;
+                    run.glyphs.iter().map(move |g| {
+                        let x = gx;
+                        let width = from_pango(g.width);
+                        gx += width;
+                        nsh_core::LinePiece {
+                            x: Points(x),
+                            width: Points(width),
+                            background: text.background_at(g.index),
+                            ascent: Points(ascent),
+                            descent: Points(descent),
+                        }
+                    })
                 })
-            });
+                .collect();
+            // Attachments hold no glyphs: their room (a span's padding
+            // too) is in the background of their span.
+            let range = line.info.start..line.info.end;
+            let before = pieces.len();
+            for (&(index, width), at) in self.attachment_extents.iter().zip(&self.attachments) {
+                if let (true, Some((x, _))) = (range.contains(&index), at) {
+                    pieces.push(nsh_core::LinePiece {
+                        x: Points(*x),
+                        width: Points(width),
+                        background: text.background_at(index),
+                        ascent: Points(0.0),
+                        descent: Points(0.0),
+                    });
+                }
+            }
+            if pieces.len() > before {
+                pieces.sort_by(|a, b| a.x.0.total_cmp(&b.x.0));
+            }
             let clip = (line.info.x, line.info.x + line.info.width);
             nsh_core::BackgroundBox::join(pieces, clip, |b| {
                 f(
@@ -2324,6 +2405,7 @@ mod tests {
 
     #[test]
     fn families() {
+        assert_eq!(resolve_family(r#"'A\\B', 'A\"B'"#, "X"), "A\\B,A\"B");
         assert_eq!(resolve_family("Inter", "Adwaita Sans"), "Inter");
         assert_eq!(resolve_family("system-ui", "Adwaita Sans"), "Adwaita Sans");
         assert_eq!(resolve_family("ui-monospace", "X"), "monospace");
@@ -2390,6 +2472,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A text's first baseline (what `align-items: baseline` lines it up
+    /// by) is where its first line is drawn, wrapped or not, also with a
+    /// line height, and grows with the font.
+    #[test]
+    fn the_first_baseline_is_the_first_lines() {
+        let engine = PangoTextEngine::new("sans-serif".into());
+        let at_of = |content: &str, style: ResolvedTextStyle, width: Option<f32>| {
+            let t = text(&[(content, style)]);
+            let prepared = engine.prepare(&t);
+            let measured = engine.measure(&prepared, width.map(Points));
+            let baseline = engine
+                .first_baseline(&prepared, measured.width)
+                .expect("a first line");
+            let line = engine.lines(&engine.layout(&prepared, measured)).remove(0);
+            (baseline.0, (line.y + line.ascender).0)
+        };
+        let at = |style, width| at_of("Chat with the world", style, width);
+        let near = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let sized = |size: f32| ResolvedTextStyle {
+            font_size: Points(size),
+            ..Default::default()
+        };
+        let (small, drawn) = at(sized(12.0), None);
+        assert!(near(small, drawn), "{small} {drawn}");
+        let (wrapped, drawn) = at(sized(12.0), Some(30.0));
+        assert!(
+            near(wrapped, drawn) && near(wrapped, small),
+            "{wrapped} {drawn}"
+        );
+        let spaced = ResolvedTextStyle {
+            line_height: Points(26.0),
+            ..sized(17.0)
+        };
+        let (baseline, drawn) = at(spaced, None);
+        assert!(near(baseline, drawn), "{baseline} {drawn}");
+        let (large, _) = at(sized(24.0), None);
+        assert!(large > small, "{large} {small}");
+        // A first line of only a break has no runs: its own baseline, not
+        // the next line's.
+        let (broken, drawn) = at_of("\nChat", sized(12.0), None);
+        assert!(
+            near(broken, drawn) && near(broken, small),
+            "{broken} {drawn}"
+        );
     }
 
     /// With a fixed `lineHeight`, an attachment taller than the line grows
@@ -2531,6 +2659,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Glyphs of the text nodes under `node`.
+    fn drawn_glyphs(node: &gsk::RenderNode) -> u32 {
+        match node.node_type() {
+            gsk::RenderNodeType::ContainerNode => {
+                let c = node.clone().downcast::<gsk::ContainerNode>().unwrap();
+                (0..c.n_children()).map(|i| drawn_glyphs(&c.child(i))).sum()
+            }
+            gsk::RenderNodeType::ShadowNode => {
+                drawn_glyphs(&node.clone().downcast::<gsk::ShadowNode>().unwrap().child())
+            }
+            gsk::RenderNodeType::TextNode => node
+                .clone()
+                .downcast::<gsk::TextNode>()
+                .unwrap()
+                .num_glyphs(),
+            _ => 0,
+        }
+    }
+
+    /// Nothing of a hidden run is drawn: not its color emoji, its
+    /// decorations or its shadow.
+    #[test]
+    fn hidden_runs_draw_nothing() {
+        crate::gtk_test::run(|| {
+            let engine = PangoTextEngine::new("sans-serif".into());
+            let plain = ResolvedTextStyle::default();
+            let underlined = ResolvedTextStyle {
+                decoration: nsh_core::TextDecoration {
+                    underline: true,
+                    line_through: false,
+                },
+                ..plain
+            };
+            let built = |hidden: bool| {
+                let mut t = text(&[("ab ", plain)]);
+                // As the core hides a span.
+                let style = ResolvedTextStyle {
+                    hidden,
+                    color: if hidden {
+                        Color::TRANSPARENT
+                    } else {
+                        plain.color
+                    },
+                    ..underlined
+                };
+                t.push("\u{1F389} cd", style);
+                t.shadow = Some(nsh_core::TextShadow {
+                    color: Color(0x0000_0080),
+                    offset_x: Points(1.0),
+                    offset_y: Points(1.0),
+                    radius: Points(0.0),
+                });
+                let prepared = engine.prepare(&t);
+                let size = engine.measure(&prepared, None);
+                let layout = engine.layout(&prepared, size);
+                let l = layout.downcast::<LinuxLayout>().unwrap();
+                let content =
+                    Bounds::new(nsh_core::geometry::point(Points(0.0), Points(0.0)), size);
+                let node = build(&t, l, content).expect("a node");
+                (drawn_glyphs(&node), node)
+            };
+            let (shown, _) = built(false);
+            let (hidden, node) = built(true);
+            // "ab " only, of "ab 🎉 cd".
+            assert!(hidden > 0 && hidden < shown, "{hidden} of {shown}");
+            assert_eq!(hidden, 3, "{node:?}");
+        });
     }
 
     #[test]
@@ -2719,6 +2916,8 @@ mod tests {
                 color: nsh_core::Color(0xeeee_eeff),
                 radius: Points(4.0),
                 node: 4,
+                top: Default::default(),
+                bottom: Default::default(),
             }),
             ..style
         };
@@ -2867,5 +3066,38 @@ mod fallback_tests {
         let latin = h("Grace");
         assert_eq!(h("Grace你好世界"), latin, "CJK");
         assert_eq!(h("Grace😀"), latin, "emoji");
+    }
+    /// The core shares measurements between the widths from a text's widest
+    /// line to the one measured (`breaks_lines_greedily`): each of them
+    /// must measure the same.
+    #[test]
+    fn widths_that_hold_the_widest_line_measure_the_same() {
+        let engine = PangoTextEngine::new("sans-serif".into());
+        let texts = [
+            "The quick brown fox jumps over the lazy dog, and keeps running through the long grass until the evening comes.",
+            "第 12 条消息：开始处理 T-1012，很快完成。窗口尺寸变化时每一段文字都要按新的宽度重新折行，详情见 PR 的说明。",
+            "混合 mixed 文本 with `code` 和 punctuation，「引号」、括号（如此）以及 https://example.com/a/very/long/path/that/has/no/spaces/at/all 这样的链接。",
+            "first line\nsecond line that is rather longer than the first\n\nafter a blank line",
+        ];
+        for text in texts {
+            let mut attributed = nsh_core::AttributedText::default();
+            attributed.push(text, nsh_core::ResolvedTextStyle::default());
+            let prepared = engine.prepare(&attributed);
+            for width in (60..700).step_by(23) {
+                let measured = engine.measure(&prepared, Some(Points(width as f32)));
+                let narrowest = measured.width.0.ceil() as i32;
+                for narrower in narrowest..width {
+                    let size = engine.measure(&prepared, Some(Points(narrower as f32)));
+                    assert_eq!(
+                        size.height, measured.height,
+                        "{text} at {narrower}, from {width}"
+                    );
+                    assert_eq!(
+                        size.width, measured.width,
+                        "{text} at {narrower}, from {width}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -142,6 +142,7 @@ impl Headless {
             self.finger_lifted(finger);
         }
         let parsed = Selector::parse(selector)?;
+        self.input_with(nsh_core::platform::InputModality::Pointer);
         let pick = self.screen.view(&parsed);
         let target = self.picked(pick, selector, "view")?;
         let bounds = self
@@ -166,10 +167,7 @@ impl Headless {
             gate,
             ..
         } = grab;
-        let press = self
-            .screen
-            .press_in_chain(&chain)
-            .map(|(node, events, delay)| input::Press::new(node, node, events, delay, 0));
+        let press = self.screen.press_in_chain(&chain);
         let mut finger = Finger {
             start,
             at: start,
@@ -323,7 +321,7 @@ impl Headless {
                 if let Some(mut press) = finger.press.take() {
                     // A quick tap inside a scroll view: the press goes in now.
                     if let Some(kind) = press.press_in() {
-                        self.send(press.node, kind, EventPayload::None);
+                        self.send(press.target(kind), kind, EventPayload::None);
                     }
                     let inside = self.screen.bounds_in_root(press.view).is_some_and(|b| {
                         let r = PRESS_RETENTION;
@@ -333,7 +331,7 @@ impl Headless {
                             && finger.at.y <= b.origin.y + b.size.height + r
                     });
                     for kind in press.press_out(inside) {
-                        self.send(press.node, kind, EventPayload::None);
+                        self.send(press.target(kind), kind, EventPayload::None);
                     }
                 }
             }
@@ -359,7 +357,7 @@ impl Headless {
     fn cancel_press(&mut self, finger: &mut Finger) {
         if let Some(mut press) = finger.press.take() {
             for kind in press.press_out(false) {
-                self.send(press.node, kind, EventPayload::None);
+                self.send(press.target(kind), kind, EventPayload::None);
             }
         }
     }
@@ -382,7 +380,12 @@ impl Headless {
                 page: finger.at,
                 location: point(finger.at.x - finger.origin.x, finger.at.y - finger.origin.y),
                 changed: true,
+                pointer_type: nsh_core::PointerType::Touch,
+                pressure: nsh_core::TouchPoint::default_pressure(phase, true),
+                tilt_x: 0.0,
+                tilt_y: 0.0,
             }],
+            modifiers: self.held,
             activated,
         };
         self.engine.control().dispatch_event(
@@ -477,7 +480,7 @@ impl Headless {
 
     /// Moves the scroll view's offset along its axis to `offset`, as its
     /// platform view reports it.
-    fn scroll_to(&mut self, view: NodeId, offset: Points) {
+    pub(super) fn scroll_to(&mut self, view: NodeId, offset: Points) {
         let Some(scroll) = self.screen.scroll_mut(view) else {
             return;
         };

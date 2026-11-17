@@ -23,6 +23,7 @@ fn start(root: Root) -> (Engine, Receiver<MountBatch>) {
         app: App::Rust(root),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -33,7 +34,7 @@ fn start(root: Root) -> (Engine, Receiver<MountBatch>) {
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -43,6 +44,10 @@ fn start(root: Root) -> (Engine, Receiver<MountBatch>) {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),
@@ -375,6 +380,7 @@ fn start_js(app: &str) -> (Engine, Receiver<MountBatch>) {
         minify: false,
         split: false,
         ui_sets: ui_sets.iter().map(Into::into).collect(),
+        ..Default::default()
     })
     .unwrap();
     let bytecode = nsh_js::compile_bytecode_with(
@@ -389,6 +395,7 @@ fn start_js(app: &str) -> (Engine, Receiver<MountBatch>) {
         app: App::Js(unsafe { nsh_engine::Bundle::bytecode(bytecode) }),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -399,7 +406,7 @@ fn start_js(app: &str) -> (Engine, Receiver<MountBatch>) {
         limits: nsh_engine::Limits::default(),
         ui_sets,
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -409,6 +416,10 @@ fn start_js(app: &str) -> (Engine, Receiver<MountBatch>) {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     (
         Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap(),

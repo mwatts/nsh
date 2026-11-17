@@ -1,6 +1,7 @@
 //! The embedding app's theme: sent before the start it is in the first
 //! frame, sent later it updates what read the theme, and it wins over the
-//! app's own theme until cleared.
+//! app's own theme until cleared. The app's own theme set while it runs
+//! (`setTheme`).
 
 use std::{collections::BTreeMap, time::Duration};
 
@@ -39,6 +40,7 @@ fn start(app_theme: Option<Theme>, host_theme: Option<Theme>) -> (Engine, Receiv
         app: App::Rust(root),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -49,7 +51,7 @@ fn start(app_theme: Option<Theme>, host_theme: Option<Theme>) -> (Engine, Receiv
         limits: nsh_engine::Limits::default(),
         ui_sets: Vec::new(),
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -59,6 +61,10 @@ fn start(app_theme: Option<Theme>, host_theme: Option<Theme>) -> (Engine, Receiv
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start_with(
         config,
@@ -132,6 +138,7 @@ fn a_tsx_apps_token_classes_follow_the_host_theme() {
         minify: false,
         split: false,
         ui_sets: Vec::new(),
+        ..Default::default()
     })
     .unwrap();
     let bytecode = nsh_js::compile_bytecode(&bundle.code, false).unwrap();
@@ -141,6 +148,7 @@ fn a_tsx_apps_token_classes_follow_the_host_theme() {
         app: App::Js(unsafe { nsh_engine::Bundle::bytecode(bytecode) }),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -151,7 +159,7 @@ fn a_tsx_apps_token_classes_follow_the_host_theme() {
         limits: nsh_engine::Limits::default(),
         ui_sets: vec![nsh_base::registry()],
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         cache: nsh_engine::CacheOptions::off(),
         storage: None,
         clock: Default::default(),
@@ -161,6 +169,10 @@ fn a_tsx_apps_token_classes_follow_the_host_theme() {
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
     assert_eq!(backgrounds(&rx), vec![default_primary()]);
@@ -217,6 +229,7 @@ fn a_hosts_theme_overrides_win_over_the_apps_tokens_they_set_and_keep_the_rest()
         minify: false,
         split: false,
         ui_sets: Vec::new(),
+        ..Default::default()
     })
     .unwrap();
     let bytecode = nsh_js::compile_bytecode(&bundle.code, false).unwrap();
@@ -226,6 +239,7 @@ fn a_hosts_theme_overrides_win_over_the_apps_tokens_they_set_and_keep_the_rest()
         app: App::Js(unsafe { nsh_engine::Bundle::bytecode(bytecode) }),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -236,7 +250,7 @@ fn a_hosts_theme_overrides_win_over_the_apps_tokens_they_set_and_keep_the_rest()
         limits: nsh_engine::Limits::default(),
         ui_sets: vec![nsh_base::registry()],
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         storage: None,
         clock: Default::default(),
         context: Default::default(),
@@ -245,7 +259,11 @@ fn a_hosts_theme_overrides_win_over_the_apps_tokens_they_set_and_keep_the_rest()
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
         cache: Default::default(),
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     // A brand's primary, light and dark, set before the app runs.
     let overrides = nsh_base::theme_overrides(
@@ -332,6 +350,7 @@ fn start_branded(
         minify: false,
         split: false,
         ui_sets: Vec::new(),
+        ..Default::default()
     })
     .unwrap();
     let _ = std::fs::remove_dir_all(&dir);
@@ -342,6 +361,7 @@ fn start_branded(
         app: App::Js(unsafe { nsh_engine::Bundle::bytecode(bytecode) }),
         viewport: Size::new(px(390.0), px(844.0)),
         trace: false,
+        content_culling: false,
         network: None,
         websocket: None,
         refuse_connections: None,
@@ -352,7 +372,7 @@ fn start_branded(
         limits: nsh_engine::Limits::default(),
         ui_sets: vec![nsh_base::registry()],
         runtime: None,
-        data_dir: None,
+        support_dir: None,
         storage: None,
         clock: Default::default(),
         context: Default::default(),
@@ -361,7 +381,11 @@ fn start_branded(
         host: Default::default(),
         picker: None,
         speech: None,
+        audio: None,
         cache: Default::default(),
+        windows: None,
+        login_item: None,
+        data_dir: None,
     };
     let engine = Engine::start_with(
         config,
@@ -404,4 +428,173 @@ fn the_host_tokens_win_in_the_first_render_and_reads_follow_their_changes() {
     assert_eq!(last_text(&rx).as_deref(), Some("#abcdefff #00ff00ff"));
     engine.control().set_tokens(None);
     assert_eq!(last_text(&rx).as_deref(), Some("#abcdefff #123456ff"));
+}
+
+/// A TSX app that sets its theme while it runs: a step every 100 ms, each
+/// showing what `token("brand")` reads right after it, and a view drawn
+/// with `bg-brand`.
+const SET_THEME: &str = r##"import { effect, mount, setColorScheme, setTheme, signal, Text, token, View } from "nsh";
+
+const status = signal("start");
+let runs = 0;
+const steps = [
+  () => {
+    setTheme({ cssVars: { light: { brand: "#00ff00" }, dark: { brand: "#003300" } } });
+    return `set ${token("brand")}`;
+  },
+  () => {
+    setColorScheme("dark");
+    return `dark ${token("brand")}`;
+  },
+  () => {
+    setColorScheme("light");
+    try {
+      setTheme({ cssVars: { light: { brand: "#0000ff" }, dark: { brand: "#zz" } } });
+      return "taken";
+    } catch (e) {
+      return `${e.name}: ${e.message}; kept ${token("brand")}`;
+    }
+  },
+  () => {
+    setTheme(null);
+    return `back ${token("brand")}`;
+  },
+  () => `runs ${runs}`,
+];
+steps.forEach((step, i) => setTimeout(() => status.set(step()), 100 * (i + 1)));
+
+function App() {
+  effect(() => {
+    token("brand");
+    runs += 1;
+  });
+  return (
+    <View>
+      <View class="h-4 bg-brand" />
+      <Text>{status()}</Text>
+    </View>
+  );
+}
+
+mount(() => <App />);
+"##;
+
+/// `setTheme` replaces the app's theme while it runs: `token()` reads it in
+/// the same turn and the classes naming its tokens follow, in each
+/// appearance; a theme with a value NSH cannot read throws a `TypeError`
+/// naming it and changes nothing; `null` gives back `nsh.json`'s. Each
+/// change runs what read a token once.
+#[test]
+fn set_theme_replaces_the_apps_theme_while_it_runs() {
+    let config = r##"{ "theme": { "cssVars": { "light": { "brand": "#123456" }, "dark": { "brand": "#654321" } } } }"##;
+    let (_engine, rx) =
+        crate::components::start_with(SET_THEME, Environment::default(), None, Some(config));
+    let batches = crate::components::until(&rx, |b| crate::components::shows(b, "runs 5"));
+    let texts: Vec<&str> = batches
+        .iter()
+        .flat_map(|b| &b.items)
+        .filter_map(|item| match item {
+            MountItem::Text { text, .. } => Some(&*text.text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "start",
+            "set #00ff00ff",
+            "dark #003300ff",
+            "TypeError: setTheme: `brand`: #zz is no color in the dark appearance; kept #00ff00ff",
+            "back #123456ff",
+            "runs 5",
+        ]
+    );
+    let mut backgrounds: Vec<Color> = batches
+        .iter()
+        .flat_map(|b| &b.items)
+        .filter_map(|item| match item {
+            MountItem::ViewStyle { style, .. } if style.background_color.0 & 0xff != 0 => {
+                Some(style.background_color)
+            }
+            _ => None,
+        })
+        .collect();
+    backgrounds.dedup();
+    assert_eq!(
+        backgrounds,
+        [
+            Color(0x123456ff),
+            Color(0x00ff00ff),
+            Color(0x003300ff),
+            Color(0x00ff00ff),
+            Color(0x123456ff),
+        ]
+    );
+}
+
+#[test]
+fn set_theme_refuses_malformed_themes_without_changing_tokens_or_views() {
+    let source = r##"import { mount, setTheme, signal, Text, token, View } from "nsh";
+const status = signal("start");
+setTimeout(() => {
+  const invalid = [
+    { cssVars: null },
+    { cssVars: [] },
+    { cssVars: true },
+    { cssVars: 12 },
+    { cssVars: "light" },
+    { cssVars: { light: { brand: "rgb(255 0 0" } } },
+    { cssVars: { light: { brand: "oklch(0.7 0.1" } } },
+    { cssVars: { light: { brand: "var(--nothing" } } },
+    { cssVars: { light: { brand: "#zz" }, dark: { brand: "12px" } } },
+    { cssVars: { light: { brand: "rgb(255 0 0)garbage" } } },
+    { cssVars: { light: { brand: "rgb(255 0 0)inset-x" } } },
+    { cssVars: { light: { brand: "color-mix(in srgb, rgb(255 0 0) 50%, blue)garbage" } } },
+    { cssVars: { light: { brand: "var(--primary)garbage" } } },
+  ];
+  const results = invalid.map(theme => {
+    setTheme({ cssVars: { light: { brand: "#00ff00" } } });
+    try { setTheme(theme); return "taken"; }
+    catch (error) { return `${error.name} kept ${token("brand")}`; }
+  });
+  status.set(results.join("; "));
+}, 100);
+mount(() => <View><View class="h-4 bg-brand" /><Text>{status()}</Text></View>);
+"##;
+    let config = r##"{ "theme": { "cssVars": { "light": { "brand": "#123456" } } } }"##;
+    let (_engine, rx) =
+        crate::components::start_with(source, Environment::default(), None, Some(config));
+    let expected = ["TypeError kept #00ff00ff"; 13].join("; ");
+    let batches = crate::components::until(&rx, |b| crate::components::shows(b, &expected));
+    let texts: Vec<&str> = batches
+        .iter()
+        .flat_map(|b| &b.items)
+        .filter_map(|item| match item {
+            MountItem::Text { text, .. } => Some(&*text.text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(texts.last().copied(), Some(expected.as_str()));
+    let themed = batches
+        .iter()
+        .flat_map(|b| &b.items)
+        .find_map(|item| match item {
+            MountItem::ViewStyle { id, style } if style.background_color == Color(0x123456ff) => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("the built theme paints the themed view before the timer runs");
+    let mut backgrounds: Vec<Color> = batches
+        .iter()
+        .flat_map(|b| &b.items)
+        .filter_map(|item| match item {
+            // Keep transparent changes too: dropping the token must not
+            // leave the preceding opaque color as the last value seen.
+            MountItem::ViewStyle { id, style } if *id == themed => Some(style.background_color),
+            _ => None,
+        })
+        .collect();
+    backgrounds.dedup();
+    assert_eq!(backgrounds, [Color(0x123456ff), Color(0x00ff00ff)]);
 }

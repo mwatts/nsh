@@ -25,9 +25,9 @@
 //! The final layout ([`GpuiLayout`]) is plain data: per line its metrics,
 //! its clusters' boxes (hit testing, selections, decorations) and glyphs
 //! (font, id, size, position). Colors and decorations are not part of it:
-//! the core reuses a layout for text that only differs in them
-//! (`AttributedText::layout_eq`), so [`draw`] reads them from the drawn
-//! text's spans.
+//! [`draw`] reads them from the drawn text's spans, so the core keeps a
+//! layout for text that only differs in its colors
+//! (`TextEngine::draws_colors_from_text`).
 //!
 //! Selectable text follows desktop conventions, as on Windows and Linux
 //! ([`Selection`]).
@@ -200,34 +200,62 @@ const FANTASY: &[&str] = &["Impact", "Papyrus"];
 /// The families a `fontFamily` value names, in order of preference: a
 /// comma-separated stack, CSS generic names and Apple's font names as fonts
 /// this platform has; `""` is the UI font.
-fn family_candidates(name: &str) -> Vec<&str> {
-    use nsh_core::FamilyName;
+fn family_candidates(name: &str) -> Vec<std::borrow::Cow<'_, str>> {
+    use std::borrow::Cow;
+
+    if name.contains('\\') {
+        let mut out = Vec::new();
+        nsh_core::for_each_font_family(name, |family| {
+            let mut candidates = Vec::new();
+            family_candidate(family, &mut candidates);
+            out.extend(candidates.into_iter().map(|f| Cow::Owned(f.into_owned())));
+        });
+        if out.is_empty() {
+            out.push(Cow::Borrowed(""));
+        }
+        return out;
+    }
     let mut out = Vec::new();
     for family in nsh_core::font_families(name) {
-        match family {
-            FamilyName::Monospace => out.extend_from_slice(MONOSPACE),
-            FamilyName::Serif => out.extend_from_slice(SERIF),
-            FamilyName::Named("cursive") => out.extend_from_slice(CURSIVE),
-            FamilyName::Named("fantasy") => out.extend_from_slice(FANTASY),
-            FamilyName::Named(f) => {
-                out.push(f);
-                // What apps written for Apple platforms name, as what
-                // this platform has (when it lacks the font itself).
-                out.extend_from_slice(match f {
-                    "Menlo" | "Monaco" | "SF Mono" | "Courier" | "Courier New" => MONOSPACE,
-                    "Times" | "New York" | "Georgia" => SERIF,
-                    "Helvetica" | "Helvetica Neue" | "Arial" => SANS,
-                    _ => &[],
-                });
-            }
-            // The system font, and its rounded design (which GPUI lacks).
-            _ => out.push(""),
-        }
+        family_candidate(family, &mut out);
     }
     if out.is_empty() {
-        out.push("");
+        out.push(Cow::Borrowed(""));
     }
     out
+}
+
+fn family_candidate<'a>(
+    family: nsh_core::FamilyName<'a>,
+    out: &mut Vec<std::borrow::Cow<'a, str>>,
+) {
+    use std::borrow::Cow;
+
+    use nsh_core::FamilyName;
+    match family {
+        FamilyName::Monospace => out.extend(MONOSPACE.iter().copied().map(Cow::Borrowed)),
+        FamilyName::Serif => out.extend(SERIF.iter().copied().map(Cow::Borrowed)),
+        FamilyName::Named("cursive") => {
+            out.extend(CURSIVE.iter().copied().map(Cow::Borrowed));
+        }
+        FamilyName::Named("fantasy") => {
+            out.extend(FANTASY.iter().copied().map(Cow::Borrowed));
+        }
+        FamilyName::Named(f) => {
+            // What apps written for Apple platforms name, as what
+            // this platform has (when it lacks the font itself).
+            let aliases = match f {
+                "Menlo" | "Monaco" | "SF Mono" | "Courier" | "Courier New" => MONOSPACE,
+                "Times" | "New York" | "Georgia" => SERIF,
+                "Helvetica" | "Helvetica Neue" | "Arial" => SANS,
+                _ => &[],
+            };
+            out.push(Cow::Borrowed(f));
+            out.extend(aliases.iter().copied().map(Cow::Borrowed));
+        }
+        // The system font, and its rounded design (which GPUI lacks).
+        _ => out.push(Cow::Borrowed("")),
+    }
 }
 
 /// The family of the UI font among the `installed` ones (by lowercase
@@ -865,8 +893,9 @@ impl Prepared {
             let s = &self.spans[i];
             nsh_core::FontExtent::new(Points(s.ascent), Points(s.descent), Points(s.x))
         };
-        let (up, down) = a.extent(font, alignments.get(a.index));
-        (a.ascent(font, alignments.get(a.index)).0, up.0, down.0)
+        // By its own baseline where it has one (the first baseline of the text in it).
+        let (up, down) = alignments.extent(a, font);
+        (alignments.ascent(a, font).0, up.0, down.0)
     }
 
     /// The width of clusters `start..end` without trailing whitespace.
@@ -1258,6 +1287,11 @@ impl Builder<'_> {
 impl TextEngine for GpuiTextEngine {
     type Prepared = Prepared;
 
+    fn draws_colors_from_text(&self) -> bool {
+        // Colors and decorations are read from the drawn text's spans.
+        true
+    }
+
     fn prepare(&self, t: &AttributedText) -> Prepared {
         self.prepare_aligned(t, &nsh_core::AttachmentAlignments::default())
     }
@@ -1408,22 +1442,35 @@ impl TextEngine for GpuiTextEngine {
             last = Some(line);
             true
         });
-        // A last line ending its paragraph gets the ellipsis after it.
+        // A last line ending its paragraph gets the ellipsis after it; one
+        // inside it holds the rest of the paragraph, cut at the box
+        // (`layout`).
         if more
             && p.ellipsizes()
             && !p.cuts_inside()
             && let Some(line) = last
-            && line.last
         {
-            let span = p.clusters[..line.end as usize]
-                .last()
-                .map_or(p.paragraphs[line.paragraph as usize].span, |c| c.span);
-            width = width.max(line.width + self.ellipsis(p, span).advance);
+            if line.last {
+                let span = p.clusters[..line.end as usize]
+                    .last()
+                    .map_or(p.paragraphs[line.paragraph as usize].span, |c| c.span);
+                width = width.max(line.width + self.ellipsis(p, span).advance);
+            } else {
+                width = max;
+            }
         }
         if max.is_finite() {
             width = width.min(max);
         }
         Size::new(Points(width.ceil()), Points(height.ceil()))
+    }
+
+    fn first_baseline(&self, p: &Prepared, width: Points) -> Option<Points> {
+        // Typeset at the size it measures `width` wide, as the text is laid
+        // out: its first line's baseline.
+        let layout = self.layout(p, self.measure(p, Some(width)));
+        let layout = layout.downcast::<GpuiLayout>()?;
+        Some(Points(layout.lines.first()?.baseline))
     }
 
     fn layout(&self, p: &Prepared, size: Size<Points>) -> TextLayout {
@@ -1471,11 +1518,30 @@ impl TextEngine for GpuiTextEngine {
         } else {
             let count = broken.len();
             for (k, line) in broken.iter().enumerate() {
-                let mut items: Vec<Item> = (line.start..line.end).map(Item::Cluster).collect();
-                let trim = p.ellipsizes()
-                    && ((k + 1 == count && more) || (t.no_wrap && line.width > avail.0 + EPSILON));
+                let clamped = k + 1 == count && more && p.ellipsizes();
+                let line = &if clamped && !line.last {
+                    // The last line a clamp shows holds the rest of its
+                    // paragraph and is cut at the box, as CoreText, Pango
+                    // and StaticLayout cut it: ending it where it broke
+                    // would leave the ellipsis after a word that fit and
+                    // the box empty past it (`truncate` in a row).
+                    let end = p.paragraphs[line.paragraph as usize].clusters.end;
+                    Broken {
+                        end,
+                        width: p.width(line.start, end),
+                        last: true,
+                        ..*line
+                    }
+                } else {
+                    *line
+                };
+                let trim =
+                    clamped || (p.ellipsizes() && t.no_wrap && line.width > avail.0 + EPSILON);
+                let mut items: Vec<Item> = Vec::new();
                 if trim {
                     self.trim_tail(p, line, &mut items, avail.0);
+                } else {
+                    items.extend((line.start..line.end).map(Item::Cluster));
                 }
                 rows.push(Row {
                     items,
@@ -1618,13 +1684,19 @@ fn visual_order(levels: &[u8]) -> Vec<usize> {
 }
 
 impl GpuiTextEngine {
-    /// Cuts the end of `line` for an ellipsis that fits in `avail`.
+    /// Pushes the clusters of `line` that fit in `avail` with an ellipsis
+    /// after them, and the ellipsis.
     fn trim_tail(&self, p: &Prepared, line: &Broken, items: &mut Vec<Item>, avail: f32) {
         let span = p.clusters[line.start as usize..line.end as usize]
             .last()
             .map_or(p.paragraphs[line.paragraph as usize].span, |c| c.span);
         let advance = self.ellipsis(p, span).advance;
-        let mut end = line.end;
+        // Past every cluster whose pen (trailing spaces included) fits: a
+        // clamped line can hold a whole long paragraph.
+        let base = p.prefix[line.start as usize];
+        let fits = p.prefix[line.start as usize + 1..=line.end as usize]
+            .partition_point(|&x| (x - base) as f32 + advance <= avail + EPSILON);
+        let mut end = (line.start + fits as u32 + 1).min(line.end);
         while end > line.start && p.width(line.start, end) + advance > avail + EPSILON {
             end -= 1;
         }
@@ -1640,7 +1712,7 @@ impl GpuiTextEngine {
         } else {
             span
         };
-        items.truncate((end - line.start) as usize);
+        items.extend((line.start..end).map(Item::Cluster));
         items.push(Item::Ellipsis { span, at });
     }
 
@@ -1965,6 +2037,18 @@ pub(crate) struct GpuiLayout {
 }
 
 impl GpuiLayout {
+    /// The glyphs drawn of `text`: all but those of hidden runs
+    /// (`ResolvedTextStyle::hidden`), whose emoji keep their own colors
+    /// and whose shadow and animated color would show them.
+    fn shown_glyphs<'a>(&'a self, text: &'a AttributedText) -> impl Iterator<Item = &'a Glyph> {
+        let hidden = text.has_hidden();
+        self.glyphs
+            .iter()
+            .filter(move |g| !hidden || !text.hidden_at(g.style))
+    }
+}
+
+impl GpuiLayout {
     /// The line at height `y`, if any.
     fn line_at(&self, y: f32) -> Option<&Line> {
         self.lines
@@ -2285,7 +2369,7 @@ pub(crate) fn draw_shadow(cx: &mut DrawCx<'_>, state: &ViewState) {
     }
     let mut glyphs = Vec::with_capacity(layout.glyphs.len() * offsets.len());
     for &(dx, dy) in &offsets {
-        for g in &layout.glyphs {
+        for g in layout.shown_glyphs(&drawn.text) {
             let o = cx.map(ox + dx + g.x, oy + dy + g.y);
             glyphs.push((o, g.font, g.id, px(g.size * k), Some(color)));
         }
@@ -2319,9 +2403,12 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
         .or(drawn.area_range)
     {
         let tint = selection_tint(text);
-        layout.selection_rects(range, |x, y, w, h| {
-            cx.fill_rect(crate::geom::rect(ox + x, oy + y, w, h), [0.0; 4], tint);
-        });
+        // Hidden characters show no highlight, as nothing of them shows.
+        for shown in text.visible_ranges(range.0..range.1) {
+            layout.selection_rects((shown.start, shown.end), |x, y, w, h| {
+                cx.fill_rect(crate::geom::rect(ox + x, oy + y, w, h), [0.0; 4], tint);
+            });
+        }
     }
     if layout.boxes.is_empty() {
         return;
@@ -2340,7 +2427,7 @@ pub(crate) fn draw(cx: &mut DrawCx<'_>, state: &ViewState) {
         .color
         .or_else(|| state.live.as_ref()?.text_color());
     let mut glyphs = Vec::with_capacity(layout.glyphs.len());
-    for g in &layout.glyphs {
+    for g in layout.shown_glyphs(text) {
         let o = cx.map(ox + g.x, oy + g.y);
         let color = if g.emoji {
             None
@@ -2402,6 +2489,7 @@ fn decorate(
             let x1 = (boxes[j - 1].x + boxes[j - 1].w).min((line.info.x + line.info.width).0);
             if x1 > x0
                 && let Some(s) = text.spans.get(span)
+                && !s.style.hidden
             {
                 stroke(
                     cx,
@@ -2530,7 +2618,7 @@ pub(crate) fn draw_silhouette(
     let tint = Some(cx.color(color));
     let mut glyphs = Vec::with_capacity(layout.glyphs.len() * offsets.len());
     // Emoji draw in their own colors: they cast no silhouette.
-    for g in layout.glyphs.iter().filter(|g| !g.emoji) {
+    for g in layout.shown_glyphs(&drawn.text).filter(|g| !g.emoji) {
         for &(dx, dy) in offsets {
             let o = cx.map(ox + g.x + dx, oy + g.y + dy);
             glyphs.push((o, g.font, g.id, px(g.size * k), tint));
@@ -2860,7 +2948,7 @@ pub(crate) fn context_menu(surface: &Rc<crate::surface::Surface>, view: &NshView
         vec![
             LocalItem::Item {
                 role: Some(MenuRole::Copy),
-                label: "",
+                label: "".into(),
                 enabled: selected,
                 action: Rc::new(move |_| {
                     if let Some(text) = selected_text(&copy) {
@@ -2870,7 +2958,7 @@ pub(crate) fn context_menu(surface: &Rc<crate::surface::Surface>, view: &NshView
             },
             LocalItem::Item {
                 role: Some(MenuRole::SelectAll),
-                label: "",
+                label: "".into(),
                 enabled: true,
                 action: Rc::new(move |s| select_all(s.key(), &all)),
             },
@@ -2878,13 +2966,12 @@ pub(crate) fn context_menu(surface: &Rc<crate::surface::Surface>, view: &NshView
     );
 }
 
-/// The selected text of `view`, without attachments' placeholders.
+/// The selected text of `view`, without attachments' placeholders and
+/// hidden runs.
 fn selected_text(view: &NshView) -> Option<String> {
     let (a, b) = view_selection(view)?.range.get()?;
     let state = view.state();
-    let text: Vec<u16> = state.text.as_ref()?.text.text.encode_utf16().collect();
-    let part = text.get(a as usize..(b as usize).min(text.len()))?;
-    Some(String::from_utf16_lossy(part).replace(ATTACHMENT_CHAR, ""))
+    Some(state.text.as_ref()?.text.copied_text(a..b)).filter(|t| !t.is_empty())
 }
 
 /// Selects all of `view`'s text.
@@ -3163,6 +3250,10 @@ mod tests {
 
     #[test]
     fn families() {
+        let plain = family_candidates("Inter");
+        assert!(matches!(plain[0], std::borrow::Cow::Borrowed("Inter")));
+        assert_eq!(family_candidates(r#"'A\\B', 'A\"B'"#), [r"A\B", "A\"B"]);
+
         assert_eq!(family_candidates("Inter"), ["Inter"]);
         assert_eq!(family_candidates("system-ui"), [""]);
         assert_eq!(family_candidates(" , "), [""]);
@@ -3459,9 +3550,10 @@ mod tests {
         let style = ResolvedTextStyle::default();
         // The first line's top of a 30 pt attachment after "Ax", and the
         // line's extent above and below its baseline.
-        let place = |align| {
+        let place_by = |align, baseline: Option<f32>| {
             let mut t = text(&[("Ax", style)]);
             let mut alignments = nsh_core::AttachmentAlignments::default();
+            alignments.set_baseline(t.len_utf16(), baseline.map(Points));
             alignments.push(
                 &mut t,
                 nsh_core::geometry::size(Points(10.0), Points(30.0)),
@@ -3475,6 +3567,7 @@ mod tests {
             let top = engine.attachments(&layout)[0].expect("shown").y.0;
             (top, line.ascender.0, line.descender.0)
         };
+        let place = |align| place_by(align, None);
         let near = |a: f32, b: f32| (a - b).abs() < 0.01;
         // Its bottom on the baseline.
         let (top, up, _) = place(nsh_core::VerticalAlign::Baseline);
@@ -3491,6 +3584,40 @@ mod tests {
         // Its middle above the baseline.
         let (top, up, _) = place(nsh_core::VerticalAlign::Middle);
         assert!(top + 15.0 < up, "{top} {up}");
+        // By a baseline of its own 22 below its top (the first baseline of the text in it): that
+        // one stands on the line's, the 8 under it in the line's descent.
+        let (top, up, down) = place_by(nsh_core::VerticalAlign::Baseline, Some(22.0));
+        assert!(near(top + 22.0, up) && down > 7.99, "{top} {up} {down}");
+    }
+
+    /// A text's first baseline (what `align-items: baseline` lines it up
+    /// by) is where its first line is drawn, wrapped or not, and grows
+    /// with the font.
+    #[test]
+    fn the_first_baseline_is_the_first_lines() {
+        let Some(engine) = engine() else {
+            return;
+        };
+        let at = |size: f32, width: Option<f32>| {
+            let t = text(&[("Chat with the world", plain(size))]);
+            let (measured, layout) = layout_of(&engine, &t, width);
+            let prepared = engine.prepare(&t);
+            let baseline = engine
+                .first_baseline(&prepared, measured.width)
+                .expect("a first line");
+            let line = engine.lines(&layout).remove(0);
+            (baseline.0, line.y.0 + line.ascender.0)
+        };
+        let near = |a: f32, b: f32| (a - b).abs() < 0.5;
+        let (small, drawn) = at(12.0, None);
+        assert!(near(small, drawn), "{small} {drawn}");
+        let (wrapped, drawn) = at(12.0, Some(30.0));
+        assert!(
+            near(wrapped, drawn) && near(wrapped, small),
+            "{wrapped} {drawn}"
+        );
+        let (large, _) = at(24.0, None);
+        assert!(large > small, "{large} {small}");
     }
 
     #[test]
@@ -3585,6 +3712,52 @@ mod tests {
         t.ellipsize = EllipsizeMode::Middle;
         let (_, layout) = layout_of(&engine, &t, Some(160.0));
         assert_eq!(shown(&t, &layout), "Short");
+    }
+
+    /// A line clamp cuts its last line at the box, inside a word if need
+    /// be, not after the last word that fit there: a `truncate`d name in
+    /// a row ended at a space or hyphen with the box empty past it.
+    #[test]
+    fn clamped_last_line_is_cut_at_the_box() {
+        let Some(engine) = engine() else {
+            return;
+        };
+        let style = plain(15.0);
+        let box_width = 150.0;
+        for (long, max_lines) in [
+            ("Hohenzollern-Sigmaringen-Wittelsbach", 1),
+            ("Karl Anton Hohenzollern-Sigmaringen", 1),
+            ("Christopher Montgomery Wellington", 1),
+            (
+                "Christopher Montgomery-Wellington the Third, Senior Equity Strategist",
+                2,
+            ),
+        ] {
+            let mut t = text(&[(long, style)]);
+            t.max_lines = max_lines;
+            t.ellipsize = EllipsizeMode::Tail;
+            let (size, layout) = layout_of(&engine, &t, Some(box_width));
+            assert_eq!(size.width.0, box_width, "{long}");
+            let s = shown(&t, &layout);
+            assert!(s.ends_with('…'), "{long}: {s}");
+            let lines = engine.lines(&layout);
+            assert_eq!(lines.len(), max_lines as usize, "{long}: {s}");
+            let last = lines.last().unwrap();
+            let end = last.x.0 + last.width.0;
+            assert!(end <= box_width + 0.01, "{long}: {s} ends at {end}");
+            // It keeps all that fits: one more letter would not.
+            let start = last.start as usize;
+            let kept = s.rsplit('|').next().unwrap().trim_end_matches('…');
+            let mut next = start + kept.len();
+            while long.as_bytes()[next] == b' ' {
+                next += 1;
+            }
+            let longer = format!("{}…", &long[start..=next]);
+            let (longer, _) = layout_of(&engine, &text(&[(&longer, style)]), None);
+            assert!(longer.width.0 > box_width, "{long}: {s} could keep more");
+            // The ellipsis stands for the rest of the text.
+            assert_eq!(last.end as usize, long.encode_utf16().count(), "{long}");
+        }
     }
 
     #[test]
@@ -3823,6 +3996,8 @@ mod tests {
                 color: Color(0xeeee_eeff),
                 radius: Points(4.0),
                 node: 4,
+                top: Default::default(),
+                bottom: Default::default(),
             }),
             ..style
         };
@@ -4026,6 +4201,36 @@ mod tests {
         let latin = h("Grace");
         assert_eq!(h("Grace你好世界"), latin, "CJK");
         assert_eq!(h("Grace😀"), latin, "emoji");
+    }
+
+    /// Nothing of a hidden run is drawn: not its emoji, which keep their
+    /// own colors, nor (in a shadow or an animated color) its other glyphs.
+    #[test]
+    fn hidden_runs_draw_no_glyphs() {
+        let Some(engine) = engine() else {
+            return;
+        };
+        let mut t = text(&[("ab ", plain(16.0))]);
+        // As the core hides a span.
+        let hidden = ResolvedTextStyle {
+            hidden: true,
+            color: nsh_core::Color::TRANSPARENT,
+            ..plain(16.0)
+        };
+        t.push("\u{1F389} cd", hidden);
+        let (_, layout) = layout_of(&engine, &t, None);
+        let l = layout.downcast::<GpuiLayout>().unwrap();
+        let shown: Vec<u32> = l.shown_glyphs(&t).map(|g| g.style).collect();
+        assert!(
+            !shown.is_empty() && shown.iter().all(|&at| at < 3),
+            "{shown:?}"
+        );
+        assert!(l.shown_glyphs(&t).all(|g| !g.emoji));
+        assert!(l.glyphs.len() > shown.len());
+        // Shown again, all are drawn.
+        let mut t = text(&[("ab ", plain(16.0))]);
+        t.push("\u{1F389} cd", plain(16.0));
+        assert_eq!(l.shown_glyphs(&t).count(), l.glyphs.len());
     }
 
     #[test]

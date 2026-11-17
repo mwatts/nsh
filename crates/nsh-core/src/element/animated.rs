@@ -162,8 +162,8 @@ impl DerivedKey {
                 input, min, max, ..
             } => {
                 input.hash(&mut h);
-                number(&mut h, *min);
-                number(&mut h, *max);
+                operand(&mut h, min);
+                operand(&mut h, max);
             }
             _ => {}
         }
@@ -298,18 +298,18 @@ impl AnimatedNode {
         &self,
         key: DerivedKey,
         now: Option<AnimationOp>,
-        other: Option<AnimatedNode>,
+        others: &[Option<AnimatedNode>],
     ) -> (AnimatedNode, bool) {
         let Some(node) = self.live() else {
             return (Self::gone(), false);
         };
-        let other = match other {
-            Some(other) => match other.live() {
-                Some(other) => Some(other),
+        let mut live = Vec::new();
+        for other in others.iter().flatten() {
+            match other.live() {
+                Some(other) => live.push(other),
                 None => return (Self::gone(), false),
-            },
-            None => None,
-        };
+            }
+        }
         let Some(executor) = node.executor() else {
             // The surface is gone: a node nothing reads.
             return (*self, false);
@@ -330,7 +330,7 @@ impl AnimatedNode {
         }
         drop(derived);
         let mut inputs = vec![node.0];
-        inputs.extend(other.map(|o| o.0));
+        inputs.extend(live.into_iter().map(|o| o.0));
         let op = now.unwrap_or_else(|| key.op.clone());
         let node = Node::new(&executor, |id| with_node(op, id), inputs);
         let weak = Rc::downgrade(&node);
@@ -444,7 +444,7 @@ impl AnimatedNode {
                 dark,
             },
             now,
-            None,
+            &[],
         )
     }
 
@@ -452,7 +452,7 @@ impl AnimatedNode {
         let a = Operand::Node(self.id());
         let b = other.operand;
         let op = AnimationOp::CreateMath { node: 0, op, a, b };
-        self.derive(DerivedKey { op, dark: None }, None, other.node)
+        self.derive(DerivedKey { op, dark: None }, None, &[other.node])
             .0
     }
 
@@ -482,23 +482,36 @@ impl AnimatedNode {
     }
 
     /// Follows the value's changes but stays within `min..=max` (a header
-    /// hiding as content scrolls up).
-    pub fn diff_clamp(&self, min: f32, max: f32) -> AnimatedNode {
+    /// hiding as content scrolls up). Each bound is a number or another
+    /// animated value, read at each evaluation: a range that changes while
+    /// dragging clamps at its current bounds.
+    pub fn diff_clamp(
+        &self,
+        min: impl Into<AnimationOperand>,
+        max: impl Into<AnimationOperand>,
+    ) -> AnimatedNode {
         self.diff_clamp_with(min, max, DiffClamp::default())
     }
 
     /// [`Self::diff_clamp`] with options: [`DiffClamp::snapping`] settles at
     /// the nearer bound when the scroll view the value follows comes to rest
     /// (TS: `diffClamp(min, max, { snap: true })`).
-    pub fn diff_clamp_with(&self, min: f32, max: f32, options: DiffClamp) -> AnimatedNode {
+    pub fn diff_clamp_with(
+        &self,
+        min: impl Into<AnimationOperand>,
+        max: impl Into<AnimationOperand>,
+        options: DiffClamp,
+    ) -> AnimatedNode {
+        let (min, max) = (min.into(), max.into());
         let op = AnimationOp::CreateDiffClamp {
             node: 0,
             input: self.id(),
-            min,
-            max,
+            min: min.operand,
+            max: max.operand,
             snap: options.snap,
         };
-        self.derive(DerivedKey { op, dark: None }, None, None).0
+        self.derive(DerivedKey { op, dark: None }, None, &[min.node, max.node])
+            .0
     }
 }
 
@@ -606,18 +619,40 @@ impl Default for Interpolation {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub struct AnimatedValue(AnimatedNode);
 
-/// How a spring moves (TS's defaults: stiffness 170, damping 26, mass 1).
+/// How a spring moves (TS's defaults: stiffness 170, damping 26, mass 1):
+/// an animated value's ([`AnimatedValue::spring`]) and a layout
+/// animation's ([`LayoutTransition::spring`](crate::LayoutTransition::spring)).
+///
+/// Made as `gpui-base`'s `Spring` is, from how long it takes and how much it
+/// overshoots ([`Spring::new`], [`Spring::damping_ratio`]), or from a
+/// stiffness, as Material 3's motion tokens give it
+/// ([`Spring::from_stiffness`]); its fields are the physics either way.
+///
+/// ```
+/// use nsh_core::element::Spring;
+///
+/// // `gpui-component`'s `spring_move`: a 280 ms response, a little springy.
+/// let spring = Spring::new(280.0).damping_ratio(0.85);
+/// assert!((spring.settle_ms() - 362.2).abs() < 0.1);
+/// // Material 3 Expressive's fast spatial spring.
+/// let spring = Spring::from_stiffness(800.0).damping_ratio(0.6);
+/// assert!((spring.settle_ms() - 407.0).abs() < 0.1);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spring {
     /// Stiffness `k`.
     pub stiffness: f32,
-    /// Damping `c`.
+    /// Damping coefficient `c` (not a ratio: the ratio is `c / (2 √(k m))`,
+    /// [`Spring::damping_ratio`] sets it).
     pub damping: f32,
     /// Mass `m`.
     pub mass: f32,
     /// The velocity it starts with (per second); `None` keeps the current
     /// one.
     pub velocity: Option<f32>,
+    /// The highest frame rate it needs, in Hz (TS's `frameRate`); `None`:
+    /// the screen's highest ([`Driver::frame_rate`]).
+    pub frame_rate: Option<f32>,
 }
 
 impl Default for Spring {
@@ -627,6 +662,7 @@ impl Default for Spring {
             damping: 26.0,
             mass: 1.0,
             velocity: None,
+            frame_rate: None,
         }
     }
 }
@@ -641,6 +677,9 @@ pub struct Timing {
     pub easing: Easing,
     /// How long it waits before it starts, in milliseconds.
     pub delay_ms: f32,
+    /// The highest frame rate it needs, in Hz (TS's `frameRate`); `None`:
+    /// the screen's highest ([`Driver::frame_rate`]).
+    pub frame_rate: Option<f32>,
 }
 
 impl Timing {
@@ -650,7 +689,14 @@ impl Timing {
             duration_ms,
             easing,
             delay_ms: 0.0,
+            frame_rate: None,
         }
+    }
+
+    /// Needing at most `hz` frames per second (a slow fade: 30).
+    pub const fn frame_rate(mut self, hz: f32) -> Self {
+        self.frame_rate = Some(hz);
+        self
     }
 
     fn driver(self, to: f32) -> Driver {
@@ -659,6 +705,7 @@ impl Timing {
             duration_ms: self.duration_ms,
             easing: self.easing,
             delay_ms: self.delay_ms,
+            frame_rate: self.frame_rate,
         }
     }
 }
@@ -670,6 +717,113 @@ impl Default for Timing {
 }
 
 impl Spring {
+    /// `gpui-base`'s `Spring::new(response)`: a mass of 1 that would swing
+    /// once in `response_ms` undamped, critically damped (no overshoot).
+    /// The response is the scale the motion is felt at, not when it stops
+    /// ([`Spring::settle_ms`]).
+    pub fn new(response_ms: f32) -> Self {
+        let omega = std::f32::consts::TAU / (response_ms / 1000.0);
+        Self {
+            stiffness: omega * omega,
+            damping: 2.0 * omega,
+            mass: 1.0,
+            velocity: None,
+            frame_rate: None,
+        }
+    }
+
+    /// A mass of 1 on a spring of `stiffness`, critically damped: a design
+    /// system's stiffness token, its damping ratio set with
+    /// [`Spring::damping_ratio`].
+    pub fn from_stiffness(stiffness: f32) -> Self {
+        Self {
+            stiffness,
+            damping: 2.0 * stiffness.max(0.0).sqrt(),
+            mass: 1.0,
+            velocity: None,
+            frame_rate: None,
+        }
+    }
+
+    /// Damped at `ratio` (`gpui-base`'s `with_damping`): 1 does not
+    /// overshoot, below 1 it passes its target and comes back, above 1 it
+    /// approaches slowly. Sets [`Spring::damping`] from the stiffness and
+    /// mass it has, so set those first.
+    pub fn damping_ratio(mut self, ratio: f32) -> Self {
+        self.damping = 2.0 * ratio * (self.stiffness * self.mass).max(0.0).sqrt();
+        self
+    }
+
+    /// How far it has gone, from 0 to 1, `ms` milliseconds after it was
+    /// released at rest: the damped oscillator's closed form, past 1 when
+    /// it is underdamped. A spring that never settles (no damping, or a
+    /// stiffness or mass that is not positive) is at 1 at once.
+    pub fn progress(self, ms: f32) -> f32 {
+        let Some((zeta, omega)) = self.oscillator() else {
+            return 1.0;
+        };
+        if ms <= 0.0 {
+            return 0.0;
+        }
+        let t = ms / 1000.0;
+        if (zeta - 1.0).abs() < CRITICAL {
+            return 1.0 - (1.0 + omega * t) * (-omega * t).exp();
+        }
+        if zeta < 1.0 {
+            let decay = zeta * omega;
+            let wd = omega * (1.0 - zeta * zeta).sqrt();
+            return 1.0 - (-decay * t).exp() * ((wd * t).cos() + decay / wd * (wd * t).sin());
+        }
+        let root = omega * (zeta * zeta - 1.0).sqrt();
+        let (slow, fast) = (zeta * omega - root, zeta * omega + root);
+        1.0 - (fast * (-slow * t).exp() - slow * (-fast * t).exp()) / (fast - slow)
+    }
+
+    /// How long it takes, in milliseconds, released at rest, to stay within
+    /// a thousandth of its travel: how long a layout animation on it lasts.
+    /// 0 for a spring that never settles.
+    pub fn settle_ms(self) -> f32 {
+        let Some((zeta, omega)) = self.oscillator() else {
+            return 0.0;
+        };
+        let seconds = if (zeta - 1.0).abs() < CRITICAL {
+            // (1 + ω t) e^(-ω t) falls to 1/1000 at ω t = 9.233.
+            9.233 / omega
+        } else if zeta < 1.0 {
+            SETTLE / (zeta * omega)
+        } else {
+            // The slow root's term, whose weight is above 1, outlasts the fast one's.
+            let root = (zeta * zeta - 1.0).sqrt();
+            let weight = (zeta + root) / (2.0 * root);
+            (SETTLE + weight.ln()) / (omega * (zeta - root))
+        };
+        seconds * 1000.0
+    }
+
+    /// The damping ratio and the natural angular frequency (radians per
+    /// second); `None` when it never settles.
+    fn oscillator(self) -> Option<(f32, f32)> {
+        let Spring {
+            stiffness,
+            damping,
+            mass,
+            ..
+        } = self;
+        if !(stiffness > 0.0 && mass > 0.0 && damping > 0.0)
+            || !(stiffness.is_finite() && mass.is_finite() && damping.is_finite())
+        {
+            return None;
+        }
+        let zeta = damping / (2.0 * (stiffness * mass).sqrt());
+        Some((zeta, (stiffness / mass).sqrt()))
+    }
+
+    /// Needing at most `hz` frames per second (a small, slow spring: 60).
+    pub const fn frame_rate(mut self, hz: f32) -> Self {
+        self.frame_rate = Some(hz);
+        self
+    }
+
     fn driver(self, to: f32) -> Driver {
         Driver::Spring {
             to,
@@ -677,9 +831,17 @@ impl Spring {
             damping: self.damping,
             mass: self.mass,
             velocity: self.velocity,
+            frame_rate: self.frame_rate,
         }
     }
 }
+
+/// ln(1000): a decay of e^(-x) falls to a thousandth at this x.
+const SETTLE: f32 = 6.907_755;
+
+/// How close to 1 a damping ratio is taken as critical, where the
+/// underdamped and overdamped forms divide by almost 0.
+const CRITICAL: f32 = 1e-3;
 
 /// The values `driver` moves a value through from `from`, one per frame at
 /// `fps` (1 to 1000), until it ends: the exact curve the graph runs.
@@ -707,6 +869,7 @@ pub fn sample_decay(from: f32, velocity: f32, deceleration: f32, fps: f32) -> Ve
             deceleration,
             clamp: None,
             bounce: 0.0,
+            frame_rate: None,
         },
         from,
         fps,
@@ -729,6 +892,7 @@ pub fn sample_decay_within(
             deceleration,
             clamp: Some((min, max)),
             bounce,
+            frame_rate: None,
         },
         from,
         fps,
@@ -847,6 +1011,7 @@ impl AnimatedValue {
             deceleration,
             clamp: None,
             bounce: 0.0,
+            frame_rate: None,
         })
     }
 
@@ -864,6 +1029,7 @@ impl AnimatedValue {
             deceleration,
             clamp: Some((min, max)),
             bounce,
+            frame_rate: None,
         })
     }
 
@@ -909,12 +1075,21 @@ impl AnimatedValue {
     }
 
     /// See [`AnimatedNode::diff_clamp`].
-    pub fn diff_clamp(&self, min: f32, max: f32) -> AnimatedNode {
+    pub fn diff_clamp(
+        &self,
+        min: impl Into<AnimationOperand>,
+        max: impl Into<AnimationOperand>,
+    ) -> AnimatedNode {
         self.0.diff_clamp(min, max)
     }
 
     /// See [`AnimatedNode::diff_clamp_with`].
-    pub fn diff_clamp_with(&self, min: f32, max: f32, options: DiffClamp) -> AnimatedNode {
+    pub fn diff_clamp_with(
+        &self,
+        min: impl Into<AnimationOperand>,
+        max: impl Into<AnimationOperand>,
+        options: DiffClamp,
+    ) -> AnimatedNode {
         self.0.diff_clamp_with(min, max, options)
     }
 
@@ -1051,6 +1226,7 @@ impl Animation {
                 deceleration,
                 clamp: None,
                 bounce: 0.0,
+                frame_rate: None,
             },
         )
     }
@@ -1071,6 +1247,7 @@ impl Animation {
                 deceleration,
                 clamp: Some((min, max)),
                 bounce,
+                frame_rate: None,
             },
         )
     }
@@ -1367,11 +1544,13 @@ impl Motion {
 }
 
 /// A timing a component's prop takes (TS `{ duration?: number; easing?:
-/// Easing; delay?: number }`): the options of `AnimatedValue.timing` in
-/// `nsh/animated`, with its defaults (300 ms, ease in-out, no delay).
+/// Easing; delay?: number; frameRate?: number }`): the options of
+/// `AnimatedValue.timing` in `nsh/animated`, with its defaults (300 ms,
+/// ease in-out, no delay, the screen's highest rate).
 impl super::JsValue for Timing {
     fn ts_type(_types: &mut super::TsTypes) -> String {
-        "{ duration?: number; easing?: import(\"nsh\").Easing; delay?: number }".into()
+        "{ duration?: number; easing?: import(\"nsh\").Easing; delay?: number; frameRate?: number }"
+            .into()
     }
 
     fn from_js(value: super::JsIn<'_>) -> Result<Self, super::PropError> {
@@ -1388,6 +1567,7 @@ impl super::JsValue for Timing {
                 .and_then(|e| crate::js::animation::easing(&JsonInput(Some(e))))
                 .unwrap_or(default.easing),
             delay_ms: num("delay").unwrap_or(default.delay_ms).max(0.0),
+            frame_rate: crate::style::frame_rate(num("frameRate")),
         })
     }
 
@@ -1395,17 +1575,21 @@ impl super::JsValue for Timing {
         &self,
         host: &'a dyn super::JsHost,
     ) -> Result<super::JsOwned<'a>, super::PropError> {
-        let json = serde_json::json!({ "duration": self.duration_ms, "delay": self.delay_ms });
+        let mut json = serde_json::json!({ "duration": self.duration_ms, "delay": self.delay_ms });
+        if let Some(hz) = self.frame_rate {
+            json["frameRate"] = hz.into();
+        }
         Ok(super::JsOwned::new(host, host.json(&json)?))
     }
 }
 
 /// A spring a component's prop takes (TS `{ stiffness?: number; damping?:
-/// number; mass?: number; velocity?: number }`): the options of
-/// `AnimatedValue.spring` in `nsh/animated`, with its defaults.
+/// number; mass?: number; velocity?: number; frameRate?: number }`): the
+/// options of `AnimatedValue.spring` in `nsh/animated`, with its defaults.
 impl super::JsValue for Spring {
     fn ts_type(_types: &mut super::TsTypes) -> String {
-        "{ stiffness?: number; damping?: number; mass?: number; velocity?: number }".into()
+        "{ stiffness?: number; damping?: number; mass?: number; velocity?: number; frameRate?: number }"
+            .into()
     }
 
     fn from_js(value: super::JsIn<'_>) -> Result<Self, super::PropError> {
@@ -1420,6 +1604,7 @@ impl super::JsValue for Spring {
             damping: num("damping").unwrap_or(default.damping),
             mass: num("mass").unwrap_or(default.mass),
             velocity: num("velocity"),
+            frame_rate: crate::style::frame_rate(num("frameRate")),
         })
     }
 
@@ -1427,11 +1612,14 @@ impl super::JsValue for Spring {
         &self,
         host: &'a dyn super::JsHost,
     ) -> Result<super::JsOwned<'a>, super::PropError> {
-        let json = serde_json::json!({
+        let mut json = serde_json::json!({
             "stiffness": self.stiffness,
             "damping": self.damping,
             "mass": self.mass,
         });
+        if let Some(hz) = self.frame_rate {
+            json["frameRate"] = hz.into();
+        }
         Ok(super::JsOwned::new(host, host.json(&json)?))
     }
 }

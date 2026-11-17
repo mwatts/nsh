@@ -6,7 +6,7 @@
 //!   is QuickJS bytecode, anything else JS source).
 //!
 //! - `--fps` logs the performance monitor's readings once a second (frame
-//!   rate, frame phases, commits, CPU and memory; target `nsh::perf`).
+//!   rate, frame phases, commits, CPU and memory; target `nsh::fps`).
 //! - `--window-size 390x844` sets the window size in points (default 1200x800,
 //!   wide enough for desktop layouts such as the gallery's sidebar).
 //! - `--data-dir <dir>` keeps the apps' data there instead of the system's
@@ -15,6 +15,15 @@
 //!   passes the app's (`nsh.json` `"id"`). The app's data (`Storage` of `nsh`)
 //!   is kept under the id its bundle carries, in the system's data
 //!   directory.
+//! - `--name <name>` names the app in the window's title and its
+//!   notifications; `nsh run` and `nsh test` pass the app's.
+//! - `--icon <file.ico>` is the app's icon: the window's (title bar,
+//!   taskbar) and its notifications'; `nsh run` and `nsh test` make one
+//!   from `nsh.json` `"icon"`.
+//! - `--background` runs the app in the background: its window shows
+//!   without activating and never comes to the foreground, so the keyboard
+//!   stays with the app the user works in (`nsh test --target windows` passes
+//!   it; the test agent's input goes to the window directly).
 //!
 //! Without arguments it connects to the dev server on this machine.
 //!
@@ -31,6 +40,7 @@ pub fn main() -> std::process::ExitCode {
 
     dev::init_logging();
     let mut source = None;
+    let mut name = None;
     // As the release runner runs the app: on its own.
     let mut options = AppOptions {
         limits: Limits::standalone(),
@@ -59,13 +69,14 @@ pub fn main() -> std::process::ExitCode {
             }
             "--trace" => options.trace = true,
             "--fps" => options.fps = true,
+            "--background" => options.background = true,
             "--app-id" => {
                 if let Some(id) = args.next().filter(|id| !id.is_empty()) {
                     options.app_id = id;
                 }
             }
-            // Where apps keep their data (`nsh test --target` gives each app
-            // a fresh one); the system's data directory otherwise.
+            // The app's data directory (`nsh test --target` gives each app a
+            // fresh one); the one under its id in the system's otherwise.
             "--data-dir" => {
                 options.data_dir = args.next().map(PathBuf::from);
                 // Its caches too (downloaded images): a test's app starts with none.
@@ -75,6 +86,8 @@ pub fn main() -> std::process::ExitCode {
                     ));
                 }
             }
+            "--name" => name = args.next().filter(|name| !name.is_empty()),
+            "--icon" => options.icon = args.next().map(PathBuf::from),
             "--window-size" => match args.next().as_deref().and_then(parse_size) {
                 Some(size) => options.size = size,
                 None => log::warn!("--window-size takes <width>x<height> in points, as 390x844"),
@@ -86,7 +99,7 @@ pub fn main() -> std::process::ExitCode {
         use nsh_dev::protocol::{DEFAULT_PORT, WS_PATH};
         AppSource::DevServer(format!("ws://127.0.0.1:{DEFAULT_PORT}{WS_PATH}"))
     });
-    options.title = "nsh".to_owned();
+    options.title = name.unwrap_or_else(|| "nsh".to_owned());
     run_app(source, options)
 }
 

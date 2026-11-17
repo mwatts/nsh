@@ -1,9 +1,14 @@
 //! WebView and Video: WKWebView / WebView, AVPlayer / MediaPlayer (as the TSX
 //! gallery's `demos/Media.tsx`): an inline page in the gallery's colors
-//! with messages both ways, a web site with its navigation state, back and
-//! forward, and a video with controls of the demo's own or the system's.
+//! with messages both ways and the gallery's logo, which the app serves to
+//! the page itself (`gallery:logo`), a web site with its navigation state,
+//! back and forward, and a video with controls of the demo's own or the
+//! system's.
 
-use nsh_core::prelude::*;
+use nsh_core::{
+    prelude::*,
+    web_resource::{WebResource, WebResourceRequest},
+};
 
 use crate::ui::{
     Badge, Button, ButtonVariant, Card, DemoPage, Finish, Finished, IconName, Meter, RoundButton,
@@ -15,6 +20,22 @@ const SITE: &str = "https://nsh.dev";
 
 /// The video.
 const FLOWER: &str = "https://interactive-examples.mdn.mozilla.net/media/cc0-videos/flower.mp4";
+
+/// The scheme of the URLs the app serves the inline page (`gallery:logo`).
+const SCHEME: &str = "gallery";
+
+/// The gallery's logo, which the inline page shows from `gallery:logo`.
+const LOGO: &[u8] = include_bytes!("../../assets/logo@2x.png");
+
+/// Answers the inline page's requests for `gallery:` URLs: the logo, and
+/// nothing else.
+fn serve(request: WebResourceRequest) {
+    if request.url() == "gallery:logo" {
+        request.respond(WebResource::new("image/png", LOGO));
+    } else {
+        request.fail();
+    }
+}
 
 /// `color` as CSS's `#rrggbb`.
 fn css(color: Hsla) -> String {
@@ -43,13 +64,15 @@ fn page(dark: bool) -> String {
 <style>
   html {{ -webkit-text-size-adjust: 100%; }}
   body {{ margin: 0; padding: 16px; background: {inset}; color: {text}; font-family: -apple-system, system-ui, sans-serif; font-size: 15px; line-height: 1.4; }}
-  h3 {{ margin: 0 0 4px; font-size: 17px; font-weight: 600; }}
+  header {{ display: flex; align-items: center; gap: 10px; margin: 0 0 4px; }}
+  header img {{ width: 24px; height: 24px; border-radius: 6px; }}
+  h3 {{ margin: 0; font-size: 17px; font-weight: 600; }}
   p {{ margin: 0 0 12px; color: {muted}; font-size: 15px; }}
   button {{ height: 44px; padding: 0 18px; border: 0; border-radius: 10px; background: {gradient}; color: {on_accent}; font-family: inherit; font-size: 15px; font-weight: 600; box-shadow: inset 0 1px 0 rgba(255,255,255,{highlight}); }}
   #got {{ margin-top: 12px; padding: 10px 12px; border-radius: 10px; border: 1px solid {border}; color: {muted}; font-size: 15px; }}
 </style></head>
 <body>
-<h3>An inline page</h3>
+<header><img src="gallery:logo" alt=""><h3>An inline page</h3></header>
 <p>HTML from a string. It sends messages to the app and receives them.</p>
 <button onclick="window.nsh.postMessage('hello from the page')">Post to the app</button>
 <div id="got">No message from the app yet.</div>
@@ -141,7 +164,7 @@ fn Site() -> impl IntoElement {
         .child(frame(
             web_view(SITE)
                 .element_ref(&site)
-                .h(px(340.0))
+                .h(px(560.0))
                 .bg(colors::INSET)
                 .on_navigation_state_change(move |s: &WebNavigation| state.set(Some(s.clone()))),
         ))
@@ -326,8 +349,9 @@ fn messaging() -> impl IntoElement {
         .subtitle("Inline HTML, with messages both ways")
         .child(frame(
             web_view_html(move || page(dark()), None)
+                .url_scheme(SCHEME, serve)
                 .element_ref(&web)
-                .h(px(210.0))
+                .h(px(360.0))
                 .bg(colors::INSET)
                 .on_message(move |data: &str| message.set(data.to_owned())),
         ))
@@ -365,7 +389,24 @@ fn messaging() -> impl IntoElement {
 /// tell the app.
 #[component]
 pub(crate) fn WebViewPage() -> impl IntoElement {
-    DemoPage::new().card(messaging).card(site)
+    DemoPage::new().columns(1).card(web_views)
+}
+
+/// The inline page and the web site, one at a time across the page's width.
+fn web_views() -> impl IntoElement {
+    // 0: the inline page, 1: the web site.
+    let tab = signal(0_u32);
+    view()
+        .flex_col()
+        .gap(px(16.0))
+        .child(
+            segmented()
+                .options([Segment::new("Inline page"), Segment::new("Web site")])
+                .selected(move || tab.get())
+                .on_change(move |&i: &u32| tab.set(i)),
+        )
+        .child(when(move || tab.get() == 0, messaging))
+        .child(when(move || tab.get() == 1, site))
 }
 
 /// The Video demo's page: a player and what it tells the app.

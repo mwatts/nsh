@@ -29,6 +29,15 @@ pub const WS_PATH: &str = "/ws";
 /// Default dev-server port.
 pub const DEFAULT_PORT: u16 = 8790;
 
+/// A build a host runs ([`ClientMessage::Hello`]).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RunningBuild {
+    /// The server run it came from ([`ServerMessage::Hello`]).
+    pub session: u64,
+    /// Its build number.
+    pub version: u64,
+}
+
 /// Messages from a dev host to the server.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -56,6 +65,13 @@ pub enum ClientMessage {
         /// The host takes test steps ([`ServerMessage::Step`]).
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         tests: bool,
+        /// The build the host's app runs, when it reconnects: a server of
+        /// the same run sends the hot updates it missed
+        /// ([`ServerMessage::Patch`]) before the latest bundle, so the app
+        /// keeps its state. `None`: a first connection, or a host that does
+        /// not say.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        running: Option<RunningBuild>,
     },
     /// The outcome of the [`ServerMessage::Step`] with this id.
     StepDone {
@@ -137,6 +153,24 @@ pub struct TestEnvironment {
     /// The locale, a BCP 47 tag.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub locale: Option<String>,
+    /// The time zone, an IANA name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_zone: Option<String>,
+    /// The preferred languages, BCP 47 tags, most preferred first.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub languages: Option<Vec<String>>,
+    /// The hour cycle, as `Intl` names it (`h23`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hour_cycle: Option<String>,
+    /// The first day of the week: 1 for Monday to 7 for Sunday.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_day_of_week: Option<u8>,
+    /// The measurement system: `metric`, `us` or `uk`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measurement_system: Option<String>,
+    /// The temperature unit: `celsius` or `fahrenheit`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature_unit: Option<String>,
     /// Whether the user asked for less motion.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reduced_motion: Option<bool>,
@@ -310,6 +344,10 @@ pub enum ServerMessage {
         /// data.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         app_id: Option<String>,
+        /// The main window's launch-time options (`nsh.json` `"window"`,
+        /// JSON): `nsh_engine::Bundle::with_main_window` reads them.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window: Option<String>,
         /// The VM limits to run the app with, as an embedding app would
         /// set them (`nsh run --limits`, in `nsh_core::js::HostLimits`'
         /// syntax: `memory=128MB,call=500ms`; empty: the embedding
@@ -361,6 +399,28 @@ pub struct SpanStyle {
     pub underline: bool,
     /// Whether it is struck through.
     pub line_through: bool,
+}
+
+/// A view's style, as [`TestStep::ViewStyle`] answers it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[non_exhaustive]
+pub struct ViewStyle {
+    /// Its `backgroundColor`, `0xRRGGBBAA`; `None` when transparent.
+    pub background_color: Option<u32>,
+    /// Its own `opacity`.
+    pub opacity: f32,
+    /// The opacity it shows with: its own times every view's around it.
+    pub effective_opacity: f32,
+}
+
+impl Default for ViewStyle {
+    fn default() -> Self {
+        ViewStyle {
+            background_color: None,
+            opacity: 1.0,
+            effective_opacity: 1.0,
+        }
+    }
 }
 
 /// A step of a test on a host's app, named as `nsh/test` names them: views
@@ -498,6 +558,15 @@ pub enum TestStep {
     },
     /// Lets go of the pointer `DragAndHold` left down (`app.drop`).
     Drop,
+    /// An input method composes `text` in the input (`app.compose`):
+    /// marked text at the caret, in place of what it composed; empty, the
+    /// composition ends with nothing committed.
+    Compose {
+        /// Which input.
+        selector: String,
+        /// What it composes.
+        text: String,
+    },
     /// Drops local files on a view (`app.dropFiles`).
     DropFiles {
         /// Where.
@@ -507,6 +576,9 @@ pub enum TestStep {
     },
     /// Goes back as the user does (`app.back`).
     Back,
+    /// Goes forward in the browser's history (`app.forward`): the web's
+    /// alone, the other platforms have no forward.
+    Forward,
     /// Lets the app run (`app.wait`).
     Wait {
         /// Milliseconds.
@@ -572,6 +644,12 @@ pub enum TestStep {
         /// The selector.
         selector: String,
     },
+    /// The style of the view `selector` names (`app.viewStyle`): a
+    /// [`ViewStyle`], or null when none matches.
+    ViewStyle {
+        /// The selector.
+        selector: String,
+    },
     /// The dialogs the app showed, in order (`app.dialogs`): a list of
     /// `nsh_core::Dialog`s.
     Dialogs,
@@ -603,6 +681,27 @@ pub enum TestStep {
     },
     /// Closes the app: the host exits.
     Quit,
+    /// The state of the app's window `id` as the platform reports it
+    /// (`app.window(id).state()`): a `WindowState` object, `null` while it
+    /// is not open. Desktops.
+    WindowState {
+        /// The app's id for the window (`"main"`: the main window).
+        id: String,
+    },
+    /// Presses the close button of the app's window `id` as the user does
+    /// (`app.window(id).pressClose()`): the platform reports the press and
+    /// closes the window when its `closeOnPress` lets it. Desktops.
+    PressWindowClose {
+        /// The app's id for the window (`"main"`: the main window).
+        id: String,
+    },
+    /// A picture of the app's window `id` (`app.window(id).screenshot()`):
+    /// PNG of its content, base64-encoded, as [`TestStep::Screenshot`] is
+    /// of the main window. Desktops.
+    WindowScreenshot {
+        /// The app's id for the window (`"main"`: the main window).
+        id: String,
+    },
     /// A question about the host's model of the app or about its views,
     /// from a test agent that runs elsewhere (the web: `nsh` acts through
     /// the browser, the page knows the app).
@@ -617,6 +716,11 @@ pub enum TestStep {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "query", rename_all = "snake_case")]
 pub enum SceneQuery {
+    /// The textual accessibility value of a composite input, if supplied.
+    InputValueText {
+        /// The input selector.
+        selector: String,
+    },
     /// How many batches the app applied and how long ago the last was.
     Activity,
     /// The app's errors since the last time, taken.
@@ -995,6 +1099,7 @@ mod tests {
             source_map: true,
             capabilities: None,
             app_id: None,
+            window: None,
             limits: None,
         };
         // No declaration: the field is left out (older hosts read the same).

@@ -7,15 +7,13 @@ use nsh_core::Points;
 pub(crate) const DEFAULT_KEYBOARD: Points = Points(336.0);
 
 /// The height `open`'s `keyboard_height` asks for, or the phone default.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct SoftwareKeyboard {
     height: Option<Points>,
-}
-
-impl Default for SoftwareKeyboard {
-    fn default() -> Self {
-        Self { height: None }
-    }
+    /// The height last published to the environment. A step that sets the
+    /// environment's keyboard itself (`setEnvironment`) keeps its height
+    /// until the focus changes what the software keyboard shows.
+    pub(crate) published: Option<Points>,
 }
 
 impl SoftwareKeyboard {

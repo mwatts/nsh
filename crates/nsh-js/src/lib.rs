@@ -25,6 +25,7 @@ mod error;
 mod host;
 mod host_channel;
 mod hot;
+mod i18n;
 mod keymap;
 mod list;
 mod modules;
@@ -41,6 +42,10 @@ mod state;
 mod timers;
 mod touch;
 mod web;
+#[cfg(test)]
+mod web_evaluation;
+mod web_page;
+mod window;
 
 // The typed API check (docs/dev/geometry.md, "Typed API"): the scan is
 // nsh-core's; this crate's lists are `unitless.txt` and `untyped.txt`.

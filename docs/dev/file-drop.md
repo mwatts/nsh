@@ -8,18 +8,41 @@ applications need no JavaScript runtime. Ordinary pointer drags and title-bar
 dragging retain their existing behavior. The application decides how to consume
 dropped files.
 
+The web backend and the mobile backends deliver no file drags today. A browser
+gives a page only each item's kind and MIME type while a drag hovers (names and
+contents arrive at the drop, as `File`s, never as local paths), so a web drop
+would carry `File`s rather than `file:` URLs and needs its own payload design.
+
 ## Contract
 
-- `Interactive::on_file_drag_enter(listener)` and `on_file_drag_leave(listener)`
-  receive unit events for the active drop destination.
-- `Interactive::on_file_drop(listener)` receives `FileDropEvent { uris }`.
+- `Interactive::on_file_drag_enter(listener)` receives
+  `FileDragEvent { uris, mime_types }` for the active drop destination (unit
+  listeners still work); `on_file_drag_leave(listener)` receives a unit event.
+- `Interactive::on_file_drop(listener)` receives
+  `FileDropEvent { uris, mime_types, page_position }`.
+- `mime_types` is derived from each URL's file name in `nsh-core`
+  (`platform::file_mime_type`), when a payload is decoded for Rust or JS: the
+  platforms send only URLs, no file is read, and every backend reports the
+  same type for a name (`""` when the name says none, as `File.type`).
   URIs use `file:` URLs, preserving spaces and escaped filenames. Native code
   converts the platform's local file list; the app can use its existing URL
   parser to obtain paths. Arbitrary text and remote URLs are not file drops.
+  AppKit resolves Finder's file reference URLs (`file:///.file/id=…`) to the
+  path's URL (`file_drop::local_file_uri`), for drops, pastes and
+  `Clipboard.readFiles` alike.
 - The native destination is the closest eligible ancestor of the hit view.
   It must listen to FileDrop and be enabled. Native modal roots bound the search.
   Native code answers drag acceptance synchronously from mounted state; it
   never waits for a Rust or JS callback.
+- Text inputs are part of the destination around them. AppKit offers a drag
+  to the deepest view registered for one of its types, and a text view (a
+  text area, the field editor of a focused field) registers for files to
+  insert their paths: their drag callbacks (`text_input.rs`) send a drag of
+  local files to the destination hit testing finds (`file_drop::text_*`),
+  and leave text drags, and files over an input outside any destination, to
+  the text view. GTK's text widgets accept strings only and the root's
+  capture-phase controller takes the drop first; Win32 and GPUI draw their
+  own editors, so hit testing alone routes the drop there.
 - Moving between targets emits leave/enter. Leaving the window, cancelling or
   completing the drop clears the active target. Removal/disablement rejects a
   subsequent drop and releases destination state.

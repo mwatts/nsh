@@ -45,7 +45,7 @@ use std::{
 
 use gtk4::{self as gtk, gdk, gio, glib, graphene, prelude::*};
 use nsh_core::{
-    AttributedText, NodeId, TextLayout,
+    AttributedText, EventKind, EventPayload, NodeId, PayloadValue, TextLayout,
     geometry::{Bounds, Point, Points},
     selection::{
         KeptRows, SelectionModel, SelectionTexts, autoscroll_step, reading_order, reorder,
@@ -82,6 +82,8 @@ struct Area {
     dirty: bool,
     /// Its keys and focus controllers.
     controllers: [gtk::EventController; 2],
+    /// The selected text last reported to its `onSelectionChange`.
+    reported: String,
 }
 
 /// The mouse pressed in an area.
@@ -133,6 +135,10 @@ impl SelectionTexts for Texts {
 
     fn content(&self, i: usize) -> &str {
         &self.items[i].text.text
+    }
+
+    fn copied(&self, i: usize, range: std::ops::Range<u32>) -> String {
+        self.items[i].text.copied_text(range)
     }
 
     fn frame(&self, i: usize) -> Bounds<Points> {
@@ -224,7 +230,7 @@ pub(crate) fn takes_part(view: &NshView) -> bool {
         .text
         .as_ref()
         .is_some_and(|t| t.text.selectable != Some(false));
-    part && area_of(view).is_some()
+    part && area_of(view).is_some() && !in_control(view)
 }
 
 /// A point in root coordinates in `area`'s.
@@ -360,7 +366,13 @@ impl Area {
                 return;
             };
             let Some(view) = c.widget() else { return };
-            if !c.is_focus() && view.root().and_then(|r| r.focus()).as_ref() != Some(&view) {
+            // Its edit menu (a popover, which leaves the window with no
+            // focus widget) keeps it too.
+            let inside = view
+                .root()
+                .and_then(|r| r.focus())
+                .is_none_or(|f| f == view || f.is_ancestor(&view));
+            if !c.is_focus() && !inside {
                 clear(&surface, id);
             }
         });
@@ -388,6 +400,7 @@ impl Area {
             kept: KeptRows::default(),
             dirty: true,
             controllers: [keys.upcast(), focus.upcast()],
+            reported: String::new(),
         }
     }
 
@@ -687,7 +700,16 @@ fn selected_text(surface: &Surface, id: NodeId) -> Option<(NshView, String)> {
         }
         model.text(&texts)
     };
+    // A selection of hidden characters only copies nothing.
+    if text.is_empty() {
+        return None;
+    }
     Some((area, text))
+}
+
+/// Whether selectable view `area` has a selection to copy.
+pub(crate) fn has_selection(surface: &Surface, area: &NshView) -> bool {
+    selected_text(surface, area.state().id).is_some()
 }
 
 /// Copies area `id`'s selection to the clipboard.
@@ -777,6 +799,37 @@ fn apply(surface: &Surface, id: NodeId, area: &NshView, texts: &Texts) {
         area.set_focusable(true);
         area.grab_focus();
     }
+    report(surface, id, area, texts);
+}
+
+/// Reports area `id`'s selected text to its `onSelectionChange` when it
+/// changed (no borrows held: the handler may run a batch).
+fn report(surface: &Surface, id: NodeId, area: &NshView, texts: &Texts) {
+    if !area.state().events.contains(EventKind::SelectionChange) {
+        return;
+    }
+    let (text, start) = {
+        let mut areas = surface.selection.areas.borrow_mut();
+        let Some(a) = areas.get_mut(&id) else { return };
+        let (text, start) = if a.model.is_empty() {
+            (String::new(), 0)
+        } else {
+            (a.model.text(texts), a.model.start_offset(texts))
+        };
+        if text == a.reported {
+            return;
+        }
+        a.reported.clone_from(&text);
+        (text, start)
+    };
+    surface.event(
+        id,
+        EventKind::SelectionChange,
+        EventPayload::Map(vec![
+            ("text", PayloadValue::Str(text)),
+            ("start", PayloadValue::Number(f64::from(start))),
+        ]),
+    );
 }
 
 /// Takes the highlight off the texts of `old` that are not in `keep`.
@@ -786,4 +839,27 @@ fn unhighlight(old: &[glib::WeakRef<NshView>], keep: &[NshView]) {
             view.queue_draw();
         }
     }
+}
+
+/// Whether `view` sits in a control (a button, link, tab…) inside its
+/// area, or in a view that takes presses: its text then keeps the control's pointer, not the I-beam.
+fn in_control(view: &NshView) -> bool {
+    let mut current = Some(view.clone());
+    while let Some(v) = current {
+        let s = v.state();
+        if s.props.selectable_view {
+            return false;
+        }
+        // A role, or a press handler on a row the app built itself.
+        if s.props.accessibility.role.is_control()
+            || [EventKind::Press, EventKind::LongPress, EventKind::PressDown]
+                .iter()
+                .any(|&k| s.events.contains(k))
+        {
+            return true;
+        }
+        drop(s);
+        current = v.parent_view();
+    }
+    false
 }

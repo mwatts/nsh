@@ -1,10 +1,11 @@
 // The core chooses the visible indices and recycles slots. This facade owns
 // only app render closures and their reactive owners, as the QuickJS host does.
-export const itemsProps = ["each", "children", "keyExtractor", "stickyHeaderIndices", "initialScrollIndex", "onViewableItemsChange", "viewabilityConfig", "refreshing", "onRefresh", "onLoadMore", "loadMoreThreshold", "header", "footer", "empty"];
+export const itemsProps = ["each", "children", "keyExtractor", "stickyHeaderIndices", "initialScrollIndex", "initialScrollAtEnd", "onViewableItemsChange", "viewabilityConfig", "refreshing", "onRefresh", "onLoadMore", "loadMoreThreshold", "header", "footer", "empty"];
 const own = new Set([...itemsProps.filter(k => !["stickyHeaderIndices", "viewabilityConfig", "refreshing", "onRefresh", "onLoadMore"].includes(k)), "ref", "estimatedItemSize", "loadMoreAtStartThreshold", "separator"]);
 export function createLists(invoke, values, reactive, dom, live, wake) {
   const lists = new Map(), rt = dom.rt;
-  const slot = value => typeof value === "function" ? reactive.untracked(() => value({})) : value;
+  // `<If>` and `<Each>` are memos, the insert's to track (as QuickJS's `slot`).
+  const slot = value => typeof value === "function" && !values.signals.has(value) && !values.memos.has(value) ? reactive.untracked(() => value({})) : value;
   const remove = (parent, entry) => { invoke(306, [parent, entry.node]); entry.dispose(); };
   const render = (props = {}) => {
     const node = rt.element("list"), id = values.nodeIds.get(node);
@@ -86,7 +87,8 @@ export function createLists(invoke, values, reactive, dom, live, wake) {
       const delay = props.viewabilityConfig?.minimumViewTime ?? 0;
       if (delay > 0) state.timer = setTimeout(report, delay); else report();
     });
-    if (typeof props.initialScrollIndex === "number") invoke(314, [id, "scrollToIndex", { index: Math.max(0, props.initialScrollIndex), animated: false }]);
+    if (props.initialScrollAtEnd) invoke(314, [id, "scrollToEnd", { animated: false }]);
+    else if (typeof props.initialScrollIndex === "number") invoke(314, [id, "scrollToIndex", { index: Math.max(0, props.initialScrollIndex), animated: false }]);
     if (typeof props.ref === "function") reactive.untracked(() => props.ref(node));
     return node;
   };
@@ -110,9 +112,10 @@ export function createLists(invoke, values, reactive, dom, live, wake) {
             const content = reactive.untracked(() => state.props.children(item, index));
             if ("separator" in state.props) {
               let separator, made = false;
+              const owner = reactive.getOwner();
               rt.insert(cell, () => {
                 if (index() >= (state.props.each?.length ?? 0) - 1) return content;
-                if (!made) { separator = slot(state.props.separator); made = true; }
+                if (!made) { separator = reactive.runWithOwner(owner, () => slot(state.props.separator)); made = true; }
                 return state.props.inverted ? [separator, content] : [content, separator];
               });
             } else rt.insert(cell, content);

@@ -8,11 +8,9 @@ on:
   release:
     types: [published]
   pull_request:
-    paths:
-      - ".github/workflows/packages.yml"
-      - ".github/packages/**"
-  push:
-    branches: [main]
+    # `closed` runs nothing, but it takes the pull request's concurrency group
+    # and so cancels its runs still queued or running once it merges or closes.
+    types: [opened, synchronize, reopened, ready_for_review, closed]
     paths:
       - ".github/workflows/packages.yml"
       - ".github/packages/**"
@@ -37,12 +35,18 @@ jobs:
     name: Check Homebrew formula
     runs-on: macos-15
     timeout-minutes: 15
-    if: github.event_name != 'release' || !github.event.release.prerelease
+    # Nothing for drafts or a pull request being closed.
+    if: (github.event_name != 'release' || !github.event.release.prerelease) && (github.event_name != 'pull_request' || (github.event.action != 'closed' && !github.event.pull_request.draft))
+    # Debounce (AGENTS.md "CI"): waits without a runner, so a newer
+    # push cancels this run before it takes one.
+    environment:
+      name: ci-debounce
+      deployment: false
     env:
       HOMEBREW_NO_AUTO_UPDATE: "1"
       HOMEBREW_NO_ANALYTICS: "1"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -115,7 +119,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           persist-credentials: false
 
@@ -124,7 +128,7 @@ jobs:
           name: nsh-homebrew-formula
           path: formula
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           repository: longbridge/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}

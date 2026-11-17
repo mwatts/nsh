@@ -1,6 +1,6 @@
-import { Canvas, cleanup, computed, createAnimatedValue, Easing, effect, type JSX, LayoutAnimation, Path2D, platform, reduceMotion, signal, Text, token, View, type ViewStyle } from "nsh";
+import { Canvas, cleanup, computed, createAnimatedValue, Easing, effect, Image, type JSX, LayoutAnimation, keymap, Path2D, platform, reduceMotion, signal, Text, View, type ViewStyle } from "nsh";
 import { Button as BaseButton, Link, Menu, MenuItem, MenuSeparator, Popover, Slider, Toggle, ToggleGroup, Toolbar, ToolbarGroup, ToolbarSeparator } from "nsh/base";
-import { alpha, Badge, Caption, Card, chart, colors, DemoPage, finish, focusRing, hovered, menuIndicator, MenuMark, mono, motion, PopIn, popupSurface, sliderFill, sliderLook, terminal, TERMINAL_GAP, Tip, Toggle as Switch } from "../ui";
+import { alpha, Badge, Caption, Card, chart, colors, DemoPage, finish, focusRing, hovered, menuIndicator, menuItemGlyph, menuItemLabel, menuItemLook, menuItemSize, MenuMark, menuSeparator, motion, photoUrl, PopIn, popoverLook, sliderFill, sliderLook, terminal, TERMINAL_GAP, Tip, toggleGlyph, toggleLabel, toggleLook, type ToggleLookOptions, toggleSizes, toolbarRule, toolbarTrack, LastEvent, LabeledToggle, menuPopup } from "../ui";
 import { Field } from "./OverlayUi";
 import { LucideIcon, type LucideIconName } from "./RichEditorUi";
 
@@ -9,73 +9,31 @@ import { LucideIcon, type LucideIconName } from "./RichEditorUi";
 // the `Button`s, `Toggle`s and `Link`s inside it, its `ToolbarGroup`s and
 // `ToggleGroup`s included; screen readers hear a toolbar, its groups by
 // name. What each control does and how it all looks are the gallery's:
-// ghost tools that raise when pressed, a press that sinks, a thumb that
-// springs to the tool chosen; none of the motion with reduced motion.
+// the toggles' shared look (`toggleLook`: ghost tools that take the on fill
+// when pressed, a press that sinks), a thumb that springs to the tool
+// chosen; none of the motion with reduced motion.
 
 const pointer = platform.idiom === "desktop";
 
-/** A tool's side and its icon's: compact with a pointer, roomier on a touch screen. */
-const TOOL = pointer ? { side: 28, icon: 16, text: 13 } : { side: 38, icon: 18, text: 15 };
+/** A tool's side, its icon's and its label's size and a wide tool's padding: compact with a pointer, roomier on a touch screen. */
+const TOOL = toggleSizes.regular;
 
 /** The gap between a toolbar's tools: two columns in a terminal, where each tool is its label. */
 const GAP = terminal ? TERMINAL_GAP : 2;
 
-/** The fades and the sink every tool shares; nothing moves with reduced motion. */
+/** The fades of the tools' parts (a caret that turns, a zoomed preview); nothing moves with reduced motion. */
 const transition = (): ViewStyle => ({
   transitionProperty: "background-color, border-color, box-shadow, transform, opacity",
   transitionDuration: reduceMotion() ? 0 : 140,
   transitionTimingFunction: "ease-out",
 });
 
-/** A tool's surface: bare while off, the raised pill while pressed or open, a hover fill, the focus ring. */
-/** The state styles of a tool, spread on its `Button` or `Toggle`. */
-type Look = { style: ViewStyle; hoverStyle?: ViewStyle; activeStyle: ViewStyle; focusStyle: ViewStyle; disabledStyle: ViewStyle };
-
-const toolLook = (on: boolean, wide = false): Look => ({
-  style: {
-    // The terminal sizes a tool to its label, which it never breaks: a bar too narrow for its tools wraps them.
-    minWidth: terminal ? undefined : TOOL.side,
-    height: terminal ? undefined : TOOL.side,
-    flexShrink: terminal ? 0 : undefined,
-    paddingHorizontal: wide ? 8 : 0,
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-    borderRadius: TOOL.side / 4 + 1,
-    borderCurve: "continuous",
-    borderWidth: 1,
-    borderColor: "transparent",
-    ...(on ? finish.pill : {}),
-    ...transition(),
-  },
-  hoverStyle: on ? undefined : hovered(),
-  activeStyle: { transform: [{ scale: 0.92 }] },
-  focusStyle: focusRing(1),
-  disabledStyle: { opacity: 0.35 },
-});
-
-/** The inset track a horizontal toolbar sits in. */
-const track = (): ViewStyle => ({
-  alignItems: "center",
-  alignSelf: "stretch",
-  gap: GAP,
-  flexWrap: terminal ? "wrap" : undefined,
-  padding: 3,
-  borderRadius: 10,
-  borderCurve: "continuous",
-  borderWidth: 1,
-  borderColor: colors.border,
-  backgroundColor: colors.inset,
-});
+/** The inset track a horizontal toolbar sits in, as wide as its card. */
+const track = (): ViewStyle => ({ ...toolbarTrack(), alignSelf: "stretch" });
 
 /** A hairline between runs of a toolbar's items. */
 function Rule(props: { vertical?: boolean }) {
-  return (
-    <ToolbarSeparator
-      style={props.vertical ? { height: 1, alignSelf: "stretch", marginVertical: 4, marginHorizontal: 6, backgroundColor: colors.line } : { width: 1, height: 18, marginHorizontal: 4, backgroundColor: colors.line }}
-    />
-  );
+  return <ToolbarSeparator style={toolbarRule(props.vertical)} />;
 }
 
 // Glyphs the gallery's Lucide subset lacks, drawn on Lucide's 24-point grid and pen.
@@ -136,7 +94,7 @@ function ToolIcon(props: Icon & { tint: string; size?: number; label: string; sh
 /** A command of a toolbar: a `Button`, its label what screen readers say and, with a pointer, its tooltip. */
 function Command(props: Icon & { label: string; short?: string; text?: string; shortcut?: string; disabled?: boolean; on?: boolean; onPress: () => void }) {
   return (
-    <BaseButton accessibilityLabel={props.label} disabled={props.disabled} tooltip={<Tip label={props.label} shortcut={props.shortcut} />} onPress={props.onPress} {...toolLook(!!props.on, !!props.text)}>
+    <BaseButton accessibilityLabel={props.label} disabled={props.disabled} tooltip={<Tip label={props.label} shortcut={props.shortcut} />} onPress={props.onPress} {...toggleLook({ on: () => !!props.on, text: !!props.text, disabled: () => props.disabled })}>
       <If when={!(terminal && props.text)}>
         <ToolIcon icon={props.icon} glyph={props.glyph} label={props.label} short={props.short} tint={props.on ? colors.text : colors.muted} />
       </If>
@@ -153,14 +111,16 @@ function Command(props: Icon & { label: string; short?: string; text?: string; s
  */
 function Trigger(props: { label: string; open: boolean; wide?: boolean; tip: JSX.Element; children: JSX.Element }) {
   return (
-    <View role="button" accessibilityLabel={props.label} tooltip={props.tip} {...toolLook(props.open, props.wide)}>
+    <View role="button" accessibilityLabel={props.label} tooltip={props.tip} {...toggleLook({ on: () => props.open, text: props.wide })}>
       {props.children}
     </View>
   );
 }
 
-/** An on / off tool of a toolbar: a `Toggle`, raised while pressed. */
-function Mark(props: Icon & { label: string; short?: string; shortcut?: string; pressed: boolean; disabled?: boolean; onChange: (pressed: boolean) => void }) {
+/** An on / off tool of a toolbar: a `Toggle`, the on fill while pressed; an icon, and a label after it when `text` is set. */
+function Mark(props: Icon & { label: string; short?: string; text?: string; shortcut?: string; pressed: boolean; disabled?: boolean; onChange: (pressed: boolean) => void }) {
+  const look: ToggleLookOptions = { text: !!props.text, disabled: () => props.disabled };
+  const pressed = () => props.pressed;
   return (
     <Toggle
       pressed={props.pressed}
@@ -168,16 +128,22 @@ function Mark(props: Icon & { label: string; short?: string; shortcut?: string; 
       accessibilityLabel={props.label}
       tooltip={<Tip label={props.label} shortcut={props.shortcut} />}
       onChange={({ pressed }) => props.onChange(pressed)}
-      {...toolLook(false)}
-      pressedStyle={finish.pill}
-      hoverStyle={props.pressed ? undefined : hovered()}
+      {...toggleLook(look)}
     >
-      <ToolIcon icon={props.icon} glyph={props.glyph} label={props.label} short={props.short} tint={props.pressed ? colors.text : colors.muted} />
+      <If when={!(terminal && props.text)}>
+        <ToolIcon icon={props.icon} glyph={props.glyph} label={props.label} short={props.short} tint={toggleGlyph(pressed).tint} />
+      </If>
+      <If when={props.text}>
+        <Text style={toggleLabel(pressed, look)}>{props.text}</Text>
+      </If>
     </Toggle>
   );
 }
 
 type Align = "left" | "center" | "right" | "justify";
+
+/** An alignment in words, for the caption. */
+const ALIGNED: Record<Align, string> = { left: "left aligned", center: "centered", right: "right aligned", justify: "justified" };
 type Block = "Paragraph" | "Heading" | "Quote";
 
 /** Four lines of a paragraph, set as `align` sets them. */
@@ -204,10 +170,10 @@ function AlignGlyph(props: { align: Align; tint: string }) {
 }
 
 const MARKS: { value: string; icon: LucideIconName; label: string; short?: string; shortcut: string }[] = [
-  { value: "bold", icon: "bold", label: "Bold", shortcut: "⌘B" },
-  { value: "italic", icon: "italic", label: "Italic", shortcut: "⌘I" },
-  { value: "underline", icon: "underline", label: "Underline", shortcut: "⌘U" },
-  { value: "strike", icon: "strikethrough", label: "Strikethrough", short: "Strike", shortcut: "⌘⇧X" },
+  { value: "bold", icon: "bold", label: "Bold", shortcut: keymap.label("mod+b") },
+  { value: "italic", icon: "italic", label: "Italic", shortcut: keymap.label("mod+i") },
+  { value: "underline", icon: "underline", label: "Underline", shortcut: keymap.label("mod+u") },
+  { value: "strike", icon: "strikethrough", label: "Strikethrough", short: "Strike", shortcut: keymap.label("mod+shift+x") },
 ];
 const ALIGNS: { value: Align; label: string; short?: string }[] = [
   { value: "left", label: "Align left", short: "Left" },
@@ -226,7 +192,6 @@ const BLOCKS: { value: Block; icon: LucideIconName }[] = [
  * mark, or with `check` an on / off tool folded into the menu (a mark), its check the app's.
  */
 function Item(props: { label: string; icon?: LucideIconName; onSelect: () => void; checked?: boolean; check?: boolean; disabled?: boolean }) {
-  const row = pointer ? { height: 26, radius: 6, font: 13, icon: 14 } : { height: 46, radius: 10, font: 16, icon: 18 };
   return (
     <MenuItem
       onSelect={props.onSelect}
@@ -234,24 +199,15 @@ function Item(props: { label: string; icon?: LucideIconName; onSelect: () => voi
       checked={props.checked}
       role={props.checked === undefined ? undefined : props.check ? "menuitemcheckbox" : "menuitemradio"}
       indicatorClass={menuIndicator}
-      indicator={props.checked === undefined ? undefined : <MenuMark kind={props.check ? "check" : "dot"} size={row.icon} tint={colors.accent} />}
-      hoverStyle={{ backgroundColor: token("accent") }}
-      activeStyle={{ backgroundColor: alpha(colors.text, 0.1) }}
-      disabledStyle={{ opacity: 0.35 }}
-      style={{ flexDirection: "row", alignItems: "center", gap: 8, height: row.height, paddingHorizontal: 8, borderRadius: row.radius }}
+      indicator={props.checked === undefined ? undefined : <MenuMark kind={props.check ? "check" : "dot"} size={menuItemSize.icon} tint={colors.accent} />}
+      {...menuItemLook()}
     >
       <If when={props.icon}>
-        <LucideIcon name={props.icon!} size={row.icon} tint={colors.muted} />
+        <LucideIcon name={props.icon!} {...menuItemGlyph()} />
       </If>
-      <Text style={{ flex: 1, fontSize: row.font, color: colors.text }}>{props.label}</Text>
+      <Text style={menuItemLabel()}>{props.label}</Text>
     </MenuItem>
   );
-}
-
-/** A menu's items: the popup surface coming in on desktops, the sheet's rows on touch screens. */
-function MenuPanel(props: { children: JSX.Element }) {
-  if (!pointer) return props.children;
-  return <PopIn style={{ ...popupSurface(), minWidth: 190, padding: 4 }}>{props.children}</PopIn>;
 }
 
 /** What a narrow formatting bar folds into "⋯" after the alignment, least used first. */
@@ -268,15 +224,12 @@ function compactWidth(folded: number): number {
   const marks = MARKS.filter((m) => !out.has(m.value)).length;
   const [gap, rule, side] = [2, 9, TOOL.side];
   // The block menu's trigger: its border, padding, icon, gap and caret.
-  const block = 2 + 16 + TOOL.icon + 6 + 7;
+  const block = 2 + 2 * TOOL.pad + TOOL.icon + 6 + 7;
   const run = (n: number) => n * side + (n - 1) * gap;
   const parts = [...(history ? [run(history), rule] : []), block, rule, run(marks), rule, side, 0, side];
   return parts.reduce((a, b) => a + b, 0) + (parts.length - 1) * gap + 8 + 8;
 }
 
-// A terminal shows a menu as a popup, framed by the terminal: no sheet's look.
-const sheet = pointer || terminal ? undefined : { backgroundColor: colors.surface, borderTopLeftRadius: 20, borderTopRightRadius: 20, paddingHorizontal: 10, paddingTop: 10, paddingBottom: 34 };
-const backdrop = { backgroundColor: "rgba(0,0,0,0.45)" };
 
 /**
  * Toolbar, ToolbarGroup and ToolbarSeparator: a text editor's formatting
@@ -346,13 +299,13 @@ export function ToolbarDemo() {
     const decoration = () => (has("underline") && has("strike") ? "underline line-through" : has("underline") ? "underline" : has("strike") ? "line-through" : "none");
     const block = () => state().block;
     return (
-      <Card title="Text formatting" subtitle="History, a block menu, marks, alignment and a link: one stop of Tab" right={<Badge label={`${past().length} edits`} />}>
+      <Card title="Text formatting" subtitle="Marks, blocks, alignment: one Tab stop" right={<Badge label={`${past().length} edits`} />}>
         <Toolbar accessibilityLabel="Formatting" style={track()} onLayout={({ bounds }) => width.set(bounds.size.width)}>
           <If when={!folded("undo")}>
             <ToolbarGroup accessibilityLabel="History" style={{ gap: GAP }}>
-              <Command icon="undo-2" label="Undo" shortcut="⌘Z" disabled={past().length === 0} onPress={undo} />
+              <Command icon="undo-2" label="Undo" shortcut={keymap.label("mod+z")} disabled={past().length === 0} onPress={undo} />
               <If when={!folded("redo")}>
-                <Command icon="redo-2" label="Redo" shortcut="⌘⇧Z" disabled={future().length === 0} onPress={redo} />
+                <Command icon="redo-2" label="Redo" shortcut={keymap.label("mod+shift+z")} disabled={future().length === 0} onPress={redo} />
               </If>
             </ToolbarGroup>
             <Rule />
@@ -360,8 +313,7 @@ export function ToolbarDemo() {
           <Menu
             offset={6}
             margin={8}
-            popupStyle={sheet}
-            backdropStyle={backdrop}
+            {...menuPopup({ minWidth: 190 })}
             onOpenChange={({ open }) => blockOpen.set(open)}
             trigger={
               <Trigger label={`Block: ${block()}`} tip={<Tip label="Turn into" />} open={blockOpen()} wide>
@@ -375,11 +327,9 @@ export function ToolbarDemo() {
               </Trigger>
             }
           >
-            <MenuPanel>
-              <Each of={BLOCKS}>
-                {(b) => <Item label={b().value} icon={b().icon} checked={block() === b().value} onSelect={() => commit({ block: b().value }, `Block: ${b().value}`)} />}
-              </Each>
-            </MenuPanel>
+            <Each of={BLOCKS}>
+              {(b) => <Item label={b().value} icon={b().icon} checked={block() === b().value} onSelect={() => commit({ block: b().value }, `Block: ${b().value}`)} />}
+            </Each>
           </Menu>
           <Rule />
           {/* A toggle group inside the toolbar is one of its groups: its toggles are the toolbar's items. */}
@@ -398,9 +348,7 @@ export function ToolbarDemo() {
                     accessibilityLabel={a().label}
                     tooltip={<Tip label={a().label} />}
                     onChange={({ pressed }) => pressed && commit({ align: a().value }, `Align: ${a().value}`)}
-                    {...toolLook(false)}
-                    pressedStyle={finish.pill}
-                    hoverStyle={state().align === a().value ? undefined : hovered()}
+                    {...toggleLook()}
                   >
                     <If when={terminal} else={<AlignGlyph align={a().value} tint={state().align === a().value ? colors.text : colors.muted} />}>
                       <Text style={{ fontSize: TOOL.text, color: state().align === a().value ? colors.text : colors.muted }}>{a().short ?? a().label}</Text>
@@ -422,13 +370,13 @@ export function ToolbarDemo() {
             offset={6}
             margin={8}
             trigger={
-              <Trigger label="Link" tip={<Tip label="Link" shortcut="⌘K" />} open={linkOpen() || !!state().link}>
+              <Trigger label="Link" tip={<Tip label="Link" shortcut={keymap.label("mod+k")} />} open={linkOpen() || !!state().link}>
                 <ToolIcon icon="link" label="Link" tint={state().link ? colors.accent : colors.muted} />
               </Trigger>
             }
           >
             {/* The popover's field and buttons are stops of their own, not the toolbar's items. */}
-            <PopIn style={{ ...popupSurface(), width: pointer ? 280 : 320, padding: 12, gap: 10 }}>
+            <PopIn style={popoverLook({ width: pointer ? 280 : 320 })}>
               <Text style={{ fontSize: pointer ? 12 : 14, fontWeight: "600", color: colors.text }}>Link to</Text>
               <Field value={draft()} onChange={({ value }) => draft.set(value)} onSubmit={applyLink} placeholder="https://" keyboardType="url" autoCapitalize="none" accessibilityLabel="Link address" autoFocus />
               <View style={{ flexDirection: "row", justifyContent: "flex-end", gap: 6 }}>
@@ -445,8 +393,7 @@ export function ToolbarDemo() {
             align="end"
             offset={6}
             margin={8}
-            popupStyle={sheet}
-            backdropStyle={backdrop}
+            {...menuPopup({ minWidth: 190 })}
             onOpenChange={({ open }) => moreOpen.set(open)}
             trigger={
               <Trigger label="More formatting" tip={<Tip label="More" />} open={moreOpen()}>
@@ -454,30 +401,28 @@ export function ToolbarDemo() {
               </Trigger>
             }
           >
-            <MenuPanel>
-              {/* What the bar folded: the history, the marks, then the alignment. */}
-              <If when={folded("redo")}>
-                <If when={folded("undo")}>
-                  <Item label="Undo" icon="undo-2" disabled={past().length === 0} onSelect={undo} />
-                </If>
-                <Item label="Redo" icon="redo-2" disabled={future().length === 0} onSelect={redo} />
-                <MenuSeparator style={{ height: 1, marginVertical: 4, marginHorizontal: 4, backgroundColor: colors.line }} />
+            {/* What the bar folded: the history, the marks, then the alignment. */}
+            <If when={folded("redo")}>
+              <If when={folded("undo")}>
+                <Item label="Undo" icon="undo-2" disabled={past().length === 0} onSelect={undo} />
               </If>
-              <If when={folded("strike")}>
-                <Each of={MARKS.filter((m) => folded(m.value))}>
-                  {(m) => <Item label={m().label} icon={m().icon} check checked={has(m().value)} onSelect={() => toggleMark(m(), !has(m().value))} />}
-                </Each>
-                <MenuSeparator style={{ height: 1, marginVertical: 4, marginHorizontal: 4, backgroundColor: colors.line }} />
-              </If>
-              <If when={compact()}>
-                <Each of={ALIGNS}>
-                  {(a) => <Item label={a().label} checked={state().align === a().value} onSelect={() => commit({ align: a().value }, `Align: ${a().value}`)} />}
-                </Each>
-                <MenuSeparator style={{ height: 1, marginVertical: 4, marginHorizontal: 4, backgroundColor: colors.line }} />
-              </If>
-              <Item label="Clear formatting" icon="x" disabled={state().marks.length === 0 && state().block === "Paragraph"} onSelect={() => commit({ marks: [], block: "Paragraph" }, "Clear formatting")} />
-              <Item label="Copy as Markdown" icon="copy" onSelect={() => last.set("Copied as Markdown")} />
-            </MenuPanel>
+              <Item label="Redo" icon="redo-2" disabled={future().length === 0} onSelect={redo} />
+              <MenuSeparator style={menuSeparator()} />
+            </If>
+            <If when={folded("strike")}>
+              <Each of={MARKS.filter((m) => folded(m.value))}>
+                {(m) => <Item label={m().label} icon={m().icon} check checked={has(m().value)} onSelect={() => toggleMark(m(), !has(m().value))} />}
+              </Each>
+              <MenuSeparator style={menuSeparator()} />
+            </If>
+            <If when={compact()}>
+              <Each of={ALIGNS}>
+                {(a) => <Item label={a().label} checked={state().align === a().value} onSelect={() => commit({ align: a().value }, `Align: ${a().value}`)} />}
+              </Each>
+              <MenuSeparator style={menuSeparator()} />
+            </If>
+            <Item label="Clear formatting" icon="x" disabled={state().marks.length === 0 && state().block === "Paragraph"} onSelect={() => commit({ marks: [], block: "Paragraph" }, "Clear formatting")} />
+            <Item label="Copy as Markdown" icon="copy" onSelect={() => last.set("Copied as Markdown")} />
           </Menu>
         </Toolbar>
         <View style={{ padding: 12, borderRadius: 8, backgroundColor: colors.inset, borderWidth: 1, borderColor: colors.line, borderLeftWidth: block() === "Quote" ? 3 : 1, borderLeftColor: block() === "Quote" ? colors.accent : colors.line }}>
@@ -498,8 +443,8 @@ export function ToolbarDemo() {
           </Text>
         </View>
         <Caption
-          label={pointer ? "Tab into the bar: ← → move, Home / End jump, Space presses" : "Press a tool; what the bar has no room for folds into ⋯"}
-          note={`${state().marks.length} marks · ${state().align}${compact() ? ` · ${1 + folds()} in ⋯` : ""}`}
+          label={pointer ? "Tab in, ← → to move" : "Press a tool; what the bar has no room for folds into ⋯"}
+          note={`${state().marks.length} ${state().marks.length === 1 ? "mark" : "marks"}, ${ALIGNED[state().align]}${compact() ? `, ${1 + folds()} folded` : ""}`}
         />
       </Card>
     );
@@ -507,10 +452,10 @@ export function ToolbarDemo() {
 
   function Player() {
     const TRACKS = [
-      { title: "Night Drive", artist: "Halcyon Arcade", length: 214, tone: () => chart.s1 },
-      { title: "Paper Lanterns", artist: "Mira Sol", length: 187, tone: () => chart.s3 },
-      { title: "Low Tide", artist: "The Quiet Fields", length: 243, tone: () => chart.s2 },
-    ];
+      { title: "Night Drive", artist: "Halcyon Arcade", length: 214, art: "rollout" },
+      { title: "Paper Lanterns", artist: "Mira Sol", length: 187, art: "sunrise" },
+      { title: "Low Tide", artist: "The Quiet Fields", length: 243, art: "arc" },
+    ] as const;
     const index = signal(0);
     const playing = signal(false);
     const shuffle = signal(false);
@@ -581,9 +526,10 @@ export function ToolbarDemo() {
     };
     const big = pointer ? 40 : 52;
     return (
-      <Card title="Media player" subtitle="Transport and volume: buttons, toggles and a slider in one bar">
+      <Card title="Media player" subtitle="Buttons, toggles and a slider in one bar">
         <View style={{ flexDirection: "row", alignItems: "center", gap: 12 }}>
-          <View style={{ width: pointer ? 56 : 64, height: pointer ? 56 : 64, borderRadius: 10, borderCurve: "continuous", backgroundColor: alpha(track().tone(), 0.3), borderWidth: 1, borderColor: alpha(track().tone(), 0.5) }} />
+          {/* The cover: one of the gallery's photos, the raised fill while it loads. */}
+          <Image src={photoUrl(track().art, "360x360")} style={{ width: pointer ? 56 : 64, height: pointer ? 56 : 64, borderRadius: 10, borderCurve: "continuous", objectFit: "cover", backgroundColor: colors.raised }} />
           <View style={{ flex: 1, gap: 2 }}>
             <Text style={{ fontSize: pointer ? 14 : 16, fontWeight: "600", color: colors.text, numberOfLines: 1 }}>{track().title}</Text>
             <Text style={{ fontSize: pointer ? 12 : 14, color: colors.muted, numberOfLines: 1 }}>{track().artist}</Text>
@@ -592,11 +538,11 @@ export function ToolbarDemo() {
         </View>
         <View style={{ gap: 4 }}>
           <View style={{ height: 4, borderRadius: 2, overflow: "hidden", backgroundColor: colors.track }}>
-            <View style={{ height: 4, width: "100%", borderRadius: 2, backgroundColor: colors.accent, transformOrigin: "left", transform: [{ scaleX: progress }] }} />
+            <View style={{ height: 4, width: "100%", borderRadius: 2, backgroundColor: colors.accent, backgroundImage: terminal ? undefined : finish.fill.backgroundImage, transformOrigin: "left", transform: [{ scaleX: progress }] }} />
           </View>
           <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-            <Text style={{ fontSize: 11, color: colors.faint, fontFamily: mono }}>{time(elapsed())}</Text>
-            <Text style={{ fontSize: 11, color: colors.faint, fontFamily: mono }}>-{time(track().length - elapsed())}</Text>
+            <Text style={{ fontSize: 11, color: colors.muted, fontVariant: ["tabular-nums"] }}>{time(elapsed())}</Text>
+            <Text style={{ fontSize: 11, color: colors.muted, fontVariant: ["tabular-nums"] }}>-{time(track().length - elapsed())}</Text>
           </View>
         </View>
         <Toolbar accessibilityLabel="Playback" style={{ alignItems: "center", gap: terminal ? TERMINAL_GAP : pointer ? 4 : 8, flexWrap: "wrap" }}>
@@ -610,10 +556,11 @@ export function ToolbarDemo() {
               accessibilityLabel={playing() ? "Pause" : "Play"}
               tooltip={<Tip label={playing() ? "Pause" : "Play"} shortcut="Space" />}
               onPress={play}
-              style={{ width: terminal ? undefined : big, height: terminal ? undefined : big, borderRadius: big / 2, alignItems: "center", justifyContent: "center", backgroundColor: colors.light, ...transition() }}
+              // The volume's fill (`sliderFill`, `finish.fill`), so the bar's play button, progress and volume are one green.
+              style={{ width: terminal ? undefined : big, height: terminal ? undefined : big, borderRadius: big / 2, alignItems: "center", justifyContent: "center", backgroundColor: colors.light, ...(terminal ? {} : { backgroundImage: finish.fill.backgroundImage, borderWidth: 1, borderColor: finish.fill.borderColor }), ...transition() }}
               hoverStyle={{ opacity: 0.9 }}
               activeStyle={{ transform: [{ scale: 0.9 }] }}
-              focusStyle={focusRing(2)}
+              focusVisibleStyle={focusRing(2)}
             >
               <View style={{ transform: [{ scale: pop }] }}>
                 <If when={playing()} else={<ToolIcon icon="play" label="Play" size={pointer ? 18 : 22} tint={colors.onLight} />}>
@@ -673,9 +620,9 @@ export function ToolbarDemo() {
       <Card title="Tool palette" subtitle="A vertical toolbar: ↑ ↓ move, ← → are left alone">
         <View style={{ flexDirection: "row", gap: terminal ? TERMINAL_GAP : 12, alignItems: "stretch" }}>
           {/* A terminal's column of labels lines up at the start; the chosen one is its own band there. */}
-          <Toolbar axis="vertical" accessibilityLabel="Tools" style={{ ...track(), alignSelf: "flex-start", gap: 2, ...(terminal ? { alignItems: "flex-start" } : {}) }}>
+          <Toolbar axis="vertical" accessibilityLabel="Tools" style={{ ...toolbarTrack({ vertical: true }), alignSelf: "flex-start", gap: 2 }}>
             <If when={!terminal}>
-              <View style={{ pointerEvents: "none", position: "absolute", top: 3, left: 3, width: TOOL.side, height: TOOL.side, borderRadius: TOOL.side / 4 + 1, borderWidth: 1, ...finish.raised, transform: [{ translateY: y }] }} />
+              <View style={{ pointerEvents: "none", position: "absolute", top: 3, left: 3, width: TOOL.side, height: TOOL.side, borderRadius: TOOL.side / 4 + 1, borderWidth: 1, ...finish.on, transform: [{ translateY: y }] }} />
             </If>
             <Each of={TOOLS}>
               {(t) => (
@@ -689,9 +636,10 @@ export function ToolbarDemo() {
                     tool.set(t().value);
                     last.set(`Tool: ${t().label}`);
                   }}
-                  {...toolLook(false)}
-                  pressedStyle={terminal ? finish.pill : undefined}
-                  hoverStyle={tool() === t().value ? undefined : hovered()}
+                  {...toggleLook({ disabled: () => t().value === "eraser" })}
+                  // The thumb shows the chosen tool (a terminal's band is the on fill); no hover over it.
+                  pressedStyle={terminal ? finish.on : undefined}
+                  hoverStyle={tool() === t().value || t().value === "eraser" ? undefined : hovered()}
                 >
                   <ToolIcon icon={t().icon} glyph={t().glyph} label={t().label} tint={tool() === t().value ? colors.text : colors.muted} />
                 </Toggle>
@@ -715,7 +663,7 @@ export function ToolbarDemo() {
             </View>
             <Text style={{ fontSize: pointer ? 13 : 15, fontWeight: "600", color: colors.text }}>{current().label}</Text>
             <Text style={{ fontSize: pointer ? 12 : 13, color: colors.muted, textAlign: "center" }}>{current().hint}</Text>
-            <Text style={{ fontSize: 11, color: colors.faint, fontFamily: mono }}>{`${zoom()}%`}</Text>
+            <Text style={{ fontSize: 11, color: colors.muted, fontVariant: ["tabular-nums"] }}>{`${zoom()}%`}</Text>
           </View>
         </View>
       </Card>
@@ -727,11 +675,12 @@ export function ToolbarDemo() {
     const approved = signal(false);
     const comments = signal(true);
     return (
-      <Card title="Disabled" subtitle="A review bar the app locks: every item in it, link included" right={<Switch value={locked()} onChange={(v) => locked.set(v)} label="Lock" />}>
+      <Card title="Disabled" subtitle="Everything in it locks, link included" right={<LabeledToggle label="Lock" value={locked()} onChange={(v) => locked.set(v)} />}>
         <Toolbar accessibilityLabel="Review" disabled={locked()} style={{ ...track(), flexWrap: "wrap" }}>
-          <Command icon="check" text="Approve" label="Approve" on={approved()} onPress={() => {
-            approved.set(!approved());
-            last.set(approved() ? "Approved" : "Approval withdrawn");
+          {/* Approved or not is on or off: a toggle, as the comments are. */}
+          <Mark icon="check" text="Approve" label="Approve" pressed={approved()} onChange={(on) => {
+            approved.set(on);
+            last.set(on ? "Approved" : "Approval withdrawn");
           }} />
           <Mark icon="message-circle" label="Show comments" short="Comments" pressed={comments()} onChange={(on) => {
             comments.set(on);
@@ -749,8 +698,8 @@ export function ToolbarDemo() {
             onOpen={({ href }) => last.set(`Open: ${href}`)}
             style={{ paddingHorizontal: 8, height: TOOL.side, justifyContent: "center", borderRadius: 6, borderWidth: 1, borderColor: "transparent", ...transition() }}
             hoverStyle={hovered()}
-            focusStyle={focusRing(1)}
-            disabledStyle={{ opacity: 0.35 }}
+            focusVisibleStyle={focusRing(1)}
+            disabledStyle={{ opacity: 0.5 }}
           >
             <Text style={{ fontSize: TOOL.text, color: colors.accent, textDecorationLine: "underline" }}>Review guide</Text>
           </Link>
@@ -763,7 +712,7 @@ export function ToolbarDemo() {
   function Last() {
     return (
       <Card title="Last event">
-        <Text style={{ fontSize: 13, color: colors.text, fontFamily: mono }}>{last()}</Text>
+        <LastEvent value={last()} hint="Use a tool" />
       </Card>
     );
   }

@@ -13,9 +13,15 @@ name: Compat
 # passes in seconds without building.
 
 on:
-  push:
-    branches: [main]
+  # Pull requests test every change before it merges; main runs every three
+  # hours when it moved, instead of on every push, which only tested again what its pull request
+  # had, and saves the dependencies' caches pull requests restore.
+  schedule:
+    - cron: "0 */3 * * *"
   pull_request:
+    # `closed` runs nothing, but it takes the pull request's concurrency group
+    # and so cancels its runs still queued or running once it merges or closes.
+    types: [opened, synchronize, reopened, ready_for_review, closed]
   merge_group:
     types: [checks_requested]
   workflow_dispatch:
@@ -26,7 +32,7 @@ permissions:
   pull-requests: read
 
 concurrency:
-  group: compat-${{ github.ref }}
+  group: compat-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -38,7 +44,23 @@ env:
   RUSTUP_TOOLCHAIN: stable
 
 jobs:
+  # Scheduled runs: only when main moved since the last one.
+  changed:
+    if: github.event_name == 'schedule'
+    permissions:
+      actions: read
+    uses: ./.github/workflows/changed.yml
+
   compat:
+    needs: changed
+    # Nothing for drafts or a pull request being closed, nor for a scheduled
+    # run when main has not changed since the last one.
+    if: ${{ !cancelled() && needs.changed.outputs.run != 'false' && (github.event_name != 'pull_request' || (github.event.action != 'closed' && !github.event.pull_request.draft)) }}
+    # Debounce (AGENTS.md "CI"): waits without a runner, so a newer
+    # push cancels this run before it takes one.
+    environment:
+      name: ci-debounce
+      deployment: false
     runs-on: ubuntu-24.04
     steps:
       # A pull request runs the checks when it changes what they build;
@@ -56,9 +78,11 @@ jobs:
               - "crates/nsh-core/**"
               - "crates/nsh-dev/**"
               - "crates/nsh-engine/**"
+              - "crates/nsh-i18n/**"
               - "crates/nsh-js/**"
               - "crates/nsh-macros/**"
               - "crates/nsh-package/**"
+              - "crates/nsh-updater/**"
               - "crates/nsh-testing/**"
               - "tests/compat/**"
               - "examples/counter/**"
@@ -70,25 +94,22 @@ jobs:
               - ".cargo/**"
               - "rust-toolchain.toml"
               - ".github/workflows/compat.yml"
+              - ".github/actions/cargo/**"
 
       - name: Decide
         id: run
         run: echo "check=${{ github.event_name != 'pull_request' || steps.changes.outputs.compat == 'true' }}" >> "$GITHUB_OUTPUT"
 
       # Side by side: nsh-compat's crates depend on `../nsh`.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: steps.run.outputs.check == 'true'
         with:
           path: nsh
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: steps.run.outputs.check == 'true'
         with:
           repository: longbridge/nsh-compat
-          # longbridge/nsh-compat#31: its runner needs this checkout's terminal
-          # idiom and `KeyMatch::Notify`, so it cannot land on its main first.
-          # Back to its default branch once it has merged.
-          ref: runner-terminal-idiom
           path: nsh-compat
 
       # QuickJS is C (bindgen needs libclang).
@@ -100,13 +121,13 @@ jobs:
         if: steps.run.outputs.check == 'true'
         uses: dtolnay/rust-toolchain@stable
 
-      # Dependencies only: main's runs save it, pull requests restore it.
-      - name: Cache Cargo
+      # huacnlee/cargo, and the dependencies' builds: main's runs save
+      # them, pull requests restore them.
+      - name: Cargo
         if: steps.run.outputs.check == 'true'
-        uses: Swatinem/rust-cache@v2
+        uses: ./nsh/.github/actions/cargo
         with:
-          workspaces: nsh
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache: compat
 
       - name: Build nsh
         if: steps.run.outputs.check == 'true'
@@ -114,10 +135,11 @@ jobs:
         run: cargo build -p nsh-cli
 
       # The checkout's versions, so the cache serves both. The cases compile
-      # shaders, which nsh-core leaves out without its `shader` feature.
+      # shaders, which nsh-core leaves out without its `shader` feature, and
+      # connect WebSockets, which nsh-engine refuses without `websocket`.
       - name: Check
         if: steps.run.outputs.check == 'true'
         working-directory: nsh-compat
         run: |
           cp ../nsh/Cargo.lock .
-          cargo test --target-dir ../nsh/target --features nsh-core/shader
+          cargo test --target-dir ../nsh/target --features nsh-core/shader,nsh-base/emoji-picker,nsh-engine/websocket

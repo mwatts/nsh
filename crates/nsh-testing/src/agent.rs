@@ -27,7 +27,7 @@ use nsh_core::{
     MountBatch, NodeId,
     geometry::{Bounds, Point, Points, Size, point},
 };
-use nsh_dev::protocol::{PickTarget, SceneQuery, SpanStyle, StepOutcome, TestStep};
+use nsh_dev::protocol::{PickTarget, SceneQuery, SpanStyle, StepOutcome, TestStep, ViewStyle};
 
 mod forward;
 
@@ -85,8 +85,12 @@ fn unix_time(ms: f64) -> std::time::SystemTime {
 const CLOCK_TIMEOUT: Duration = Duration::from_secs(60);
 /// A long press's hold when the view does not say (`delayLongPress`).
 const LONG_PRESS: Duration = Duration::from_millis(500);
-/// How many gestures scrolling a view into view takes at most.
-const SCROLLS_INTO_VIEW: usize = 20;
+/// How many gestures scrolling a view into view takes at most: only a
+/// guard against a view that keeps moving without ever arriving. Gestures
+/// that move nothing end it sooner ([`anchor`]), and each moves at most
+/// part of its scroll view, so a row far down a long list in a small window
+/// (the gallery's home at 640x480 needs about 30) takes many.
+const SCROLLS_INTO_VIEW: usize = 100;
 
 /// What a host's app shows, as test steps see it: the batches the host
 /// applied and the errors the app reported.
@@ -187,6 +191,29 @@ impl Model {
             .locale
             .as_deref()
             .and_then(nsh_core::platform::Locale::parse);
+        pins.time_zone = environment
+            .time_zone
+            .as_deref()
+            .and_then(nsh_core::platform::TimeZone::parse);
+        pins.languages = environment
+            .languages
+            .as_ref()
+            .and_then(|tags| nsh_core::platform::Languages::parse(tags.iter().map(String::as_str)));
+        pins.hour_cycle = environment
+            .hour_cycle
+            .as_deref()
+            .and_then(nsh_core::platform::HourCycle::parse);
+        pins.first_day_of_week = environment
+            .first_day_of_week
+            .and_then(nsh_core::platform::Weekday::from_number);
+        pins.measurement_system = environment
+            .measurement_system
+            .as_deref()
+            .and_then(nsh_core::platform::MeasurementSystem::parse);
+        pins.temperature_unit = environment
+            .temperature_unit
+            .as_deref()
+            .and_then(nsh_core::platform::TemperatureUnit::parse);
         pins.reduce_motion = environment.reduced_motion;
         pins.safe_area =
             environment
@@ -289,6 +316,9 @@ impl Model {
     /// The engine [`Model::set_up_engine`] set up started: the test moves
     /// its clock through it.
     pub fn engine_started(&self, engine: nsh_engine::EngineControl) {
+        // Steps reach every view of a page, below its fold too, as the
+        // headless driver's do.
+        engine.set_content_culling(false);
         if let Some(setup) = &mut *self.setup.lock().unwrap_or_else(|e| e.into_inner()) {
             setup.engine = Some(engine);
         }
@@ -408,6 +438,10 @@ pub trait Scene: Send + Sync {
     }
     /// The app's errors since the last time, taken.
     fn take_errors(&self) -> Result<Vec<String>, String>;
+    /// The semantic text of a composite input, when its native field is a sink.
+    fn input_value_text(&self, _selector: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
     /// The one view `selector` names for a step on `target`.
     fn pick(&self, selector: &str, target: PickTarget) -> Result<Pick, String>;
     /// The scroll views around `id`, innermost first, and whether each
@@ -434,6 +468,8 @@ pub trait Scene: Send + Sync {
     fn enabled(&self, selector: &str) -> Result<bool, String>;
     /// The resolved style of the first character `selector` names.
     fn span_style(&self, selector: &str) -> Result<SpanStyle, String>;
+    /// The style of the view `selector` names, `None` when none matches.
+    fn view_style(&self, selector: &str) -> Result<Option<ViewStyle>, String>;
     /// The input `selector` names.
     fn input_id(&self, selector: &str) -> Result<Option<NodeId>, String>;
     /// The dialogs the app showed.
@@ -482,9 +518,34 @@ pub trait Scene: Send + Sync {
     fn send_host_event(&self, name: &str, data: serde_json::Value) -> Result<(), String>;
     /// The URLs the app opened ([`Model::opened_urls`]).
     fn opened_urls(&self) -> Result<Vec<String>, String>;
+    /// The root of the app's window `id` while it is open (`"main"`: the
+    /// main window's, [`nsh_core::ROOT_ID`]). Without windows of the app's
+    /// own (the web), only the main one.
+    fn window_root(&self, id: &str) -> Result<Option<NodeId>, String> {
+        Ok((id == "main").then_some(nsh_core::ROOT_ID))
+    }
+    /// The root of the window view `id` is in (the main window's when it is
+    /// in none of the app's own).
+    fn window_of(&self, id: NodeId) -> Result<NodeId, String> {
+        let _ = id;
+        Ok(nsh_core::ROOT_ID)
+    }
 }
 
 impl Scene for Model {
+    fn input_value_text(&self, selector: &str) -> Result<Option<String>, String> {
+        let state = self.lock();
+        let Some(id) = state.screen.input_id(selector)? else {
+            return Ok(None);
+        };
+        Ok(state.screen.semantic_input_text(id).map(str::to_owned))
+    }
+    fn window_root(&self, id: &str) -> Result<Option<NodeId>, String> {
+        Ok(self.lock().screen.window_root(id))
+    }
+    fn window_of(&self, id: NodeId) -> Result<NodeId, String> {
+        Ok(self.lock().screen.window_of(id))
+    }
     fn canvas_node(&self, selector: &str) -> Result<Option<(NodeId, Point<Points>)>, String> {
         Ok(self.lock().screen.canvas_node(&Selector::parse(selector)?))
     }
@@ -514,13 +575,23 @@ impl Scene for Model {
         let parsed = Selector::parse(selector)?;
         let state = self.lock();
         let screen = &state.screen;
-        Ok(match target {
+        let picked = match target {
             PickTarget::Pressable => screen.pressable(&parsed),
             PickTarget::LongPressable => screen.long_pressable(&parsed),
             PickTarget::Input => screen.input_view(&parsed),
             PickTarget::ScrollView => screen.scroll_view(&parsed),
             PickTarget::View => screen.view(&parsed),
-        })
+        };
+        if matches!(target, PickTarget::Input)
+            && let Pick::One(id) = picked
+            && let Some(cover) = screen.input_cover(id)
+        {
+            return Err(crate::failure::covered(
+                selector,
+                &screen.selector_of(cover),
+            ));
+        }
+        Ok(picked)
     }
     fn scroll_ancestors(&self, id: NodeId) -> Result<Vec<(NodeId, bool)>, String> {
         Ok(self.lock().screen.scroll_ancestors(id))
@@ -563,6 +634,15 @@ impl Scene for Model {
         span.underline = style.decoration.underline;
         span.line_through = style.decoration.line_through;
         Ok(span)
+    }
+    fn view_style(&self, selector: &str) -> Result<Option<ViewStyle>, String> {
+        Ok(self.lock().screen.view_style(selector)?.map(|s| {
+            let mut style = ViewStyle::default();
+            style.background_color = s.background_color;
+            style.opacity = s.opacity;
+            style.effective_opacity = s.effective_opacity;
+            style
+        }))
     }
     fn input_id(&self, selector: &str) -> Result<Option<NodeId>, String> {
         self.lock().screen.input_id(selector)
@@ -651,6 +731,8 @@ impl MenuValue {
                 role: None,
                 when: nsh_core::keymap::When::Always,
                 icon: None,
+                symbol: None,
+                destructive: false,
             }),
             MenuValue::Submenu {
                 label,
@@ -662,6 +744,8 @@ impl MenuValue {
                 items: items.into_iter().map(MenuValue::into_item).collect(),
                 // A scene's answer is about what a test can ask of a menu.
                 icon: None,
+                symbol: None,
+                inline: false,
             },
         }
     }
@@ -733,6 +817,9 @@ pub fn answer(model: &Model, step: &TestStep) -> Option<Result<serde_json::Value
         TestStep::SpanStyle { selector } => {
             model.span_style(selector).and_then(|s| json(to_value(s)))
         }
+        TestStep::ViewStyle { selector } => {
+            model.view_style(selector).and_then(|s| json(to_value(s)))
+        }
         TestStep::Dialogs => model.dialogs().and_then(|d| json(to_value(d))),
         TestStep::PendingDialog => model.pending_dialog().and_then(|d| json(to_value(d))),
         TestStep::Scene { query } => match query {
@@ -743,6 +830,9 @@ pub fn answer(model: &Model, step: &TestStep) -> Option<Result<serde_json::Value
                 })
             }),
             SceneQuery::TakeErrors => model.take_errors().map(Value::from),
+            SceneQuery::InputValueText { selector } => {
+                model.input_value_text(selector).map(Value::from)
+            }
             SceneQuery::Pick { selector, target } => model.pick(selector, *target).map(pick_value),
             SceneQuery::ScrollAncestors { id } => {
                 model.scroll_ancestors(*id).and_then(|a| json(to_value(a)))
@@ -820,6 +910,11 @@ impl RemoteScene {
 }
 
 impl Scene for RemoteScene {
+    fn input_value_text(&self, selector: &str) -> Result<Option<String>, String> {
+        self.query(SceneQuery::InputValueText {
+            selector: selector.into(),
+        })
+    }
     fn canvas_node(&self, selector: &str) -> Result<Option<(NodeId, Point<Points>)>, String> {
         self.query(SceneQuery::CanvasNode {
             selector: selector.into(),
@@ -887,6 +982,11 @@ impl Scene for RemoteScene {
     }
     fn span_style(&self, selector: &str) -> Result<SpanStyle, String> {
         self.get(TestStep::SpanStyle {
+            selector: selector.into(),
+        })
+    }
+    fn view_style(&self, selector: &str) -> Result<Option<ViewStyle>, String> {
+        self.get(TestStep::ViewStyle {
             selector: selector.into(),
         })
     }
@@ -963,11 +1063,74 @@ pub enum Key {
 /// Called from the agent's thread; each call does its work on the host's
 /// main thread and returns once it is done (input posted, not answered).
 pub trait Native: Send + Sync {
-    /// The view `id`'s unclipped bounds in the window's content, in points
-    /// from its top-left. Mounted views outside a Scroll or the window
-    /// retain their bounds so the agent can scroll them into view;
-    /// `None` means the platform has no displayed view for this node.
+    /// The view `id`'s unclipped bounds in the content of the window it is
+    /// in (the main window, or one of the app's own), in points from its
+    /// top-left. Mounted views outside a Scroll or the window retain their
+    /// bounds so the agent can scroll them into view; `None` means the
+    /// platform has no displayed view for this node.
     fn bounds(&self, id: NodeId) -> Option<Bounds<Points>>;
+    /// How far scroll view `id` can still scroll along its axis
+    /// (`horizontal`): back towards its start and on towards its end.
+    /// `None` where the platform does not say: the agent's gestures find
+    /// out.
+    fn scroll_room(&self, id: NodeId, horizontal: bool) -> Option<(Points, Points)> {
+        let _ = (id, horizontal);
+        None
+    }
+    /// The window the pointer's input that follows acts in, until the next
+    /// call: the one whose root node is `window` ([`nsh_core::ROOT_ID`]:
+    /// the main window). The points [`Native::press`],
+    /// [`Native::long_press`], [`Native::scroll`], [`Native::drag`],
+    /// [`Native::hover`], [`Native::right_click`],
+    /// [`Native::drag_and_hold`], [`Native::drop_files`] and
+    /// [`Native::drop_at`] get are in that window's content, and their input
+    /// goes to that window (which a press activates, as a click does). The
+    /// agent names it before each step on a view. A platform without
+    /// windows of the app's own acts in the main window only.
+    fn target_window(&self, window: NodeId) -> Result<(), String> {
+        if window == nsh_core::ROOT_ID {
+            Ok(())
+        } else {
+            Err("this platform's test agent acts in the main window only: \
+                 views in windows of the app's own cannot be reached yet"
+                .into())
+        }
+    }
+    /// The state of the window whose root node is `window`
+    /// ([`nsh_core::ROOT_ID`]: the main window) as the platform reports it
+    /// to the app now (`app.window(id).state()`); `None` when no such
+    /// window is open.
+    fn window_state(
+        &self,
+        window: NodeId,
+    ) -> Result<Option<nsh_core::desktop::WindowState>, String> {
+        let _ = window;
+        Err("this platform's test agent reads no window state yet".into())
+    }
+    /// Presses the close button of the window whose root node is `window`
+    /// as the user does (`app.window(id).pressClose()`), through the
+    /// platform's own path: the window reports the press (reason
+    /// `closeButton`) and closes when its `closeOnPress` lets it. An error
+    /// when it has no close button.
+    fn press_window_close(&self, window: NodeId) -> Result<(), String> {
+        let _ = window;
+        Err("this platform's test agent presses no window's close button yet".into())
+    }
+    /// A picture of the window whose root node is `window`
+    /// ([`nsh_core::ROOT_ID`]: the main window), as [`Native::screenshot`]
+    /// takes of the main one: PNG bytes of its content
+    /// (`app.window(id).screenshot()`). An error when no such window is
+    /// open.
+    fn window_screenshot(&self, window: NodeId) -> Result<Vec<u8>, String> {
+        if window == nsh_core::ROOT_ID {
+            self.screenshot()
+        } else {
+            Err(
+                "this platform's test agent takes no picture of windows of the app's own yet"
+                    .into(),
+            )
+        }
+    }
     /// Where the characters `start..end` (UTF-16 units) of text view
     /// `text` are on screen: the part on their first line, in the
     /// window's content as [`Native::bounds`] (`None`: not on screen, or
@@ -1010,7 +1173,7 @@ pub trait Native: Send + Sync {
         Err("this platform has no mouse".into())
     }
     /// The input that has the keyboard focus, where the platform can tell:
-    /// a paste into it needs no press (one would move its caret).
+    /// typing or a paste into it needs no press (one would move its caret).
     fn focused(&self) -> Option<NodeId> {
         None
     }
@@ -1024,6 +1187,13 @@ pub trait Native: Send + Sync {
                 .into(),
         )
     }
+    /// An input method composes `text` in the focused input: marked text
+    /// at the caret, in place of what it composed; empty, the composition
+    /// ends with nothing committed.
+    fn compose(&self, text: &str) -> Result<(), String> {
+        let _ = text;
+        Err("`compose` runs headless and on macOS for now".into())
+    }
     /// Chooses the action of the open context menu (`Menu.popup`) at the
     /// end of `path`: the labels of the submenus on the way, then its own.
     fn choose_menu_item(&self, path: &[String]) -> Result<(), String> {
@@ -1035,8 +1205,9 @@ pub trait Native: Send + Sync {
         Err("this platform shows no context menus to close".into())
     }
     /// Presses `keys`, a keystroke as `nsh/keymap` names it (`"mod+k"`;
-    /// `mod` the platform's command key), on a hardware keyboard: the app's
-    /// shortcuts hear it, else what has the keyboard focus. Every
+    /// `mod` the platform's command key), on a hardware keyboard, in the
+    /// window that has the keyboard focus (one of the app's own too): the
+    /// app's shortcuts hear it, else what has the keyboard focus. Every
     /// platform's agent makes them; one that cannot refuses it.
     fn press_keys(&self, keys: &str) -> Result<(), String> {
         let _ = keys;
@@ -1052,7 +1223,7 @@ pub trait Native: Send + Sync {
     /// does.
     fn drop_files(&self, at: Point<Points>, uris: Vec<String>) -> Result<(), String> {
         let _ = (at, uris);
-        Err("`dropFiles` runs headless and on Linux for now".into())
+        Err("`dropFiles` runs headless, on Linux and on macOS for now".into())
     }
     /// Lets go of the button [`Native::drag_and_hold`] holds, at `at`.
     fn drop_at(&self, at: Point<Points>) -> Result<(), String> {
@@ -1062,11 +1233,11 @@ pub trait Native: Send + Sync {
     /// Holds modifier keys down (`down`) or lets go of them: the presses,
     /// drags and hovers until then carry them. One that cannot refuses it.
     fn hold_keys(&self, keys: &str, down: bool) -> Result<(), String> {
-        let _ = (keys, down);
-        Err(
-            "holding keys (`keyboard.down` / `keyboard.up`) runs headless and on Linux for now"
-                .into(),
-        )
+        let _ = keys;
+        Err(crate::failure::unsupported_here(
+            if down { "keyboard.down" } else { "keyboard.up" },
+            "holding keys runs headless and on Linux for now",
+        ))
     }
     /// Types `text` into the focused input, key by key.
     fn type_text(&self, text: &str);
@@ -1077,6 +1248,11 @@ pub trait Native: Send + Sync {
     /// Goes back as the user does (a back gesture, the back button,
     /// Escape): an error when the platform has none.
     fn back(&self) -> Result<(), String>;
+    /// Goes forward in the browser's history: the web's; the other
+    /// platforms have no forward.
+    fn forward(&self) -> Result<(), String> {
+        Err(crate::failure::web_only("forward"))
+    }
     /// Answers the dialog the app shows now (the oldest): presses its
     /// button with the text `button`, or closes it without one.
     fn answer_dialog(&self, button: Option<&str>) -> Result<(), String>;
@@ -1391,6 +1567,7 @@ impl Agent {
             TestStep::OpenedUrls => self.scene.opened_urls().map(Value::from),
             TestStep::DragAndHold { selector, x, y } => done(self.drag_and_hold(&selector, x, y)),
             TestStep::Drop => done(self.drop_held()),
+            TestStep::Compose { selector, text } => done(self.compose(&selector, &text)),
             TestStep::DropFiles { selector, uris } => done(
                 self.find(&selector, "view", PickTarget::View)
                     .and_then(|(_, at)| self.native.drop_files(at, uris))
@@ -1405,6 +1582,7 @@ impl Agent {
                 done(self.native.press_keys(&keys).and_then(|()| self.settled()))
             }
             TestStep::Back => done(self.native.back().and_then(|()| self.settled())),
+            TestStep::Forward => done(self.native.forward().and_then(|()| self.settled())),
             TestStep::Wait { ms } => {
                 std::thread::sleep(Duration::from_millis(ms));
                 done(self.check())
@@ -1440,7 +1618,13 @@ impl Agent {
             TestStep::SpanStyle { selector } => {
                 serde_json::to_value(self.scene.span_style(&selector)?).map_err(|e| e.to_string())
             }
+            TestStep::ViewStyle { selector } => {
+                serde_json::to_value(self.scene.view_style(&selector)?).map_err(|e| e.to_string())
+            }
             TestStep::Value { selector } => {
+                if let Some(text) = self.scene.input_value_text(&selector)? {
+                    return Ok(Value::from(text));
+                }
                 let id = self.scene.input_id(&selector)?;
                 Ok(id
                     .and_then(|id| self.native.input_text(id))
@@ -1472,6 +1656,39 @@ impl Agent {
                 self.native.quit();
                 Ok(Value::Null)
             }
+            TestStep::WindowState { id } => match self.scene.window_root(&id)? {
+                Some(root) => Ok(self
+                    .native
+                    .window_state(root)?
+                    .map_or(Value::Null, |s| crate::window_json::to_json(&s))),
+                None => Ok(Value::Null),
+            },
+            TestStep::PressWindowClose { id } => {
+                let root = self
+                    .scene
+                    .window_root(&id)?
+                    .ok_or_else(|| format!("no window {id:?} is open"))?;
+                done(
+                    self.native
+                        .press_window_close(root)
+                        .map_err(|e| format!("cannot press the close button of window {id:?}: {e}"))
+                        .and_then(|()| self.settled()),
+                )
+            }
+            TestStep::WindowScreenshot { id } => {
+                use base64::Engine as _;
+                let root = self
+                    .scene
+                    .window_root(&id)?
+                    .ok_or_else(|| format!("no window {id:?} is open"))?;
+                let png = self
+                    .native
+                    .window_screenshot(root)
+                    .map_err(|e| format!("cannot take a picture of window {id:?}: {e}"))?;
+                Ok(Value::from(
+                    base64::engine::general_purpose::STANDARD.encode(png),
+                ))
+            }
             TestStep::Scene { query } => self.scene_query(query),
         }
     }
@@ -1500,6 +1717,9 @@ impl Agent {
                 })
             }),
             SceneQuery::TakeErrors => scene.take_errors().map(Value::from),
+            SceneQuery::InputValueText { selector } => {
+                scene.input_value_text(&selector).map(Value::from)
+            }
             SceneQuery::Pick { selector, target } => scene.pick(&selector, target).map(pick_value),
             SceneQuery::ScrollAncestors { id } => {
                 scene.scroll_ancestors(id).and_then(|a| json(to_value(a)))
@@ -1597,6 +1817,8 @@ impl Agent {
         self.settled()?;
         let picked = self.scene.pick(selector, target)?;
         let id = self.picked(picked, selector, what)?;
+        // The pointer acts in the window the view is in.
+        self.native.target_window(self.scene.window_of(id)?)?;
         if let Some((canvas, center)) = self.scene.canvas_node(selector)? {
             return Ok((
                 id,
@@ -1619,6 +1841,10 @@ impl Agent {
                 }
                 _ => self.scroll_into_view(id, selector)?,
             };
+            if matches!(target, PickTarget::Input) {
+                // Scrolling can bring the field underneath another view.
+                self.scene.pick(selector, target)?;
+            }
             return Ok((id, at));
         };
         // A span of a text: its text view comes into view, then the finger
@@ -1697,18 +1923,34 @@ impl Agent {
             {
                 misses += 1;
             }
+            // A scroll view already at the end a gesture would move it
+            // towards brings nothing nearer: the finger would pull it past
+            // that end (a pull to refresh, a page sheet following the drag
+            // down and closing).
+            let can_move = |scroller: NodeId, horizontal: bool, b: &Bounds<Points>| {
+                let back = if horizontal {
+                    at.x.0 < b.center().x.0
+                } else {
+                    at.y.0 < b.center().y.0
+                };
+                self.native
+                    .scroll_room(scroller, horizontal)
+                    .is_none_or(|(start, end)| if back { start.0 } else { end.0 } >= 1.0)
+            };
             // The innermost scroll view whose bounds leave the middle out,
             // or near their edge (where a finger does not press and bars,
             // the home indicator and fades sit), else the outermost one
             // when the window does.
             let hiding = scrollers.iter().find_map(|&(scroller, horizontal)| {
                 let b = self.native.bounds(scroller)?;
-                (!well_inside(&b, at, horizontal)).then_some((scroller, horizontal, b))
+                (!well_inside(&b, at, horizontal) && can_move(scroller, horizontal, &b))
+                    .then_some((scroller, horizontal, b))
             });
             let hiding = hiding.or_else(|| {
                 let &(s, h) = scrollers.last()?;
                 (!well_inside(&window, at, h)).then_some(())?;
-                Some((s, h, self.native.bounds(s)?))
+                let b = self.native.bounds(s)?;
+                can_move(s, h, &b).then_some((s, h, b))
             });
             let Some((scroll, horizontal, scroller)) = hiding else {
                 if window.contains(&at) {
@@ -1859,13 +2101,27 @@ impl Agent {
 
     /// Focuses the input `selector` names by pressing it.
     fn focus(&self, selector: &str) -> Result<(), String> {
-        let (_, at) = self.find(selector, "input", PickTarget::Input)?;
+        let (id, at) = self.find(selector, "input", PickTarget::Input)?;
         self.native.press(at);
-        self.settled()
+        self.settled()?;
+        if let Some(focused) = self.native.focused()
+            && focused != id
+        {
+            return Err(crate::failure::covered(
+                selector,
+                &format!("`view:{focused}`"),
+            ));
+        }
+        Ok(())
     }
 
     fn type_text(&self, selector: &str, text: &str) -> Result<(), String> {
-        self.focus(selector)?;
+        // As the user types in the field they are in: a press first would
+        // move its caret, collapsing a selection the typing replaces.
+        let (id, _) = self.find(selector, "input", PickTarget::Input)?;
+        if self.native.focused() != Some(id) {
+            self.focus(selector)?;
+        }
         // A line break is the return key, as the headless driver types it.
         for (i, line) in text.split('\n').enumerate() {
             if i > 0 {
@@ -1911,6 +2167,16 @@ impl Agent {
             self.focus(selector)?;
         }
         self.native.paste(content)?;
+        self.settled()
+    }
+
+    fn compose(&self, selector: &str, text: &str) -> Result<(), String> {
+        // In the field the user is in: a press would commit what it composes.
+        let (id, _) = self.find(selector, "input", PickTarget::Input)?;
+        if self.native.focused() != Some(id) {
+            self.focus(selector)?;
+        }
+        self.native.compose(text)?;
         self.settled()
     }
 
@@ -2116,7 +2382,11 @@ impl Agent {
     }
 
     fn on_screen(&self) -> String {
-        format!("on screen: {:?}", self.scene.texts().unwrap_or_default())
+        let texts = self.scene.texts().unwrap_or_default();
+        format!(
+            "on screen: [{}]",
+            crate::failure::screen_texts(&texts, Some(crate::failure::SCREEN_TEXT_LIMIT))
+        )
     }
 }
 
@@ -2132,7 +2402,7 @@ mod tests {
     };
     use nsh_engine::{EngineConfig, EngineControl};
 
-    use super::*;
+    use super::{Key, *};
 
     /// A count and a button that adds one.
     #[component]
@@ -2261,6 +2531,10 @@ mod tests {
                 size(px(320.0), px(height)),
             ))
         }
+        fn scroll_room(&self, _: NodeId, _: bool) -> Option<(Points, Points)> {
+            let offset = *self.offset.lock().unwrap();
+            Some((px(offset), px(Page::CONTENT - Page::LENGTH - offset)))
+        }
         fn viewport(&self) -> Size<Points> {
             size(px(320.0), px(640.0))
         }
@@ -2365,6 +2639,53 @@ mod tests {
             near[2] == bottom && near[3..].iter().all(|&y| y == top),
             "{near:?}"
         );
+    }
+
+    #[test]
+    fn a_view_no_gesture_brings_nearer_is_pressed_where_it_is() {
+        use nsh_core::{MountItem, ViewKind};
+        // The gestures that bring view 4 at `target` into view from
+        // `offset`, in a modal (6) shown from inside scroll view 2 or in the
+        // scroll view itself.
+        let landings = |target: f32, offset: f32, modal: bool| {
+            let model = Arc::new(Model::default());
+            let create = |id, kind| MountItem::Create { id, kind };
+            let insert = |parent, child| MountItem::Insert {
+                parent,
+                child,
+                before: None,
+            };
+            let mut items = vec![
+                create(2, ViewKind::Scroll),
+                create(4, ViewKind::View),
+                insert(1, 2),
+            ];
+            if modal {
+                items.extend([create(6, ViewKind::Modal), insert(2, 6), insert(6, 4)]);
+            } else {
+                items.push(insert(2, 4));
+            }
+            model.apply(&MountBatch { items });
+            let landed = Arc::new(Mutex::new(Vec::new()));
+            let page = Page {
+                offset: Mutex::new(offset),
+                target,
+                undone: Vec::new(),
+                landed: landed.clone(),
+            };
+            let agent = Agent::new(model, Box::new(page));
+            let (at, _) = agent.bring_into_view(4, "id:row", None).unwrap();
+            (at.y.0, landed.lock().unwrap().len())
+        };
+        // At the top edge of a scroll view at its top: a finger dragging it
+        // down would pull it past its top (a pull to refresh, a page sheet
+        // closing), so it is pressed where it is.
+        assert_eq!(landings(10.0, 0.0, false), (30.0, 0));
+        // Scrolled down, the scroll view brings it nearer.
+        assert!(landings(300.0, 280.0, false).1 > 0);
+        // A modal shows over the window: the scroll view around it in the
+        // tree does not move it.
+        assert_eq!(landings(300.0, 280.0, true), (40.0, 0));
     }
 
     #[test]
@@ -2509,6 +2830,13 @@ mod tests {
                 message: "no back here".into()
             }
         );
+        // Only the web's native goes forward.
+        assert_eq!(
+            agent.take(TestStep::Forward),
+            StepOutcome::Failed {
+                message: crate::failure::web_only("forward")
+            }
+        );
         // No input to type into.
         assert!(matches!(
             agent.take(TestStep::Type { selector: "Add".into(), text: "x".into() }),
@@ -2516,5 +2844,214 @@ mod tests {
         ));
         assert!(typed.lock().unwrap().is_empty());
         drop(engine);
+    }
+
+    #[test]
+    fn covered_inputs_fail_before_native_input_even_when_focused() {
+        use nsh_core::{MountItem, ViewKind};
+        let model = Arc::new(Model::default());
+        let mut items = Vec::new();
+        for id in [2, 3] {
+            items.extend([
+                MountItem::Create {
+                    id,
+                    kind: ViewKind::Input,
+                },
+                MountItem::Insert {
+                    parent: 1,
+                    child: id,
+                    before: None,
+                },
+                MountItem::Frame {
+                    id,
+                    frame: Bounds::new(point(px(0.0), px(0.0)), size(px(200.0), px(40.0))),
+                },
+            ]);
+        }
+        model.apply(&MountBatch { items });
+        let did = Arc::new(Mutex::new(Vec::new()));
+        let agent = Agent::new(
+            model,
+            Box::new(Field {
+                did: did.clone(),
+                focused: Mutex::new(true),
+            }),
+        );
+        for step in [
+            TestStep::Clear {
+                selector: "view:2".into(),
+            },
+            TestStep::Type {
+                selector: "view:2".into(),
+                text: "X".into(),
+            },
+        ] {
+            assert!(
+                matches!(agent.take(step), StepOutcome::Failed { message } if message.contains("is covered") && message.contains("view:3"))
+            );
+        }
+        assert!(did.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn local_and_remote_values_read_composite_input_text() {
+        use nsh_core::{AccessibilityValue, MountItem, ViewKind, ViewProps};
+        let model = Arc::new(Model::default());
+        model.apply(&MountBatch {
+            items: vec![
+                MountItem::Create {
+                    id: 2,
+                    kind: ViewKind::Input,
+                },
+                MountItem::Frame {
+                    id: 2,
+                    frame: Bounds::new(point(px(0.0), px(0.0)), size(px(200.0), px(40.0))),
+                },
+                MountItem::Insert {
+                    parent: 1,
+                    child: 2,
+                    before: None,
+                },
+            ],
+        });
+        let remote_model = model.clone();
+        let remote = Arc::new(RemoteScene::new(move |step| {
+            answer(&remote_model, &step).unwrap()
+        }));
+        for text in ["Hallo\nworld", "AHallo\nworld", "external", ""] {
+            let mut props = ViewProps::default();
+            props.accessibility.value = Some(AccessibilityValue {
+                text: Some(text.into()),
+                ..Default::default()
+            });
+            model.apply(&MountBatch {
+                items: vec![MountItem::ViewProps {
+                    id: 2,
+                    props: Box::new(props),
+                }],
+            });
+            for scene in [model.clone() as Arc<dyn Scene>, remote.clone()] {
+                let agent = Agent::new(
+                    scene,
+                    Box::new(Field {
+                        did: Arc::default(),
+                        focused: Mutex::new(false),
+                    }),
+                );
+                assert_eq!(
+                    agent.take(TestStep::Value {
+                        selector: "view:2".into()
+                    }),
+                    StepOutcome::Done {
+                        value: serde_json::json!(text)
+                    }
+                );
+            }
+        }
+    }
+
+    /// A field (view 2): what the agent does to it, and whether it has the
+    /// keyboard focus.
+    struct Field {
+        did: Arc<Mutex<Vec<String>>>,
+        focused: Mutex<bool>,
+    }
+
+    impl Native for Field {
+        fn bounds(&self, id: NodeId) -> Option<Bounds<Points>> {
+            (id == 2).then(|| {
+                Bounds::new(
+                    point(Points(0.0), Points(0.0)),
+                    Size::new(Points(200.0), Points(40.0)),
+                )
+            })
+        }
+        fn viewport(&self) -> Size<Points> {
+            Size::new(Points(400.0), Points(400.0))
+        }
+        fn press(&self, _: Point<Points>) {
+            *self.focused.lock().unwrap() = true;
+            self.did.lock().unwrap().push("press".into());
+        }
+        fn long_press(&self, _: Point<Points>, _: Duration) {}
+        fn scroll(&self, _: Point<Points>, _: Point<Points>) {}
+        fn drag(&self, _: Point<Points>, _: Point<Points>) {}
+        fn type_text(&self, text: &str) {
+            self.did.lock().unwrap().push(format!("type {text}"));
+        }
+        fn key(&self, key: Key) {
+            self.did.lock().unwrap().push(format!("{key:?}"));
+        }
+        fn focused(&self) -> Option<NodeId> {
+            self.focused.lock().unwrap().then_some(2)
+        }
+        fn input_text(&self, _: NodeId) -> Option<String> {
+            None
+        }
+        fn back(&self) -> Result<(), String> {
+            Err("no back here".into())
+        }
+        fn answer_dialog(&self, _: Option<&str>) -> Result<(), String> {
+            Ok(())
+        }
+        fn animating(&self) -> bool {
+            false
+        }
+        fn screenshot(&self) -> Result<Vec<u8>, String> {
+            Ok(Vec::new())
+        }
+        fn resize(&self, _: Points, _: Points) -> Result<(), String> {
+            Ok(())
+        }
+        fn set_dark(&self, _: bool) -> Result<(), String> {
+            Ok(())
+        }
+        fn quit(&self) {}
+    }
+
+    #[test]
+    fn typing_into_the_focused_field_keeps_its_caret_and_selection() {
+        use nsh_core::{MountItem, ViewKind};
+        // #2180: a press before typing would collapse a selection (Cmd+A)
+        // the typing replaces, as it does when the user types.
+        let model = Arc::new(Model::default());
+        model.apply(&MountBatch {
+            items: vec![
+                MountItem::Create {
+                    id: 2,
+                    kind: ViewKind::Input,
+                },
+                MountItem::Frame {
+                    id: 2,
+                    frame: Bounds::new(
+                        point(Points(0.0), Points(0.0)),
+                        Size::new(Points(200.0), Points(40.0)),
+                    ),
+                },
+                MountItem::Insert {
+                    parent: 1,
+                    child: 2,
+                    before: None,
+                },
+            ],
+        });
+        let did = Arc::new(Mutex::new(Vec::new()));
+        let field = Field {
+            did: did.clone(),
+            focused: Mutex::new(false),
+        };
+        let agent = Agent::new(model, Box::new(field));
+        let ok = StepOutcome::Done {
+            value: serde_json::Value::Null,
+        };
+        let step = |text: &str| TestStep::Type {
+            selector: "view:2".into(),
+            text: text.into(),
+        };
+        // Not focused: pressed to take the focus.
+        assert_eq!(agent.take(step("A")), ok);
+        // Focused: typed where its caret is.
+        assert_eq!(agent.take(step("Y")), ok);
+        assert_eq!(*did.lock().unwrap(), ["press", "type A", "type Y"]);
     }
 }

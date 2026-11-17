@@ -73,7 +73,7 @@ function PhotoRow(props: { photo: Photo }) {
 function PhotoTile(props: { photo: Photo }) {
   return (
     <Press scale={0.97} accessibilityLabel={props.photo.title}>
-      <View class="hover:bg-card" style={{ padding: 6, gap: 8, borderRadius: radius.card, borderCurve: "continuous", cursor: "pointer" }}>
+      <View class="hover:bg-card" style={{ padding: 6, gap: 8, borderRadius: radius.card, borderCurve: "continuous" }}>
         <Image
           src={photoUrl(photoNames[props.photo.id % photoNames.length], "small")}
           style={{
@@ -188,7 +188,7 @@ export function Photos() {
         </View>
         <Text style={{ fontSize: 40, fontWeight: "600", color: colors.text, fontVariant: ["tabular-nums"], letterSpacing: -1 }}>
           {grouped(photos().length)}
-          <Text style={{ fontSize: 15, fontWeight: "500", color: colors.accent }}> photos</Text>
+          <Text style={{ fontSize: 15, fontWeight: "500", color: colors.muted }}> photos</Text>
         </Text>
         <View style={{ flexDirection: "row", borderTopWidth: 1, borderTopColor: colors.line, paddingTop: 10 }}>
           <Stat width="33%" label="Pages" value={String(Math.ceil(photos().length / PAGE))} />

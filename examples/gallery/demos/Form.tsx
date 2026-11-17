@@ -1,25 +1,26 @@
-import { cleanup, effect, type InputRef, type JSX, reduceMotion, Scroll, signal, split, Text, View } from "nsh";
+import { cleanup, effect, type InputRef, type JSX, reduceMotion, Scroll, signal, split, Text, token, View } from "nsh";
 import { Animated, createAnimatedValue, LayoutAnimation } from "nsh";
 import { Dialog, Input, type InputProps, NavPage } from "nsh/base";
 import { Keyboard, keyboardFrame, platform, safeAreaInsets } from "nsh";
+import { isAvailable as hasWindow, titleBar } from "nsh/desktop";
 import { Icon, type IconName } from "../icons";
 import { nav } from "../nav";
-import { alpha, Appear, Badge, Button, Caption, Card, colors, DemoPage, finish, focusRing, follow, header, hint, IconTile, Inset, Meter, mono, PageHeader, Press, radius, RoundButton, Section, Segmented, Spinner, terminal, TERMINAL_COLUMN, TERMINAL_GAP, TERMINAL_ROW, tints, type Tone, toneColor } from "../ui";
+import { alpha, Appear, Badge, Button, Caption, Card, colors, DemoPage, fieldLook, fieldSize, fieldText, finish, focusRing, follow, header, hint, IconTile, Inset, Meter, PageHeader, Press, radius, RoundButton, Section, Segmented, Spinner, terminal, TERMINAL_COLUMN, TERMINAL_GAP, TERMINAL_ROW, tints, type Tone, toneColor } from "../ui";
 
 /** A pointer and a keyboard: desktop density. */
 const pointer = platform.desktop;
 
-/** A field's text size and its side padding: in the terminal the text sits
+/** A field's text size and its side padding (`fieldSize`): in the terminal the text sits
  * one Cell inside the border's own column. */
-const fieldFont = pointer ? 13 : 15;
-const fieldPad = terminal ? 2 * TERMINAL_COLUMN - 1 : pointer ? 8 : 14;
+const fieldFont = fieldSize.font;
+const fieldPad = fieldSize.pad;
 
 /** The next commit's frames ease to their new places (a message sliding in), unless motion is reduced. */
 const relayout = () => {
   if (!reduceMotion()) LayoutAnimation.configureNext(LayoutAnimation.Presets.easeInEaseOut);
 };
 
-/** A prefix or suffix of a field: quiet text inside it, or an `addon` set off on the inset color with a hairline. */
+/** A prefix or suffix of a field: quiet text inside it, or an `addon` set off on the muted fill with a hairline. */
 function Affix(props: { text: string; addon?: boolean; side: "start" | "end" }) {
   return (
     <If
@@ -31,7 +32,8 @@ function Affix(props: { text: string; addon?: boolean; side: "start" | "end" }) 
           alignSelf: "stretch",
           justifyContent: "center",
           paddingHorizontal: fieldPad,
-          backgroundColor: colors.inset,
+          // shadcn's input addon: the muted fill, a step off the field in both appearances.
+          backgroundColor: token("muted"),
           [props.side === "start" ? "borderRightWidth" : "borderLeftWidth"]: 1,
           borderColor: colors.line,
           // The field's corners on its outer side, inside its border.
@@ -48,7 +50,7 @@ function Affix(props: { text: string; addon?: boolean; side: "start" | "end" }) 
 
 /**
  * A labelled input (`api` names the prop it shows, `hint` is a plain note):
- * the border glows accent while focused (a ring springing in natively), an
+ * the field's edge turns accent while focused (`fieldLook`'s focus edge), an
  * error turns it red, slides a message in (layout animation) and shakes
  * the field, again each time `attempt` grows (a submit); `valid` fades a
  * check in at its end. `prefix` / `suffix` are text around the value
@@ -78,8 +80,6 @@ function Field(
   // Made once: the views inside follow their own state.
   const leading = own.leading;
   const trailing = own.trailing;
-  const focused = signal(false);
-  const focus = follow(() => (focused() ? 1 : 0));
   const ok = follow(() => (own.valid && !own.error ? 1 : 0));
   const shake = createAnimatedValue(0);
   const wobble = () => {
@@ -101,45 +101,21 @@ function Field(
     tried = n;
     if (own.error) wobble();
   });
-  // Desktop density with a pointer (28 pt, text 13), touch density otherwise;
-  // in the terminal the text sits one Cell inside the border's own row.
-  const box = () =>
-    terminal
-      ? props.multiline
-        ? { minHeight: 3 * TERMINAL_ROW, paddingTop: TERMINAL_ROW - 1, paddingBottom: TERMINAL_ROW - 1 }
-        : { height: 3 * TERMINAL_ROW }
-      : props.multiline
-        ? pointer
-          ? { minHeight: 28, paddingTop: 6, paddingBottom: 6 }
-          : { minHeight: 46, paddingTop: 13, paddingBottom: 13 }
-        : { height: pointer ? 28 : 46 };
   return (
     <View style={{ gap: terminal ? 0 : 6, translate: [shake, 0], opacity: props.disabled ? 0.5 : 1 }}>
       {/* The terminal keeps two columns between the label, the API and the hint: one would run them together. */}
       <View style={{ flexDirection: "row", alignItems: "baseline", gap: terminal ? TERMINAL_GAP : 8 }}>
-        <Text style={{ flex: 1, fontSize: 13, fontWeight: "500", color: colors.muted }}>{own.label}</Text>
+        <Text style={{ flex: 1, fontSize: 13, fontWeight: "500", color: colors.text }}>{own.label}</Text>
         <If when={own.api}>
-          <Text style={{ fontSize: 12, color: colors.faint, fontFamily: mono }}>{own.api}</Text>
+          {/* The API in the sans of the hints beside it, as the sections' notes: one face on every field's row. */}
+          <Text style={{ fontSize: 12, color: colors.faint }}>{own.api}</Text>
         </If>
         <If when={own.hint}>
           <Text style={{ fontSize: 13, color: own.hintColor ?? colors.faint, fontVariant: ["tabular-nums"], transitionProperty: "color", transitionDuration: 150 }}>{own.hint}</Text>
         </If>
       </View>
-      <View
-        style={{
-          flexDirection: "row",
-          alignItems: props.multiline ? "flex-start" : "center",
-          borderRadius: radius.control,
-          borderCurve: "continuous",
-          borderWidth: 1,
-          borderColor: own.error ? colors.danger : props.readonly || props.disabled ? colors.line : colors.fieldBorder,
-          backgroundColor: colors.field,
-          // Recessed while editable; a read-only or disabled field lies flat.
-          ...(props.readonly || props.disabled ? {} : finish.field),
-          transitionProperty: "border-color",
-          transitionDuration: reduceMotion() ? 0 : 150,
-        }}
-      >
+      {/* The well: its edge, and the fields' focus edge while the input in it has the keys (`fieldLook`). */}
+      <View {...fieldLook({ invalid: () => !!own.error, readonly: () => !!props.readonly, disabled: () => !!props.disabled, multiline: props.multiline })}>
         <If when={own.prefix}>
           <Affix text={own.prefix!} addon={own.addon} side="start" />
         </If>
@@ -149,27 +125,14 @@ function Field(
         <Input
           returnKeyType={own.next ? "next" : "done"}
           onSubmit={() => own.next?.()?.focus()}
-          onFocus={() => {
-            focused.set(true);
-            own.onFocus?.();
-          }}
-          onBlur={() => {
-            focused.set(false);
-            own.onBlur?.();
-          }}
+          onFocus={() => own.onFocus?.()}
+          onBlur={() => own.onBlur?.()}
           {...input}
           style={[
             {
-              flex: 1,
-              paddingHorizontal: fieldPad,
+              ...fieldText({ readonly: props.readonly, multiline: props.multiline, inWell: true }),
               // The terminal keeps one Cell between a prefix and the value.
               paddingLeft: own.prefix && terminal ? TERMINAL_COLUMN : fieldPad,
-              fontSize: fieldFont,
-              color: props.readonly ? colors.muted : colors.text,
-              placeholderColor: colors.faint,
-              caretColor: colors.accent,
-              selectionColor: colors.accent,
-              ...box(),
             },
             ...(Array.isArray(own.style) ? own.style : [own.style]),
           ]}
@@ -185,22 +148,6 @@ function Field(
         <If when={own.suffix}>
           <Affix text={own.suffix!} addon={own.addon} side="end" />
         </If>
-        <View
-          style={{
-            pointerEvents: "none",
-            position: "absolute",
-            top: -1,
-            left: -1,
-            right: -1,
-            bottom: -1,
-            // Around the field's border: its radius plus the 1pt it reaches out.
-            borderRadius: radius.control + 1,
-            borderCurve: "continuous",
-            borderWidth: 2,
-            borderColor: own.error ? colors.danger : colors.accent,
-            opacity: focus,
-          }}
-        />
       </View>
       <If when={own.error}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: 7 }}>
@@ -233,7 +180,7 @@ function FieldButton(props: { icon: IconName; label: string; short: string; show
       accessibilityLabel={props.label}
       disabled={props.show === false}
       hitSlop={4}
-      focusStyle={focusRing()}
+      focusVisibleStyle={focusRing()}
       hoverStyle={{ backgroundColor: alpha(colors.text, 0.06) }}
       activeStyle={{ backgroundColor: alpha(colors.text, 0.12), transform: [{ scale: 0.9 }] }}
       style={{
@@ -313,7 +260,7 @@ function LinkRow(props: { icon: IconName; title: string; note: string; first?: b
         <IconTile name={props.icon} size={34} />
         <View style={terminal ? { flex: 1, flexDirection: "row", gap: TERMINAL_GAP } : { flex: 1, gap: 2 }}>
           <Text style={{ flex: terminal ? 1 : undefined, fontSize: 15, fontWeight: "500", color: colors.text }}>{props.title}</Text>
-          <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.faint, fontFamily: mono }}>
+          <Text style={{ numberOfLines: 1, fontSize: 12, color: colors.faint }}>
             {props.note}
           </Text>
         </View>
@@ -373,7 +320,7 @@ function Strength(props: { password: string }) {
             {(i) => {
               const on = follow(() => (score() > i() ? 1 : 0));
               return (
-                <View style={{ flex: 1, height: 6, borderRadius: 3, overflow: "hidden", backgroundColor: colors.track, borderWidth: 1, ...finish.track }}>
+                <View style={{ flex: 1, height: 6, borderRadius: 3, overflow: "hidden", backgroundColor: alpha(colors.text, 0.1) }}>
                   <View
                     style={{
                       position: "absolute",
@@ -625,11 +572,12 @@ export function Form() {
           <Card
             icon="form"
             title="Keyboard"
-            subtitle="keyboardDismissMode while dragging"
-            right={<Badge label={`${Math.round(keyboardFrame().height)} pt`} tone={keyboardFrame().height > 0 ? "accent" : "neutral"} />}
+            subtitle="How a drag dismisses the keyboard"
+            // Only where there is an on-screen keyboard: what it covers while up.
+            right={pointer ? undefined : <Badge label={keyboardFrame().height > 0 ? `Keyboard up, ${Math.round(keyboardFrame().height)} pt` : "Keyboard hidden"} tone={keyboardFrame().height > 0 ? "accent" : "neutral"} />}
           >
             <Segmented options={modes} value={mode()} onChange={(m) => mode.set(m)} />
-            <Caption label={hint("Drag the form with the keyboard up", "Desktops have no on-screen keyboard to dismiss")} note={mode()} />
+            <Caption label={hint("Drag the form with the keyboard up", "Desktops have no on-screen keyboard to dismiss")} />
           </Card>
         ),
         () => (
@@ -700,7 +648,7 @@ export function Form() {
               api="url"
               testID="site"
               prefix="https://"
-              suffix=".nsh.app"
+              suffix=".nsh.dev"
               addon
               keyboardType="url"
               autoCapitalize="none"
@@ -726,8 +674,7 @@ export function Form() {
             </Pair>
             <Field
               label="Offset"
-              api="numbers-and-punctuation"
-              hint="dark keyboard (iOS)"
+              hint="A dark keyboard on iOS"
               keyboardType="numbers-and-punctuation"
               ios={{ keyboardAppearance: "dark" }}
               placeholder="-12.5"
@@ -803,6 +750,14 @@ export function Form() {
               <Meter value={notes().length / 280} tone={notes().length >= 280 ? "danger" : notes().length > 250 ? "warn" : "accent"} />
             </View>
             <AutoGrow />
+            <Field
+              label="Scrolls its text"
+              hint="The wheel scrolls the lines, then the page"
+              testID="scrolling-notes"
+              multiline
+              defaultValue={Array.from({ length: 20 }, (_, i) => `Line ${i + 1}`).join("\n")}
+              style={{ height: 120 }}
+            />
             <Field label="No caret" api="caret" caret={false} defaultValue="No caret here" />
           </Section>
         ),
@@ -848,6 +803,11 @@ export function Form() {
       ]}
     >
       <Dialog open={sheet()} presentation="pageSheet" onOpenChange={({ open }) => sheet.set(open)} style={{ flex: 1 }}>
+        {/* On the desktops a dialog covers the whole window: leave the
+            gallery's title bar showing, and still dragging the window. */}
+        <If when={hasWindow && !terminal}>
+          <View desktop={{ windowDrag: true }} style={{ height: titleBar().height || 40, flexShrink: 0 }} />
+        </If>
         <View
           style={{
             flex: 1,
@@ -967,7 +927,7 @@ function MessageBar() {
             testID="message-bar"
             returnKeyType="send"
             style={{
-              placeholderColor: colors.faint,
+              placeholderColor: colors.muted,
               caretColor: colors.accent,
               selectionColor: colors.accent,
               flex: 1,

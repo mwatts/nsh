@@ -14,6 +14,9 @@ pub(crate) struct Mounter {
     pub(crate) components: HashMap<String, ComponentFactory>,
     pub(crate) appearance: Option<Appearance>,
     pub(crate) exit: bool,
+    /// The app turned the performance line on or off
+    /// (`setFpsEnabled`), for the app to apply.
+    pub(crate) perf_monitor: Option<bool>,
     pub(crate) keymap: std::sync::Arc<nsh_core::keymap::Keymap>,
     pub(crate) scrolled: Vec<NodeId>,
     pub(crate) dirty_stacks: Vec<NodeId>,
@@ -31,6 +34,9 @@ pub(crate) struct Mounter {
     /// The Cells text was drawn on this frame (by buffer index), kept to
     /// reuse its allocation (`render.rs`).
     pub(crate) text_cells: Vec<bool>,
+    /// The Cells drawn this frame that hold a glyph inside a view with an
+    /// `href` (by buffer index), kept to reuse its allocation (`link.rs`).
+    pub(crate) links: crate::link::Painted,
     /// The links of the texts drawn last that are stops of Tab
     /// (`TextLink::focus_stop`), by the span's node: no views of their own,
     /// each stands after its text view in the focus order.
@@ -50,6 +56,7 @@ impl Default for Mounter {
             components: HashMap::new(),
             appearance: None,
             exit: false,
+            perf_monitor: None,
             keymap: Default::default(),
             scrolled: Vec::new(),
             dirty_stacks: Vec::new(),
@@ -60,6 +67,7 @@ impl Default for Mounter {
             focus_requests: Vec::new(),
             scroll_bars: Vec::new(),
             text_cells: Vec::new(),
+            links: Default::default(),
             spans: HashMap::new(),
             focused_span: None,
             dialogs: Default::default(),
@@ -451,6 +459,15 @@ impl Mounter {
                     command: Command::ExitApp,
                     ..
                 } => self.exit = true,
+                MountItem::Command {
+                    command: Command::PerfMonitor(enabled),
+                    ..
+                } => self.perf_monitor = Some(enabled),
+                // `Application.quit()`: the app ends, as with a menu's quit role.
+                MountItem::Command {
+                    command: Command::Desktop(ref desktop),
+                    ..
+                } if **desktop == nsh_core::desktop::DesktopCommand::Quit => self.exit = true,
                 // The app's design tokens, for the platform's own controls
                 // (Linux's menus, iOS's and Android's alerts). The
                 // terminal's own controls (menus, the menu bar, system

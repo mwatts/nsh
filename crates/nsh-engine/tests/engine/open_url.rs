@@ -30,6 +30,7 @@ fn bundle(app: &str) -> Bundle {
         minify: false,
         split: false,
         ui_sets: ui_sets.iter().map(Into::into).collect(),
+        ..Default::default()
     })
     .unwrap();
     let bytecode = nsh_js::compile_bytecode_with(
@@ -173,7 +174,7 @@ mount(() => (
     <TextView
       markdown="See [the docs](https://example.com/docs) or [the top](#top)."
       links="open"
-      onLinkPress={({ url }) => pressed.set([...pressed(), url])}
+      onLinkPress={({ url, modifiers }) => pressed.set([...pressed(), modifiers.platform ? `cmd+${url}` : url])}
     />
     <Text>{`pressed ${pressed().join(" ")}`}</Text>
   </View>
@@ -198,17 +199,28 @@ fn a_text_view_opens_its_links_when_asked() {
         }
     }
     assert_eq!(links.len(), 2, "no text with two links");
-    for link in links {
-        engine
-            .control()
-            .dispatch_event(link, EventKind::Press, EventPayload::None);
-    }
+    // The page clicked with Command held, the anchor pressed from the
+    // keyboard (no pointer, no modifiers).
+    let cmd = nsh_core::PressEvent {
+        modifiers: nsh_core::keymap::Modifiers {
+            cmd: true,
+            ..Default::default()
+        },
+        clicks: 1,
+        ..Default::default()
+    };
+    engine
+        .control()
+        .dispatch_event(links[0], EventKind::Press, EventPayload::Press(cmd));
+    engine
+        .control()
+        .dispatch_event(links[1], EventKind::Press, EventPayload::None);
     // The page opens; the anchor is only reported.
     let (_, urls) = run(
         &engine,
         &rx,
         true,
-        &["pressed https://example.com/docs #top"],
+        &["pressed cmd+https://example.com/docs #top"],
     );
     assert_eq!(urls, ["https://example.com/docs"]);
     drop(engine);
@@ -271,15 +283,19 @@ fn a_link_opens_its_href_through_the_system_or_the_app() {
         Some(AccessibilityCurrent::Page)
     );
     assert!(home_props.accessibility.state.disabled);
-    // No look of its own: only the app's `disabled:` class styles a link.
+    // No look of its own beyond the pointer cursor: only the app's
+    // `disabled:` class styles a link.
     for id in [docs, order] {
-        assert!(
-            !first
-                .items
-                .iter()
-                .any(|i| matches!(i, MountItem::ViewStyle { id: v, .. } if *v == id)),
-            "no style of its own"
-        );
+        for i in &first.items {
+            if let MountItem::ViewStyle { id: v, style } = i
+                && *v == id
+            {
+                assert_eq!(style.cursor, nsh_core::Cursor::Pointer);
+                let mut rest = style.clone();
+                rest.cursor = Default::default();
+                assert_eq!(rest, Default::default(), "no style beyond the cursor");
+            }
+        }
     }
     // A disabled link takes no presses.
     assert!(!first.items.iter().any(|i| matches!(
@@ -353,4 +369,47 @@ fn opening_urls_is_a_capability() {
     }
     assert_eq!(urls, ["https://example.com"]);
     drop(engine);
+}
+
+/// A Rust root that opens an `https:` URL, then an `smb:` one, and shows
+/// the answers.
+#[nsh_core::prelude::component]
+fn Opener() -> impl nsh_core::prelude::IntoElement {
+    use nsh_core::prelude::*;
+    let answers = signal(String::new());
+    spawn(async move {
+        let web = open_url("https://example.com/a").await;
+        let share = open_url("smb://server/share").await;
+        answers.set(format!("web {web} share {share}"));
+    });
+    text(move || answers.get())
+}
+
+/// Runs `root` until it shows its answers: the text and the URLs it asked
+/// the platform to open.
+fn opened_by(root: nsh_core::element::Root) -> (String, Vec<String>) {
+    let (tx, rx) = crossbeam_channel::unbounded();
+    let config = EngineConfig {
+        viewport: Size::new(px(400.0), px(600.0)),
+        ..EngineConfig::new(root)
+    };
+    let engine = Engine::start(config, || ApproxTextEngine, ChannelSink(tx)).unwrap();
+    run(&engine, &rx, true, &["web ", "share "])
+}
+
+#[test]
+fn a_rust_root_opens_urls_under_its_declared_capabilities() {
+    use nsh_core::element::Root;
+    // `nsh.json` `capabilities` of a Rust root (`"root"`): only `https:`.
+    let declared =
+        Capabilities::from_json(&serde_json::json!({ "openUrl": { "schemes": ["https"] } }))
+            .unwrap();
+    let (text, urls) = opened_by(Root::of::<Opener>().capabilities(declared));
+    assert_eq!(text, "web true share false");
+    assert_eq!(urls, ["https://example.com/a"]);
+
+    // No declaration: every URL the platform opens.
+    let (text, urls) = opened_by(Root::of::<Opener>());
+    assert_eq!(text, "web true share true");
+    assert_eq!(urls, ["https://example.com/a", "smb://server/share"]);
 }

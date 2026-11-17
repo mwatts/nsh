@@ -1,7 +1,7 @@
 import { keymap, signal, Text, View } from "nsh";
 import { Tooltip } from "nsh/base";
 import type { LucideIconName } from "../icons";
-import { Badge, Button, Caption, Card, colors, createPresence, DemoPage, type PopupSide, terminal, TERMINAL_GAP, Tip } from "../ui";
+import { Badge, Button, Caption, Card, colors, createPresence, DemoPage, type PopupSide, terminal, TERMINAL_GAP, Tip, tooltipLook, tooltipNote, tooltipText } from "../ui";
 import { Avatar, createEvents, pointer, Trigger } from "./OverlayUi";
 
 type Tool = { id: string; icon: LucideIconName; label: string; key: string; hint: string };
@@ -65,14 +65,14 @@ export function Tooltips() {
     const key = (k: string) => (pointer ? keymap.label(k) : undefined);
     const current = () => tools.find((t) => t.id === tool())!;
     return (
-      <Card icon="tooltip" title="On a toolbar" subtitle={pointer ? "Rest the pointer on a tool; its key works too" : "Touch screens show none: the names are the buttons' labels"}>
+      <Card icon="tooltip" title="On a toolbar" subtitle={pointer ? "Rest the pointer on a tool; its key works too" : "Touch screens show none: names are labels"}>
         <View style={{ flexDirection: "row", alignItems: "center", gap: terminal ? TERMINAL_GAP : 2, alignSelf: "flex-start", padding: 3, borderRadius: 10, borderWidth: 1, borderColor: colors.border, backgroundColor: colors.inset }}>
           <Each of={tools}>
             {(t) => (
               <Trigger
                 icon={t().icon}
                 variant="ghost"
-                open={tool() === t().id}
+                on={tool() === t().id}
                 ink={tool() === t().id ? colors.text : colors.muted}
                 accessibilityLabel={t().label}
                 tip={<Tip label={t().label} shortcut={key(t().key)} placement="bottom" />}
@@ -116,7 +116,7 @@ export function Tooltips() {
       </View>
     );
     return (
-      <Card icon="tooltip" title="Its side" subtitle="Each comes out of the side it is on; it flips where there is no room">
+      <Card icon="tooltip" title="Its side" subtitle="Each from its side; it flips without room">
         <View style={{ alignItems: "center", gap: 6, paddingVertical: 8 }}>
           {side("top", "arrow-up")}
           <View style={{ flexDirection: "row", gap: pointer ? 46 : 60 }}>
@@ -138,16 +138,16 @@ export function Tooltips() {
             accessibilityLabel={`Approved by ${reviewers.join(", ")}`}
             tooltip={
               <Tooltip delay={300} onOpen={presence.show} onClose={presence.hide}>
-                <View class="rounded-lg border border-border bg-popover" style={{ ...presence.style, padding: 10, gap: 8, width: 210 }}>
-                  <Text class="text-xs font-semibold text-popover-foreground">Approved by 3 reviewers</Text>
+                <View class={tooltipLook({ rich: true }).class} style={{ ...presence.style, width: 210 }}>
+                  <Text class={`${tooltipText} font-semibold`}>Approved by 3 reviewers</Text>
                   <Each of={reviewers}>
                     {(name) => (
                       <View style={{ flexDirection: "row", alignItems: "center", gap: 8 }}>
                         <Avatar name={name()} size={20} />
-                        <Text class="text-xs text-popover-foreground" style={{ flex: 1 }}>
+                        <Text class={tooltipText} style={{ flex: 1 }}>
                           {name()}
                         </Text>
-                        <Text class="text-xs text-muted-foreground">2h ago</Text>
+                        <Text class={tooltipNote}>2h ago</Text>
                       </View>
                     )}
                   </Each>
@@ -175,7 +175,7 @@ export function Tooltips() {
     const pinned = signal(false);
     const presence = createPresence("bottom");
     return (
-      <Card icon="tooltip" title="Opened by the app" subtitle="Controlled: shown while pinned, or while the pointer rests">
+      <Card icon="tooltip" title="Opened by the app" subtitle="Shown while pinned or while the pointer rests">
         <View
           tooltip={
             <Tooltip
@@ -189,8 +189,8 @@ export function Tooltips() {
               placement="bottom"
               delay={300}
             >
-              <View class="rounded-md border border-border bg-popover px-2 py-1" style={presence.style}>
-                <Text class="text-xs text-popover-foreground">Shown while pinned or hovered</Text>
+              <View class={tooltipLook().class} style={presence.style}>
+                <Text class={tooltipText}>Shown while pinned or hovered</Text>
               </View>
             </Tooltip>
           }

@@ -136,6 +136,7 @@ impl DevSession {
                 source_map,
                 capabilities,
                 app_id,
+                window,
                 limits,
             } => {
                 let result = (|| -> Result<_, String> {
@@ -153,6 +154,7 @@ impl DevSession {
                     }
                     let bundle = bundle
                         .with_app_id(app_id.as_deref())
+                        .with_main_window(window.as_deref())
                         .with_capabilities_json(capabilities.as_deref())?;
                     Ok((bundle, Limits::development(limits.as_deref())?))
                 })();
@@ -365,7 +367,9 @@ impl Diagnostics {
             "Escape" | "q" => self.close(),
             "g" if modifiers.ctrl => self.close(),
             "r" => self.reload = true,
-            "Up" => {
+            // The terminal names its arrows `ArrowUp`…: an embedder may
+            // name them as the keymap does.
+            "Up" | "ArrowUp" => {
                 self.follow = false;
                 self.scroll.0 = self.scroll.0.saturating_sub(1);
             }
@@ -373,7 +377,7 @@ impl Diagnostics {
                 self.follow = false;
                 self.scroll.0 = self.scroll.0.saturating_sub(10);
             }
-            "Down" => {
+            "Down" | "ArrowDown" => {
                 self.follow = false;
                 self.scroll.0 = self.scroll.0.saturating_add(1);
             }
@@ -386,8 +390,8 @@ impl Diagnostics {
                 self.scroll.0 = 0;
             }
             "End" => self.follow = true,
-            "Left" => self.scroll.1 = self.scroll.1.saturating_sub(8),
-            "Right" => self.scroll.1 = self.scroll.1.saturating_add(8),
+            "Left" | "ArrowLeft" => self.scroll.1 = self.scroll.1.saturating_sub(8),
+            "Right" | "ArrowRight" => self.scroll.1 = self.scroll.1.saturating_add(8),
             _ => {}
         }
         true

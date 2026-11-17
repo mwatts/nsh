@@ -92,7 +92,7 @@ mount(App);
 
 内容来自以下三个属性之一，按此顺序读取：
 
-- **`markdown`**：CommonMark 加上 GitHub 的扩展（表格、任务列表、删除线、自动链接、脚注、提示块）、公式（`$…$` 和 `$$…$$`）以及 Markdown 中的 HTML。
+- **`markdown`**：CommonMark 加上 GitHub 的扩展（表格、任务列表、删除线、自动链接、脚注、提示块）、公式（`$…$` 和 `$$…$$`）以及 Markdown 中的 HTML。中日韩文字旁的强调按 CommonMark 的 CJK 友好修订判定，`**涨幅：**5%` 会加粗到冒号为止；裸网址遇到中日韩文字或弯引号即结束：`https://example.com。下一句` 只链接 `https://example.com`。写在尖括号里（`<https://zh.wikipedia.org/wiki/中文>`）或写成链接的网址保留全部字符。标签名既不是 HTML 元素、也不是 `tag` 扩展时（`<US tech>`、`<公司名>`），按原样显示为文字。
 - **`html`**：按阅读模式的方式显示 HTML。文本、结构和行内格式都会保留；脚本、样式、表单控件和隐藏元素不会显示。片段和完整页面都可以（完整页面显示其 body）。
 - **`document`**：应用构建或保存的文档块：TSX 中是普通对象，Rust 中是 `nsh_base::text_view::Document`（[文档模型](#the-document-model)）。
 
@@ -240,7 +240,7 @@ fn reply(markdown: Signal<SharedString>) -> impl IntoElement {
 
 ## 流式 AI 回复
 
-随着回复增长传入它，并设置 `options={{ streaming: true }}`（Rust 中是 `MarkdownOptions { streaming: true, .. }`）。仍在到达的文本末尾常常留着未闭合的语法（`**bold`、`` `code ``、`[a link](htt`、刚到达表头的表格）；流式模式会把它显示成闭合后的样子，读者不会看到零散的 `**` 或 `[`。文档块按位置保留：已完成的块保留它们的视图，只有正在写的块会重新生成，因此长回复的更新依然很轻。
+随着回复增长传入它，并设置 `options={{ streaming: true }}`（Rust 中是 `MarkdownOptions { streaming: true, .. }`）。仍在到达的文本末尾常常留着未闭合的语法（`**bold`、`` `code ``、`[a link](htt`、刚到达表头的表格）；流式模式会把它显示成闭合后的样子，读者不会看到零散的 `**` 或 `[`。含义要看后面字符的末行在这一行结束时显示：单独的列表标记、段落下的 `-` 或 `=` 行、代码围栏的开头行或打了一半的收尾围栏，因此列表项、标题和代码块一出现就是最终的样子。词内的 `*`（`a*b`）保持原样。回复结束后（关闭 `streaming`），文本按原样解析。文档块按位置保留：已完成的块只解析一次并保留它们的视图，每次更新只重新解析并生成正在写的块，因此长回复的更新依然很轻。
 
 `streamingCaret` 跟随文档末尾：以行内方式显示在最后一段文本的末尾，无论最后一个块在哪里结束（段落、列表项、代码块、表格的最后一个单元格）；否则单独一行显示在最后一个块之后（分隔线、渲染函数的内容）。回复结束后去掉它。
 
@@ -287,7 +287,7 @@ function Reply(props: { stream: AsyncIterable<string> }) {
 
 ## 链接
 
-链接是[可点击的片段](./text.md#链接)。点击链接会以 `{ url }` 调用 `onLinkPress`；打开什么由应用决定（应用自己的页面、[`WebView`](./web-view.md)、滚动到某个标题）。标题带有锚点（GitHub 的规则：`## Getting started` 是 `#getting-started`），因此指向 `#getting-started` 的链接会以这个字符串到达，脚注引用则以 `#footnote-<label>` 到达。在终端里，Tab 依次到达每个链接和脚注引用，Return 按下获得焦点的那一个：`onLinkPress` 收到它，与收到点击一样。
+链接是[可点击的片段](./text.md#链接)。点击链接会以 `{ url }` 调用 `onLinkPress`；打开什么由应用决定（应用自己的页面、[`WebView`](./web-view.md)、滚动到某个标题）。标题带有锚点（GitHub 的规则：`## Getting started` 是 `#getting-started`），因此指向 `#getting-started` 的链接会以这个字符串到达，脚注引用则以 `#footnote-<label>` 到达。在终端里，Tab 依次到达每个链接和脚注引用，Return 按下获得焦点的那一个：`onLinkPress` 收到它，与收到点击一样。事件还带有按下时按住的修饰键（`modifiers`，与点击事件的相同），应用可以把按住 Command（macOS 以外是 Control）的点击交给浏览器，普通点击自己处理；键盘或辅助技术触发的按下不带修饰键。
 
 ```rust tabs
 use nsh_base::{TextViewLinkPressEvent, text_view};
@@ -326,6 +326,8 @@ text_view().markdown(doc).links(TextViewLinks::Open)
 ```tsx tabs
 <TextView markdown={doc} links="open" />
 ```
+
+在桌面平台和桌面形态的 Web 上，指针停在链接上会在指针下方显示它去往哪里：链接有标题时先显示标题（`[docs](https://example.com/docs "The guide")`，或 HTML 链接的 `title`），下面一行是用主题 `muted-foreground` 颜色显示的目的地。URL 按解析后的样子显示，协议、主机和端口始终完整（国际化域名显示为 ASCII 形式，冒充的字母会显示出本来面目），过长的路径从中间截断；路径和文档内的锚点（`#…`）按原样显示。链接里的图片也以同样方式在图片下方显示链接的目的地和标题。这与 [Link](./link.md#去往哪里) 的核对相同。
 
 <a id="render-functions"></a>
 
@@ -414,6 +416,8 @@ import { Image, View } from "nsh";
   renderMath={(math) => <MathView tex={math.tex} display={math.display} />}
 />
 ```
+
+单独成段的图片（一段或一个表格单元格里只有图片）放在与正文同宽的框里：`w-full` 填满这个宽度，`max-w-full` 让更宽的图片收在其中，固定宽度的图片保持自己的宽度，靠行首排列。位于一行文字中的图片保持它要求的尺寸。
 
 `Highlighted` 和 `MathView`（Rust 中是 `highlighted` 和 `math_view`）代表应用自己的组件（高亮器、公式渲染器，或应用 Rust crate 中的组件）。没有 `renderMath` 时，`TextView` 自己排版公式（`math` 和 `mathBlock` 部件）：支持 KaTeX 的 TeX 语法并使用 KaTeX 字体，颜色跟随文本，在各平台上效果一致；无法解析的 TeX 以等宽字体显示其源码。
 
@@ -549,7 +553,7 @@ function Custom(props: { node: TextViewCustomNode }) {
 
 | 键 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
-| `math` | `boolean` | `true` | 公式：文本中的 `$…$`，`$$…$$` 公式块。 |
+| `math` | `boolean` | `true` | 公式：文本中的 `$…$` 和 `\(…\)`，`$$…$$` 和 `\[…\]` 公式块。转义方括号里是引用编号或中日韩文字时（`\[1\]\[3\]`、`\[注\]`）按文字显示。 |
 | `html` | `boolean` | `true` | Markdown 中的 HTML 按 `html` 属性的方式读取；`false` 时显示为文本。 |
 | `alerts` | `boolean` | `true` | GitHub 的提示块：`> [!NOTE]`、`[!TIP]`、`[!IMPORTANT]`、`[!WARNING]`、`[!CAUTION]`。 |
 | `frontmatter` | `boolean` | `false` | 开头的 YAML front matter（`---` … `---`）成为名为 `frontmatter` 的自定义节点，其 `text` 是 YAML。 |
@@ -568,7 +572,7 @@ function Custom(props: { node: TextViewCustomNode }) {
 | `heading` | `level`（1–6）、`content`、`anchor?` |
 | `blockquote` | `children`、`alert?`（`"note"`、`"tip"`、`"important"`、`"warning"`、`"caution"`） |
 | `list` | `ordered?`、`start?`、`loose?`、`items`（`{ checked?, children }`） |
-| `codeBlock` | `language?`、`meta?`、`code` |
+| `codeBlock` | `language?`、`meta?`、`code`、`id?`、`content?`、`wrap?` |
 | `math` | `tex` |
 | `table` | `align?`（每列 `"none"`、`"left"`、`"center"`、`"right"`）、`head`（单元格）、`rows?`（由单元格组成的行）；单元格是 `{ content }` |
 | `rule` | |
@@ -589,6 +593,8 @@ function Custom(props: { node: TextViewCustomNode }) {
 | `custom` | 同块节点 |
 
 文档还可以有 `footnotes?`：`{ label, index, children }`，按首次引用的顺序显示在文档块之后。应用可以把回复存成文档、用自己的数据构建文档，或者混入由 `renderCustom` 显示的自定义节点。
+
+代码块的 `id` 由应用设定：`onCodeBlockAction` 会连同它把代码块交回，操作由此知道作用于哪一块。`wrap: true` 让代码在视图宽度内换行，而不是横向滚动。`content` 是以行内内容表示的代码（应用的标注：强调、高亮，以及在 `custom` 部件中显示为其内容的自定义节点）；其纯文本与 `code` 相同时代替高亮后的代码显示，因此显示的就是复制得到的文本。
 
 <a id="parsing-and-plain-text"></a>
 
@@ -754,9 +760,19 @@ fn chat() -> impl IntoElement {
 
 | 事件 | Rust | 说明 |
 |---|---|---|
-| `onLinkPress` | `.on_link_press(\|event: &TextViewLinkPressEvent\| ..)` | 链接被点击：`{ url }`，其 URL；标题为 `#anchor`，脚注为 `#footnote-<label>`。 |
+| `onLinkPress` | `.on_link_press(\|event: &TextViewLinkPressEvent\| ..)` | 链接被点击：`{ url, modifiers }`，其 URL（标题为 `#anchor`，脚注为 `#footnote-<label>`）和按住的修饰键。 |
 | `onCodeBlockAction` | `.on_code_block_action(\|event: &TextViewCodeActionEvent\| ..)` | 代码块的操作被按下（`copy` 会在复制后报告）。 |
+| `onSelectionChange` | `.on_selection_change(\|event: &TextViewSelectionEvent\| ..)` | 设置了 `selectable` 的 `TextView` 的选区变化：`{ text, start, bounds, pageBounds }`，与复制得到的内容相同的选中文字、其起始位置及其外框；不再有选中内容时为 `""`（[读取选中的文字](./text-selection.md#读取选中的文字)）。放在可选择视图里时改由外层视图报告。 |
+
+## 方法
+
+`ref` 提供 `TextViewRef`（Rust 中通过 `component_ref::<TextView>()` 取得 `TextViewApi`）。JS 中的方法返回 `Promise`。
+
+| 方法 | Rust | 说明 |
+|---|---|---|
+| `selectedText({ format? })` | `selected_text(Option<TextSelectionOptions>)` | 读取 `selectable` 视图的选区：`format` 为 `"plain"`（默认，与复制相同）、`"markdown"` 或 `"html"`，由选中的节点重新生成；选中全部时返回原样的源文（[读取为 Markdown 或 HTML](./text-selection.md#读取为-markdown-或-html)）。没有选中内容时返回 `""`。 |
 | `onImagePress` | `.on_image_press(\|image: &Image\| ..)` | 不在链接中的图片被点击：`{ image }` 是该图片，由应用放大显示（应用自己的可缩放查看器）。 |
+| `onTaskPress` | `.on_task_press(\|event: &TextViewTaskPressEvent\| ..)` | 任务项的方框被点击：`{ index, checked }`，即文档中的第几个任务（从 0 开始，按阅读顺序）以及这次点击要求的状态。文档本身不会改变：由应用把修改后的源文本交给视图。 |
 
 <a id="accessibility"></a>
 

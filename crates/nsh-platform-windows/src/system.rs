@@ -22,6 +22,14 @@
 //!   Windows. POSIX variables (`LANG`, `LC_*`) are not looked at: Windows
 //!   programs do not, and shells like Git Bash set `LANG` regardless of
 //!   the user's settings;
+//! - the locale settings (`localeSettings()`): the preferred languages, the
+//!   user's display languages, most preferred first
+//!   (`GetUserPreferredUILanguages`: Settings > Time & language > Language
+//!   & region), the locale alone when it lists none; the regional
+//!   preferences, the regional format's time format, first day of the
+//!   week and measurement system (`GetLocaleInfoEx`, with the user's
+//!   changes to the format), over the region's; Windows has no temperature
+//!   unit setting: the region's; the time zone, below;
 //! - the font scale: Settings > Accessibility > Text size
 //!   (`TextScaleFactor`, 100 to 225 percent);
 //! - reduce motion: Settings > Accessibility > Visual effects > Animation
@@ -40,7 +48,21 @@
 //!   the window (an embedded surface's root window) is minimized or hidden,
 //!   active while the app is the active one (its windows get
 //!   `WM_ACTIVATEAPP`; before the first, the foreground window is the
-//!   process's), inactive otherwise.
+//!   process's), inactive otherwise; background too while the user cannot
+//!   see it: the session locked or without a display, the display off, the
+//!   window on another virtual desktop ([`crate::presence`], followed from
+//!   the system's notifications), and from the moment the session may end
+//!   (signing out, shutting down: [`crate::session`]);
+//! - the wake count (`wakeCount()`): one more on every
+//!   `WM_POWERBROADCAST` with `PBT_APMRESUMEAUTOMATIC` ([`woke`]), which
+//!   top-level windows get on every resume (an embedded surface's root
+//!   window passes it on);
+//! - the time zone (`localeSettings()`'s): the zone of the system's setting
+//!   (`GetDynamicTimeZoneInformation`, its Windows key name) by its IANA
+//!   name, which the ICU Windows ships knows
+//!   (`ucal_getTimeZoneIDForWindowsID`, loaded when first needed: `UTC`
+//!   without it); re-read on `WM_TIMECHANGE` too, which a change of the
+//!   zone sends.
 //!
 //! Safe area and keyboard height are zero: desktop windows have neither.
 //!
@@ -63,13 +85,17 @@ use nsh_core::{
     geometry::px,
     platform::{Appearance, clipboard},
 };
-use nsh_engine::{ColorScheme, Edges, Environment, Lifecycle, Locale};
+use nsh_engine::{
+    ColorScheme, Edges, Environment, HourCycle, Languages, Lifecycle, Locale, LocaleSettings,
+    MeasurementSystem, TimeZone, Weekday,
+};
 use windows::{
     Win32::{
         Foundation::{LPARAM, WPARAM},
         Globalization::{
-            GetLocaleInfoEx, GetUserDefaultLocaleName, GetUserDefaultUILanguage, LCIDToLocaleName,
-            LOCALE_IREADINGLAYOUT,
+            GetLocaleInfoEx, GetUserDefaultLocaleName, GetUserDefaultUILanguage,
+            GetUserPreferredUILanguages, LCIDToLocaleName, LOCALE_IFIRSTDAYOFWEEK, LOCALE_IMEASURE,
+            LOCALE_IREADINGLAYOUT, LOCALE_STIMEFORMAT, MUI_LANGUAGE_NAME,
         },
         Graphics::{
             Direct2D::{D2D1_DRAW_TEXT_OPTIONS_ENABLE_COLOR_FONT, D2D1_ROUNDED_RECT},
@@ -81,12 +107,17 @@ use windows::{
             },
         },
         System::{
-            LibraryLoader::{GetModuleHandleW, GetProcAddress},
+            LibraryLoader::{
+                GetModuleHandleW, GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW,
+            },
             Registry::{
                 HKEY, HKEY_CURRENT_USER, RRF_RT_REG_BINARY, RRF_RT_REG_DWORD, RegGetValueW,
             },
             SystemInformation::OSVERSIONINFOW,
             Threading::GetCurrentProcessId,
+            Time::{
+                DYNAMIC_TIME_ZONE_INFORMATION, GetDynamicTimeZoneInformation, TIME_ZONE_ID_INVALID,
+            },
         },
         UI::{
             Shell::{SetCurrentProcessExplicitAppUserModelID, ShellExecuteW},
@@ -98,7 +129,7 @@ use windows::{
             },
         },
     },
-    core::{BOOL, HSTRING, PCWSTR, s, w},
+    core::{BOOL, HSTRING, PCWSTR, PWSTR, s, w},
 };
 
 use crate::{
@@ -149,6 +180,8 @@ struct Settings {
     rtl: bool,
     screen_reader: bool,
     locale: Locale,
+    /// All but the time zone, which [`update`] reads ([`time_zone`]).
+    locale_settings: LocaleSettings,
 }
 
 /// Makes the system look dark (or light) from now on (`nsh test
@@ -171,6 +204,16 @@ pub(crate) fn system_dark() -> bool {
     ) == Some(0)
 }
 
+/// True when the taskbar is dark (Settings > Personalization > Colors,
+/// "Windows mode"), which the tray's template icons are painted for.
+pub(crate) fn taskbar_dark() -> bool {
+    reg_dword(
+        HKEY_CURRENT_USER,
+        w!("Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize"),
+        w!("SystemUsesLightTheme"),
+    ) != Some(1)
+}
+
 /// True when the surface draws in its dark appearance. The environment is
 /// kept current by this module, so drawing never reads the registry.
 pub(crate) fn dark(surface: &Surface) -> bool {
@@ -179,7 +222,9 @@ pub(crate) fn dark(surface: &Surface) -> bool {
 
 /// The color behind the app's views (the default theme's background).
 pub(crate) fn window_background(surface: &Surface) -> Color {
-    if dark(surface) {
+    if surface.transparent() {
+        Color::TRANSPARENT
+    } else if dark(surface) {
         Color(0x0a0a_0aff)
     } else {
         Color(0xffff_ffff)
@@ -199,6 +244,8 @@ pub(crate) fn watch_environment(surface: &Rc<Surface>) {
 pub(crate) fn settings_changed(surface: &Rc<Surface>) {
     refresh_accent();
     update(surface, settings());
+    // The taskbar's colors may have changed: a template tray icon follows.
+    crate::tray::refresh(surface.hwnd());
     // The accent may have changed without the environment.
     surface.invalidate();
 }
@@ -208,8 +255,9 @@ pub(crate) fn settings_changed(surface: &Rc<Surface>) {
 pub(crate) fn environment_applied(surface: &Surface) {
     let hwnd = surface.hwnd();
     if !hwnd.is_invalid() {
-        crate::window::set_dark_title_bar(hwnd, dark(surface));
+        crate::shell::set_color_scheme(surface, hwnd, Appearance::System);
     }
+    crate::app_window::appearance_changed(surface);
     // Menus follow the scheme; the caption buttons are drawn again.
     crate::chrome::appearance_changed(surface);
 }
@@ -230,6 +278,8 @@ pub(crate) fn set_app_id(id: &str) {
 
 /// The system's settings now.
 fn settings() -> Settings {
+    let name = user_locale_name();
+    let locale = user_locale(name.as_deref());
     Settings {
         dark: system_dark(),
         font_scale: text_scale(reg_dword(
@@ -241,8 +291,76 @@ fn settings() -> Settings {
         reduce_motion: spi_bool(SPI_GETCLIENTAREAANIMATION) == Some(false),
         rtl: ui_language_rtl(),
         screen_reader: spi_bool(SPI_GETSCREENREADER) == Some(true),
-        locale: user_locale(user_locale_name().as_deref()),
+        locale,
+        locale_settings: locale_settings(locale, name.as_deref()),
     }
+}
+
+/// The user's locale settings (`localeSettings()`) but the time zone: the
+/// display languages (`locale` alone when Windows lists none), and the
+/// regional format's (`name`'s, with the user's changes to it) time format,
+/// first day of the week and measurement system, over the region's.
+fn locale_settings(locale: Locale, name: Option<&str>) -> LocaleSettings {
+    let mut preferences = LocaleSettings::parse(name.unwrap_or_default());
+    preferences.languages = preferred_languages(locale);
+    if let Some(cycle) = locale_info(LOCALE_STIMEFORMAT).and_then(|f| HourCycle::of_pattern(&f)) {
+        preferences.hour_cycle = cycle;
+    }
+    // 0 for Monday to 6 for Sunday.
+    let first = locale_info(LOCALE_IFIRSTDAYOFWEEK).and_then(|d| d.trim().parse::<u8>().ok());
+    if let Some(day) = first.and_then(|d| Weekday::from_number(d + 1)) {
+        preferences.first_day_of_week = day;
+    }
+    // 0 metric (as the UK's units are, which Windows does not tell
+    // apart), 1 US.
+    match locale_info(LOCALE_IMEASURE).as_deref().map(str::trim) {
+        Some("0") if preferences.measurement_system == MeasurementSystem::Us => {
+            preferences.measurement_system = MeasurementSystem::Metric;
+        }
+        Some("1") => preferences.measurement_system = MeasurementSystem::Us,
+        _ => {}
+    }
+    preferences
+}
+
+/// A value of the user's regional format, with the user's changes to it.
+fn locale_info(kind: u32) -> Option<String> {
+    let mut buf = [0u16; 80];
+    // SAFETY: the buffer's length is passed with it; no name is the user's
+    // default locale.
+    let len = unsafe { GetLocaleInfoEx(PCWSTR::null(), kind, Some(&mut buf)) };
+    // The length counts the terminating null.
+    (len > 1).then(|| String::from_utf16_lossy(&buf[..len as usize - 1]))
+}
+
+/// The user's display languages, most preferred first; `locale` alone when
+/// Windows lists none.
+fn preferred_languages(locale: Locale) -> Languages {
+    let (mut count, mut len) = (0u32, 0u32);
+    // SAFETY: a size query: no buffer, the length written to `len`.
+    if unsafe { GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &mut count, None, &mut len) }
+        .is_err()
+        || len == 0
+    {
+        return Languages::one(locale);
+    }
+    let mut names = vec![0u16; len as usize];
+    // SAFETY: a buffer of the `len` characters the query asked for.
+    if unsafe {
+        GetUserPreferredUILanguages(
+            MUI_LANGUAGE_NAME,
+            &mut count,
+            Some(PWSTR(names.as_mut_ptr())),
+            &mut len,
+        )
+    }
+    .is_err()
+    {
+        return Languages::one(locale);
+    }
+    // A list of null-terminated names, ended by an empty one.
+    let names = String::from_utf16_lossy(&names);
+    Languages::parse(names.split('\0')).unwrap_or(Languages::one(locale))
 }
 
 /// `WM_ACTIVATEAPP`: this thread's windows became the active app's
@@ -260,6 +378,13 @@ pub(crate) fn lifecycle_changed(surface: &Surface) {
     surface.set_environment(env);
 }
 
+/// The system woke from sleep: `surface` counts it (`wakeCount()`).
+pub(crate) fn woke(surface: &Surface) {
+    let mut env: Environment = surface.environment.get();
+    env.wake_count = env.wake_count.wrapping_add(1);
+    surface.set_environment(env);
+}
+
 /// The app's state as `surface` sees it; `current` before its window
 /// exists.
 fn lifecycle(surface: &Surface, current: Lifecycle) -> Lifecycle {
@@ -270,10 +395,24 @@ fn lifecycle(surface: &Surface, current: Lifecycle) -> Lifecycle {
     // SAFETY: plain calls on a window handle.
     let root = unsafe { GetAncestor(hwnd, GA_ROOT) };
     // SAFETY: as above.
-    let shown = unsafe { IsWindowVisible(root).as_bool() && !IsIconic(root).as_bool() };
-    if !shown {
+    let shown = unsafe { IsWindowVisible(root).as_bool() && !IsIconic(root).as_bool() }
+        && !crate::presence::cloaked(root);
+    // A test's app runs as it does on screen whatever the screen shows (a
+    // locked or remote session), so its tests see what they see unlocked.
+    let seen = surface.testing() || crate::presence::screen_seen();
+    lifecycle_of(shown, seen, crate::session::ending(), || {
+        ACTIVE.with(Cell::get).unwrap_or_else(foreground_is_ours)
+    })
+}
+
+/// The app's state with its window `shown` (not minimized, hidden or on
+/// another virtual desktop), the screen `seen` (the session unlocked and
+/// connected, the display on: [`crate::presence`]), the session `ending`
+/// ([`crate::session`]) and whether it is the `active` app.
+fn lifecycle_of(shown: bool, seen: bool, ending: bool, active: impl FnOnce() -> bool) -> Lifecycle {
+    if !shown || !seen || ending {
         Lifecycle::Background
-    } else if ACTIVE.with(Cell::get).unwrap_or_else(foreground_is_ours) {
+    } else if active() {
         Lifecycle::Active
     } else {
         Lifecycle::Inactive
@@ -309,6 +448,8 @@ fn update(surface: &Surface, settings: Settings) {
     };
     env.color_scheme = surface.appearance.get().resolve(system);
     env.locale = settings.locale;
+    env.locale_settings = settings.locale_settings;
+    env.locale_settings.time_zone = time_zone();
     env.font_scale = settings.font_scale;
     env.reduce_motion = settings.reduce_motion;
     env.rtl = settings.rtl;
@@ -321,6 +462,62 @@ fn update(surface: &Surface, settings: Settings) {
     env.keyboard_height = px(0.0);
     env.lifecycle = lifecycle(surface, env.lifecycle);
     surface.set_environment(env);
+}
+
+/// The system's time zone: the setting's Windows zone by its
+/// IANA name.
+fn time_zone() -> TimeZone {
+    let mut info = DYNAMIC_TIME_ZONE_INFORMATION::default();
+    // SAFETY: an out structure of the size the call writes.
+    if unsafe { GetDynamicTimeZoneInformation(&mut info) } == TIME_ZONE_ID_INVALID {
+        return TimeZone::UTC;
+    }
+    let key = &info.TimeZoneKeyName;
+    let len = key.iter().position(|&c| c == 0).unwrap_or(key.len());
+    iana_name(&key[..len])
+        .and_then(|name| TimeZone::parse(&name))
+        .unwrap_or_default()
+}
+
+/// The IANA name of the Windows zone `key` (`W. Europe Standard Time`:
+/// `Europe/Berlin`), from the ICU Windows ships (`icu.dll` since Windows 10
+/// 1903, `icuin.dll` before), loaded at run time so that apps start where
+/// it is missing.
+fn iana_name(key: &[u16]) -> Option<String> {
+    type ToIana = unsafe extern "C" fn(*const u16, i32, *const u8, *mut u16, i32, *mut i32) -> i32;
+    // Looked up once for the process, not once per thread that asks (each
+    // surface's own, when they run on several).
+    static TO_IANA: std::sync::OnceLock<Option<ToIana>> = std::sync::OnceLock::new();
+    let to_iana = (*TO_IANA.get_or_init(|| {
+        // SAFETY: system libraries by name, from System32 only; the
+        // function, if there, has the signature above (ICU's C API).
+        unsafe {
+            [w!("icu.dll"), w!("icuin.dll")]
+                .into_iter()
+                .find_map(|name| LoadLibraryExW(name, None, LOAD_LIBRARY_SEARCH_SYSTEM32).ok())
+                .and_then(|icu| GetProcAddress(icu, s!("ucal_getTimeZoneIDForWindowsID")))
+                .map(|proc| std::mem::transmute::<_, ToIana>(proc))
+        }
+    }))?;
+    let mut name = [0u16; 64];
+    let mut status = 0i32;
+    // SAFETY: `key` and `name` hold the lengths given; no region (ICU's
+    // default mapping, `001`).
+    let len = unsafe {
+        to_iana(
+            key.as_ptr(),
+            key.len() as i32,
+            std::ptr::null(),
+            name.as_mut_ptr(),
+            name.len() as i32,
+            &mut status,
+        )
+    };
+    // ICU's errors are positive codes, its warnings negative.
+    if status > 0 || len <= 0 {
+        return None;
+    }
+    String::from_utf16(name.get(..len as usize)?).ok()
 }
 
 /// A `REG_DWORD` value, if it is set.
@@ -533,6 +730,24 @@ pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
                 clipboard_answer(*id, has, text),
             );
         }
+        Command::SetClipboardItem(item) => {
+            let units: Vec<u16> = item.text.encode_utf16().chain(Some(0)).collect();
+            let text: Vec<u8> = units.iter().flat_map(|u| u.to_le_bytes()).collect();
+            let unicode = u32::from(windows::Win32::System::Ole::CF_UNICODETEXT.0);
+            let mut formats = vec![(unicode, text)];
+            if let Some(html) = &item.html {
+                let mut html = clipboard::cf_html(html).into_bytes();
+                html.push(0);
+                formats.push((html_format(), html));
+            }
+            let formats: Vec<(u32, &[u8])> = formats
+                .iter()
+                .map(|(kind, bytes)| (*kind, bytes.as_slice()))
+                .collect();
+            if !set_clipboard_formats(&formats) {
+                log::debug!("windows: cannot set the clipboard");
+            }
+        }
         Command::SetClipboardImage(uri) => match clipboard::decode_data_uri(uri) {
             Some(("image/png", bytes)) => {
                 if !set_clipboard_bytes(png_format(), &bytes) {
@@ -557,9 +772,27 @@ pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
             clipboard::files_answer(*id, &clipboard_files()),
         ),
         Command::PickImages { id, request } => crate::picker::pick_images(surface, *id, *request),
+        Command::PickFiles { id, request } => {
+            crate::file_requests::pick_files(surface, *id, request);
+        }
         Command::FileRequest { id, request } => {
             crate::file_requests::request(surface, *id, request)
         }
+        Command::RenderCanvas {
+            id,
+            drawing,
+            width,
+            height,
+            scale,
+            format,
+        } => crate::canvas::render_offscreen(
+            surface,
+            *id,
+            drawing.clone(),
+            (*width, *height),
+            *scale,
+            *format,
+        ),
         Command::OpenUrl { id, url } => {
             let opened = open_url(url);
             surface.event(
@@ -588,11 +821,25 @@ pub(crate) fn command(surface: &Rc<Surface>, _id: NodeId, command: &Command) {
             }
         }
         Command::Announce(text) => crate::access::announce(surface, text),
+        Command::PerfMonitor(true) => surface.enable_fps(),
+        Command::PerfMonitor(false) => surface.disable_fps(),
         Command::Notification(command) => crate::notifications::command(surface, command),
+        Command::Audio(command) => {
+            let base = surface.asset_base.borrow().clone();
+            surface.control(|c| {
+                crate::audio::command(&surface.audio, surface.key(), c, command, base.as_ref())
+            })
+        }
         Command::Desktop(command) => crate::chrome::command(surface, command),
         // The status bar is a phone's; layout animations arrive as mount
         // items.
-        Command::StatusBar(_) | Command::SetStatusBar(_) | Command::LayoutAnimation(_) => {}
+        Command::StatusBar(_)
+        | Command::SetStatusBar(_)
+        | Command::LayoutAnimation(_)
+        | Command::CancelPress
+        // The app's address: this platform keeps none.
+        | Command::SetAppUrl(_)
+        | Command::PushAppUrl(_) => {}
         other => log::debug!("windows: command {other:?} is not supported"),
     }
 }
@@ -792,7 +1039,7 @@ fn fade(surface: &Rc<Surface>, serial: u64, to: f32, secs: f64, remove: bool) {
     };
     let from = kind.opacity().get();
     let mut start = None;
-    surface.on_frame(move |surface, now| {
+    surface.on_draw_frame(move |surface, now| {
         let Some((_, kind)) = find(serial) else {
             return false;
         };
@@ -1331,6 +1578,8 @@ struct DialogLayout {
 /// (it takes every pointer event: the dialog is modal).
 struct DialogItem {
     key: u64,
+    /// The UI thread of the surface: the answer is posted back to it.
+    ui: crate::window::UiThread,
     serial: u64,
     id: u32,
     sheet: bool,
@@ -1442,7 +1691,7 @@ impl DialogItem {
             return;
         }
         let (key, serial, id) = (self.key, self.serial, self.id);
-        crate::window::invoke(move || {
+        self.ui.invoke(move || {
             let Some(surface) = Surface::by_key(key) else {
                 return;
             };
@@ -1754,6 +2003,7 @@ fn show_dialog(surface: &Rc<Surface>, dialog: &Dialog) {
     let serial = next_serial();
     let item = Rc::new(DialogItem {
         key: surface.key(),
+        ui: surface.ui_thread(),
         serial,
         id: dialog.id,
         sheet,
@@ -1814,6 +2064,17 @@ pub(crate) fn dialog_point(
         None if dialog.cancelable => Ok((1.0, 1.0)),
         None => Err("the dialog can only be answered with a button".into()),
     }
+}
+
+/// Whether a dialog shows over the app: it owns the keyboard, so a view
+/// under it hears no key releases either.
+pub(crate) fn dialog_shown(surface: &Surface) -> bool {
+    OVERLAYS.with(|overlays| {
+        overlays.borrow().iter().any(|overlay| {
+            overlay.key == surface.key()
+                && matches!(&overlay.kind, OverlayKind::Dialog(d) if !d.closing.get())
+        })
+    })
 }
 
 /// Keys while a dialog shows over the app (it is modal: every key goes to
@@ -1952,8 +2213,21 @@ fn clipboard_bytes(format: u32) -> Option<Vec<u8>> {
     }
 }
 
+/// Windows' `HTML Format` (CF_HTML).
+fn html_format() -> u32 {
+    use windows::{Win32::System::DataExchange::RegisterClipboardFormatW, core::w};
+    // SAFETY: a plain registration of a constant name.
+    unsafe { RegisterClipboardFormatW(w!("HTML Format")) }
+}
+
 /// Puts `bytes` on the clipboard as `format`, replacing what it holds.
 fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> bool {
+    set_clipboard_formats(&[(format, bytes)])
+}
+
+/// Puts each of `formats`' bytes on the clipboard as its format, together,
+/// replacing what it holds: the same content in several formats.
+fn set_clipboard_formats(formats: &[(u32, &[u8])]) -> bool {
     use windows::Win32::{
         Foundation::{GlobalFree, HANDLE, HGLOBAL},
         System::{
@@ -1961,24 +2235,28 @@ fn set_clipboard_bytes(format: u32, bytes: &[u8]) -> bool {
             Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock},
         },
     };
-    // SAFETY: as in `set_clipboard_text`: the memory is the clipboard's once
-    // `SetClipboardData` succeeds, freed here otherwise.
+    // SAFETY: as in `set_clipboard_text`: each format's memory is the
+    // clipboard's once `SetClipboardData` succeeds, freed here otherwise.
     unsafe {
         if OpenClipboard(None).is_err() {
             return false;
         }
-        let mut ok = false;
-        if EmptyClipboard().is_ok()
-            && let Ok(memory) = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1))
-        {
-            let ptr = GlobalLock(memory) as *mut u8;
-            if !ptr.is_null() {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
-                let _ = GlobalUnlock(memory);
-                ok = SetClipboardData(format, Some(HANDLE(memory.0))).is_ok();
-            }
+        let mut ok = EmptyClipboard().is_ok();
+        for &(format, bytes) in formats {
             if !ok {
-                let _ = GlobalFree(Some(HGLOBAL(memory.0)));
+                break;
+            }
+            ok = false;
+            if let Ok(memory) = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1)) {
+                let ptr = GlobalLock(memory) as *mut u8;
+                if !ptr.is_null() {
+                    std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
+                    let _ = GlobalUnlock(memory);
+                    ok = SetClipboardData(format, Some(HANDLE(memory.0))).is_ok();
+                }
+                if !ok {
+                    let _ = GlobalFree(Some(HGLOBAL(memory.0)));
+                }
             }
         }
         let _ = CloseClipboard();
@@ -2085,6 +2363,46 @@ pub(crate) fn clipboard_has_text() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_ending_session_puts_the_app_in_the_background() {
+        assert_eq!(lifecycle_of(true, true, false, || true), Lifecycle::Active);
+        assert_eq!(
+            lifecycle_of(true, true, false, || false),
+            Lifecycle::Inactive
+        );
+        assert_eq!(
+            lifecycle_of(false, true, false, || true),
+            Lifecycle::Background
+        );
+        assert_eq!(
+            lifecycle_of(true, true, true, || true),
+            Lifecycle::Background
+        );
+        assert_eq!(
+            lifecycle_of(true, true, true, || false),
+            Lifecycle::Background
+        );
+    }
+
+    #[test]
+    fn a_screen_the_user_cannot_see_puts_the_app_in_the_background() {
+        // Locked, disconnected or turned off: active or not, nothing shows.
+        assert_eq!(
+            lifecycle_of(true, false, false, || true),
+            Lifecycle::Background
+        );
+        assert_eq!(
+            lifecycle_of(true, false, false, || false),
+            Lifecycle::Background
+        );
+        let locked = crate::presence::Screen::default()
+            .session_changed(windows::Win32::UI::WindowsAndMessaging::WTS_SESSION_LOCK);
+        assert_eq!(
+            lifecycle_of(true, locked.seen(), false, || true),
+            Lifecycle::Background
+        );
+    }
 
     #[test]
     fn bitmaps_become_bmp_files() {

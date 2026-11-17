@@ -23,7 +23,9 @@ use super::{IntoReactive, Reactive, SharedString};
 use crate::{
     BlendMode, BoxShadow, Cursor, FontVariant, ObjectPosition, TransformOrigin, TransitionProps,
     color::{Hsla, Rgba, transparent_black},
-    effects::{Filter, GradientKind, GradientSize, KeyframeAnimation, Keyframes},
+    effects::{
+        ColorStop, Filter, Gradient, GradientKind, GradientSize, KeyframeAnimation, Keyframes,
+    },
     geometry::{
         AbsoluteLength, DefiniteLength, Length, Percentage, Points, REM_SIZE, Radians, Rems, deg,
         percentage, px, relative,
@@ -171,6 +173,8 @@ impl Variant {
     pub(crate) const HOVER: Self = Self::states(state::HOVERED);
     /// While focused.
     pub(crate) const FOCUS: Self = Self::states(state::FOCUSED);
+    /// While focused and showing it (the keyboard moved the focus).
+    pub(crate) const FOCUS_VISIBLE: Self = Self::states(state::FOCUS_VISIBLE);
     /// While it or a view inside it is focused.
     pub(crate) const FOCUS_WITHIN: Self = Self::states(state::FOCUS_WITHIN);
     /// While pressed.
@@ -227,6 +231,7 @@ impl Variant {
         let keys = [
             (state::HOVERED, rank::HOVER),
             (state::FOCUSED, rank::FOCUS),
+            (state::FOCUS_VISIBLE, rank::FOCUS_VISIBLE),
             (state::FOCUS_WITHIN, rank::FOCUS_WITHIN),
             (state::PRESSED, rank::ACTIVE),
             (state::DISABLED, rank::DISABLED),
@@ -469,13 +474,16 @@ pub(crate) enum Declaration {
     Duration(Bits),
     Delay(Bits),
     Ease([Bits; 4]),
+    /// A spring's stiffness, damping and mass (`ease-spring-[…]`).
+    EaseSpring([Bits; 3]),
     /// Tailwind's `ease-*`.
     EasePreset(&'static str),
     /// A keyframe animation (`None`: none).
     Animate(Option<u8>),
     /// A keyframe animation with its own timing: the keyframes' index,
-    /// duration, delay, easing and iterations (`None`: forever).
-    Animation(u8, Bits, Bits, [Bits; 4], Option<u32>),
+    /// duration, delay, easing, iterations (`None`: forever) and the
+    /// highest frame rate it needs (`None`: the screen's highest).
+    Animation(u8, Bits, Bits, [Bits; 4], Option<u32>, Option<Bits>),
     /// `repeat(n, minmax(0, 1fr))` tracks.
     Tracks(StyleKey, u16),
     /// `span n / span n`.
@@ -567,7 +575,7 @@ impl Declaration {
                 if let Some(&(size, line)) = PRESETS.text.get(*name) {
                     out.push(Decl::Set(
                         StyleKey::FontSize,
-                        PropertyValue::OptPoints(Some(px(size))),
+                        PropertyValue::FontSize(Some(px(size)), None),
                     ));
                     // As `text-lg`'s: a line height set anywhere wins.
                     if let Some(m) = line {
@@ -706,13 +714,19 @@ impl Declaration {
             Declaration::Duration(ms) => part(out, Part::Duration(ms.0)),
             Declaration::Delay(ms) => part(out, Part::Delay(ms.0)),
             Declaration::Ease(curve) => part(out, Part::Ease(curve.map(|b| b.0))),
+            Declaration::EaseSpring(physics) => {
+                let [stiffness, damping, mass] = physics.map(|b| b.0);
+                if let Some(spring) = crate::style::spring_of((stiffness, damping, mass)) {
+                    part(out, Part::Spring(spring));
+                }
+            }
             Declaration::EasePreset(name) => {
                 if let Some(curve) = PRESETS.ease.get(*name) {
                     part(out, Part::Ease(*curve));
                 }
             }
             Declaration::Animate(k) => part(out, Part::Animate(k.map(|i| KEYFRAMES[i as usize]))),
-            Declaration::Animation(k, duration, delay, easing, iterations) => part(
+            Declaration::Animation(k, duration, delay, easing, iterations, frame_rate) => part(
                 out,
                 Part::Animation(KeyframeAnimation {
                     keyframes: KEYFRAMES[*k as usize],
@@ -720,6 +734,7 @@ impl Declaration {
                     delay: delay.0,
                     easing: easing.map(|b| b.0),
                     iterations: *iterations,
+                    frame_rate: frame_rate.map(|b| b.0),
                 }),
             ),
             Declaration::Tracks(key, n) => out.push(Decl::Set(
@@ -736,9 +751,94 @@ impl Declaration {
     }
 }
 
-type Entries = Vec<(Variant, Declaration)>;
+/// The static declarations of a [`StyleRefinement`], in order. Shared by
+/// its copies, which a page keeps several of per element (what a view
+/// applied, and the record its bindings patch against), and copied on the
+/// first change to a shared one.
+#[derive(Clone, Default)]
+struct Entries(Option<Rc<Vec<(Variant, Declaration)>>>);
+
+impl Entries {
+    fn with_capacity(capacity: usize) -> Self {
+        Self(Some(Rc::new(Vec::with_capacity(capacity))))
+    }
+
+    fn as_slice(&self) -> &[(Variant, Declaration)] {
+        self.0.as_deref().map_or(&[], Vec::as_slice)
+    }
+
+    fn capacity(&self) -> usize {
+        self.0.as_ref().map_or(0, |v| v.capacity())
+    }
+
+    fn reserve(&mut self, additional: usize) {
+        self.vec().reserve(additional);
+    }
+
+    fn push(&mut self, entry: (Variant, Declaration)) {
+        self.vec().push(entry);
+    }
+
+    fn extend_from_slice(&mut self, entries: &[(Variant, Declaration)]) {
+        self.vec().extend_from_slice(entries);
+    }
+
+    fn vec(&mut self) -> &mut Vec<(Variant, Declaration)> {
+        Rc::make_mut(self.0.get_or_insert_default())
+    }
+
+    fn into_vec(self) -> Vec<(Variant, Declaration)> {
+        self.0.map(Rc::unwrap_or_clone).unwrap_or_default()
+    }
+}
+
+impl std::ops::Deref for Entries {
+    type Target = [(Variant, Declaration)];
+
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl PartialEq for Entries {
+    fn eq(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (Some(a), Some(b)) if Rc::ptr_eq(a, b) => true,
+            _ => self.as_slice() == other.as_slice(),
+        }
+    }
+}
+
+impl Eq for Entries {}
+
+impl Hash for Entries {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_slice().hash(state);
+    }
+}
+
+impl fmt::Debug for Entries {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
 
 crate::static_reactive!(AdaptiveColor: AdaptiveColor, Hsla, Rgba, Color);
+
+// Static colors keep the same ergonomics where the native default is also
+// a value. Optional signals and closures use IntoReactive's existing path.
+macro_rules! optional_reactive_colors {
+    ($($source:ty),*) => {$(
+        impl IntoReactive<Option<AdaptiveColor>> for $source {
+            fn into_reactive(self) -> Reactive<Option<AdaptiveColor>> {
+                Reactive::Static(Some(self.into()))
+            }
+        }
+    )*};
+}
+
+optional_reactive_colors!(AdaptiveColor, Hsla, Rgba, Color);
+
 crate::static_reactive!(Length: Length, Points, Rems, AbsoluteLength, DefiniteLength, Percentage);
 crate::static_reactive!(DefiniteLength: Points, Rems, AbsoluteLength, DefiniteLength, Percentage);
 crate::static_reactive!(AbsoluteLength: Points, Rems, AbsoluteLength);
@@ -836,8 +936,18 @@ impl StyleRefinement {
     /// The style now: the static declarations, then the bound parts' (read
     /// in the running computation, which subscribes to them).
     pub(crate) fn resolved(&self) -> StyleRefinement {
+        // Without bound parts it is the static part, shared. With them, a
+        // copy with room for one declaration a part, the usual count: a
+        // style is kept as long as its element.
+        let entries = if self.bound.is_empty() {
+            self.entries.clone()
+        } else {
+            let mut entries = Entries::with_capacity(self.entries.len() + self.bound.len());
+            entries.extend_from_slice(&self.entries);
+            entries
+        };
         let mut out = StyleRefinement {
-            entries: self.entries.clone(),
+            entries,
             names: self.names.clone(),
             bound: Vec::new(),
         };
@@ -916,7 +1026,7 @@ impl StyleRefinement {
     /// `other`'s declarations, applying while in `variant` (and in their
     /// own).
     pub(crate) fn extend_as(&mut self, variant: Variant, other: StyleRefinement) {
-        for (mut v, d) in other.entries {
+        for (mut v, d) in other.entries.into_vec() {
             if v.group != 0 {
                 v.group = self.name(other.names[v.group as usize - 1]);
             }
@@ -974,7 +1084,7 @@ impl StyleRefinement {
     pub(crate) fn lower(&self) -> ClassList {
         let mut variants: Vec<Variant> = Vec::new();
         let mut groups: Vec<Box<str>> = Vec::new();
-        for (v, d) in &self.entries {
+        for (v, d) in self.entries.iter() {
             if let Declaration::Group(name) = d {
                 if !groups.iter().any(|g| **g == **name) {
                     groups.push((*name).into());
@@ -989,7 +1099,7 @@ impl StyleRefinement {
             // Decorations add up within a variant (`.underline()
             // .line_through()` draws both).
             let mut decoration = 0;
-            for (v, d) in &self.entries {
+            for (v, d) in self.entries.iter() {
                 if *v != variant {
                     continue;
                 }
@@ -1590,6 +1700,8 @@ pub trait Styled: Sized {
     /// Laid out but not shown, nor what is inside it (CSS's `visibility:
     /// hidden`, Tailwind's `invisible`, GPUI's `Styled::invisible`): it
     /// keeps its place and frame, and takes no presses or keyboard focus.
+    /// On a text nested in another (a span), its characters keep their
+    /// place in the lines and are left out of copies and screen readers.
     fn invisible(mut self) -> Self {
         self.style()
             .value(StyleKey::Visibility, PropertyValue::Bool(true));
@@ -2779,6 +2891,84 @@ pub trait Styled: Sized {
         self
     }
 
+    /// Masks the view and its content with a linear gradient's alpha:
+    /// opaque stops reveal it, transparent stops hide it. Colors do not tint it.
+    /// The angle follows CSS (0 up, `deg(90.0)` right). Stops accept colors or
+    /// `(color, position)` pairs, with typed fractions or lengths. Both arguments
+    /// accept signals and closures (`Vec<ColorStop>` for reactive stops); static
+    /// values create no binding.
+    /// `.mask_linear(deg(90.0), [transparent_black(), black(), transparent_black()])`.
+    /// An empty stop vector clears the mask reactively. Includes backdrop filters.
+    /// Not drawn on Windows and GPUI.
+    fn mask_linear(
+        mut self,
+        angle: impl IntoReactive<Radians>,
+        stops: impl IntoReactive<Vec<ColorStop>>,
+    ) -> Self {
+        let angle = angle.into_reactive();
+        let stops = stops.into_reactive();
+        let gradient = match (angle, stops) {
+            (Reactive::Static(angle), Reactive::Static(stops)) => Reactive::Static(Gradient {
+                kind: GradientKind::Linear { angle },
+                stops,
+                repeating: false,
+            }),
+            (angle, stops) => Reactive::Bound(Rc::new(move || Gradient {
+                kind: GradientKind::Linear { angle: angle.get() },
+                stops: stops.get(),
+                repeating: false,
+            })),
+        };
+        self.style().bind_value(gradient, |s, gradient| {
+            s.value(
+                StyleKey::MaskImage,
+                PropertyValue::Gradients(if gradient.stops.is_empty() {
+                    Vec::new().into()
+                } else {
+                    vec![gradient].into()
+                }),
+            );
+        });
+        self
+    }
+
+    /// Masks with an elliptical gradient from the center to the farthest corner.
+    /// Stops and platform support follow [`Styled::mask_linear`]. Use a
+    /// `Vec<ColorStop>` for signal/closure results, or an array of colors/pairs
+    /// for static stops. An empty vector clears the mask reactively.
+    fn mask_radial(mut self, stops: impl IntoReactive<Vec<ColorStop>>) -> Self {
+        self.style().bind_value(stops, |s, stops| {
+            let gradients = if stops.is_empty() {
+                Vec::new()
+            } else {
+                vec![Gradient {
+                    kind: GradientKind::Radial {
+                        circle: false,
+                        size: GradientSize::FarthestCorner,
+                        x: percentage(0.5),
+                        y: percentage(0.5),
+                    },
+                    stops,
+                    repeating: false,
+                }]
+            };
+            s.value(
+                StyleKey::MaskImage,
+                PropertyValue::Gradients(gradients.into()),
+            );
+        });
+        self
+    }
+
+    /// Clears the gradient mask, including in state styles.
+    fn mask_none(mut self) -> Self {
+        self.style().value(
+            StyleKey::MaskImage,
+            PropertyValue::Gradients(Vec::new().into()),
+        );
+        self
+    }
+
     /// Blurs it and its content by `radius` (Tailwind's `blur-sm` is 8
     /// points).
     fn blur(self, radius: impl Into<Points>) -> Self {
@@ -2923,6 +3113,19 @@ pub trait Styled: Sized {
         self
     }
 
+    /// The tint of the glass material (`glassTintColor`). A color tints the
+    /// native glass; `None` restores its default. Bind an optional adaptive
+    /// color to set and clear the tint; static colors can be passed directly.
+    /// Has no effect without `glassEffect`.
+    fn glass_tint_color(mut self, color: impl IntoReactive<Option<AdaptiveColor>>) -> Self {
+        self.style()
+            .bind_value(color, |s, color: Option<AdaptiveColor>| match color {
+                Some(color) => s.color(&[StyleKey::GlassTintColor], color),
+                None => s.value(StyleKey::GlassTintColor, PropertyValue::Color(None)),
+            });
+        self
+    }
+
     /// The pointer's look over the element (`cursor`; desktops, and iPad
     /// and Android with a mouse).
     fn cursor(mut self, cursor: Cursor) -> Self {
@@ -3020,10 +3223,25 @@ pub trait Styled: Sized {
         self
     }
 
-    /// Transitions along the cubic Bézier curve `x1, y1, x2, y2`.
+    /// Transitions along the cubic Bézier curve `x1, y1, x2, y2` (a `y`
+    /// outside 0..1 overshoots).
     fn ease_bezier(mut self, x1: f32, y1: f32, x2: f32, y2: f32) -> Self {
         self.style()
             .push(Declaration::Ease([x1, y1, x2, y2].map(Bits)));
+        self
+    }
+
+    /// Transitions on a spring's physics (its stiffness, damping and mass;
+    /// Tailwind extension `ease-spring-[620,36]`): they time themselves,
+    /// lasting until the spring settles ([`Spring::settle_ms`]), so
+    /// [`Self::duration`] is not used. A spring that cannot settle (a
+    /// stiffness, damping or mass that is not positive) sets nothing.
+    ///
+    /// [`Spring::settle_ms`]: crate::element::Spring::settle_ms
+    fn ease_spring(mut self, spring: crate::element::Spring) -> Self {
+        self.style().push(Declaration::EaseSpring(
+            [spring.stiffness, spring.damping, spring.mass].map(Bits),
+        ));
         self
     }
 
@@ -3053,7 +3271,8 @@ pub trait Styled: Sized {
 
     /// A keyframe animation with its own timing (TS: `animationName`
     /// with `animationDuration`, `animationDelay`,
-    /// `animationTimingFunction`, `animationIterationCount`):
+    /// `animationTimingFunction`, `animationIterationCount`,
+    /// `animationFrameRate`):
     /// `.animation(KeyframeAnimation::new(Keyframes::Spin).duration(800.0))`.
     fn animation(mut self, animation: KeyframeAnimation) -> Self {
         let index = KEYFRAMES
@@ -3066,6 +3285,7 @@ pub trait Styled: Sized {
             Bits(animation.delay),
             animation.easing.map(Bits),
             animation.iterations,
+            crate::style::frame_rate(animation.frame_rate).map(Bits),
         ));
         self
     }
@@ -4118,6 +4338,12 @@ pub trait Styled: Sized {
         in_group(self, "", state::FOCUS_WITHIN, f)
     }
 
+    /// Styles while the nearest group around it has the keyboard focus
+    /// and shows it (`group-focus-visible:`).
+    fn group_focus_visible(self, f: impl FnOnce(StyleRefinement) -> StyleRefinement) -> Self {
+        in_group(self, "", state::FOCUS_VISIBLE, f)
+    }
+
     /// Styles while the group `name` around it is pressed
     /// (`group-active/name:`).
     fn group_active_named(
@@ -4144,6 +4370,16 @@ pub trait Styled: Sized {
         f: impl FnOnce(StyleRefinement) -> StyleRefinement,
     ) -> Self {
         in_group(self, name, state::FOCUS_WITHIN, f)
+    }
+
+    /// Styles while the group `name` around it has the keyboard focus and
+    /// shows it (`group-focus-visible/name:`).
+    fn group_focus_visible_named(
+        self,
+        name: &'static str,
+        f: impl FnOnce(StyleRefinement) -> StyleRefinement,
+    ) -> Self {
+        in_group(self, name, state::FOCUS_VISIBLE, f)
     }
 }
 
@@ -4239,7 +4475,7 @@ mod tests {
     use super::*;
     use crate::{
         Style,
-        color::rgba,
+        color::{black, rgba},
         element::palette::{EMERALD, PINK, RED, SKY, VIOLET},
         geometry::point,
         tailwind::{ClassEnvironment, ClassProps, Context},
@@ -4583,6 +4819,27 @@ mod tests {
             s().transition_transform().duration(200.0),
             "transition-transform duration-200",
         );
+        let spring = crate::element::Spring {
+            stiffness: 620.0,
+            damping: 36.0,
+            ..crate::element::Spring::default()
+        };
+        same(
+            s().transition_transform().ease_spring(spring),
+            "transition-transform ease-spring-[620,36]",
+        );
+        same(
+            s().transition_opacity()
+                .ease_spring(crate::element::Spring {
+                    mass: 2.0,
+                    ..spring
+                }),
+            "transition-opacity ease-spring-[620,36,2]",
+        );
+        same(
+            s().transition().ease_bezier(0.3, 1.25, 0.6, 1.0),
+            "transition ease-[cubic-bezier(0.3,1.25,0.6,1)]",
+        );
         for (typed, classes) in [
             (s().animate_spin(), "animate-spin"),
             (s().animate_ping(), "animate-ping"),
@@ -4591,6 +4848,100 @@ mod tests {
         ] {
             same(typed, classes);
         }
+    }
+
+    #[test]
+    fn mask_gradients_match_css() {
+        let css = |value: &'static str| {
+            move |style: &mut Style| {
+                style
+                    .set_key(StyleKey::MaskImage, crate::StyleValue::Str(value))
+                    .unwrap();
+            }
+        };
+        same_with(
+            s().mask_linear(
+                deg(90.0),
+                [transparent_black(), black(), transparent_black()],
+            ),
+            "",
+            &css("linear-gradient(to right, transparent, black, transparent)"),
+        );
+        same_with(
+            s().mask_linear(
+                deg(180.0),
+                [
+                    (transparent_black(), percentage(0.2)),
+                    (black(), percentage(0.8)),
+                ],
+            ),
+            "",
+            &css("linear-gradient(to bottom, transparent 20%, black 80%)"),
+        );
+        same_with(
+            s().mask_linear(
+                deg(90.0),
+                [(transparent_black(), px(12.0)), (black(), px(24.0))],
+            ),
+            "",
+            &css("linear-gradient(to right, transparent 12px, black 24px)"),
+        );
+        same_with(
+            s().mask_radial([black(), transparent_black()]),
+            "",
+            &css("radial-gradient(black, transparent)"),
+        );
+        same_with(
+            s().mask_radial([black(), transparent_black()]).mask_none(),
+            "",
+            &css("none"),
+        );
+    }
+
+    #[test]
+    fn empty_stops_clear_masks_and_radial_accepts_reactive_stops() {
+        same_with(
+            s().mask_linear(deg(90.0), Vec::<ColorStop>::new()),
+            "",
+            &|style| {
+                style
+                    .set_key(StyleKey::MaskImage, crate::StyleValue::Str("none"))
+                    .unwrap();
+            },
+        );
+        same_with(s().mask_radial(Vec::<ColorStop>::new()), "", &|style| {
+            style
+                .set_key(StyleKey::MaskImage, crate::StyleValue::Str("none"))
+                .unwrap();
+        });
+        // Constructed inside a component in normal use; these static reactive
+        // wrappers exercise the same accepted type without needing an owner.
+        let stops = Reactive::Static(vec![ColorStop::from(black()), transparent_black().into()]);
+        same_with(s().mask_radial(stops), "", &|style| {
+            style
+                .set_key(
+                    StyleKey::MaskImage,
+                    crate::StyleValue::Str("radial-gradient(black, transparent)"),
+                )
+                .unwrap();
+        });
+    }
+
+    #[test]
+    fn masks_keep_background_stops_separate() {
+        let typed = s()
+            .bg_linear(deg(180.0))
+            .gradient_from(black())
+            .gradient_to(crate::color::white())
+            .mask_linear(deg(90.0), [black(), transparent_black()]);
+        same_with(typed, "bg-linear-180 from-black to-white", &|style| {
+            style
+                .set_key(
+                    StyleKey::MaskImage,
+                    crate::StyleValue::Str("linear-gradient(to right, black, transparent)"),
+                )
+                .unwrap();
+        });
     }
 
     #[test]
@@ -4636,6 +4987,37 @@ mod tests {
             "animate-none",
             &timed("spin", 800.0, "linear"),
         );
+    }
+
+    #[test]
+    fn keyframe_animations_take_their_frame_rate() {
+        // As TS's `animationFrameRate` with the animation's other keys.
+        let capped = |hz: f32| {
+            move |style: &mut Style| {
+                use crate::StyleValue;
+                for (key, value) in [
+                    (StyleKey::AnimationName, StyleValue::Str("spin")),
+                    (StyleKey::AnimationDuration, StyleValue::Number(800.0)),
+                    (StyleKey::AnimationTimingFunction, StyleValue::Str("linear")),
+                    (StyleKey::AnimationFrameRate, StyleValue::Number(hz)),
+                ] {
+                    style.set_key(key, value).unwrap();
+                }
+            }
+        };
+        same_with(
+            s().animation(
+                KeyframeAnimation::new(Keyframes::Spin)
+                    .duration(800.0)
+                    .frame_rate(30.0),
+            ),
+            "animate-none",
+            &capped(30.0),
+        );
+        let typed = s()
+            .animation(KeyframeAnimation::new(Keyframes::Spin).frame_rate(24.0))
+            .lower();
+        assert!(resolve(&typed, false, 0, 0).contains("frame_rate: Some(24.0)"));
     }
 
     #[test]
