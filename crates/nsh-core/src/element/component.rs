@@ -1541,18 +1541,21 @@ pub fn declarations(registry: &Registry, omit: &[&str]) -> String {
         };
         // A component with methods: its ref is an object of them. Host
         // props it declares itself are its own.
-        let mut omit: Vec<&str> = HOST_PROPS
+        let mut hidden: Vec<&str> = HOST_PROPS
             .iter()
             .copied()
             .filter(|&h| !spec.host_props().any(|p| p == h))
             .collect();
         if !spec.methods.is_empty() {
-            omit.insert(0, "ref");
+            hidden.insert(0, "ref");
         }
-        let host = if omit.is_empty() {
+        let host = if hidden.is_empty() {
             "ComponentHostProps".to_owned()
         } else {
-            let names = omit.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>();
+            let names = hidden
+                .iter()
+                .map(|n| format!("\"{n}\""))
+                .collect::<Vec<_>>();
             format!("Omit<ComponentHostProps, {}>", names.join(" | "))
         };
         if !spec.methods.is_empty() {
@@ -1955,6 +1958,19 @@ mod tests {
         );
         assert_eq!(data(&StepperEvent::Reset), None);
         assert_eq!(StepperEvent::Reset.name(), "reset");
+    }
+
+    /// An export named in `omit` keeps its props and ref types but loses its
+    /// constant: the caller declares that value itself (`nsh-js`, or an
+    /// app's set that exports `nativeModule(...)` under the same name).
+    #[test]
+    fn an_omitted_export_keeps_its_types_but_not_its_constant() {
+        let mut registry = Registry::new();
+        registry.register::<Stepper>();
+        let ts = declarations(&registry, &["Stepper"]);
+        assert!(ts.contains("export interface StepperProps"), "{ts}");
+        assert!(ts.contains("export interface StepperRef {"), "{ts}");
+        assert!(!ts.contains("export declare const Stepper"), "{ts}");
     }
 
     #[test]
