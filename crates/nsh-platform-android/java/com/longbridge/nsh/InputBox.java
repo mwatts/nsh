@@ -66,6 +66,8 @@ final class InputBox extends FrameLayout implements Node {
     boolean pasteInserts = true;
     /** Whether the EditText shows a vertical scroll bar of its own by default. */
     private final boolean defaultVerticalBar;
+    /** Platform hint colors before any explicit `placeholderTextColor` override. */
+    private final android.content.res.ColorStateList defaultHintColors;
     /**
      * A built-in bar replaces the scroll indicator (`InputConfig::replaced`):
      * how far the text scrolled is reported to the engine.
@@ -194,6 +196,7 @@ final class InputBox extends FrameLayout implements Node {
         if (Build.VERSION.SDK_INT >= 28) edit.setFallbackLineSpacing(false);
         if (Build.VERSION.SDK_INT >= 35) edit.setLocalePreferredLineHeightForMinimumUsed(false);
         defaultVerticalBar = edit.isVerticalScrollBarEnabled();
+        defaultHintColors = edit.getHintTextColors();
         edit.addTextChangedListener(new TextWatcher() {
             @Override
             public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
@@ -315,17 +318,19 @@ final class InputBox extends FrameLayout implements Node {
                    boolean secure, int keyboard, int returnKey, int capitalize, boolean autoCorrect,
                    boolean multiline, int maxLength, boolean editable, boolean autoFocus,
                    boolean hasSelectionColor, int selectionColor, boolean hasCaretColor, int caretColor,
-                   int submit) {
+                   int submit, boolean rtl, int fontVariant) {
         boolean restart = this.submit != submit && multiline && configured;
         this.multiline = multiline;
         this.submit = submit;
         edit.setTextSize(TypedValue.COMPLEX_UNIT_PX, fontSizeDp * mounter.density);
         edit.setTextColor(color);
-        if (letterSpacingDp != 0) edit.setLetterSpacing(letterSpacingDp / fontSizeDp);
-        int horizontal = align == 1 ? Gravity.CENTER_HORIZONTAL : align == 2 ? Gravity.END : Gravity.START;
+        edit.setLetterSpacing(TextLayouts.letterSpacing(letterSpacingDp, fontSizeDp));
+        edit.setFontFeatureSettings(TextLayouts.features(fontVariant));
+        int horizontal = TextLayouts.horizontalGravity(align, rtl);
         edit.setGravity(horizontal | (multiline ? Gravity.TOP : Gravity.CENTER_VERTICAL));
         edit.setHint(placeholder);
         if (hasPlaceholderColor) edit.setHintTextColor(placeholderColor);
+        else if (defaultHintColors != null) edit.setHintTextColor(defaultHintColors);
         int type;
         switch (keyboard) {
             case 1: type = InputType.TYPE_CLASS_NUMBER; break;
@@ -401,6 +406,7 @@ final class InputBox extends FrameLayout implements Node {
             });
         }
         edit.setHighlightColor(hasSelectionColor ? (selectionColor & 0x00ffffff) | 0x55000000 : 0x5533b5e5);
+        tintHandles(hasSelectionColor ? selectionColor : null);
         boolean first = !configured;
         configured = true;
         if (first && autoFocus) post(this::focus);
@@ -409,6 +415,37 @@ final class InputBox extends FrameLayout implements Node {
             InputMethodManager imm = (InputMethodManager) getContext().getSystemService(Context.INPUT_METHOD_SERVICE);
             if (imm != null) imm.restartInput(edit);
         }
+    }
+
+    /** The color the selection handles are tinted (null: the theme's). */
+    private Integer handleColor;
+
+    /**
+     * Tints the selection and insertion handles {@code color}, as the
+     * selection's highlight (null: the theme's, as a fresh copy of the
+     * theme's drawables keeps it). Android 10 (API 29) and later.
+     */
+    private void tintHandles(Integer color) {
+        if (Build.VERSION.SDK_INT < 29 || java.util.Objects.equals(handleColor, color)) return;
+        int[] attrs = {
+            android.R.attr.textSelectHandleLeft, android.R.attr.textSelectHandleRight, android.R.attr.textSelectHandle
+        };
+        for (int i = 0; i < attrs.length; i++) {
+            android.content.res.TypedArray a = getContext().obtainStyledAttributes(new int[] {attrs[i]});
+            android.graphics.drawable.Drawable d = a.getDrawable(0);
+            a.recycle();
+            // A handle the theme has no drawable for keeps the EditText's own;
+            // the others still take the color.
+            if (d == null) continue;
+            d = d.mutate();
+            if (color != null) d.setTint(color);
+            if (i == 0) edit.setTextSelectHandleLeft(d);
+            else if (i == 1) edit.setTextSelectHandleRight(d);
+            else edit.setTextSelectHandle(d);
+        }
+        // Recorded only once applied, so the same color asked again is not
+        // skipped as already set.
+        handleColor = color;
     }
 
     /** Return submitted: `onSubmitEditing`, then unfocuses for `blurAndSubmit`. */
@@ -874,6 +911,9 @@ final class InputBox extends FrameLayout implements Node {
         };
         getViewTreeObserver().addOnGlobalLayoutListener(pendingFocus);
         getViewTreeObserver().addOnWindowFocusChangeListener(pendingWindowFocus);
+        // Whoever asked (`ref.focus()` or `autoFocus`), this is now
+        // the latest request: a newer one or a blur ends the wait.
+        if (mounter != null) mounter.inputFocusWaits(this);
     }
 
     /** {@link #focus()} waiting for the field to be shown in a focused window. */
@@ -882,11 +922,22 @@ final class InputBox extends FrameLayout implements Node {
         if (focused && pendingFocus != null) pendingFocus.onGlobalLayout();
     };
 
-    private void cancelPendingFocus() {
+    /** Whether {@link #focus()} still waits for the field to be shown in a focused window. */
+    boolean focusPending() {
+        return pendingFocus != null;
+    }
+
+    /**
+     * Ends a waiting {@link #focus()}: the field is shown (it is focused
+     * next), a newer focus request or a blur took over, or it left its
+     * window. The mounter forgets the request with it.
+     */
+    void cancelPendingFocus() {
         if (pendingFocus == null) return;
         getViewTreeObserver().removeOnGlobalLayoutListener(pendingFocus);
         getViewTreeObserver().removeOnWindowFocusChangeListener(pendingWindowFocus);
         pendingFocus = null;
+        if (mounter != null) mounter.inputFocusWaitEnded(this);
     }
 
     @Override

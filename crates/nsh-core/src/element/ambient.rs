@@ -53,6 +53,9 @@ pub(crate) struct Ambient {
     storage: Option<crate::storage::Store>,
     /// The app's own data directory ([`data_dir`]).
     data_dir: Option<std::path::PathBuf>,
+    /// What `nsh/updater` checks with for Rust code
+    /// ([`crate::runtime::prompt_for_update`]).
+    updater: Option<std::sync::Arc<dyn crate::runtime::UpdaterHost>>,
     /// The displays (desktops), as the platform reports them.
     displays: Option<Signal<Arc<[crate::desktop::Display]>>>,
     /// Whether the performance monitor measures, as the platform reports
@@ -176,6 +179,15 @@ impl super::Runtime {
         with_data(|d| d.ambient.data_dir = dir);
     }
 
+    /// What Rust code checks for updates with ([`updater_host`]).
+    pub(crate) fn set_updater(
+        &self,
+        updater: Option<std::sync::Arc<dyn crate::runtime::UpdaterHost>>,
+    ) {
+        let _entered = self.enter();
+        with_data(|d| d.ambient.updater = updater);
+    }
+
     /// How text is measured (the core's text engine).
     pub(crate) fn set_measure(&self, measure: MeasureFn) {
         let _entered = self.enter();
@@ -289,6 +301,15 @@ pub(super) fn executor() -> Rc<Executor> {
 
 fn act(action: Action) {
     executor().act(action);
+}
+
+/// [`act`] while the engine runs Rust code, else nothing: for cleanups and
+/// handles that may outlive it.
+pub(super) fn act_if_running(action: Action) {
+    if let Some(executor) = super::reactive::try_with_data(|d| d.ambient.executor.clone()).flatten()
+    {
+        executor.act(action);
+    }
 }
 
 // --- The environment ---------------------------------------------------------
@@ -667,6 +688,12 @@ pub fn data_dir() -> Option<std::path::PathBuf> {
     with_data(|d| d.ambient.data_dir.clone())
 }
 
+/// What Rust code checks for updates with: the engine's, `None` where the
+/// app does not update.
+pub(crate) fn updater_host() -> Option<std::sync::Arc<dyn crate::runtime::UpdaterHost>> {
+    with_data(|d| d.ambient.updater.clone())
+}
+
 /// The file the app's log lines are written to (TS: `process.logFile`): a
 /// packaged desktop app's rolling log, `logs/app.log` in the app's data
 /// directory, for a diagnostics report or an "Open logs folder" command
@@ -834,6 +861,18 @@ pub fn open_auth_session(
     let (answer, slot) = Answer::new();
     act(Action::AuthSession(request, slot));
     answer
+}
+
+/// Closes the app's web sign-in session ([`open_auth_session`]) while it
+/// still waits, as when the app learned the user signed in some other way
+/// (a device code approved on the page, which never redirects back): its
+/// answer resolves now as
+/// [`Cancelled`](crate::auth_session::AuthSessionOutcome::Cancelled), and
+/// iOS and Android take the page off the screen, bringing the app back.
+/// A page in the system browser elsewhere stays open. Only the app's own
+/// session closes; with none waiting, nothing happens.
+pub fn close_auth_session() {
+    act(Action::CloseAuthSession);
 }
 
 /// Whether the system's share sheet shows here (TS: `Share.available()`):

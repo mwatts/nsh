@@ -98,6 +98,19 @@ pub(crate) struct UpdateCheckOptions {
     /// declares are accepted: the app's code chooses, the package says
     /// where.
     pub(crate) channel: Option<String>,
+    /// The language the app shows (a BCP 47 tag such as `zh-TW`): `notes`
+    /// is then the manifest's notes in it, or in its language (`zh`),
+    /// downloading only that file, else the default notes.
+    pub(crate) locale: Option<String>,
+}
+
+/// Options of `checkForPackage`.
+#[derive(Debug, Clone, Default, JsObject)]
+#[non_exhaustive]
+pub(crate) struct PackageCheckOptions {
+    /// As `checkForUpdate`'s: the language `notes` is in, when the
+    /// manifest has it.
+    pub(crate) locale: Option<String>,
 }
 
 /// A newer version of the app.
@@ -106,7 +119,8 @@ pub(crate) struct UpdateCheckOptions {
 pub(crate) struct AppUpdate {
     /// Its version.
     pub(crate) version: String,
-    /// What changed, as the manifest says it.
+    /// What changed, as the manifest says it: in the check's `locale` when
+    /// the manifest has it.
     pub(crate) notes: Option<String>,
     /// Where the user can get it by hand: the archive, or a store's page on
     /// iOS and Android. For `openUrl` when `canInstall` is false.
@@ -131,7 +145,8 @@ pub(crate) struct PackageUpdate {
     pub(crate) version: String,
     /// Its build number, newer than the running one.
     pub(crate) build: f64,
-    /// What changed, as the manifest says it.
+    /// What changed, as the manifest says it: in the check's `locale` when
+    /// the manifest has it.
     pub(crate) notes: Option<String>,
     /// Its size in bytes, when the manifest says it.
     pub(crate) size: Option<f64>,
@@ -208,8 +223,8 @@ impl Updater {
         options: Option<UpdateCheckOptions>,
         sys: System,
     ) -> Later<Option<AppUpdate>> {
-        let channel = options.and_then(|options| options.channel);
-        Later::new(native::check(sys, channel))
+        let options = options.unwrap_or_default();
+        Later::new(native::check(sys, options.channel, options.locale))
     }
 
     /// Downloads the update the last `checkForUpdate` found and checks it
@@ -220,6 +235,9 @@ impl Updater {
         #[args(progress)] on_progress: Option<Callback<UpdateProgress>>,
         sys: System,
     ) -> Later<()> {
+        let on_progress = on_progress.map(|callback| {
+            Box::new(move |progress| callback.post(progress)) as Box<dyn Fn(UpdateProgress)>
+        });
         Later::new(native::download(sys, on_progress))
     }
 
@@ -248,6 +266,31 @@ impl Updater {
         Later::new(native::install_on_quit(sys))
     }
 
+    /// Checks for a newer version as `checkForUpdate` does and asks the
+    /// user about it in NSH's built-in prompt, as macOS apps' Sparkle does:
+    /// the version, its notes and Skip This Version, Remind Me Later and
+    /// Install Update, then the download's progress and Install and
+    /// Relaunch or Install on Quit. Where the app cannot install itself
+    /// (`canInstall` false: iOS, Android) Install Update opens the update's
+    /// `url`. The user's Skip This Version and "Automatically download and
+    /// install updates" are kept in the app's data directory: a `quiet`
+    /// check (at startup, in the background) shows nothing for a skipped
+    /// version, and installs an update as the app quits without asking
+    /// once the user chose to; it shows nothing either when the app is up
+    /// to date or the check fails. Without `quiet` (a "Check for Updates…"
+    /// menu item) the user hears that too. Resolves once the prompt shows,
+    /// or there is nothing to show; never rejects.
+    pub(crate) fn prompt_for_update(
+        options: Option<UpdatePromptOptions>,
+        sys: System,
+    ) -> Later<()> {
+        let options = options.unwrap_or_default();
+        Later::new(async move {
+            prompt::run(sys, options).await;
+            Ok::<_, JsError>(())
+        })
+    }
+
     /// Asks the source in `nsh.json`'s `"updater"` for a newer build of the
     /// app's code: a signed package newer than the running build (the
     /// running package's, else the one the app shipped with) that this
@@ -255,8 +298,12 @@ impl Updater {
     /// app trusts no package roots (`"updater": { "packages": { "roots" } }`)
     /// or runs where apps do not update (the web, a development run).
     /// Rejects as `checkForUpdate` does.
-    pub(crate) fn check_for_package(sys: System) -> Later<Option<PackageUpdate>> {
-        Later::new(native::check_package(sys))
+    pub(crate) fn check_for_package(
+        options: Option<PackageCheckOptions>,
+        sys: System,
+    ) -> Later<Option<PackageUpdate>> {
+        let locale = options.and_then(|options| options.locale);
+        Later::new(native::check_package(sys, locale))
     }
 
     /// Downloads the package the last `checkForPackage` found, checks it
@@ -311,6 +358,10 @@ impl Updater {
     }
 }
 
+mod prompt;
+
+pub use prompt::{UpdatePrompt, UpdatePromptOptions, prompt_for_update, set_update_presenter};
+
 /// Why no package can be downloaded.
 fn no_package() -> JsError {
     JsError::Error("no package to download: checkForPackage found none".into())
@@ -329,6 +380,8 @@ fn unavailable() -> JsError {
 
 #[cfg(all(not(target_arch = "wasm32"), feature = "updater"))]
 mod native {
+    use std::collections::BTreeMap;
+
     use nsh_updater::{Available, Config, Download};
 
     use super::*;
@@ -396,6 +449,7 @@ mod native {
     pub(super) async fn check(
         sys: System,
         channel: Option<String>,
+        locale: Option<String>,
     ) -> Result<Option<AppUpdate>, JsError> {
         let found = sys.locals.get::<Found>();
         let _operation = begin(&found)?;
@@ -437,8 +491,11 @@ mod native {
                 .check(&manifest, signature.as_deref(), &nsh_updater::platform())
                 .map_err(|e| e.to_string())?;
             let running = worker.running_package();
-            Ok(available.map(|available| {
+            Ok(available.map(|mut available| {
                 let shell = package_covers(running.as_ref(), &available.version);
+                if let Some(notes) = localized(&*worker, &available.localized_notes, locale) {
+                    available.notes = Some(notes);
+                }
                 (bytes, config, available, shell)
             }))
         })
@@ -510,6 +567,45 @@ mod native {
         Ok(Some(update))
     }
 
+    /// The app's display name and version as it was packaged
+    /// (`nsh-updater.json`), when it has them.
+    pub(super) async fn shipped(sys: &System) -> (Option<String>, Option<String>) {
+        let Some(host) = sys.updater.clone() else {
+            return (None, None);
+        };
+        let shipped = blocking(move || {
+            Ok(host
+                .config()
+                .and_then(|bytes| Config::parse(&bytes).ok())
+                .map(|config| (config.name, config.version)))
+        })
+        .await;
+        match shipped {
+            Ok(Some((name, version))) => (name, Some(version)),
+            _ => (None, None),
+        }
+    }
+
+    /// The notes in `locale` among `files`, downloaded and checked; `None`
+    /// keeps the default notes, also when the file cannot be had: notes in
+    /// another language must not fail a check.
+    fn localized(
+        host: &dyn UpdaterHost,
+        files: &BTreeMap<String, nsh_updater::NotesFile>,
+        locale: Option<String>,
+    ) -> Option<String> {
+        let file = nsh_updater::notes_for(files, &locale?)?;
+        let opened = get_all(host, &file.url)
+            .and_then(|bytes| nsh_updater::open_notes(file, bytes).map_err(|e| e.to_string()));
+        match opened {
+            Ok(notes) => Some(notes),
+            Err(e) => {
+                log::warn!("updater: notes: {e}");
+                None
+            }
+        }
+    }
+
     /// A small file, whole. A manifest is a few kilobytes.
     fn get_all(host: &dyn UpdaterHost, url: &str) -> Result<Vec<u8>, String> {
         const MAX: usize = 1 << 20;
@@ -536,7 +632,7 @@ mod native {
 
     pub(super) async fn download(
         sys: System,
-        on_progress: Option<Callback<UpdateProgress>>,
+        on_progress: Option<Box<dyn Fn(UpdateProgress)>>,
     ) -> Result<(), JsError> {
         use std::io::Write as _;
 
@@ -583,8 +679,8 @@ mod native {
             tokio::select! {
                 result = &mut work => break result?,
                 Some((received, total)) = rx.recv() => {
-                    if let Some(callback) = &on_progress {
-                        callback.post(UpdateProgress {
+                    if let Some(on_progress) = &on_progress {
+                        on_progress(UpdateProgress {
                             received: received as f64,
                             total: total.map(|t: u64| t as f64),
                         });
@@ -603,7 +699,10 @@ mod native {
     /// The downloaded package the app's next start runs.
     const NEXT: &str = "next.nshpkg";
 
-    pub(super) async fn check_package(sys: System) -> Result<Option<PackageUpdate>, JsError> {
+    pub(super) async fn check_package(
+        sys: System,
+        locale: Option<String>,
+    ) -> Result<Option<PackageUpdate>, JsError> {
         let found = sys.locals.get::<Found>();
         let _operation = begin(&found)?;
         let (Some(host), Some(data_dir)) = (sys.updater.clone(), sys.data_dir.clone()) else {
@@ -636,7 +735,12 @@ mod native {
                     env!("CARGO_PKG_VERSION"),
                 )
                 .map_err(|e| e.to_string())?;
-            Ok(available.map(|available| (config, available, running_build)))
+            Ok(available.map(|mut available| {
+                if let Some(notes) = localized(&*worker, &available.localized_notes, locale) {
+                    available.notes = Some(notes);
+                }
+                (config, available, running_build)
+            }))
         })
         .await?;
         let Some((config, available, running_build)) = checked else {
@@ -783,12 +887,14 @@ mod native {
         // directory or `.app` is swapped, this process' executable is the
         // old one, moved aside and deleted.
         crate::restart::remember_program();
-        blocking(move || {
-            installation.install(&archive).map_err(|e| e.to_string())?;
+        let program = blocking(move || {
+            let program = installation.install(&archive).map_err(|e| e.to_string())?;
             let _ = std::fs::remove_file(&archive);
-            Ok(())
+            Ok(program)
         })
         .await?;
+        // The update may have renamed the executable or its `.app`.
+        crate::restart::set_program(program);
         // As `Application.restart()`: the app quits as the user's quit does
         // (storage written, windows closed), and the new version starts
         // once this process has exited (`crate::restart`).
@@ -831,7 +937,11 @@ mod native {
             // user knows, as `install` has it.
             crate::restart::remember_program();
             match staged.finish() {
-                Ok(()) => log::info!("installed version {version} as the app quit"),
+                Ok(program) => {
+                    // The update may have renamed the executable or its `.app`.
+                    crate::restart::set_program(program);
+                    log::info!("installed version {version} as the app quit")
+                }
                 Err(e) => log::error!("cannot install version {version} as the app quits: {e}"),
             }
             let _ = std::fs::remove_file(&archive);
@@ -914,6 +1024,22 @@ mod native {
             .into_bytes()
         }
 
+        const ZH_TW: &str = "https://x.dev/beta/notes.zh-TW.md";
+        const JA: &str = "https://x.dev/beta/notes.ja.md";
+
+        /// The beta manifest: notes, and in zh-TW and ja beside it (ja's
+        /// file does not match its hash).
+        fn beta() -> Vec<u8> {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&served("1.1.0-beta.1")).unwrap();
+            manifest["notes"] = "Fixes".into();
+            manifest["localizedNotes"] = serde_json::json!({
+                "zh-TW": { "url": "notes.zh-TW.md", "sha256": nsh_updater::sha256("修復".as_bytes()) },
+                "ja": { "url": "notes.ja.md", "sha256": nsh_updater::sha256("修正".as_bytes()) },
+            });
+            serde_json::to_vec(&manifest).unwrap()
+        }
+
         impl UpdaterHost for Channels {
             fn config(&self) -> Option<Vec<u8>> {
                 Some(
@@ -928,7 +1054,9 @@ mod native {
                 self.0.lock().unwrap().push(url.to_owned());
                 let manifest = match url.strip_suffix(".sig").unwrap_or(url) {
                     STABLE => served("1.0.0"),
-                    BETA => served("1.1.0-beta.1"),
+                    BETA => beta(),
+                    ZH_TW => return sink("修復".as_bytes(), None),
+                    JA => return sink(b"tampered", None),
                     _ => return Err("not found".into()),
                 };
                 let body = if url.ends_with(".sig") {
@@ -948,7 +1076,7 @@ mod native {
                 tokio::runtime::Builder::new_current_thread()
                     .build()
                     .unwrap()
-                    .block_on(check(sys.clone(), channel.map(str::to_owned)))
+                    .block_on(check(sys.clone(), channel.map(str::to_owned), None))
             };
             // The default source has nothing newer; the beta channel has.
             assert!(checked(None).unwrap().is_none());
@@ -969,6 +1097,32 @@ mod native {
             assert!(checked(Some("nightly")).is_err());
             assert!(checked(Some("https://evil.dev/latest.json")).is_err());
             assert!(host.0.lock().unwrap().is_empty());
+        }
+
+        #[test]
+        fn a_check_downloads_only_the_notes_of_its_locale() {
+            let host = Arc::new(Channels(Default::default()));
+            let sys = System::default().with_updater(Some(host.clone()));
+            let notes = |locale: Option<&str>| {
+                host.0.lock().unwrap().clear();
+                let update = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap()
+                    .block_on(check(
+                        sys.clone(),
+                        Some("beta".into()),
+                        locale.map(str::to_owned),
+                    ))
+                    .unwrap()
+                    .unwrap();
+                let fetched = host.0.lock().unwrap().len();
+                (update.notes.unwrap(), fetched)
+            };
+            assert_eq!(notes(None), ("Fixes".to_owned(), 2));
+            assert_eq!(notes(Some("zh-TW")), ("修復".to_owned(), 3));
+            // No file for it, or one that fails its hash: the default notes.
+            assert_eq!(notes(Some("de")), ("Fixes".to_owned(), 2));
+            assert_eq!(notes(Some("ja")), ("Fixes".to_owned(), 3));
         }
 
         /// Nothing waits to install when no check found an update the app
@@ -1004,13 +1158,21 @@ mod native {
 mod native {
     use super::*;
 
-    pub(super) async fn check(_: System, _: Option<String>) -> Result<Option<AppUpdate>, JsError> {
+    pub(super) async fn check(
+        _: System,
+        _: Option<String>,
+        _: Option<String>,
+    ) -> Result<Option<AppUpdate>, JsError> {
         Ok(None)
+    }
+
+    pub(super) async fn shipped(_: &System) -> (Option<String>, Option<String>) {
+        (None, None)
     }
 
     pub(super) async fn download(
         _: System,
-        _: Option<Callback<UpdateProgress>>,
+        _: Option<Box<dyn Fn(UpdateProgress)>>,
     ) -> Result<(), JsError> {
         Err(unavailable())
     }
@@ -1023,7 +1185,10 @@ mod native {
         Err(unavailable())
     }
 
-    pub(super) async fn check_package(_: System) -> Result<Option<PackageUpdate>, JsError> {
+    pub(super) async fn check_package(
+        _: System,
+        _: Option<String>,
+    ) -> Result<Option<PackageUpdate>, JsError> {
         Ok(None)
     }
 

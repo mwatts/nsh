@@ -124,11 +124,17 @@ impl Headless {
         self.deliver_held();
         let apple = keymap::apple_keys(self.environment.os, self.environment.apple_keyboard);
         let stroke = Keystroke::parse_with(keys, apple).map_err(|e| e.to_string())?;
-        let editing = self.screen.focused().is_some();
-        let focused = self
+        // A text input the newest modal over its window covers (the app
+        // left the focus under a dialog where the platform does not move it
+        // into the modal) edits nothing: the modal's window has the keys,
+        // as on Android, whose dialog is a window of its own, so Escape
+        // reaches the dialog instead of the input under it.
+        let input = self
             .screen
             .focused()
-            .filter(|&id| self.screen.input(id).is_some());
+            .filter(|&view| self.screen.in_focus_scope(view));
+        let editing = input.is_some();
+        let focused = input.filter(|&id| self.screen.input(id).is_some());
         let m = stroke.modifiers;
         if stroke.key == Key::Escape && !(m.ctrl || m.alt || m.cmd || m.shift) {
             self.disarm_text();
@@ -163,7 +169,8 @@ impl Headless {
         focus.control = control.is_some();
         focus.covered = self
             .screen
-            .key_focus()
+            .focused()
+            .or(self.screen.key_focus())
             .is_some_and(|view| !self.screen.in_focus_scope(view));
         let found = match self.screen.keymap() {
             Some(keymap) => keymap.find_with(window, stroke, focus, false),
@@ -183,10 +190,7 @@ impl Headless {
                 .screen
                 .key_focus()
                 .is_some_and(|view| self.screen.hears(view, EventKind::Press));
-        let input_focused = self
-            .screen
-            .focused()
-            .is_some_and(|id| self.screen.input(id).is_some());
+        let input_focused = focused.is_some();
         // A focused view that hears raw keys (`focusable`, on Linux) takes
         // the character itself: it does not wait for a field.
         let view_takes_keys = !editing
@@ -231,7 +235,7 @@ impl Headless {
         // focused when the source reports them; the simulator moves the
         // focus between them as a Tab or a dialog can.
         let mut raw = false;
-        let captured = if !editing
+        let captured = if self.screen.focused().is_none()
             && self.delivers_raw_input()
             && let Some(view) = self.screen.key_focus()
             && self.screen.accepts_key_focus(view)

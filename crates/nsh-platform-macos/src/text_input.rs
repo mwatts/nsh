@@ -1652,6 +1652,16 @@ fn field_editor(mtm: MainThreadMarker, window: &objc2_app_kit::NSWindow) -> Reta
     })
 }
 
+struct PadState {
+    owner: objc2::rc::Weak<NSView>,
+    forwarding: Cell<bool>,
+}
+
+pub(crate) fn pad_owner(view: &NSView) -> Option<NshView> {
+    let owner = view.downcast_ref::<InputPad>()?.ivars().owner.load()?;
+    NshView::from_ns(&owner)
+}
+
 define_class!(
     /// Fills an input's view and holds its editor (and placeholder), so a
     /// click anywhere in the input edits, its padding and the space around
@@ -1659,7 +1669,7 @@ define_class!(
     /// nearest point inside it.
     #[unsafe(super(NSView, NSResponder, NSObject))]
     #[thread_kind = MainThreadOnly]
-    #[ivars = Cell<bool>]
+    #[ivars = PadState]
     #[name = "NshInputPad"]
     struct InputPad;
 
@@ -1680,17 +1690,20 @@ define_class!(
         fn mouse_down(&self, event: &NSEvent) {
             // An editor that passes the press on (up the responder chain)
             // brings it back here: it ends here then.
-            if !self.ivars().replace(true) {
+            if !self.ivars().forwarding.replace(true) {
                 self.forward(event);
-                self.ivars().set(false);
+                self.ivars().forwarding.set(false);
             }
         }
     }
 );
 
 impl InputPad {
-    fn create(mtm: MainThreadMarker) -> Retained<NSView> {
-        let this = Self::alloc(mtm).set_ivars(Cell::new(false));
+    fn create(mtm: MainThreadMarker, owner: &NshView) -> Retained<NSView> {
+        let this = Self::alloc(mtm).set_ivars(PadState {
+            owner: objc2::rc::Weak::new(owner.ns()),
+            forwarding: Cell::new(false),
+        });
         // SAFETY: NSView's designated initializer.
         let this: Retained<Self> =
             unsafe { msg_send![super(this), initWithFrame: ns_rect(0.0, 0.0, 0.0, 0.0)] };
@@ -1708,10 +1721,20 @@ impl InputPad {
         ) else {
             return;
         };
+        // A press the editor can't take where it fell still focuses it: a
+        // click in the input must never leave it without the focus.
+        let focus = || {
+            if !window.firstResponder().is_some_and(|r| {
+                r.downcast_ref::<NSView>()
+                    .is_some_and(|r| r.isDescendantOf(&editor))
+            }) {
+                window.makeFirstResponder(Some(&editor));
+            }
+        };
         let p = self.convertPoint_fromView(event.locationInWindow(), None);
         let f = editor.frame();
         if f.size.width < 2.0 || f.size.height < 2.0 {
-            return;
+            return focus();
         }
         let inside = NSPoint::new(
             p.x.clamp(f.origin.x + 1.0, f.origin.x + f.size.width - 1.0),
@@ -1721,7 +1744,7 @@ impl InputPad {
         let at = self.convertPoint_toView(inside, Some(&outer));
         let me: &NSView = self;
         let Some(target) = self.hitTest(at).filter(|t| &**t != me) else {
-            return;
+            return focus();
         };
         // The window gives the focus to what a press hits before it sends
         // the press, and a field only edits a press once it has the focus
@@ -1743,7 +1766,7 @@ impl InputPad {
             event.clickCount(),
             event.pressure(),
         );
-        let Some(moved) = moved else { return };
+        let Some(moved) = moved else { return focus() };
         target.mouseDown(&moved);
         // The editor tracked the press to the release at its real point,
         // beside the text, so a click selected from the caret to the
@@ -2009,7 +2032,7 @@ pub(crate) fn create(surface: &Rc<Surface>, view: &NshView) {
             editor: RefCell::new(new_editor(mtm, &cx, &delegate, false, false)),
             undo_manager: RefCell::new(None),
             delegate,
-            pad: InputPad::create(mtm),
+            pad: InputPad::create(mtm, view),
             placeholder,
             config: RefCell::new(InputConfig::default()),
             configured: Cell::new(false),

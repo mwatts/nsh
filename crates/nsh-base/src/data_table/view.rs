@@ -364,14 +364,10 @@ fn hit_layer(dt: Dt, lead: Lead) -> impl IntoElement {
                                 // selects or moves.
                                 .on_mouse_move(move |e: &MouseEvent| {
                                     if e.pressed_button.is_none() {
-                                        hover.hover_at(e.position);
+                                        hover.hover_at(e);
                                     }
                                 })
-                                .on_mouse_leave(move |_: &MouseEvent| {
-                                    if leave.hover.get_untracked().is_some() {
-                                        leave.hover.set(None);
-                                    }
-                                })
+                                .on_mouse_leave(move |_: &MouseEvent| leave.hover_left())
                                 .on_context_menu(move |e: &ContextMenuEvent| {
                                     menu.context_menu(e.position, e.page_position)
                                 }),
@@ -418,7 +414,8 @@ impl Lead {
     }
 }
 
-/// The desktops' horizontal scroll bar: a band over the body's bottom edge
+/// The desktops' horizontal scroll bar: a band over the body's bottom edge,
+/// under the scrolling columns (between the fixed ones, which do not move),
 /// whose own scroll view the bar belongs to, moving the table's.
 fn strip(dt: Dt, lead: Lead) -> impl IntoElement {
     let props = dt.props;
@@ -439,14 +436,21 @@ fn strip(dt: Dt, lead: Lead) -> impl IntoElement {
     let width_dt = dt.clone();
     when(shown, move || {
         let (scroll_dt, width_dt) = (dt.clone(), width_dt.clone());
+        let (left_dt, right_dt) = (dt.clone(), dt.clone());
         let lead = lead.clone();
         scroll()
             .horizontal()
             .element_ref(&dt.strip)
             .test_id("data-table-scrollbar")
             .absolute()
-            .left_0()
-            .right_0()
+            .left(move || {
+                let g = left_dt.geo();
+                Length::from(px(g.lead + g.fixed))
+            })
+            .right(move || {
+                let g = right_dt.geo();
+                Length::from(px(g.end + g.bar))
+            })
             .bottom_0()
             .h(px(STRIP))
             .on_scroll_drag_start({
@@ -475,7 +479,7 @@ fn strip(dt: Dt, lead: Lead) -> impl IntoElement {
             .child(
                 view()
                     .h(px(1.0))
-                    .w(move || Length::from(px(content_width(&width_dt)))),
+                    .w(move || Length::from(px(width_dt.geo().x.extent() as f32))),
             )
     })
 }
@@ -934,6 +938,12 @@ fn body_row(
     let props = dt.props;
     let (top_dt, height_dt, width_dt) = (dt.clone(), dt.clone(), dt.clone());
     let (row_selected, list) = row_parts(&dt, row);
+    // Its `hover:` classes and the `group-hover:` classes of the cells in
+    // it, in every region, follow the hit layer's hovered row.
+    let row_hovered = {
+        let hover = dt.hover;
+        computed(move || row.get().is_some() && hover.get() == row.get())
+    };
     let (press_dt, menu_dt, class_dt) = (dt.clone(), dt.clone(), dt.clone());
     let el = parts_with(
         view()
@@ -942,6 +952,7 @@ fn body_row(
             .style_when(move || row.get().is_none(), |s| s.hidden())
             // The table is one stop of Tab, its hit layer.
             .focusable(false)
+            .project_hovered(row_hovered)
             .on(EventKind::Press, move |p: &EventPayload| {
                 let Some(row) = row.get_untracked() else {
                     return;

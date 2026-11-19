@@ -63,7 +63,7 @@ TSX app adds its entry (`nsh package App.tsx --target …`).
 
 `nsh.json` also holds `rust` and `root` (the app's crates and its root component, [Building with Rust](./rust.md)),
 `theme` and `appearance`, `tailwind` (see [Tailwind](./tailwind.md)), `capabilities` (see
-[Sandbox and capabilities](./sandbox-and-capabilities.md)), `android` (`targetSdk` and `usesCleartextTraffic`, [below](#target-api-level)), `ios` and `macos` (the `Info.plist` keys and entitlements
+[Sandbox and capabilities](./sandbox-and-capabilities.md)), `android` (`targetSdk`, `usesCleartextTraffic` and `permissions`, [below](#target-api-level)), `ios` and `macos` (the `Info.plist` keys and entitlements
 of their packages, [below](#infoplist-keys-and-entitlements); `macos.activationPolicy`, a [menu bar app](./macos.md#menu-bar-apps)) and `updater`, which makes desktop packages update themselves
 (see [App Updates](./app-updates.md)) and every native package take [OTA updates](./ota-updates.md); [Project structure](./project-structure.md#nshjson) lists
 every key. A key or value NSH cannot read is reported as a warning and left out, so an app written for a newer NSH
@@ -201,6 +201,24 @@ Packaged apps make requests over HTTPS. For servers without TLS, such as one on 
 
 Development builds (`nsh run --target android`) always allow plain HTTP: they load the app from the dev server over it.
 
+### Permissions
+
+The manifest declares the permissions NSH's own features need: `INTERNET`, `POST_NOTIFICATIONS` for
+[notifications](./sandbox-and-capabilities.md#notifications), `RECORD_AUDIO` and `CAMERA` for a web view's `media`. `android.permissions` adds
+others, for code of the app or an extension that calls Android itself: a bare name is one of Android's
+(`android.permission.<NAME>`), a dotted one is written as it is.
+
+```json
+{
+  "android": { "permissions": ["ACCESS_NETWORK_STATE", "com.example.permission.READ_ORDERS"] }
+}
+```
+
+A normal permission such as `ACCESS_NETWORK_STATE` is granted when the app is installed. A runtime permission
+(`ACCESS_FINE_LOCATION`, say) is only declared: the app's own code still asks the user for it. The TSX development
+host (`nsh run --target android` of a TSX app) declares none of these; a Rust app's `nsh run` builds its package and
+declares them.
+
 ### Google Play: App Bundles
 
 Google Play takes Android App Bundles, not APKs. `--format aab` writes `.nsh/out/<Name>.aab` instead of the APK, from
@@ -320,6 +338,7 @@ says what to set instead:
 | iOS: `CFBundleIcons`, `CFBundleIcons~ipad`, `CFBundleIconName`; macOS: `CFBundleIconFile` | `icon` |
 | iOS: `UIUserInterfaceStyle` | `appearance` |
 | iOS: `UIStatusBarStyle`, `UIStatusBarHidden` | `statusBar` |
+| iOS: `UILaunchScreen`, when `ios.launchScreen` is set | `ios.launchScreen` ([Launch screen](#launch-screen)) |
 | macOS: `LSUIElement` | `macos.activationPolicy` ([Menu bar apps](./macos.md#menu-bar-apps)) |
 | `CFBundleExecutable`, `CFBundlePackageType`, `CFBundleSupportedPlatforms`; iOS: `LSRequiresIPhoneOS`, `UIApplicationSceneManifest`, `UIApplicationSupportsMultipleScenes`; macOS: `NSPrincipalClass` | the package itself |
 | Entitlements: `application-identifier`, `com.apple.application-identifier`, `com.apple.developer.team-identifier` | `id` and the provisioning profile |
@@ -349,9 +368,10 @@ later system, through its own [Rust crate](./rust.md) for example, raises its mi
 ```
 
 The value is a string of one to three numbers joined by dots (`"15"`, `"15.2"`, `"15.2.1"`) from NSH's minimum up:
-`"15.0"` on iOS, `"14.0"` on macOS. The package declares it as written, and the iOS app icon is compiled for it. A
-lower version, or a value of another form, is an error that names NSH's minimum, reported as soon as `nsh.json` is
-read.
+`"15.0"` on iOS, `"14.0"` on macOS. The package declares it as written, the app's Rust code (Rust and C alike) is
+built for it, and the iOS app icon is compiled for it. A deployment target set in the environment
+(`IPHONEOS_DEPLOYMENT_TARGET`, `MACOSX_DEPLOYMENT_TARGET`) is used as it is. A lower version, or a value of another
+form, is an error that names NSH's minimum, reported as soon as `nsh.json` is read.
 
 ## Icons
 
@@ -386,6 +406,31 @@ Windows, Linux and Android fill it. Give `icon` an object to use a PNG per platf
 `--icon` replaces it for the target being packaged.
 
 Without an icon, the system shows its default.
+
+## Launch screen
+
+From the tap on the icon until the app's first frame, iOS shows the app's launch screen: the system's background
+color in the app's appearance unless `nsh.json` gives one. `ios.launchScreen` sets its color and an image in the
+middle of the screen, the same in both appearances or one for each:
+
+```json
+{
+  "ios": {
+    "launchScreen": {
+      "background": { "light": "#ffffff", "dark": "#131312" },
+      "image": { "light": "launch.png", "dark": "launch-dark.png" }
+    }
+  }
+}
+```
+
+- `background` is `#rrggbb` or `#rrggbbaa`, or an object with `light` and `dark`.
+- `image` is a PNG relative to `nsh.json`, or an object with `light` and `dark`. It is drawn for 3x screens: the
+  system shows it at a third of its size in pixels, so a 288×288 PNG is 96×96 points, centered.
+
+Both are compiled into the app's asset catalog with its icon and named in `UILaunchScreen`, which the app no longer
+sets in `ios.infoPlist`. A launch screen that matches the app's first frame (its background, the same image in the
+same place) makes the start look seamless. `appearance` picks which of the two the system shows.
 
 ## Camera, Bluetooth and other hardware
 

@@ -37,15 +37,16 @@ use objc2_core_foundation::{CGFloat, CGSize};
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSString};
 use objc2_quartz_core::{CAMediaTiming, CATransition};
 use objc2_ui_kit::{
-    NSForegroundColorAttributeName, UIAction, UIAdaptivePresentationControllerDelegate,
-    UIBarButtonItem, UIBarButtonItemStyle, UIBarButtonSystemItem, UIBehavioralStyle, UIColor,
-    UIEdgeInsets, UIGestureRecognizer, UIGestureRecognizerDelegate, UIImage,
-    UIInterfaceOrientationMask, UIMenu, UIMenuElement, UIMenuElementAttributes, UIMenuElementState,
-    UIMenuOptions, UIModalPresentationStyle, UIModalTransitionStyle, UINavigationBar,
-    UINavigationBarAppearance, UINavigationController, UINavigationControllerDelegate,
-    UINavigationItem, UINavigationItemLargeTitleDisplayMode, UIPresentationController, UIResponder,
-    UIScrollView, UISheetPresentationController, UISheetPresentationControllerDelegate,
-    UISheetPresentationControllerDetent, UISheetPresentationControllerDetentIdentifierLarge,
+    NSDirectionalRectEdge, NSForegroundColorAttributeName, UIAction,
+    UIAdaptivePresentationControllerDelegate, UIBarButtonItem, UIBarButtonItemStyle,
+    UIBarButtonSystemItem, UIBehavioralStyle, UIColor, UIEdgeInsets, UIGestureRecognizer,
+    UIGestureRecognizerDelegate, UIImage, UIInterfaceOrientationMask, UIMenu, UIMenuElement,
+    UIMenuElementAttributes, UIMenuElementState, UIMenuOptions, UIModalPresentationStyle,
+    UIModalTransitionStyle, UINavigationBar, UINavigationBarAppearance, UINavigationController,
+    UINavigationControllerDelegate, UINavigationItem, UINavigationItemLargeTitleDisplayMode,
+    UIPresentationController, UIResponder, UIScrollView, UISheetPresentationController,
+    UISheetPresentationControllerDelegate, UISheetPresentationControllerDetent,
+    UISheetPresentationControllerDetentIdentifierLarge,
     UISheetPresentationControllerDetentIdentifierMedium,
     UISheetPresentationControllerDetentResolutionContext, UIView, UIViewAutoresizing,
     UIViewController, UIViewControllerTransitionCoordinator,
@@ -98,6 +99,11 @@ pub(crate) struct ScreenIvars {
     /// The header height last reported to the core.
     measured: Cell<Option<f32>>,
     insets: Cell<Option<EdgeInsets>>,
+    /// `headerBackgroundOnScroll`: the header follows the scroll view that
+    /// runs under it (`follow_content_scroll`).
+    follow_scroll: Cell<bool>,
+    /// The scroll view last given to UIKit as the content scroll view.
+    followed: RefCell<Option<Weak<UIScrollView>>>,
 }
 
 define_class!(
@@ -113,6 +119,7 @@ define_class!(
             // SAFETY: calling the superclass implementation.
             let _: () = unsafe { msg_send![super(self), viewDidLayoutSubviews] };
             self.report_insets();
+            self.follow_content_scroll();
         }
 
         /// The stack correcting what UIKit granted a screen beside a side
@@ -160,6 +167,8 @@ impl ScreenController {
             measure: Cell::new(false),
             measured: Cell::new(None),
             insets: Cell::new(None),
+            follow_scroll: Cell::new(false),
+            followed: RefCell::new(None),
         });
         // SAFETY: UIViewController's designated initializer.
         unsafe {
@@ -169,6 +178,27 @@ impl ScreenController {
 
     pub(crate) fn screen_id(&self) -> NodeId {
         self.ivars().id
+    }
+
+    /// With `headerBackgroundOnScroll`, the header switches to its standard
+    /// appearance once the content scrolls under it. UIKit watches the
+    /// controller's content scroll view for that, and before iOS 26 finds it
+    /// on its own only next to the root view, not deep in the screen's
+    /// content: it is pointed at the scroll view that runs under the header.
+    pub(crate) fn follow_content_scroll(&self) {
+        let ivars = self.ivars();
+        let found = if ivars.follow_scroll.get() {
+            self.view().and_then(|view| scroll_under_header(&view))
+        } else {
+            None
+        };
+        let followed = ivars.followed.borrow().as_ref().and_then(Weak::load);
+        if followed.as_deref().map(|v| v as *const UIScrollView)
+            != found.as_deref().map(|v| v as *const UIScrollView)
+        {
+            self.setContentScrollView_forEdge(found.as_deref(), NSDirectionalRectEdge::Top);
+            *ivars.followed.borrow_mut() = found.as_deref().map(Weak::new);
+        }
     }
 
     /// The screen's insets not covered by system UI or its header, for
@@ -191,6 +221,38 @@ impl ScreenController {
                 .dispatch_event(id, EventKind::Insets, insets_payload(insets));
         }
     }
+}
+
+/// The scroll view a header follows: the visible one that starts at the top of
+/// `root` (under a transparent header) and shows the most of itself, outside
+/// other scroll views.
+fn scroll_under_header(root: &UIView) -> Option<Retained<UIScrollView>> {
+    let bounds = root.bounds();
+    let mut best: Option<(CGFloat, Retained<UIScrollView>)> = None;
+    let mut queue = vec![root.retain()];
+    while let Some(parent) = queue.pop() {
+        for child in parent.subviews().iter() {
+            if child.isHidden() || child.alpha() <= 0.0 {
+                continue;
+            }
+            let Ok(scroll) = child.clone().downcast::<UIScrollView>() else {
+                queue.push(child);
+                continue;
+            };
+            let frame = parent.convertRect_toView(scroll.frame(), Some(root));
+            let width = (frame.origin.x + frame.size.width).min(bounds.size.width)
+                - frame.origin.x.max(0.0);
+            let height = (frame.origin.y + frame.size.height).min(bounds.size.height);
+            if frame.origin.y > 0.5 || width <= 0.0 || height <= 0.0 {
+                continue;
+            }
+            let area = width * height;
+            if best.as_ref().is_none_or(|(most, _)| area > *most) {
+                best = Some((area, scroll));
+            }
+        }
+    }
+    best.map(|(_, scroll)| scroll)
 }
 
 fn first_responder(view: &UIView) -> Option<Retained<UIView>> {
@@ -1427,6 +1489,16 @@ fn update_right_item(
         let label = kept.label.map(NSString::from_str);
         button.setAccessibilityLabel(label.as_deref(), mtm);
     }
+    set_item_id(button, item);
+}
+
+/// The button's accessibility identifier from the item's `key`, as a view's
+/// `testID` is: what UI tests (a test's selector `id:<key>`) find it by.
+fn set_item_id(button: &UIBarButtonItem, item: &HeaderItem) {
+    let id = item.key.as_deref().map(NSString::from_str);
+    // SAFETY: UIBarButtonItem's `UIAccessibilityIdentification` setter, an
+    // optional string.
+    let _: () = unsafe { msg_send![button, setAccessibilityIdentifier: id.as_deref()] };
 }
 
 /// One trailing `ios.headerRightItems` button.
@@ -1461,6 +1533,7 @@ fn make_right_item(
         use objc2_ui_kit::NSObjectUIAccessibility;
         button.setAccessibilityLabel(Some(&NSString::from_str(label)), mtm);
     }
+    set_item_id(&button, item);
     button
 }
 
@@ -2020,10 +2093,14 @@ impl ScreenHost {
         } else {
             UINavigationItemLargeTitleDisplayMode::Never
         });
-        let appearance = header_appearance(mtm, c);
-        nav_item.setStandardAppearance(appearance.as_deref());
-        nav_item.setScrollEdgeAppearance(appearance.as_deref());
-        nav_item.setCompactAppearance(appearance.as_deref());
+        let appearances = header_appearances(mtm, c);
+        let (standard, scroll_edge) = match &appearances {
+            Some((standard, scroll_edge)) => (Some(&**standard), Some(&**scroll_edge)),
+            None => (None, None),
+        };
+        nav_item.setStandardAppearance(standard);
+        nav_item.setScrollEdgeAppearance(scroll_edge);
+        nav_item.setCompactAppearance(standard);
         // The bar of the screen on top, too (Catalyst does not always take
         // the item's appearance).
         if let Some(nav) = self.controller.navigationController()
@@ -2043,7 +2120,11 @@ impl ScreenHost {
         ivars
             .measure
             .set(c.header_visible && !c.header_transparent && !c.large_title);
+        ivars
+            .follow_scroll
+            .set(c.header_transparent && c.header_background_on_scroll);
         self.controller.report_insets();
+        self.controller.follow_content_scroll();
     }
 }
 
@@ -2070,22 +2151,54 @@ pub(crate) fn keep_in_window(bar: &UINavigationBar) {
     }
 }
 
-/// The header's appearance from the screen's options (`None`: UIKit's).
+/// The header's appearances from the screen's options (`None`: UIKit's):
+/// the standard one (also the compact one), and the one while the content
+/// rests at its top (the scroll edge), clear for a transparent header that
+/// shows its background only on scroll.
+fn header_appearances(
+    mtm: MainThreadMarker,
+    c: &ScreenConfig,
+) -> Option<(
+    Retained<UINavigationBarAppearance>,
+    Retained<UINavigationBarAppearance>,
+)> {
+    if c.background_color.is_none()
+        && c.title_color.is_none()
+        && !c.header_transparent
+        && c.header_shadow_visible
+    {
+        return None;
+    }
+    let on_scroll = c.header_transparent && c.header_background_on_scroll;
+    let standard = header_appearance(mtm, c, c.header_transparent && !on_scroll);
+    let scroll_edge = if on_scroll {
+        header_appearance(mtm, c, true)
+    } else {
+        standard.clone()
+    };
+    Some((standard, scroll_edge))
+}
+
+/// One appearance of the header: `transparent`, or its background color,
+/// else UIKit's default background.
 fn header_appearance(
     mtm: MainThreadMarker,
     c: &ScreenConfig,
-) -> Option<Retained<UINavigationBarAppearance>> {
-    if c.background_color.is_none() && c.title_color.is_none() && !c.header_transparent {
-        return None;
-    }
+    transparent: bool,
+) -> Retained<UINavigationBarAppearance> {
     let appearance = UINavigationBarAppearance::new(mtm);
-    if c.header_transparent {
+    if transparent {
         appearance.configureWithTransparentBackground();
     } else if let Some(bg) = c.background_color {
         appearance.configureWithOpaqueBackground();
         appearance.setBackgroundColor(Some(&ui_color(bg)));
     } else {
         appearance.configureWithDefaultBackground();
+    }
+    if !c.header_shadow_visible {
+        // The configured backgrounds come with UIKit's hairline (the shadow
+        // image is nil after `configureWith…`): no color, no line.
+        appearance.setShadowColor(None);
     }
     if let Some(color) = c.title_color {
         let attributes = objc2_foundation::NSDictionary::from_retained_objects(
@@ -2099,7 +2212,7 @@ fn header_appearance(
             appearance.setLargeTitleTextAttributes(&attributes);
         }
     }
-    Some(appearance)
+    appearance
 }
 
 /// Styles a stack's navigation bar for the screen it shows: the screen's
@@ -2111,11 +2224,11 @@ pub(crate) fn style_bar(bar: &UINavigationBar, c: &ScreenConfig) {
     let tint = c.tint_color.map(ui_color);
     // SAFETY: a plain setter; `None` restores the default tint.
     unsafe { bar.setTintColor(tint.as_deref()) };
-    match header_appearance(mtm, c) {
-        Some(appearance) => {
-            bar.setStandardAppearance(&appearance);
-            bar.setScrollEdgeAppearance(Some(&appearance));
-            bar.setCompactAppearance(Some(&appearance));
+    match header_appearances(mtm, c) {
+        Some((standard, scroll_edge)) => {
+            bar.setStandardAppearance(&standard);
+            bar.setScrollEdgeAppearance(Some(&scroll_edge));
+            bar.setCompactAppearance(Some(&standard));
         }
         None => {
             let appearance = UINavigationBarAppearance::new(mtm);
@@ -2285,40 +2398,151 @@ impl ModalHost {
     }
 }
 
-/// The back button a user taps in the header shown over `window`: the
-/// navigation bar's (UIKit draws it, so it is found by what it is).
+/// The navigation bars showing in `view`'s subtree, in drawing order (the
+/// front one last).
 #[cfg(feature = "dev")]
-pub(crate) fn back_button(window: &objc2_ui_kit::UIWindow) -> Option<Retained<UIView>> {
-    fn bars(view: &UIView, out: &mut Vec<Retained<UIView>>) {
-        if view.isHidden() || view.alpha() < 0.01 {
-            return;
-        }
-        if view.isKindOfClass(<UINavigationBar as objc2::ClassType>::class()) {
-            out.push(objc2::Message::retain(view));
-        }
-        for sub in view.subviews().iter() {
-            bars(&sub, out);
-        }
+fn bars(view: &UIView, out: &mut Vec<Retained<UIView>>) {
+    if view.isHidden() || view.alpha() < 0.01 {
+        return;
     }
-    fn named(view: &UIView, part: &str) -> bool {
-        view.class().name().to_string_lossy().contains(part)
+    if view.isKindOfClass(<UINavigationBar as objc2::ClassType>::class()) {
+        out.push(objc2::Message::retain(view));
     }
-    // A bar button that carries the back chevron's mask.
+    for sub in view.subviews().iter() {
+        bars(&sub, out);
+    }
+}
+
+/// Whether `view`'s class name has `part` in it (UIKit's private views are
+/// found by what they are).
+#[cfg(feature = "dev")]
+pub(crate) fn class_named(view: &UIView, part: &str) -> bool {
+    view.class().name().to_string_lossy().contains(part)
+}
+
+/// The back button a user taps in the front header shown in `root` (a
+/// window, a sheet's view): the navigation bar's (UIKit draws it, so it is
+/// found by what it is).
+#[cfg(feature = "dev")]
+pub(crate) fn back_button(root: &UIView) -> Option<Retained<UIView>> {
+    // A showing bar button that carries the back chevron's mask (the bar
+    // keeps a page's it left, hidden, for a while).
     fn back(view: &UIView) -> Option<Retained<UIView>> {
+        if view.isHidden() || view.alpha() < 0.01 {
+            return None;
+        }
         let subviews = view.subviews();
-        if named(view, "ButtonBarButton")
-            && !view.isHidden()
-            && view.alpha() > 0.01
-            && subviews.iter().any(|v| named(&v, "BackButton"))
+        if class_named(view, "ButtonBarButton")
+            && subviews.iter().any(|v| class_named(&v, "BackButton"))
         {
             return Some(objc2::Message::retain(view));
         }
         subviews.iter().find_map(|v| back(&v))
     }
     let mut found = Vec::new();
-    bars(window, &mut found);
+    bars(root, &mut found);
     // The front one: the last drawn.
     found.iter().rev().find_map(|bar| back(bar))
+}
+
+/// What names a bar button to a test: its identifier (the item's `key`) or
+/// its accessibility label.
+#[cfg(feature = "dev")]
+pub(crate) enum BarName<'a> {
+    Id(&'a str),
+    Label(&'a str),
+}
+
+/// The button a user taps for the bar button `name` names in the front
+/// header that has one over `window` (UIKit draws it for the item, which
+/// carries the name).
+#[cfg(feature = "dev")]
+pub(crate) fn bar_button(
+    window: &objc2_ui_kit::UIWindow,
+    name: &BarName<'_>,
+) -> Option<Retained<UIView>> {
+    fn text(object: &AnyObject, getter: objc2::runtime::Sel) -> Option<String> {
+        // SAFETY: an optional-string getter (`accessibilityIdentifier`,
+        // `accessibilityLabel`) the object answers, checked first.
+        unsafe {
+            let answers: bool = msg_send![object, respondsToSelector: getter];
+            if !answers {
+                return None;
+            }
+            let text: Option<Retained<NSString>> =
+                objc2::msg_send![object, performSelector: getter];
+            text.map(|t| t.to_string())
+        }
+    }
+    fn named(object: &AnyObject, name: &BarName<'_>) -> bool {
+        match name {
+            BarName::Id(id) => {
+                text(object, objc2::sel!(accessibilityIdentifier)).as_deref() == Some(*id)
+            }
+            BarName::Label(label) => {
+                text(object, objc2::sel!(accessibilityLabel)).is_some_and(|l| l.trim() == *label)
+                    || text(object, objc2::sel!(title)).is_some_and(|l| l.trim() == *label)
+            }
+        }
+    }
+    // A showing view in the bar that carries the name itself.
+    fn view_named(view: &UIView, name: &BarName<'_>) -> Option<Retained<UIView>> {
+        if view.isHidden() || view.alpha() < 0.01 {
+            return None;
+        }
+        if class_named(view, "ButtonBarButton") && named(view, name) {
+            return Some(objc2::Message::retain(view));
+        }
+        view.subviews().iter().find_map(|v| view_named(&v, name))
+    }
+    let mut found = Vec::new();
+    bars(window, &mut found);
+    found.iter().rev().find_map(|bar| {
+        let bar = bar.downcast_ref::<UINavigationBar>()?;
+        let item = bar.topItem()?;
+        let items = [item.rightBarButtonItems(), item.leftBarButtonItems()];
+        let item = items
+            .iter()
+            .flatten()
+            .flat_map(|items| items.to_vec())
+            .find(|item| named(item, name));
+        match item {
+            // The view UIKit made for the item (`view`, private), else
+            // the bar's button that took the item's name.
+            Some(item) => {
+                // SAFETY: the item's `view` getter (private), returning an
+                // optional view; an item without one is asked first.
+                let view: Option<Retained<UIView>> = unsafe {
+                    let answers: bool = msg_send![&*item, respondsToSelector: objc2::sel!(view)];
+                    if answers {
+                        msg_send![&*item, view]
+                    } else {
+                        None
+                    }
+                };
+                view.filter(|v| v.window().is_some() && !v.isHidden())
+                    .or_else(|| view_named(bar, name))
+            }
+            None => view_named(bar, name),
+        }
+    })
+}
+
+/// Whether a navigation controller in `window`'s app (its presented
+/// controllers' included) is in a transition: a push or pop UIKit is still
+/// animating, which takes no gesture for a sheet until it ends.
+#[cfg(feature = "dev")]
+pub(crate) fn navigation_transitioning(window: &objc2_ui_kit::UIWindow) -> bool {
+    fn walk(c: &UIViewController) -> bool {
+        if c.isKindOfClass(<UINavigationController as objc2::ClassType>::class())
+            && c.transitionCoordinator().is_some()
+        {
+            return true;
+        }
+        c.childViewControllers().iter().any(|c| walk(&c))
+            || c.presentedViewController().is_some_and(|p| walk(&p))
+    }
+    window.rootViewController().is_some_and(|root| walk(&root))
 }
 
 /// The sheet presented over `window`'s app (a modal), whose swipe down

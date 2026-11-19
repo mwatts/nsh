@@ -106,7 +106,8 @@ impl FollowTarget {
 /// An element another one names for assistive technologies
 /// ([`crate::AccessibilityProp::ActiveDescendant`],
 /// [`crate::AccessibilityProp::Controls`],
-/// [`crate::AccessibilityProp::DescribedBy`]): a node JS passes (a `ref`),
+/// [`crate::AccessibilityProp::DescribedBy`]) or as the scroll view it
+/// floats over ([`ScrollEdgeTarget`]): a node JS passes (a `ref`),
 /// or whatever element carries a Rust [`ElementRef`], looked up as the
 /// core commits, so the element may be rendered after the one naming it
 /// (a list's row made as the list lays out).
@@ -133,6 +134,26 @@ impl ElementTarget {
         match &self.0 {
             Named::Node(node) => Some(*node),
             Named::Ref(target) => Some(target.0.node.get()).filter(|&n| n != 0),
+        }
+    }
+}
+
+/// The scroll view a view floats over and the edge of it the view sits
+/// at ([`crate::Prop::ScrollEdgeElement`], `ios={{ scrollEdgeElement }}`).
+/// The scroll view is looked up as the core commits, as an
+/// [`ElementTarget`] is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollEdgeTarget {
+    pub(crate) scroll_view: ElementTarget,
+    pub(crate) edge: crate::ScrollEdge,
+}
+
+impl ScrollEdgeTarget {
+    /// Scroll view `scroll_view` (JS's ref), at `edge`.
+    pub(crate) fn of_node(scroll_view: NodeId, edge: crate::ScrollEdge) -> Self {
+        Self {
+            scroll_view: ElementTarget::of_node(scroll_view),
+            edge,
         }
     }
 }
@@ -489,8 +510,8 @@ impl ElementRef {
     /// view took it. For a component whose own hit layer lies over content
     /// the app renders (a table's cells): that content's pressable views
     /// get the presses on them. The element's own `pointerEvents` do not
-    /// count; hover and press states stay the hit layer's. Await it in a
-    /// task.
+    /// count; press states stay the hit layer's, hovers are passed on with
+    /// [`Self::hover_at`]. Await it in a task.
     pub fn press_at(&self, press: crate::PressEvent) -> Answer<bool> {
         let (answer, slot) = Answer::new();
         let pending = slot.clone();
@@ -501,6 +522,21 @@ impl ElementRef {
             slot.borrow_mut().deliver(false);
         }
         answer
+    }
+
+    /// Passes a pointer on into the element, as [`Self::press_at`] does a
+    /// press: the views in it under `mouse.page_position` (in its root
+    /// view, as a pointer's) and the views around them up to the element
+    /// are hovered, with the layout of the last commit. Their `hover:`
+    /// classes and the `group-hover:` classes inside them apply, and those
+    /// that listen hear `onMouseEnter` / `onMouseLeave` as the views under
+    /// the pointer change and `onMouseMove` on each call. `None`: the
+    /// pointer left the element. For a component whose own hit layer lies
+    /// over content the app renders (a table's cells), from the hit layer's
+    /// `onMouseMove` and `onMouseLeave`. The element's own `pointerEvents`
+    /// do not count.
+    pub fn hover_at(&self, mouse: Option<crate::MouseEvent>) {
+        self.reach(|node, executor| executor.act(Action::HoverAt(node, mouse)));
     }
 
     /// How long the element's transitions run (`transition*`: the

@@ -9,11 +9,13 @@
 // `{ title, icon, disabled }`), the selected one (`selectedIndex`), which
 // the app sets, `disabled`, and `onChange` with the index the user chose.
 // `Switch`, the system's switch on iOS and Android: `checked`, which the
-// app sets, `disabled`, `accessibilityLabel`, and `onChange` with the value
-// the user asked for. `DateTimePicker`, the system's date and time picker
+// app sets, `disabled`, `accessibilityLabel`, `onChange` with the value the
+// user asked for, and the `accentColor` style it is on in.
+// `DateTimePicker`, the system's date and time picker
 // on iOS and Android: what it picks (`mode`), its value and bounds (`value`,
 // `min`, `max`: ISO strings in the mode's form), `minuteInterval`,
-// `disabled`, and `onChange({ value })` with the user's pick.
+// `disabled`, `accessibilityLabel`, and `onChange({ value })` with the
+// user's pick.
 import { Text, View, signal } from "nsh";
 import { DateTimePicker, SegmentedControl, Switch, TabBar, isAvailable } from "nsh/mobile";
 
@@ -41,7 +43,13 @@ function App() {
         style={{ marginHorizontal: 16, height: 32 }}
       />
       <Text>{`Wi-Fi: ${wifi()}`}</Text>
-      <Switch testID="wifi" accessibilityLabel="Wi-Fi" checked={wifi()} onChange={({ checked }) => wifi.set(checked)} />
+      <Switch
+        testID="wifi"
+        accessibilityLabel="Wi-Fi"
+        checked={wifi()}
+        onChange={({ checked }) => wifi.set(checked)}
+        style={{ accentColor: "#34c759" }}
+      />
       <Switch testID="locked" accessibilityLabel="Locked" disabled />
       <Text>{`When: ${when()}`}</Text>
       <DateTimePicker
@@ -52,6 +60,7 @@ function App() {
         max="2027-11-01T00:00"
         minuteInterval={5}
         disabled={false}
+        accessibilityLabel="When"
         onChange={({ value }) => when.set(value)}
         style={{ marginHorizontal: 16 }}
       />

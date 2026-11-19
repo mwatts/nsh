@@ -1467,8 +1467,8 @@ fn a_system_menus_choice_told_after_its_dismissal_still_reaches_the_app() {
         .unwrap();
 }
 
-/// A system menu the app owns the `open` of, and closes itself ("Close
-/// it").
+/// A system menu the app owns the `open` of, and opens ("Open it") and
+/// closes ("Close it") itself.
 #[component]
 fn AppClosedSystemMenu() -> impl IntoElement {
     let open = signal(false);
@@ -1503,6 +1503,11 @@ fn AppClosedSystemMenu() -> impl IntoElement {
         )
         .child(
             view()
+                .on_press(move || open.set(true))
+                .child(text("Open it")),
+        )
+        .child(
+            view()
                 .on_press(move || open.set(false))
                 .child(text("Close it")),
         )
@@ -1525,23 +1530,264 @@ fn a_system_menu_the_app_closes_reports_only_its_closing() {
         .unwrap();
 }
 
+/// A prop of the context menu's native component, as last sent.
+fn system_menu_prop(app: &App, name: &str) -> Option<serde_json::Value> {
+    let seen = app.seen.lock().unwrap();
+    let id = seen.components[CONTEXT_MENU_COMPONENT];
+    seen.component_props[&(id, name.to_owned())].clone()
+}
+
 #[test]
-fn off_ios_a_context_menus_items_are_not_used() {
-    for os in [Os::Web, Os::Android] {
-        let mut app = start_on(Root::of::<SystemMenuRow>(), os);
-        assert!(
-            !app.seen
-                .lock()
-                .unwrap()
-                .components
-                .contains_key(CONTEXT_MENU_COMPONENT),
-            "{os:?}: no system menu"
+fn with_items_android_opens_the_systems_popup_menu_where_the_finger_held() {
+    let mut app = start_on(Root::of::<SystemMenuRow>(), Os::Android);
+    assert_eq!(
+        system_menu_prop(&app, "items"),
+        Some(serde_json::json!([
+            { "id": "rename", "label": "Rename", "icon": "pencil" },
+            { "id": "", "label": "", "inline": true, "items": [
+                { "id": "delete", "label": "Delete", "destructive": true },
+            ] },
+        ]))
+    );
+    assert_eq!(
+        system_menu_prop(&app, "title"),
+        Some(serde_json::json!("Notes.txt"))
+    );
+    assert_eq!(
+        system_menu_prop(&app, "open"),
+        Some(serde_json::json!(false))
+    );
+    // Android's popup menu has no opener of its own: the held finger opens
+    // it through `open`, at the point it held, and NSH draws none.
+    hold_row(&mut app, PointerType::Touch);
+    app.app.wait_for("text:heard: true:LongPress").unwrap();
+    assert!(!app.app.shows("Drawn rename"), "no drawn menu");
+    assert_eq!(
+        system_menu_prop(&app, "open"),
+        Some(serde_json::json!(true))
+    );
+    assert_eq!(
+        system_menu_prop(&app, "at"),
+        Some(serde_json::json!({ "x": 10.0, "y": 110.0 }))
+    );
+    // The platform tells it shown, then the choice and its dismissal, as
+    // iOS's: the opening is not reported twice.
+    system_menu_event(&mut app, "open", serde_json::json!("touch"));
+    system_menu_event(&mut app, "select", serde_json::json!("delete"));
+    system_menu_event(&mut app, "close", serde_json::Value::Null);
+    app.app
+        .wait_for("text:heard: true:LongPress open false:Select select:delete close")
+        .unwrap();
+    assert_eq!(
+        system_menu_prop(&app, "open"),
+        Some(serde_json::json!(false))
+    );
+}
+
+#[test]
+fn an_android_system_menu_the_app_opens_drops_below_the_trigger() {
+    let mut app = start_on(Root::of::<AppClosedSystemMenu>(), Os::Android);
+    app.app.press("text:Open it").unwrap();
+    app.app.settle();
+    // No finger asked for it: no point, the menu goes below the trigger.
+    assert_eq!(
+        system_menu_prop(&app, "open"),
+        Some(serde_json::json!(true))
+    );
+    assert_eq!(system_menu_prop(&app, "at"), Some(serde_json::Value::Null));
+}
+
+#[test]
+fn an_android_system_menu_that_never_showed_does_not_stay_open() {
+    let mut app = start_on(Root::of::<SystemMenuRow>(), Os::Android);
+    hold_row(&mut app, PointerType::Touch);
+    app.app.wait_for("text:heard: true:LongPress").unwrap();
+    // The platform could not show it (the row left the window before the
+    // menu came up): it tells the closing alone, and the menu is asked
+    // closed, with no opening or closing reported.
+    system_menu_event(&mut app, "close", serde_json::Value::Null);
+    app.app
+        .wait_for("text:heard: true:LongPress false:Cancel")
+        .unwrap();
+    assert_eq!(
+        system_menu_prop(&app, "open"),
+        Some(serde_json::json!(false))
+    );
+    // The next hold asks for it again.
+    hold_row(&mut app, PointerType::Touch);
+    app.app
+        .wait_for("text:heard: true:LongPress false:Cancel true:LongPress")
+        .unwrap();
+    assert_eq!(
+        system_menu_prop(&app, "open"),
+        Some(serde_json::json!(true))
+    );
+}
+
+#[test]
+fn on_the_web_a_context_menus_items_are_not_used() {
+    let mut app = start_on(Root::of::<SystemMenuRow>(), Os::Web);
+    assert!(
+        !app.seen
+            .lock()
+            .unwrap()
+            .components
+            .contains_key(CONTEXT_MENU_COMPONENT),
+        "no system menu"
+    );
+    hold_row(&mut app, PointerType::Touch);
+    app.app.wait_for("Drawn rename").unwrap();
+}
+
+/// A row whose system menu has a preview (iOS): the text says what the app
+/// heard, in order.
+#[component]
+fn PreviewMenuRow() -> impl IntoElement {
+    let heard = signal(String::from("heard:"));
+    let hear = move |what: &str| {
+        heard.update(|h| {
+            h.push(' ');
+            h.push_str(what);
+        })
+    };
+    view()
+        .pt(px(100.0))
+        .child(
+            context_menu()
+                .items(vec![MenuButtonItem::new("rename", "Rename")])
+                .on_open_change(move |e: &ContextMenuEvents| {
+                    if let ContextMenuEvents::OpenChange(open, reason) = e {
+                        hear(&format!("{open}:{reason:?}"));
+                    }
+                })
+                .on_open(move || hear("open"))
+                .on_preview_press(move || hear("preview"))
+                .on_close(move || hear("close"))
+                .preview(
+                    view()
+                        .test_id("preview")
+                        .w(px(300.0))
+                        .h(px(120.0))
+                        .child(text("Last lines")),
+                )
+                .trigger(
+                    view()
+                        .test_id("row")
+                        .w(px(200.0))
+                        .h(px(40.0))
+                        .child(text("Row")),
+                ),
+        )
+        .child(text(move || heard.get()))
+}
+
+/// One phase of a finger on the row, settled.
+fn touch_row(app: &mut App, phase: nsh_core::TouchPhase) {
+    let row = app.seen.lock().unwrap().test_ids["row"];
+    let event = EventPayload::Touch(Box::new(nsh_core::TouchEvent {
+        phase,
+        timestamp: 0.0,
+        points: vec![nsh_core::TouchPoint {
+            id: 1,
+            target: row,
+            path: if phase == nsh_core::TouchPhase::Start {
+                vec![row]
+            } else {
+                Vec::new()
+            },
+            page: point(px(10.0), px(110.0)),
+            location: point(px(10.0), px(10.0)),
+            changed: true,
+            pointer_type: PointerType::Touch,
+            pressure: 0.5,
+            tilt_x: 0.0,
+            tilt_y: 0.0,
+        }],
+        modifiers: Default::default(),
+        activated: None,
+    }));
+    app.app
+        .engine()
+        .control()
+        .dispatch_event(nsh_core::ROOT_ID, EventKind::Touch, event);
+    app.app.settle();
+}
+
+/// The preview's laid out size, while it is made.
+fn preview_size(app: &App) -> Option<(f32, f32)> {
+    app.app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|n| n.test_id.as_deref() == Some("preview"))
+        .map(|n| (n.bounds.size.width.0, n.bounds.size.height.0))
+}
+
+#[test]
+fn a_system_menus_preview_is_made_under_a_finger_and_kept_while_the_menu_is_up() {
+    let mut app = start_on(Root::of::<PreviewMenuRow>(), Os::Ios);
+    {
+        let seen = app.seen.lock().unwrap();
+        let id = seen.components[CONTEXT_MENU_COMPONENT];
+        assert_eq!(
+            seen.component_props[&(id, "preview".to_owned())],
+            Some(serde_json::json!(true))
         );
-        hold_row(&mut app, PointerType::Touch);
-        app.app
-            .wait_for("Drawn rename")
-            .unwrap_or_else(|e| panic!("{os:?}: {e}"));
     }
+    // Nothing is made for rows nobody touches.
+    assert_eq!(preview_size(&app), None);
+    // A finger down: made, at its own size, out of sight, before the
+    // system asks for it.
+    touch_row(&mut app, nsh_core::TouchPhase::Start);
+    assert_eq!(preview_size(&app), Some((300.0, 120.0)));
+    assert!(!app.app.shows("Last lines"), "out of sight");
+    // The system takes the touch over and shows the menu: the preview stays.
+    system_menu_event(&mut app, "open", serde_json::json!("touch"));
+    touch_row(&mut app, nsh_core::TouchPhase::Cancel);
+    app.app.wait(std::time::Duration::from_secs(2)).unwrap();
+    assert_eq!(preview_size(&app), Some((300.0, 120.0)));
+    // A press on it closes the menu as a choice does, and it goes.
+    system_menu_event(&mut app, "previewPress", serde_json::Value::Null);
+    system_menu_event(&mut app, "close", serde_json::Value::Null);
+    app.app
+        .wait_for("text:heard: true:LongPress open false:Select preview close")
+        .unwrap();
+    assert_eq!(preview_size(&app), None);
+}
+
+#[test]
+fn a_system_menus_preview_goes_after_a_tap_that_opened_no_menu() {
+    let mut app = start_on(Root::of::<PreviewMenuRow>(), Os::Ios);
+    touch_row(&mut app, nsh_core::TouchPhase::Start);
+    touch_row(&mut app, nsh_core::TouchPhase::End);
+    assert!(preview_size(&app).is_some(), "kept a moment");
+    app.app
+        .wait(std::time::Duration::from_millis(1100))
+        .unwrap();
+    assert_eq!(preview_size(&app), None);
+    // A preview press told after the dismissal still reaches the app.
+    system_menu_event(&mut app, "open", serde_json::json!("touch"));
+    system_menu_event(&mut app, "close", serde_json::Value::Null);
+    system_menu_event(&mut app, "previewPress", serde_json::Value::Null);
+    app.app
+        .wait_for("text:heard: true:LongPress open false:PressOutside close preview")
+        .unwrap();
+}
+
+#[test]
+fn without_a_preview_a_system_menu_makes_none() {
+    let mut app = start_on(Root::of::<SystemMenuRow>(), Os::Ios);
+    {
+        let seen = app.seen.lock().unwrap();
+        let id = seen.components[CONTEXT_MENU_COMPONENT];
+        assert_eq!(
+            seen.component_props[&(id, "preview".to_owned())],
+            Some(serde_json::json!(false))
+        );
+    }
+    let before = app.app.screen().layout_nodes().len();
+    touch_row(&mut app, nsh_core::TouchPhase::Start);
+    assert_eq!(app.app.screen().layout_nodes().len(), before);
 }
 
 /// A row with a context menu and no `items`, as before they existed.
