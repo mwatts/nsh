@@ -5179,9 +5179,10 @@ impl Mounter {
 
     /// The finger lifted on a pressable view.
     pub(crate) fn pressed(&mut self, id: NodeId, at: PressAt) {
-        if let Some(s) = self.slot(id)
-            && s.events.contains(EventKind::Press)
-        {
+        let heard = self
+            .slot(id)
+            .is_some_and(|s| s.events.contains(EventKind::Press));
+        if heard {
             let payload = self.press_payload(id, at);
             self.control.dispatch_event(id, EventKind::Press, payload);
         }
