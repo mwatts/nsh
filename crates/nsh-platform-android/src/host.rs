@@ -23,8 +23,8 @@ use nsh_core::{
     geometry::{DevicePixels, point, px, size},
 };
 use nsh_engine::{
-    App, Assets, Bundle, ColorScheme, Edges, Engine, EngineConfig, EngineControl, Environment,
-    HourCycle, Idiom, Languages, Lifecycle, Locale, LocaleSettings, MountSink, Policy, Root,
+    App, Assets, Bundle, ColorScheme, Edges, Engine, EngineConfig, EngineContext, EngineControl,
+    Environment, HourCycle, Idiom, Languages, Lifecycle, Locale, LocaleSettings, MountSink, Policy, Root,
     TimeZone,
 };
 
@@ -69,6 +69,9 @@ pub(crate) struct Host {
     content_culling: AtomicBool,
     /// The embedding app's runtime for apps loaded from now on.
     runtime: Mutex<Option<tokio::runtime::Handle>>,
+    /// What the embedding app gives the engines of apps loaded from now on
+    /// ([`EngineConfig::context`]).
+    context: Mutex<EngineContext>,
     /// Where loaded apps keep their data, each in a directory named by its
     /// id ([`EngineConfig::support_dir`]): `nsh` in the files directory.
     pub(crate) support_dir: Option<std::path::PathBuf>,
@@ -259,7 +262,7 @@ impl Host {
                 nsh_engine::FileStorage::open(dir) as Arc<dyn nsh_engine::StorageBackend>
             }),
             clock: Default::default(),
-            context: Default::default(),
+            context: self.context.lock().expect("context").clone(),
             pinned: Default::default(),
             clipboard: None,
             host: self.host.clone(),
@@ -738,6 +741,7 @@ extern "system" fn Java_com_longbridge_nsh_Native_create(
         limits: Mutex::new(nsh_engine::Limits::default()),
         content_culling: AtomicBool::new(true),
         runtime: Mutex::new(None),
+        context: Mutex::new(EngineContext::default()),
         support_dir,
         storage: Mutex::new(None),
         access: Mutex::new(Arc::default()),
@@ -1277,6 +1281,44 @@ pub unsafe fn set_runtime(handle: jlong, runtime: Option<tokio::runtime::Handle>
     // SAFETY: the caller guarantees a live handle that cannot be destroyed.
     let host = unsafe { host(handle) };
     *host.runtime.lock().expect("runtime") = runtime;
+}
+
+/// Sets what the embedding app gives the engines of apps loaded next in
+/// one `NshView` ([`EngineConfig::context`]): its UI sets' Rust code reads
+/// it with `nsh_core::element::engine_context`, as on iOS
+/// (`SurfaceOptions::context`).
+///
+/// Call before loading an app. Later changes apply from the next load,
+/// including an app waiting for its first size; a running engine keeps its
+/// context.
+///
+/// # Safety
+///
+/// As [`set_runtime`]: `handle` must be the live native handle of a
+/// `NshView` from this linked library, and the call must run on the view's
+/// UI thread, before it is destroyed.
+pub unsafe fn set_context(handle: jlong, context: EngineContext) {
+    // SAFETY: the caller guarantees a live handle that cannot be destroyed.
+    let host = unsafe { host(handle) };
+    *host.context.lock().expect("context") = context;
+}
+
+/// Runs `app` (a bundle or a Rust root) in one `NshView`, replacing the
+/// running app: what an embedding app that holds its bundle in its own
+/// library calls instead of `NshView.loadBundleFile` or `loadAssetBundle`.
+///
+/// The view's granted capabilities apply to a bundle, as they do to one
+/// Java loads. The app starts once the view has a size.
+///
+/// # Safety
+///
+/// As [`set_runtime`]: `handle` must be the live native handle of a
+/// `NshView` from this linked library, and the call must run on the view's
+/// UI thread, before it is destroyed.
+pub unsafe fn load(handle: jlong, app: impl Into<App>) {
+    // SAFETY: the caller guarantees a live handle that cannot be destroyed.
+    let host = unsafe { host(handle) };
+    host.load(app);
 }
 
 /// Runs a Rust app's root in the `NshView` with native handle `handle`
