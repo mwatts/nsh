@@ -108,30 +108,6 @@ public class NshView extends FrameLayout {
     };
 
     @Override
-    public void onWindowFocusChanged(boolean hasWindowFocus) {
-        super.onWindowFocusChanged(hasWindowFocus);
-        if (!hasWindowFocus && handle != 0) Native.disarmHold(handle);
-    }
-
-    @Override
-    public boolean dispatchKeyEvent(android.view.KeyEvent event) {
-        if (event.getAction() == android.view.KeyEvent.ACTION_DOWN && handle != 0) {
-            android.view.View focus = findFocus();
-            if (!(focus instanceof android.widget.EditText)) {
-                if (event.getKeyCode() == android.view.KeyEvent.KEYCODE_ESCAPE) {
-                    Native.disarmHold(handle);
-                } else if (!event.isCtrlPressed() && !event.isAltPressed() && !event.isMetaPressed()) {
-                    int unicode = event.getUnicodeChar();
-                    if (unicode != 0 && Native.offerHold(handle, new String(Character.toChars(unicode)))) {
-                        return true;
-                    }
-                }
-            }
-        }
-        return super.dispatchKeyEvent(event);
-    }
-
-    @Override
     public boolean dispatchTouchEvent(android.view.MotionEvent e) {
         android.view.MotionEvent t = mounter.keyboardTap(e);
         boolean tracking = touches.onTouch(t);
@@ -157,7 +133,22 @@ public class NshView extends FrameLayout {
      */
     @Override
     public boolean dispatchKeyEvent(android.view.KeyEvent e) {
-        return keys.dispatchKeyEvent(e) || super.dispatchKeyEvent(e);
+        return offerToHold(e) || keys.dispatchKeyEvent(e) || super.dispatchKeyEvent(e);
+    }
+
+    /**
+     * Outside a text field, a typed character goes to an armed hold first, and Escape disarms it.
+     */
+    private boolean offerToHold(android.view.KeyEvent e) {
+        if (e.getAction() != android.view.KeyEvent.ACTION_DOWN || handle == 0) return false;
+        if (findFocus() instanceof android.widget.EditText) return false;
+        if (e.getKeyCode() == android.view.KeyEvent.KEYCODE_ESCAPE) {
+            Native.disarmHold(handle);
+            return false;
+        }
+        if (e.isCtrlPressed() || e.isAltPressed() || e.isMetaPressed()) return false;
+        int unicode = e.getUnicodeChar();
+        return unicode != 0 && Native.offerHold(handle, new String(Character.toChars(unicode)));
     }
 
     /**
@@ -176,7 +167,10 @@ public class NshView extends FrameLayout {
             // The releases of the keys held may never come.
             keys.focusLost();
             backKeyDown = false;
-            if (handle != 0) Native.keyReset(handle);
+            if (handle != 0) {
+                Native.keyReset(handle);
+                Native.disarmHold(handle);
+            }
         } else {
             focusForKeyboard();
         }
