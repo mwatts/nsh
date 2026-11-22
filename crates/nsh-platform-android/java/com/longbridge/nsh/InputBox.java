@@ -465,14 +465,10 @@ final class InputBox extends FrameLayout implements Node {
     private final float[] caret = new float[4];
 
     /**
-     * `onCaretMove` while the input edits, if its caret moved: the caret at the
-     * selection's end, in the input's coordinates (dp; the EditText's padding,
-     * gravity and scrolling applied).
+     * `onSelectionChange` of `view`'s selection `start..end`, with the caret's rectangle at the selection's end
+     * and, for a range, its first line's, as `SelectionEvent` places them: in the input's coordinates, in dp,
+     * where `onCaretMove` puts the caret. The two offsets alone while the view has no layout yet.
      */
-    /// `onSelectionChange` of `view`'s selection `start..end`, with the
-    /// caret's rectangle and, for a selection, its first line's, in points
-    /// in the input (as the GPUI backend sends them). The two offsets alone
-    /// while the view has no layout yet.
     private void reportSelection(android.widget.TextView view, int start, int end) {
         android.text.Layout layout = view.getLayout();
         if (layout == null || start < 0 || end < 0) {
@@ -480,13 +476,14 @@ final class InputBox extends FrameLayout implements Node {
                     new Object[] {(double) start, (double) end});
             return;
         }
-        // Layout is in pixels. The event is in points.
         float d = mounter.density;
+        float left = textLeft(view), top = textTop(view);
         int n = view.length();
-        int at = Math.min(Math.max(end, 0), n);
-        int line = layout.getLineForOffset(at);
-        double x = layout.getPrimaryHorizontal(at) / d;
-        double y = layout.getLineTop(line) / d;
+        int a = Math.min(Math.min(start, end), n);
+        int b = Math.min(Math.max(start, end), n);
+        int line = layout.getLineForOffset(b);
+        double x = (left + layout.getPrimaryHorizontal(b)) / d;
+        double y = (top + layout.getLineTop(line)) / d;
         double h = (layout.getLineBottom(line) - layout.getLineTop(line)) / d;
         if (start == end) {
             mounter.eventMap(id, Native.SELECTION_CHANGE,
@@ -494,21 +491,25 @@ final class InputBox extends FrameLayout implements Node {
                     new Object[] {(double) start, (double) end, x, y, 2.0, h});
             return;
         }
-        int a = Math.min(Math.max(Math.min(start, end), 0), n);
-        int b = Math.min(Math.max(Math.max(start, end), 0), n);
         int lineA = layout.getLineForOffset(a);
         int lineB = layout.getLineForOffset(Math.max(b - 1, a));
-        double x0 = layout.getPrimaryHorizontal(a) / d;
-        double x1 = lineA == lineB ? layout.getPrimaryHorizontal(b) / d : layout.getLineRight(lineA) / d;
-        double top = layout.getLineTop(lineA) / d;
-        double height = (layout.getLineBottom(lineA) - layout.getLineTop(lineA)) / d;
+        float x0 = layout.getPrimaryHorizontal(a);
+        float x1 = lineA == lineB ? layout.getPrimaryHorizontal(b) : layout.getLineRight(lineA);
+        double firstX = (left + Math.min(x0, x1)) / d;
+        double firstY = (top + layout.getLineTop(lineA)) / d;
+        double firstH = (layout.getLineBottom(lineA) - layout.getLineTop(lineA)) / d;
         mounter.eventMap(id, Native.SELECTION_CHANGE,
                 new String[] {"start", "end", "caretX", "caretY", "caretWidth", "caretHeight",
                         "firstX", "firstY", "firstWidth", "firstHeight"},
                 new Object[] {(double) start, (double) end, x, y, 2.0, h,
-                        Math.min(x0, x1), top, Math.abs(x1 - x0), height});
+                        firstX, firstY, Math.abs(x1 - x0) / d, firstH});
     }
 
+    /**
+     * `onCaretMove` while the input edits, if its caret moved: the caret at the
+     * selection's end, in the input's coordinates (dp; the EditText's padding,
+     * gravity and scrolling applied).
+     */
     private void reportCaret(android.widget.TextView view) {
         if (mounter == null || !mounter.wants(id, Native.CARET_MOVE) || !view.hasFocus()) return;
         android.text.Layout layout = view.getLayout();
@@ -516,9 +517,7 @@ final class InputBox extends FrameLayout implements Node {
         if (layout == null || end < 0) return;
         int line = layout.getLineForOffset(end);
         float d = mounter.density;
-        // The EditText sits in the container's padding (the content box).
-        float left = view.getLeft() + view.getTotalPaddingLeft() - view.getScrollX();
-        float top = view.getTop() + view.getTotalPaddingTop() - view.getScrollY();
+        float left = textLeft(view), top = textTop(view);
         float[] now = {
             (left + layout.getPrimaryHorizontal(end)) / d,
             (top + layout.getLineTop(line)) / d,
@@ -530,6 +529,16 @@ final class InputBox extends FrameLayout implements Node {
         System.arraycopy(now, 0, caret, 0, 4);
         mounter.eventMap(id, Native.CARET_MOVE, new String[] {"caretX", "caretY", "caretWidth", "caretHeight"},
                 new Object[] {(double) now[0], (double) now[1], (double) now[2], (double) now[3]});
+    }
+
+    // Where `view`'s text layout starts in the input (px). The EditText sits in the container's padding (the
+    // content box); its own padding and gravity apply, and the text's scrolling.
+    private static float textLeft(android.widget.TextView view) {
+        return view.getLeft() + view.getTotalPaddingLeft() - view.getScrollX();
+    }
+
+    private static float textTop(android.widget.TextView view) {
+        return view.getTop() + view.getTotalPaddingTop() - view.getScrollY();
     }
 
     /** `onKeyPress`. */

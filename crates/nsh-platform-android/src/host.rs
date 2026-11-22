@@ -24,8 +24,8 @@ use nsh_core::{
 };
 use nsh_engine::{
     App, Assets, Bundle, ColorScheme, Edges, Engine, EngineConfig, EngineContext, EngineControl,
-    Environment, HourCycle, Idiom, Languages, Lifecycle, Locale, LocaleSettings, MountSink, Policy, Root,
-    TimeZone,
+    Environment, HourCycle, Idiom, Languages, Lifecycle, Locale, LocaleSettings, MountSink, Policy,
+    Root, TimeZone,
 };
 
 use crate::{
@@ -1999,54 +1999,8 @@ extern "system" fn Java_com_longbridge_nsh_Native_eventMap(
                 continue;
             };
             // Payload keys are static: intern the known ones.
-            let key: &'static str = match key.as_str() {
-                "url" => "url",
-                "title" => "title",
-                "loading" => "loading",
-                "canGoBack" => "canGoBack",
-                "canGoForward" => "canGoForward",
-                "data" => "data",
-                "generation" => "generation",
-                "message" => "message",
-                "code" => "code",
-                "duration" => "duration",
-                "width" => "width",
-                "height" => "height",
-                "currentTime" => "currentTime",
-                "isBuffering" => "isBuffering",
-                "id" => "id",
-                "state" => "state",
-                "filename" => "filename",
-                "path" => "path",
-                "bytes" => "bytes",
-                "index" => "index",
-                "start" => "start",
-                "end" => "end",
-                "key" => "key",
-                "loaded" => "loaded",
-                "total" => "total",
-                "error" => "error",
-                "text" => "text",
-                "has" => "has",
-                "opened" => "opened",
-                "permission" => "permission",
-                "shown" => "shown",
-                "pressed" => "pressed",
-                "reason" => "reason",
-                "composing" => "composing",
-                "caretX" => "caretX",
-                "caretY" => "caretY",
-                "caretWidth" => "caretWidth",
-                "caretHeight" => "caretHeight",
-                "kind" => "kind",
-                "durationMs" => "durationMs",
-                "positionMs" => "positionMs",
-                "truncated" => "truncated",
-                "buffering" => "buffering",
-                "action" => "action",
-                "target" => "target",
-                "value" => "value",
-                _ => continue,
+            let Some(key) = nsh_core::PAYLOAD_KEYS.iter().copied().find(|k| *k == key) else {
+                continue;
             };
             if let Some(v) = read(&mut env, i) {
                 fields.push((key, v));
