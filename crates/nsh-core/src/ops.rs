@@ -1092,6 +1092,62 @@ pub enum PayloadValue {
     Bounds(Bounds<Points>),
 }
 
+/// The keys a platform may name in a map payload it reports by name
+/// (Android's `eventMap`). Android interns each key it reads against these
+/// and drops any other, so a key a platform sends is listed here.
+pub const PAYLOAD_KEYS: &[&str] = &[
+    "url",
+    "title",
+    "loading",
+    "canGoBack",
+    "canGoForward",
+    "data",
+    "generation",
+    "message",
+    "code",
+    "duration",
+    "width",
+    "height",
+    "currentTime",
+    "isBuffering",
+    "id",
+    "state",
+    "filename",
+    "path",
+    "bytes",
+    "index",
+    "start",
+    "end",
+    "key",
+    "loaded",
+    "total",
+    "error",
+    "text",
+    "has",
+    "opened",
+    "permission",
+    "shown",
+    "pressed",
+    "reason",
+    "composing",
+    "caretX",
+    "caretY",
+    "caretWidth",
+    "caretHeight",
+    "firstX",
+    "firstY",
+    "firstWidth",
+    "firstHeight",
+    "kind",
+    "durationMs",
+    "positionMs",
+    "truncated",
+    "buffering",
+    "action",
+    "target",
+    "value",
+];
+
 /// Data delivered with an event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventPayload {
@@ -4098,5 +4154,41 @@ mod tests {
             EventKind::ALL.len(),
             "Native.java has codes of no kind"
         );
+    }
+
+    /// Android drops a map payload's key that [`super::PAYLOAD_KEYS`] does
+    /// not list: every key the Java runtime names in an `eventMap` call is
+    /// one of them.
+    #[test]
+    fn androids_event_map_keys_are_payload_keys() {
+        let dir = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nsh-platform-android/java/com/longbridge/nsh"
+        );
+        let mut checked = 0;
+        for entry in std::fs::read_dir(dir).expect("the Java runtime") {
+            let path = entry.expect("a Java file").path();
+            let java = std::fs::read_to_string(&path).expect("Java source");
+            for (at, _) in java.match_indices("eventMap(") {
+                let call = &java[at..];
+                let call = &call[..call.find(';').unwrap_or(call.len())];
+                let Some(keys) = call.split_once("new String[] {").map(|(_, rest)| rest) else {
+                    continue;
+                };
+                let keys = &keys[..keys.find('}').expect("the keys' end")];
+                for key in keys
+                    .split(',')
+                    .filter_map(|key| key.trim().strip_prefix('"')?.strip_suffix('"'))
+                {
+                    assert!(
+                        super::PAYLOAD_KEYS.contains(&key),
+                        "{} sends {key:?}, which Android drops",
+                        path.display()
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 40, "found the eventMap calls ({checked} keys)");
     }
 }
