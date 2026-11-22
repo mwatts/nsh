@@ -994,7 +994,8 @@ impl EventTarget {
     }
 }
 
-/// The caret and the selection's first line, in `view`'s coordinates.
+/// The caret, drawn or not, and the selection's first line, in the input's
+/// coordinates, as `onCaretMove` places the caret.
 fn selection_geometry(
     view: &UIView,
 ) -> (
@@ -1005,8 +1006,6 @@ fn selection_geometry(
     let Some(range) = range else {
         return (None, None);
     };
-    let end: Retained<AnyObject> = unsafe { msg_send![&*range, end] };
-    let caret_rect: CGRect = unsafe { msg_send![view, caretRectForPosition: &*end] };
     let rects: Option<Retained<NSArray<AnyObject>>> =
         unsafe { msg_send![view, selectionRectsForRange: &*range] };
     let first_line = rects.and_then(|rects| {
@@ -1016,14 +1015,7 @@ fn selection_geometry(
         }
         let item: Retained<AnyObject> = unsafe { msg_send![&*rects, objectAtIndex: 0_usize] };
         let rect: CGRect = unsafe { msg_send![&*item, rect] };
-        Some(shown_rect(rect))
+        Some(input::in_input(view, rect))
     });
-    (Some(shown_rect(caret_rect)), first_line)
-}
-
-fn shown_rect(rect: CGRect) -> nsh_core::Bounds<nsh_core::Points> {
-    nsh_core::geometry::bounds(
-        point(px(rect.origin.x as f32), px(rect.origin.y as f32)),
-        nsh_core::geometry::size(px(rect.size.width as f32), px(rect.size.height as f32)),
-    )
+    (input::caret(view), first_line)
 }
