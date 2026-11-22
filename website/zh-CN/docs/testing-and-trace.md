@@ -71,7 +71,7 @@ cargo test adds_a_todo        # 名称包含 "adds_a_todo" 的测试
 `scroll(selector, px(3000.0))`、`back`、`wait`、`wait_for`、`wait_for_gone`、`wait_until`、`run_for`、`fast_forward`、
 `set_system_time`、`set_viewport`、`set_clipboard` 和 `on_dialog`；`app.shows(text)` 和 `app.screen()`（`texts()`、
 `count(selector)`、`enabled(selector)`、`dialogs()`、`clipboard()`、`commands()`）读取屏幕上的内容。无法执行的步骤会返回一个错误，
-附带屏幕上的文字。`app.clear_commands()` 让 `commands()` 从头记起，长测试只留下它要检查的那些步骤发出的命令。
+附带屏幕上的文字。`nsh_testing::by_role(role, name)` 写出具有该角色和名称的那一个视图的选择器（`app.press(&by_role("button", title))`）。`app.clear_commands()` 让 `commands()` 从头记起，长测试只留下它要检查的那些步骤发出的命令。
 
 `nsh_testing::tsx(entry, sets)`（feature `bundle`）以同样的方式打开应用的 TSX 入口，基于 NSH 的和 crate 的 UI 集合构建
 （[用 Rust 开发](./rust.md#测试)）。`examples/gallery-rs` 就这样测试它的 Rust 根组件，每个演示一个模块；`examples/rust-exports`
@@ -363,7 +363,7 @@ expect(app.texts()).toContain("Saved at 09:00:10");
 | `id:<testID>` | 设置了该 `testID` 的视图。 |
 | `label:<label>` | 设置了该 `accessibilityLabel` 的视图。 |
 | `text:<text>` | 内容为该文字的文本（忽略首尾空格）、文本中可以按的片段（嵌套的 `<Text onPress>`、`TextView` 的链接），或者内容为该文字、空着时占位文字为该文字的输入框。 |
-| `role:<role>`、`role:<role>[<name>]` | 设置了该 `role` 的视图（`role:button`），并且名称为 `<name>`：它的标签，没有标签时取它内部的文字（`role:button[Save]`）。 |
+| `role:<role>`、`role:<role>[<name>]` | 平台对外呈现为该角色的视图（`role:button`）：它的 `role`；没有设置时，输入框为 `textbox`，可以按的视图为 `button`。写了名称时只匹配名称为 `<name>` 的那个：它的标签，没有标签时取它内部的文字（输入框的文字是它的值，不是名称），与 Testing Library 的 `getByRole(role, { name })` 一致（`role:button[Save]`）。没有无障碍名称的视图永远不会按角色找到；按角色选择器找不到视图的步骤会列出屏幕上该角色的视图的名称，以及没有名称的那些。 |
 | `view:<id>` | `--trace` 输出中该 id 的视图。 |
 | 其他写法 | 依次按 `testID`、标签、文字匹配。 |
 
