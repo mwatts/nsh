@@ -98,6 +98,8 @@ extern "system" fn Java_com_example_app_RuntimeBridge_configure(
 }
 ```
 
+同一个句柄还能设置视图的引擎上下文（`nsh::set_context`，对应 iOS 的 `SurfaceOptions::context`），应用的 Rust 组件和模块函数会读取它；也能加载应用库里自带的 bundle（`nsh::load`，对应 iOS 的 `AppView::load`）。两者都在 UI 线程上调用，在 Java 加载之前或代替 Java 加载。
+
 开启混淆时，保留桥接类的名称（`-keep class com.example.app.RuntimeBridge { *; }`）；分发的 AAR 已保留 `com.longbridge.nsh` 包，包括 `NshView.handle`。
 
 ## 为每个平台编写

@@ -98,6 +98,8 @@ extern "system" fn Java_com_example_app_RuntimeBridge_configure(
 }
 ```
 
+The same handle takes the view's engine context, which the app's Rust components and module functions read (`nsh::set_context`, iOS `SurfaceOptions::context`), and a bundle the app's library holds (`nsh::load`, iOS `AppView::load`). Both apply on the UI thread, before or instead of a Java load.
+
 In minified builds, keep the bridge class's names (`-keep class com.example.app.RuntimeBridge { *; }`); the distributed AARs already keep the `com.longbridge.nsh` package, `NshView.handle` included.
 
 ## Writing for every platform

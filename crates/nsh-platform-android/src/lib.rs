@@ -40,7 +40,9 @@ mod text;
 use std::ffi::c_void;
 
 pub use component::{ComponentContext, ComponentFactory, Components, NativeComponent};
-pub use host::{run_root, set_runtime};
+pub use host::{load, run_root, set_context, set_runtime};
+/// What [`load`] runs and what [`set_context`] gives.
+pub use nsh_engine::{App, Bundle, EngineContext};
 /// What [`ui_sets!`] gives.
 pub use nsh_core::element::Registry;
 /// What [`root!`] gives.

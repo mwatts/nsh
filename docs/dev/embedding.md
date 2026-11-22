@@ -86,6 +86,10 @@
   `EngineConfig::runtime`, per view; `None` keeps the process-wide shared runtime. Both are read each time an engine
   starts, so a change applies from the next load and a running engine keeps its runtime. NSH only clones the handle;
   the app owns the runtime. The engine's `runtime` tests cover it (`nsh-engine/tests/engine/runtime.rs`).
+- **An engine context and a bundle from Rust (Android)**: `nsh::set_context(handle, context)` is Android's
+  `SurfaceOptions::context`. It forwards the embedding app's `EngineContext` to `EngineConfig::context`, per view, read
+  each time an engine starts. `nsh::load(handle, app)` runs a `Bundle` or `Root` that the app's own library holds, as
+  `AppView::load` does on iOS, with the view's granted capabilities applied to a bundle.
 - **Native components** (`nsh`'s `nativeComponent`; `component.rs`, `ComponentBox.java`): the embedding app registers its own native
   views by name — Swift `NshAppView.register(component:) { context in … }` (`NshComponent`: `view`, `setProp`,
   `command`), Java `NshView.registerComponent(name, factory)` (`NshComponent`), Rust `AppView::register_component`
