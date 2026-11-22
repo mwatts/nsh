@@ -2181,3 +2181,91 @@ fn a_background_app_s_hidden_main_window_is_not_focused(cx: &mut TestAppContext)
     wait_for(&view, cx, "focused=true");
     cx.update(|_, cx| crate::window::set_in_background(false, cx));
 }
+
+/// A button that sets the focused field's text, and a disabled one.
+#[cfg(feature = "test-support")]
+const ACCESSIBLE_BUTTONS: &str = r#"
+import { mount, signal, View } from "nsh";
+import { Input } from "nsh/base";
+
+function App() {
+  const text = signal("none");
+  return (
+    <View style={{ flex: 1, padding: 8, gap: 8 }}>
+      <View accessibilityRole="button" accessibilityLabel="Save" onPress={() => text.set("saved")} style={{ width: 80, height: 30 }} />
+      <View accessibilityRole="button" accessibilityLabel="Delete" accessibilityState={{ disabled: true }} onPress={() => text.set("deleted")} style={{ width: 80, height: 30 }} />
+      <Input autoFocus value={text()} style={{ height: 30 }} />
+    </View>
+  );
+}
+mount(App);
+"#;
+
+/// The views' nodes are in the tree a host's test reads, with their roles,
+/// names and states, the focused field's under the focus proxy, and a
+/// `Click` request reaches the button it names as a press does. GPUI's
+/// test windows build the tree only with `GPUI_A11Y_ACTIVE=1`, which GPUI
+/// reads once per process: without it, the test runs itself in a child
+/// process that has it.
+#[cfg(feature = "test-support")]
+#[gpui::test]
+fn accessibility(cx: &mut TestAppContext) {
+    use gpui::accesskit::{Action, ActionRequest, NodeId, Role, TreeId};
+
+    if std::env::var("GPUI_A11Y_ACTIVE").as_deref() != Ok("1") {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::accessibility", "--nocapture"])
+            .env("GPUI_A11Y_ACTIVE", "1")
+            .status()
+            .expect("run the test in a child process");
+        assert!(status.success(), "the child process failed: {status}");
+        return;
+    }
+    cx.executor().allow_parking();
+    crate::set_ui_sets(vec![nsh_base::registry()]);
+    let (view, cx) =
+        cx.add_window_view(|window, cx| AppView::new(AppOptions::default(), window, cx));
+    let code = nsh_bundler::compile_module("App.tsx", ACCESSIBLE_BUTTONS, &[]).unwrap();
+    view.update(cx, |view, _| view.load(App::Js(Bundle::source(code))));
+    cx.update(|window, cx| window.focus(&view.focus_handle(cx), cx));
+    wait_for(&view, cx, "none");
+    let click = |target_node| ActionRequest {
+        action: Action::Click,
+        target_tree: TreeId::ROOT,
+        target_node,
+        data: None,
+    };
+    let named = |cx: &mut VisualTestContext, role: Role, name: &str| {
+        let tree = cx.update(|window, _| crate::accessibility::tree(window));
+        tree.nodes
+            .into_iter()
+            .find(|(_, node)| node.role() == role && node.label() == Some(name))
+    };
+    wait_until_window(cx, "the Save button is in the tree", |cx| {
+        named(cx, Role::Button, "Save").is_some()
+    });
+    let (save, node) = named(cx, Role::Button, "Save").unwrap();
+    assert!(node.supports_action(Action::Click) && !node.is_disabled());
+    let (delete, node) = named(cx, Role::Button, "Delete").expect("the Delete button");
+    assert!(node.is_disabled() && !node.supports_action(Action::Click));
+    let tree = cx.update(|window, _| crate::accessibility::tree(window));
+    let field = tree
+        .nodes
+        .iter()
+        .find(|(_, node)| node.role() == Role::TextInput)
+        .expect("the focused field, under the focus proxy");
+    assert_eq!(field.1.value(), Some("none"));
+    let root = tree.nodes.iter().find(|(id, _)| *id == NodeId(0)).unwrap();
+    assert!(root.1.children().contains(&field.0), "{:?}", root.1);
+
+    let disabled =
+        cx.update(|window, cx| crate::accessibility::perform_action(&click(delete), window, cx));
+    assert!(!disabled, "a disabled button takes no Click");
+    let pressed =
+        cx.update(|window, cx| crate::accessibility::perform_action(&click(save), window, cx));
+    assert!(pressed, "Save takes a Click");
+    wait_for(&view, cx, "saved");
+    let unknown =
+        cx.update(|window, cx| crate::accessibility::perform_action(&click(NodeId(1)), window, cx));
+    assert!(!unknown, "no view's node has that id");
+}

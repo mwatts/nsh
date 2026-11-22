@@ -78,6 +78,7 @@ Features:
 | `video` | videos with GStreamer (`native/video.rs`); without it a video is a placeholder that reports `onError` | Linux |
 | `dev` | the dev server client, log forwarding, the error overlay (`dev.rs`) | yes |
 | `shot` | screenshots on macOS and Windows (`nsh test --target gpui`'s) through GPUI's `test-support` (`Window::render_to_image`); the tests in windows of GPUI's test platform (`tests.rs`) | macOS, Windows |
+| `test-support` | a host's tests of its accessibility tree in windows of GPUI's test platform, which have no AccessKit adapter (`accessibility::tree`, `accessibility::perform_action`) | no |
 | `runtime-shaders` | GPUI's Metal shaders compiled when the app starts, not by the build (`gpui_platform/runtime_shaders`): builds on a Mac without the Metal Toolchain; nothing elsewhere | the CLI's, where `xcrun metal` fails; never the distribution's |
 
 `shot` turns on GPUI's test support, for the host and the tests; apps that embed the crate leave it off. With it, the
@@ -142,6 +143,25 @@ xvfb-run -a dbus-run-session -- sh -c '
   need something in the window to change: press its controls from an AT-SPI client, which also reads the tree as a
   screen reader does (Python's `gi.repository.Atspi`: the application under `Atspi.get_desktop(0)`, then an
   element's `get_action_iface().do_action(0)`).
+
+### Testing a host's accessibility tree
+
+A window of GPUI's test platform has no AccessKit adapter: nothing attaches, so GPUI builds no tree, and nothing
+sends an action. With `test-support`, and `GPUI_A11Y_ACTIVE=1` in the test's environment (GPUI's `test-support`
+reads it once per process and builds every window's tree as though an assistive technology were attached), a host's
+test reads and acts on what the backend gave the tree:
+
+- `accessibility::tree(window)` is what the surfaces drawn in `window` gave GPUI's tree in its last frame built
+  with a client attached (`access::synthetic`): the views' nodes as the adapter gets them, the focused element's
+  under the focus proxy's id, under a `Window` root, as an AccessKit `TreeUpdate` (`accesskit_consumer::Tree` reads
+  it as the adapters do). A native component's elements push GPUI's own nodes, which are not in it.
+- `accessibility::perform_action(&request, window, cx)` runs an AccessKit `ActionRequest` as GPUI runs one the
+  adapter sends: the listener the view registered for that node and action as the surface painted. It is false when
+  no view took that action on that node.
+
+What is left out is GPUI's routing of a request to its listener and the platform's adapter (NSAccessibility, UI
+Automation, AT-SPI): [Checking the accessibility tree on Linux](#checking-the-accessibility-tree-on-linux) covers
+those.
 
 ## Architecture
 

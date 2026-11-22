@@ -82,6 +82,8 @@ pub use nsh_engine::{
 #[cfg(feature = "js")]
 pub use nsh_engine::{LoadedPackage, accept_package, load_package, package, verify_package};
 
+#[cfg(feature = "test-support")]
+pub use crate::access::testing as accessibility;
 #[cfg(feature = "dev")]
 pub use crate::app::set_root;
 pub use crate::{
