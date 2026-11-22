@@ -17,6 +17,7 @@ pub(crate) struct SoftwareKeyboard {
 }
 
 impl SoftwareKeyboard {
+    #[cfg(any(test, feature = "js"))]
     pub(crate) fn set(&mut self, height: Points) {
         self.height = Some(height);
     }

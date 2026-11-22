@@ -556,6 +556,7 @@ impl Headless {
 
     /// The height the software keyboard takes while an editable field is
     /// focused on iOS or Android (`open`'s `keyboard_height`).
+    #[cfg(any(test, feature = "js"))]
     pub(crate) fn set_software_keyboard(&mut self, height: Points) {
         self.software_keyboard.set(height);
         // Published anew: the new height replaces the one shown.
@@ -5432,7 +5433,7 @@ mod tests {
                     .readonly(true)
                     .element_ref(&locked),
             )
-            .child(view().on_press(|| dismiss_keyboard()).child(text("Done")))
+            .child(view().on_press(dismiss_keyboard).child(text("Done")))
             .child(view().on_press(move || locked.focus()).child(text("Lock")))
     }
 
