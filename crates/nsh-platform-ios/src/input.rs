@@ -862,14 +862,21 @@ pub(crate) fn caret(view: &UIView) -> Option<Bounds<Points>> {
         let end: Retained<AnyObject> = msg_send![&range?, end];
         msg_send![view, nshCaretRectForPosition: &*end]
     };
+    Some(in_input(view, rect))
+}
+
+/// `rect`, in input view `view`'s own coordinates (for a text area, its
+/// content, scrolled), in the input's: its container, which the editor
+/// fills.
+pub(crate) fn in_input(view: &UIView, rect: CGRect) -> Bounds<Points> {
     let rect = match view.superview() {
         Some(container) => view.convertRect_toView(rect, Some(&container)),
         None => rect,
     };
-    Some(Bounds {
+    Bounds {
         origin: nsh_core::geometry::point(px(rect.origin.x as f32), px(rect.origin.y as f32)),
         size: nsh_core::geometry::size(px(rect.size.width as f32), px(rect.size.height as f32)),
-    })
+    }
 }
 
 /// Records `caret` as the one reported for input view `view`; false when
