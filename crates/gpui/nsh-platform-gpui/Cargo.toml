@@ -46,6 +46,10 @@ crypto = ["js", "nsh-engine/crypto"]
 # renders the window's frame offscreen (its `test-support`; development
 # hosts only).
 shot = ["gpui/test-support", "gpui_platform/test-support"]
+# A host's tests of its accessibility tree on GPUI's test platform, which
+# has no AccessKit adapter: `accessibility::tree` and
+# `accessibility::perform_action` (`docs/dev/gpui.md`).
+test-support = []
 # Compile GPUI's Metal shaders at run time (macOS), so building needs no Metal
 # Toolchain (`xcodebuild -downloadComponent MetalToolchain`).
 runtime-shaders = ["gpui_platform/runtime_shaders"]

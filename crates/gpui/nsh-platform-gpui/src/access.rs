@@ -910,6 +910,9 @@ struct State {
     listeners: Vec<(accesskit::NodeId, NodeId, Vec<Action>)>,
     /// The last announcement and its sequence number.
     announcement: Option<(u64, String)>,
+    /// What the last frame gave GPUI's tree, for hosts' tests.
+    #[cfg(feature = "test-support")]
+    shown: testing::Shown,
 }
 
 thread_local! {
@@ -1047,6 +1050,10 @@ pub(crate) fn prepaint(
     let active = window.is_a11y_active();
     let key = surface.key();
     with_state(surface, |s| s.active = active);
+    #[cfg(feature = "test-support")]
+    with_state(surface, |s| {
+        s.shown.window = Some(window.window_handle().window_id());
+    });
     // A client attached to any of its windows.
     let any = self::active(surface);
     let mut env = surface.environment.get();
@@ -1073,10 +1080,17 @@ pub(crate) fn prepaint(
     let mut built = build(key, &root, surface.origin.get(), scale, &field);
     let mut proxied = None;
     let mut proxy = None;
+    #[cfg(feature = "test-support")]
+    let mut shown_proxy = None;
     if let Some(view) = focused(surface).map(|v| v.id())
         && let Some((entry, below)) = built.take_subtree(node_id(key, view))
     {
         let node = entry.node;
+        #[cfg(feature = "test-support")]
+        {
+            let below = below.iter().map(|e| (e.id, e.node.clone())).collect();
+            shown_proxy = Some((node.clone(), below));
+        }
         let k = scale.max(f32::EPSILON) as f64;
         let b = node.bounds().unwrap_or_default();
         let (x, y) = ((b.x0 / k) as f32, (b.y0 / k) as f32);
@@ -1107,6 +1121,10 @@ pub(crate) fn prepaint(
         s.built = Some(built);
         s.proxied = proxied;
         s.proxy = proxy;
+        #[cfg(feature = "test-support")]
+        {
+            s.shown.proxy = shown_proxy;
+        }
     });
 }
 
@@ -1130,7 +1148,10 @@ pub(crate) fn synthetic(surface: &Surface, builder: &mut A11ySubtreeBuilder) {
         (s.built.take(), s.proxied.take(), s.announcement.clone())
     });
     let Some(built) = built else { return };
+    #[cfg(not(feature = "test-support"))]
     let listeners = attach(surface.key(), built, proxied, announcement, builder);
+    #[cfg(feature = "test-support")]
+    let listeners = testing::record(surface, built, proxied, announcement, builder);
     with_state(surface, |s| s.listeners = listeners);
 }
 
@@ -1184,19 +1205,36 @@ pub(crate) fn paint(surface: &Surface, window: &mut Window, cx: &mut App) {
     }
     let key = surface.key();
     let root = crate::window::entered(surface);
-    for (node, view, actions) in listeners {
-        for action in actions {
-            window.on_a11y_action(node, action, move |data, window, cx| {
-                if let Some(surface) = Surface::by_key(key)
-                    && let Some(view) = surface.view(view)
-                {
-                    let _in = crate::window::enter(&surface, root);
-                    perform(&surface, &view, action, data, window.scale_factor());
-                }
-                crate::rt::flush(cx);
+    for (node, view, actions) in &listeners {
+        let view = *view;
+        for &action in actions {
+            window.on_a11y_action(*node, action, move |data, window, cx| {
+                on_action(key, root, view, action, data, window, cx);
             });
         }
     }
+    #[cfg(feature = "test-support")]
+    with_state(surface, |s| s.shown.listeners = (root, listeners));
+}
+
+/// AccessKit's adapter asked for `action` on the node of `view` of the
+/// surface `key`, drawn in its window `root`.
+fn on_action(
+    key: u64,
+    root: Option<NodeId>,
+    view: NodeId,
+    action: Action,
+    data: Option<&ActionData>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(surface) = Surface::by_key(key)
+        && let Some(view) = surface.view(view)
+    {
+        let _in = crate::window::enter(&surface, root);
+        perform(&surface, &view, action, data, window.scale_factor());
+    }
+    crate::rt::flush(cx);
 }
 
 /// Activates an element as a tap would: its `activate` action when it
@@ -1371,6 +1409,156 @@ fn scroll_to(surface: &Rc<Surface>, view: &NshView, x: f32, y: f32) {
         animated: false,
     };
     crate::scroll::command(surface, view, &command);
+}
+
+/// The accessibility tree on GPUI's test platform, whose windows have no
+/// AccessKit adapter: what a window's surfaces gave GPUI's tree, and
+/// AccessKit's action requests run as the adapter's would be, for a host's
+/// tests of its own screens. GPUI builds the tree only while an assistive
+/// technology is attached; `GPUI_A11Y_ACTIVE=1` makes its test windows
+/// build it as though one were.
+#[cfg(feature = "test-support")]
+pub mod testing {
+    use gpui::{WindowId, accesskit::ActionRequest};
+
+    use super::*;
+
+    /// What a surface gave GPUI's tree in the last frame built while a
+    /// client was attached, and the listeners it registered as it painted.
+    #[derive(Default)]
+    pub(super) struct Shown {
+        pub(super) window: Option<WindowId>,
+        /// The focus proxy's node and its subtree, this frame.
+        pub(super) proxy: Option<(Node, Vec<(accesskit::NodeId, Node)>)>,
+        top: Vec<accesskit::NodeId>,
+        nodes: Vec<(accesskit::NodeId, Node)>,
+        /// The window the surface painted in, and its listeners.
+        pub(super) listeners: (Option<NodeId>, Vec<Listener>),
+    }
+
+    /// A view's node and the actions it registered listeners for.
+    type Listener = (accesskit::NodeId, NodeId, Vec<Action>);
+
+    /// A builder that keeps a copy of each node pushed through it.
+    struct Recorder<'a, S: Subtree> {
+        inner: &'a mut S,
+        nodes: Vec<(accesskit::NodeId, Node)>,
+    }
+
+    impl<S: Subtree> Subtree for Recorder<'_, S> {
+        fn parent_node(&mut self) -> &mut Node {
+            self.inner.parent_node()
+        }
+
+        fn push_child(&mut self, id: accesskit::NodeId, node: Node) -> bool {
+            self.nodes.push((id, node.clone()));
+            self.inner.push_child(id, node)
+        }
+    }
+
+    /// [`attach`], keeping what it gave GPUI's tree, with the focus proxy
+    /// (its node is the element's, under the proxy's id).
+    pub(super) fn record(
+        surface: &Surface,
+        built: Built,
+        proxied: Option<(NodeId, Vec<Action>)>,
+        announcement: Option<(u64, String)>,
+        builder: &mut impl Subtree,
+    ) -> Vec<Listener> {
+        let proxied_view = proxied.as_ref().map(|(view, _)| *view);
+        let mut recorder = Recorder {
+            inner: builder,
+            nodes: Vec::new(),
+        };
+        let listeners = attach(surface.key(), built, proxied, announcement, &mut recorder);
+        let top = recorder.parent_node().children().to_vec();
+        let mut nodes = recorder.nodes;
+        with_state(surface, |s| {
+            let proxy = proxied_view.zip(s.shown.proxy.take());
+            if let Some((view, (node, below))) = proxy
+                && let Some((id, ..)) = listeners.iter().find(|(_, v, _)| *v == view)
+            {
+                nodes.push((*id, node));
+                nodes.extend(below);
+            }
+            s.shown.top = top;
+            s.shown.nodes = nodes;
+        });
+        listeners
+    }
+
+    /// The states of the surfaces drawn in `window` while a client was
+    /// attached.
+    fn shown_in<R>(window: WindowId, mut f: impl FnMut(u64, &Shown) -> Option<R>) -> Option<R> {
+        STATES.with_borrow(|states| {
+            states
+                .iter()
+                .filter(|(_, s)| s.active && s.shown.window == Some(window))
+                .find_map(|(key, s)| f(key.0, &s.shown))
+        })
+    }
+
+    /// What the nsh surfaces drawn in `window` gave its accessibility tree
+    /// in the last frame built while a client was attached, as one tree: a
+    /// `Window` root (id 0) whose children are each surface's top
+    /// elements. The views' nodes are as AccessKit's adapter gets them,
+    /// the focused element's under the focus proxy's id. A native
+    /// component's elements push nodes of GPUI's own, which are not here.
+    pub fn tree(window: &Window) -> accesskit::TreeUpdate {
+        let id = window.window_handle().window_id();
+        let mut nodes = Vec::new();
+        let mut top = Vec::new();
+        shown_in(id, |_, shown| {
+            top.extend(
+                shown
+                    .top
+                    .iter()
+                    .filter(|t| shown.nodes.iter().any(|(n, _)| n == *t)),
+            );
+            nodes.extend(shown.nodes.iter().cloned());
+            None::<()>
+        });
+        let root = accesskit::NodeId(0);
+        let mut window_node = Node::new(Role::Window);
+        window_node.set_children(top);
+        nodes.insert(0, (root, window_node));
+        accesskit::TreeUpdate {
+            nodes,
+            tree: Some(accesskit::Tree::new(root)),
+            tree_id: accesskit::TreeId::ROOT,
+            focus: root,
+        }
+    }
+
+    /// Runs `request` as GPUI does when AccessKit's adapter sends it to
+    /// `window`: what the view registered for that node and action as the
+    /// surface last painted. False when no view of `window` took that
+    /// action on that node.
+    pub fn perform_action(request: &ActionRequest, window: &mut Window, cx: &mut App) -> bool {
+        let id = window.window_handle().window_id();
+        let found = shown_in(id, |key, shown| {
+            let (root, listeners) = &shown.listeners;
+            listeners
+                .iter()
+                .find(|(node, _, actions)| {
+                    *node == request.target_node && actions.contains(&request.action)
+                })
+                .map(|(_, view, _)| (key, *root, *view))
+        });
+        let Some((key, root, view)) = found else {
+            return false;
+        };
+        on_action(
+            key,
+            root,
+            view,
+            request.action,
+            request.data.as_ref(),
+            window,
+            cx,
+        );
+        true
+    }
 }
 
 #[cfg(test)]
