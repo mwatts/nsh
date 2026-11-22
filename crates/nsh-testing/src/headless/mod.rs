@@ -1890,7 +1890,10 @@ impl Headless {
             Pick::None => Err(format!(
                 "{}; {}",
                 failure::not_found(what, selector),
-                self.on_screen()
+                Selector::parse(selector)
+                    .ok()
+                    .and_then(|s| self.screen.role_hint(&s))
+                    .unwrap_or_else(|| self.on_screen())
             )),
             Pick::Many(n) => Err(format!(
                 "`{selector}` matches {n} {what}s: say which (`{selector} >> nth=0`), or look inside \
@@ -3624,6 +3627,91 @@ mod tests {
         app.press("role:button[Bold]").unwrap();
         app.wait(Duration::from_millis(50)).unwrap();
         assert_eq!(pressed(&app), Ok(Some(nsh_core::Checked::True)));
+    }
+
+    /// A view that presses (a button by its press, named by its text),
+    /// two buttons of one name, a labelled input and an icon with no name.
+    #[component]
+    fn Roles() -> impl IntoElement {
+        let said = signal(String::from("none"));
+        view()
+            .child(
+                view()
+                    .on_press(move || said.set("opened".into()))
+                    .child(text("Open")),
+            )
+            .child(
+                view()
+                    .role(AccessibilityRole::Button)
+                    .on_press(|| {})
+                    .child(text("Delete")),
+            )
+            .child(
+                view()
+                    .role(AccessibilityRole::Button)
+                    .on_press(|| {})
+                    .child(text("Delete")),
+            )
+            .child(
+                input()
+                    .label("Title")
+                    .placeholder("Untitled")
+                    .value(move || said.get())
+                    .on_change(move |text: &str| said.set(text.to_owned())),
+            )
+            .child(
+                view()
+                    .role(AccessibilityRole::Toolbar)
+                    .label("Tools")
+                    .child(
+                        view()
+                            .test_id("icon")
+                            .w(px(20.0))
+                            .h(px(20.0))
+                            .on_press(|| {}),
+                    ),
+            )
+            .child(text(move || format!("said: {}", said.get())))
+    }
+
+    #[test]
+    fn a_role_and_name_find_one_control() {
+        let mut app = Headless::start(EngineConfig::new(Root::of::<Roles>())).unwrap();
+        app.first_render().unwrap();
+        app.press(&crate::by_role("button", "Open")).unwrap();
+        app.wait_for("text:said: opened").unwrap();
+        app.type_text(&crate::by_role("textbox", "Title"), " now")
+            .unwrap();
+        assert_eq!(
+            app.screen().input_text("role:textbox[Title]"),
+            Ok(Some("opened now"))
+        );
+        assert_eq!(
+            app.press("role:button[Delete]").unwrap_err(),
+            "`role:button[Delete]` matches 2 pressable views: say which (`role:button[Delete] >> \
+             nth=0`), or look inside a view around it (`id:list >> role:button[Delete]`)"
+        );
+        assert_eq!(
+            app.press("role:button[Save]").unwrap_err(),
+            "no pressable view matches `role:button[Save]`; the buttons on screen are named \
+             \"Open\", \"Delete\", \"Delete\"; a button with no accessible name is found by no \
+             role selector: `id:icon` (give it a `label` or a text)"
+        );
+        assert_eq!(
+            app.press("role:toolbar[Tools] >> role:button").unwrap_err(),
+            "no pressable view matches `role:toolbar[Tools] >> role:button`; the buttons on \
+             screen are named \"Open\", \"Delete\", \"Delete\"; a button with no accessible \
+             name is found by no role selector: `id:icon` (give it a `label` or a text)"
+        );
+        assert_eq!(
+            app.press("role:switch[Wi-Fi]").unwrap_err(),
+            "no pressable view matches `role:switch[Wi-Fi]`; no view on screen has the role \
+             switch; the roles on screen: button, textbox, toolbar"
+        );
+        assert_eq!(
+            app.press("role:button[]").unwrap_err(),
+            "`role:button[]`: an empty name; a role selector finds only named views"
+        );
     }
 
     /// The metrics of a line of text in a canvas font.

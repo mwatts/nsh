@@ -155,9 +155,15 @@ impl Matcher {
                     let name = name
                         .strip_suffix(']')
                         .ok_or_else(|| format!("`{whole}`: `[` without its `]`"))?;
+                    let name = TextMatch::parse(name, whole)?;
+                    if matches!(&name, TextMatch::Exact(n) if n.is_empty()) {
+                        return Err(format!(
+                            "`{whole}`: an empty name; a role selector finds only named views"
+                        ));
+                    }
                     Self::Role {
                         role: role.to_owned(),
-                        name: Some(TextMatch::parse(name, whole)?),
+                        name: Some(name),
                     }
                 }
                 None => Self::Role {
@@ -179,6 +185,29 @@ impl Matcher {
             _ => Self::Any(s.to_owned()),
         })
     }
+}
+
+/// The selector that finds the one view with role `role` named `name`
+/// exactly, as Testing Library's `getByRole(role, { name })` does:
+/// `role:<role>[<name>]`. A step on it fails when no view or more than
+/// one has that role and name, and a view with no accessible name is
+/// never found by role.
+///
+/// # Panics
+///
+/// When `name` is empty or cannot be written exactly in a selector: it
+/// holds ` >> `, or reads as a regex (`/…/`).
+pub fn by_role(role: &str, name: &str) -> String {
+    let name = name.trim();
+    assert!(
+        !name.is_empty(),
+        "by_role({role:?}, \"\"): a role selector finds only named views"
+    );
+    assert!(
+        !name.contains(" >> ") && !(name.starts_with('/') && name[1..].contains('/')),
+        "by_role({role:?}, {name:?}): the name cannot be written exactly in a selector"
+    );
+    format!("role:{role}[{name}]")
 }
 
 /// Whether `word`, before a part's first colon, has a prefix's shape: a

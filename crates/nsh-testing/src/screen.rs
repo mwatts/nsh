@@ -2282,12 +2282,12 @@ impl Screen {
                     matching(&|_, v| v.label.as_deref().is_some_and(|l| want.matches(l)))
                 }
                 Matcher::Text(want) => matching(&|_, v| shows_text(v, want)),
-                Matcher::Role { role, name } => matching(&|id, v| {
-                    v.role != AccessibilityRole::None
-                        && v.role.js_name() == role
-                        && name
-                            .as_ref()
-                            .is_none_or(|name| name.matches(&self.name(id)))
+                Matcher::Role { role, name } => matching(&|id, _| {
+                    self.role(id) == Some(role.as_str()) && {
+                        let named = self.name(id);
+                        !named.trim().is_empty()
+                            && name.as_ref().is_none_or(|name| name.matches(&named))
+                    }
                 }),
                 Matcher::View(id) => layers
                     .iter()
@@ -2629,10 +2629,89 @@ impl Screen {
         self.nodes.get(&id)?.long_press_delay
     }
 
-    /// A view's accessible name: its label, else the texts in it.
+    /// A view's role as the platforms expose it: its `role`, else a
+    /// text input's `textbox` and a view that hears presses' `button`
+    /// (`nsh-platform-gpui`'s and `nsh-platform-linux`'s `role_for`);
+    /// `None` for a view assistive technology meets as no control.
+    pub(crate) fn role(&self, id: NodeId) -> Option<&'static str> {
+        let v = self.nodes.get(&id)?;
+        if v.role != AccessibilityRole::None {
+            return Some(v.role.js_name());
+        }
+        if v.kind == Some(ViewKind::Input) {
+            return Some("textbox");
+        }
+        (v.events.contains(EventKind::Press) || v.events.contains(EventKind::LongPress))
+            .then_some("button")
+    }
+
+    /// Why no view matches the role selector `selector`, as Testing
+    /// Library's `getByRole` tells it: the names of the views on screen
+    /// with the role it asks for (and those that have none, which a role
+    /// selector never finds), else the roles on screen. `None` when the
+    /// selector's last part is not a role.
+    pub(crate) fn role_hint(&self, selector: &Selector) -> Option<String> {
+        let Matcher::Role { role, .. } = &selector.parts.last()?.matcher else {
+            return None;
+        };
+        const LIMIT: usize = 20;
+        let shown = self.by_layer();
+        let mut named = Vec::new();
+        let mut unnamed = Vec::new();
+        for id in shown.iter().copied() {
+            if self.role(id) != Some(role.as_str()) {
+                continue;
+            }
+            let name = self.name(id);
+            if name.trim().is_empty() {
+                unnamed.push(self.selector_of(id));
+            } else {
+                named.push(format!("{:?}", name.trim()));
+            }
+        }
+        if named.is_empty() && unnamed.is_empty() {
+            let mut roles: Vec<&str> = shown.iter().filter_map(|id| self.role(*id)).collect();
+            roles.sort_unstable();
+            roles.dedup();
+            return Some(format!(
+                "no view on screen has the role {role}; the roles on screen: {}",
+                roles.join(", ")
+            ));
+        }
+        let mut hint = String::new();
+        if !named.is_empty() {
+            let more = named.len().saturating_sub(LIMIT);
+            named.truncate(LIMIT);
+            hint = format!("the {role}s on screen are named {}", named.join(", "));
+            if more > 0 {
+                hint.push_str(&format!(" and {more} more"));
+            }
+        }
+        if !unnamed.is_empty() {
+            if !hint.is_empty() {
+                hint.push_str("; ");
+            }
+            unnamed.truncate(LIMIT);
+            hint.push_str(&format!(
+                "a {role} with no accessible name is found by no role selector: {} (give it a \
+                 `label` or a text)",
+                unnamed.join(", ")
+            ));
+        }
+        Some(hint)
+    }
+
+    /// A view's accessible name: its label, else the texts in it (none
+    /// for a text input, whose text is its value).
     fn name(&self, id: NodeId) -> String {
-        if let Some(label) = self.nodes.get(&id).and_then(|v| v.label.as_deref()) {
+        let Some(view) = self.nodes.get(&id) else {
+            return String::new();
+        };
+        if let Some(label) = view.label.as_deref() {
             return label.to_owned();
+        }
+        if view.kind == Some(ViewKind::Input) {
+            return String::new();
         }
         let mut texts = Vec::new();
         let mut stack = vec![id];

@@ -76,7 +76,7 @@ options set below: `storage` (`MemoryStorage::new(entries)`), `network` (`StubNe
 `scroll(selector, px(3000.0))`, `back`, `wait`, `wait_for`, `wait_for_gone`, `wait_until`, `run_for`, `fast_forward`,
 `set_system_time`, `set_viewport`, `set_clipboard` and `on_dialog`; `app.shows(text)` and `app.screen()` (`texts()`,
 `count(selector)`, `enabled(selector)`, `dialogs()`, `clipboard()`, `commands()`) read what is on screen. A step
-returns an error with the texts on screen when it cannot be taken. `app.clear_commands()` starts the record of
+returns an error with the texts on screen when it cannot be taken. `nsh_testing::by_role(role, name)` writes the selector of the one view with that role and name (`app.press(&by_role("button", title))`). `app.clear_commands()` starts the record of
 `commands()` afresh, so a long test keeps only the commands of the steps it checks.
 
 `nsh_testing::tsx(entry, sets)` (feature `bundle`) opens an app's TSX entry the same way, built against NSH's and the
@@ -398,7 +398,7 @@ Steps name views with **selectors**, written as Playwright's:
 | `id:<testID>` | The view with that `testID`. |
 | `label:<label>` | The view with that `accessibilityLabel`. |
 | `text:<text>` | A text that reads it (spaces around it aside), a span of a text that takes presses (a nested `<Text onPress>`, a `TextView`'s link), or an input holding it or, while empty, with that placeholder. |
-| `role:<role>`, `role:<role>[<name>]` | A view with that `role` (`role:button`), and that name: its label, else the texts in it (`role:button[Save]`). |
+| `role:<role>`, `role:<role>[<name>]` | A view with that role as platforms expose it (`role:button`): its `role`, else `textbox` for an input and `button` for a view that takes presses. With a name, only the one so named: its label, else the texts in it (an input's text is its value, not its name), as Testing Library's `getByRole(role, { name })` (`role:button[Save]`). A view with no accessible name is never found by role, and a step whose role selector finds none lists the names of the views on screen with that role, and those that have no name. |
 | `view:<id>` | The view with that id in `--trace` output. |
 | anything else | A `testID`, else a label, else a text, as written. |
 
